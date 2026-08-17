@@ -1,0 +1,31 @@
+# --- 依赖与构建产物 ---
+node_modules/
+.pnpm-store/
+lib/
+*.tgz
+
+# --- 锁文件（本地开发用；仓库不锁依赖） ---
+pnpm-lock.yaml
+package-lock.json
+
+# --- 运行时 / 隐私数据（绝不公开：含会话 ID、绝对路径、团队实例记录） ---
+orchestra/
+
+# --- 内部开发文档（不随公开仓库发布） ---
+AGENTS.md
+STATE.md
+DSH-INTEGRATION.md
+TESTING.md
+
+# --- 顶层早期布局残留（插件实际读取 <cwd>/orchestra/... ；顶层这几目录是旧结构，不入库） ---
+archive/
+state/
+reports/
+
+# --- 本机 / 临时文件 ---
+.DS_Store
+*.log
+.env
+.env.*
+probe.txt
+.probe-mkdtemp.txt

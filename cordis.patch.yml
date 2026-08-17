@@ -1,0 +1,14 @@
+# Bundle patch layer for orchestra-dsh.
+# Applied when a profile lists this bundle (dsh plugin --profile web add orchestra-dsh).
+# Two host-plane plugin rows: A2A transport + topology management, plus a
+# bundle-root row that lets the client module system discover the browser
+# settings panel (package-level dsh.client declaration).
+- insert:
+    - id: orchestra-bundle
+      name: orchestra-dsh
+
+    - id: orchestra-a2a
+      name: orchestra-dsh/a2a
+
+    - id: orchestra-manager
+      name: orchestra-dsh/orchestra

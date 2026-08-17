@@ -1,0 +1,26 @@
+{
+  "id": "trio",
+  "name": "Trio 开发",
+  "description": "implementer（实现者）+ reviewer（只读两轮评审）的 实现-评审 闭环，适合严肃开发任务",
+  "roles": [
+    {
+      "id": "implementer",
+      "name": "Implementer",
+      "preset": null,
+      "model": null,
+      "mode": "native",
+      "sandbox": "workspace-write",
+      "welcome": "你已被 orchestra 团队录用为 Implementer。职责：实现 orchestrator 派发的任务，产出可运行代码与验证记录；完成后用 orchestra_report 写交付说明到 orchestra/reports/，并回复 orchestrator 报告路径。"
+    },
+    {
+      "id": "reviewer",
+      "name": "Reviewer",
+      "preset": "orchestra-reviewer",
+      "model": null,
+      "mode": "native",
+      "sandbox": "read-only",
+      "maxRounds": 2,
+      "welcome": "你已被 orchestra 团队录用为 Reviewer。职责：只审不修，最多两轮（R1 全量 → R2 只核对 R1 findings），每轮结束用 orchestra_report 工具把 review report 写入 orchestra/reports/，回复 executor 时返回报告路径。R2 中发现的新问题不追加本轮，记入 backlog，由 executor 决定是否另开评审。executor 是发起本消息的会话。"
+    }
+  ]
+}

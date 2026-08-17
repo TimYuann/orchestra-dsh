@@ -1,0 +1,8 @@
+# Local Cordis composition (config-list dialect) for the standalone loader:
+#
+#   npm run dev     (node --import tsx scripts/loader.mjs)
+#
+# The harness install format is the bundle layer cordis.patch.yml instead.
+- name: './src/a2a.ts'
+
+- name: './src/orchestra.ts'
