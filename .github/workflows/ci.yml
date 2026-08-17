@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "11"
+
+      - name: Install dependencies (skip prepare build for deterministic CI)
+        run: pnpm install --ignore-scripts
+
+      - name: Typecheck (host + client)
+        run: pnpm typecheck
+
+      - name: Build (host tsc + client tsc + tsdown bundle)
+        run: pnpm build
+
+      # Project discipline gate: @deepseek-ai/* must NEVER land in dependencies
+      # (a duplicated host package breaks every tool call in DSH).
+      - name: Gate — no @deepseek-ai in dependencies
+        run: |
+          leaked=$(jq -r '.dependencies // {} | keys[] | select(startswith("@deepseek-ai"))' package.json || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::@deepseek-ai/* found in dependencies: $leaked (peerDependencies only!)"
+            exit 1
+          fi
+          echo "ok: no @deepseek-ai in dependencies"
+
+      # Privacy gate: no credentials/emails/private paths in tracked files.
+      - name: Gate — no secrets/emails/private paths in tracked files
+        run: |
+          hits=$(git ls-files -z | xargs -0 grep -nE 'sk-[A-Za-z0-9]{16,}|BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY|ghp_[A-Za-z0-9]{20,}|github_pat_|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' 2>/dev/null || true)
+          if [ -n "$hits" ]; then
+            echo "::error::sensitive pattern found in tracked files:"
+            echo "$hits"
+            exit 1
+          fi
+          echo "ok: tracked files clean (no keys/emails/tokens)"
