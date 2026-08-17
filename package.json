@@ -1,6 +1,6 @@
 {
   "name": "orchestra-dsh",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Orchestra — DSH multi-role topology collaboration. A2A transport (list/create/send/reply/read across agent threads) plus topology management (create/team/activate/report) with role presets, review rounds, and document handoff.",
   "type": "module",
   "main": "lib/index.js",

@@ -49,7 +49,7 @@ Requirements: DSH (DeepSeek Harness) with Node ≥ 22.
 
    ```bash
    npm run typecheck && npm run build     # host tsc + client tsc + tsdown bundle
-   npm pack --cache /tmp/dsh-npm-cache    # produces orchestra-dsh-0.2.0.tgz
+   npm pack --cache /tmp/dsh-npm-cache    # produces orchestra-dsh-0.2.1.tgz
    ```
 
    then add the tarball to your profile's `package.json` (pnpm profiles require forcing the reinstall):
