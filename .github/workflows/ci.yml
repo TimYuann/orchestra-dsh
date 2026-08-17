@@ -45,7 +45,10 @@ jobs:
       # Privacy gate: no credentials/emails/private paths in tracked files.
       - name: Gate — no secrets/emails/private paths in tracked files
         run: |
-          hits=$(git ls-files -z | xargs -0 grep -nE 'sk-[A-Za-z0-9]{16,}|BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY|ghp_[A-Za-z0-9]{20,}|github_pat_|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' 2>/dev/null || true)
+          mail_local='[A-Za-z0-9._%+-]+'
+          mail_domain='[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+          us='_'
+          hits=$(git ls-files -z | xargs -0 grep -nE 'sk-[A-Za-z0-9]{16,}|BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY|ghp_[A-Za-z0-9]{20,}|github_pat'"${us}"'|'"${mail_local}"'@'"${mail_domain}" 2>/dev/null || true)
           if [ -n "$hits" ]; then
             echo "::error::sensitive pattern found in tracked files:"
             echo "$hits"
