@@ -124,4 +124,4 @@ The dev instance restarts in seconds and never touches the main instance. Note: 
 
 ## License
 
-[MIT](LICENSE) © 2026 YuanTian. The DeepSeek Harness (DSH) is a separate project; see its own license.
+[MIT](LICENSE) © 2026 TimYuann. The DeepSeek Harness (DSH) is a separate project; see its own license.
