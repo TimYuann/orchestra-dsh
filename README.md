@@ -34,22 +34,31 @@ This is the core story of the project — the pitch and the demo start here.
 
 Requirements: DSH (DeepSeek Harness) with Node ≥ 22.
 
-1. **Build & install** — from this repo:
+1. **Install from npm** — one line per DSH profile:
+
+   ```bash
+   cd ~/.dsh/profiles/<your-profile>
+   pnpm add orchestra-dsh
+   ```
+
+   A just-published version is held back by pnpm's `minimumReleaseAge` policy for 24h — if you install right after a release, add `orchestra-dsh@<version>` to your profile's `pnpm-workspace.yaml` → `minimumReleaseAgeExclude`.
+
+   Safety rule of this plugin: **never** let `@deepseek-ai/*` land in `dependencies` — a duplicated host package breaks every tool call.
+
+2. **Or from source (development)** — build the tarball from this repo:
 
    ```bash
    npm run typecheck && npm run build     # host tsc + client tsc + tsdown bundle
    npm pack --cache /tmp/dsh-npm-cache    # produces orchestra-dsh-0.2.0.tgz
    ```
 
-2. **Install into a DSH profile** — add the tarball to your profile's `package.json`, then (pnpm profiles require forcing the reinstall):
+   then add the tarball to your profile's `package.json` (pnpm profiles require forcing the reinstall):
 
    ```bash
    cd ~/.dsh/profiles/<your-profile>
    rm -f node_modules/.modules.yaml node_modules/.pnpm-workspace-state-v1.json
    pnpm install
    ```
-
-   Safety rule of this plugin: **never** let `@deepseek-ai/*` land in `dependencies` — a duplicated host package breaks every tool call.
 
 3. **Restart DSH** and open a new session.
 
