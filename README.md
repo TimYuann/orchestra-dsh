@@ -34,16 +34,22 @@ This is the core story of the project — the pitch and the demo start here.
 
 Requirements: DSH (DeepSeek Harness) with Node ≥ 22.
 
-1. **Install from npm** — one line per DSH profile:
+1. **Install from npm** — `orchestra-dsh` is on the npm registry; any package manager works. Run it in your DSH profile directory (`cd ~/.dsh/profiles/<your-profile>` first):
+
+   | Manager | Command | Notes |
+   |---|---|---|
+   | **npm** (recommended) | `npm install orchestra-dsh` | npm ≥7 auto-installs peer dependencies — set `auto-install-peers=false` in the profile's `.npmrc` first, or add `--legacy-peer-deps`. |
+   | **pnpm** | `pnpm add orchestra-dsh` | When installing right after a release (24h `minimumReleaseAge` policy), add `orchestra-dsh@<version>` to `pnpm-workspace.yaml` → `minimumReleaseAgeExclude`. |
+   | **yarn** | `yarn add orchestra-dsh` | Yarn auto-installs peer dependencies — run the safety check below after installing. |
+   | **bun** | `bun add orchestra-dsh` | Bun auto-installs peer dependencies — run the safety check below after installing. |
+
+   **Safety check (all managers)** — this plugin's `@deepseek-ai/*` are `peerDependencies` provided by the DSH host. If your package manager materialized its own copies, the plugin double-loads and every tool call breaks:
 
    ```bash
-   cd ~/.dsh/profiles/<your-profile>
-   pnpm add orchestra-dsh
+   ls node_modules | grep '^@deepseek-ai'   # expect no output (a *.dup-bak leftover is fine)
    ```
 
-   A just-published version is held back by pnpm's `minimumReleaseAge` policy for 24h — if you install right after a release, add `orchestra-dsh@<version>` to your profile's `pnpm-workspace.yaml` → `minimumReleaseAgeExclude`.
-
-   Safety rule of this plugin: **never** let `@deepseek-ai/*` land in `dependencies` — a duplicated host package breaks every tool call.
+   If copies are present, remove `node_modules/@deepseek-ai` and re-run your install command with peer auto-install disabled.
 
 2. **Or from source (development)** — build the tarball from this repo:
 
