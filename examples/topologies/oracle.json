@@ -1,16 +1,28 @@
 {
+  "schemaVersion": 1,
   "id": "oracle",
   "name": "Oracle 推演",
-  "description": "oracle（深度推演搭档）：driver 与它对话式推演方案（讨论即计划），收敛后把结论作为自包含任务派给执行角色（计划即任务）",
+  "description": "driver + oracle（深度推演搭档）：对话式推演方案（讨论即计划），收敛后把结论作为自包含任务派给执行角色",
+  "controller": { "id": "driver", "source": "caller" },
   "roles": [
     {
       "id": "oracle",
       "name": "Oracle",
-      "preset": null,
-      "model": null,
-      "mode": "native",
+      "preset": "orchestra-oracle",
       "sandbox": "read-only",
-      "welcome": "你已被 orchestra 团队录用为 Oracle。职责：与 driver 深入推演——分析目标、权衡方案、识别风险、产出可执行的设计结论；推演过程即计划（取代 plan mode），收敛后用 orchestra_report 把设计结论写入 orchestra/reports/，并回复 driver 结论路径。"
+      "welcome": "你已被 orchestra 团队录用为 Oracle。职责：与 driver 深入推演——分析目标、权衡方案、识别风险、产出可执行的设计结论；推演过程即计划，收敛后用 orchestra_report 把设计结论写入 orchestra/reports/，并回复 driver 结论路径。"
     }
-  ]
+  ],
+  "protocol": {
+    "ownership": {
+      "scope": "driver",
+      "advice": "oracle",
+      "closure": "driver"
+    },
+    "routes": [
+      { "kind": "escalation", "from": ["driver"], "to": ["oracle"] },
+      { "kind": "advice", "from": "oracle", "to": ["driver"] }
+    ],
+    "completion": { "owner": "driver", "rule": "Driver acceptance" }
+  }
 }

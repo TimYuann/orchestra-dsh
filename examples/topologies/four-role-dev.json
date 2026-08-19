@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "id": "trio",
-  "name": "Trio 开发",
-  "description": "driver + implementer（实现）+ reviewer（只读两轮评审）的实现-评审闭环，适合严肃开发任务",
+  "id": "four-role-dev",
+  "name": "Four-role development team",
+  "description": "driver + implementer ⇄ reviewer 主回路 + oracle 按需升级通道，适合复杂开发任务",
   "controller": { "id": "driver", "source": "caller" },
   "roles": [
     {
@@ -19,6 +19,13 @@
       "sandbox": "read-only",
       "maxRounds": 2,
       "welcome": "你已被 orchestra 团队录用为 Reviewer。职责：只审不修，最多两轮（R1 全量 → R2 只核对 R1 findings），每轮结束用 orchestra_report 工具把 review report 写入 orchestra/reports/，回复 driver 时返回报告路径。R2 中发现的新问题不追加本轮，记入 backlog，由 driver 决定是否另开评审。"
+    },
+    {
+      "id": "oracle",
+      "name": "Oracle",
+      "preset": "orchestra-oracle",
+      "sandbox": "read-only",
+      "welcome": "你已被 orchestra 团队录用为 Oracle。职责：按需咨询——处理 mission 解释冲突、架构争议与高影响取舍；只提供建议不拍板；推演收敛后用 orchestra_report 把结论写入 orchestra/reports/。"
     }
   ],
   "protocol": {
@@ -26,13 +33,16 @@
       "scope": "driver",
       "implementation": "implementer",
       "review_verdict": "reviewer",
-      "closure": "driver"
+      "closure": "driver",
+      "advice": "oracle"
     },
     "routes": [
       { "kind": "mission", "from": "driver", "to": ["implementer", "reviewer"] },
       { "kind": "candidate", "from": "implementer", "to": ["reviewer"] },
       { "kind": "findings", "from": "reviewer", "to": ["implementer", "driver"] },
-      { "kind": "verdict", "from": "reviewer", "to": ["driver"] }
+      { "kind": "verdict", "from": "reviewer", "to": ["driver"] },
+      { "kind": "escalation", "from": ["driver", "implementer", "reviewer"], "to": ["oracle"] },
+      { "kind": "advice", "from": "oracle", "to": ["driver"] }
     ],
     "completion": { "owner": "driver", "rule": "Review PASS or explicit user override" }
   }

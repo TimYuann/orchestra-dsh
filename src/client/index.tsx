@@ -32,6 +32,8 @@ interface TemplateSummary {
   name: string;
   description?: string;
   source: string;
+  controller?: Record<string, unknown>;
+  protocol?: Record<string, unknown>;
   roles: RoleSummary[];
 }
 
@@ -43,7 +45,7 @@ interface InstanceRole {
   sandbox?: string;
   live: boolean;
   status: string;
-  rounds: number;
+  reportCount: number;
   lastReport: string | null;
   lastActivity?: string;
 }
@@ -51,9 +53,12 @@ interface InstanceRole {
 interface TeamInstance {
   workspacePath: string;
   workspaceTitle?: string;
+  teamId: string;
+  status: string;
+  goal: string;
   topology: string;
   createdAt: number;
-  executorSessionId: string;
+  controllerSessionId: string;
   archived: boolean;
   archivePath?: string;
   roles: InstanceRole[];
@@ -82,6 +87,30 @@ const PANE_STYLE: React.CSSProperties = {
 
 function templateRolesSummary(t: TemplateSummary): string {
   return t.roles.map((r) => `${r.name} (${r.id})`).join(", ") || "—";
+}
+
+/** Compact protocol summary: ownership decisions + route kinds. */
+function templateProtocolSummary(t: TemplateSummary): string {
+  const protocol = t.protocol;
+  if (protocol === undefined) return "";
+  const parts: string[] = [];
+  const ownership = protocol.ownership;
+  if (typeof ownership === "object" && ownership !== null) {
+    parts.push(
+      `owns: ${Object.entries(ownership)
+        .map(([decision, owner]) => `${decision}→${String(owner)}`)
+        .join(", ")}`,
+    );
+  }
+  const routes = protocol.routes;
+  if (Array.isArray(routes)) {
+    parts.push(
+      `routes: ${routes
+        .map((r) => `${String(r.kind)}: ${Array.isArray(r.from) ? r.from.join("+") : r.from}→${Array.isArray(r.to) ? r.to.join(",") : r.to}`)
+        .join("; ")}`,
+    );
+  }
+  return parts.join(" · ");
 }
 
 /** One flattened template role row: row-leading role name, deduped by role id. */
@@ -129,11 +158,14 @@ function teamKey(team: TeamInstance): string {
 function teamLabel(team: TeamInstance): string {
   const where =
     team.workspaceTitle === undefined ? team.workspacePath : `${team.workspaceTitle} — ${team.workspacePath}`;
-  return `${team.topology}${team.archived ? " · archived" : " · active"} · created ${new Date(team.createdAt).toLocaleString()} · ${where === "" ? "" : where}`;
+  const goal = team.goal === "" ? "" : ` · “${team.goal.slice(0, 48)}${team.goal.length > 48 ? "…" : ""}”`;
+  const created =
+    team.createdAt === 0 ? "" : ` · created ${new Date(team.createdAt).toLocaleString()}`;
+  return `${team.topology} · ${team.status}${goal}${created} · ${where === "" ? "" : where}`;
 }
 
 function instanceRoleLine(r: InstanceRole): string {
-  return `${r.name} (${r.id}) · ${r.status} · R${r.rounds}${r.preset === undefined ? "" : ` · ${r.preset}`}${r.sandbox === undefined ? "" : ` · ${r.sandbox}`}${r.lastReport === null ? "" : ` · report: ${r.lastReport}`}${r.lastActivity === undefined ? "" : ` · last: ${r.lastActivity.slice(0, 60)}`}`;
+  return `${r.name} (${r.id}) · ${r.status} · R${r.reportCount}${r.preset === undefined ? "" : ` · ${r.preset}`}${r.sandbox === undefined ? "" : ` · ${r.sandbox}`}${r.lastReport === null ? "" : ` · report: ${r.lastReport}`}${r.lastActivity === undefined ? "" : ` · last: ${r.lastActivity.slice(0, 60)}`}`;
 }
 
 /** Settings panel page: two display-only scrollable panes. */
@@ -191,6 +223,9 @@ export function OrchestraPanel(): React.JSX.Element {
                       <div style={{ opacity: 0.75, fontSize: 12 }}>{t.description}</div>
                     )}
                     <div style={{ opacity: 0.55, fontSize: 12 }}>roles: {templateRolesSummary(t)}</div>
+                    {templateProtocolSummary(t) === "" ? null : (
+                      <div style={{ opacity: 0.5, fontSize: 11 }}>{templateProtocolSummary(t)}</div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -205,8 +240,11 @@ export function OrchestraPanel(): React.JSX.Element {
                       {team.archivePath === undefined
                         ? null
                         : <div style={{ opacity: 0.6, fontSize: 12 }}>archive: {team.archivePath}</div>}
+                      {team.teamId === "" ? null : (
+                        <div style={{ opacity: 0.6, fontSize: 12 }}>team: {team.teamId}</div>
+                      )}
                       <div style={{ opacity: 0.6, fontSize: 12 }}>
-                        roles: {team.roles.map((r) => `${r.id} R${r.rounds}`).join(", ") || "—"}
+                        roles: {team.roles.map((r) => `${r.id} R${r.reportCount}`).join(", ") || "—"}
                       </div>
                     </div>
                   ))

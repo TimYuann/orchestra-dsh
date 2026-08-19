@@ -1,17 +1,29 @@
 {
+  "schemaVersion": 1,
   "id": "duo",
   "name": "Duo 开发",
-  "description": "executor（主会话）+ reviewer（只读评审）最小闭环：执行 → 定向评审两轮 → 文档交接",
+  "description": "driver + reviewer（只读评审）最小闭环：评审闭环，适合快速验收",
+  "controller": { "id": "driver", "source": "caller" },
   "roles": [
     {
       "id": "reviewer",
       "name": "Reviewer",
       "preset": "orchestra-reviewer",
-      "model": null,
-      "mode": "native",
       "sandbox": "read-only",
       "maxRounds": 2,
-      "welcome": "你已被 orchestra 团队录用为 Reviewer。职责：只审不修，最多两轮（R1 全量 → R2 只核对 R1 findings），每轮结束用 orchestra_report 工具把 review report 写入 orchestra/reports/，回复 executor 时返回报告路径。R2 中发现的新问题不追加本轮，记入 backlog，由 executor 决定是否另开评审。executor 是发起本消息的会话。"
+      "welcome": "你已被 orchestra 团队录用为 Reviewer。职责：只审不修，最多两轮（R1 全量 → R2 只核对 R1 findings），每轮结束用 orchestra_report 工具把 review report 写入 orchestra/reports/，回复 driver 时返回报告路径。R2 中发现的新问题不追加本轮，记入 backlog，由 driver 决定是否另开评审。"
     }
-  ]
+  ],
+  "protocol": {
+    "ownership": {
+      "scope": "driver",
+      "review_verdict": "reviewer",
+      "closure": "driver"
+    },
+    "routes": [
+      { "kind": "candidate", "from": "driver", "to": ["reviewer"] },
+      { "kind": "verdict", "from": "reviewer", "to": ["driver"] }
+    ],
+    "completion": { "owner": "driver", "rule": "Review PASS or explicit user override" }
+  }
 }
