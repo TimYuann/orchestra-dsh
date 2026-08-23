@@ -28,6 +28,15 @@ import type {} from "@deepseek-ai/dsh-system-prompt";
 import type {} from "@deepseek-ai/dsh-commands";
 import { createSession, installModelOverride, deliverMessage } from "./a2a.js";
 import type { ResolvedPresetFile } from "./a2a.js";
+import {
+  createActiveTeamStateStore,
+  normalizeTeam,
+} from "./orchestra-state.js";
+import type {
+  ActiveTeamRead,
+  TeamRole,
+  TeamState,
+} from "./orchestra-state.js";
 import { mountPreset } from "@deepseek-ai/dsh-agent-presets";
 import "./relay-types.js";
 import { basename, join } from "node:path";
@@ -102,44 +111,6 @@ interface TopologyConfig {
 interface ResolvedTopology {
   config: TopologyConfig;
   source: "project" | "global" | "bundled";
-}
-
-/** team.json v1.1 role record (spec §7.1). */
-interface TeamRole {
-  id: string;
-  name: string;
-  sessionId: string;
-  /** Replacement history: previous session ids this role was bound to. */
-  sessionHistory: { sessionId: string; replacedAt: number; reason: string }[];
-  preset: string | null;
-  sandbox: string;
-  /** Per-role model override snapshot, re-applied by orchestra_activate after a restart. */
-  model?: { provider?: string; model?: string; reasoningEffort?: string };
-  reportCount: number;
-  lastReport: string | null;
-}
-
-/** team.json v1.1 runtime state (spec §7.1). */
-interface TeamState {
-  schemaVersion: number;
-  teamId: string;
-  status: "active" | "degraded";
-  rootCwd: string;
-  controllerSessionId: string;
-  controllerHistory: { sessionId: string; replacedAt: number; reason: string }[];
-  topologyRef: { id: string; source: "project" | "global" | "bundled" };
-  mission: {
-    objective: string;
-    scope: string[];
-    constraints: string[];
-    acceptanceCriteria: string[];
-    nonGoals: string[];
-    context: string;
-  };
-  createdAt: number;
-  activatedFromArchiveId: string | null;
-  roles: TeamRole[];
-  reports: { reportId: string; roleId: string; sessionId: string; path: string; createdAt: number }[];
 }
 
 /** Archive snapshot: the team state plus dismissal bookkeeping (spec §7.2). */
@@ -745,79 +716,7 @@ async function ensureBuiltinArtifacts(): Promise<void> {
   }
 }
 
-/** Normalize a raw team.json (v1.0 or v1.1) into v1.1 shape; undefined when there is no active team.
- *  `allowDismissed` lets archive snapshots (whose status is "dismissed") parse too. */
-export function normalizeTeam(raw: unknown, cwd: string, options: { allowDismissed?: boolean } = {}): TeamState | undefined {
-  if (typeof raw !== "object" || raw === null) return undefined;
-  const record = raw as Record<string, any>;
-  if (record.archived === true) return undefined;
-  if (record.status === "dismissed" && options.allowDismissed !== true) return undefined;
-  if (!Array.isArray(record.roles)) return undefined;
-  const createdAt = typeof record.createdAt === "number" ? record.createdAt : Date.now();
-  const teamId = typeof record.teamId === "string" && record.teamId !== "" ? record.teamId : `team-${createdAt}`;
-  const roles: TeamRole[] = record.roles
-    .filter((role: any) => typeof role?.sessionId === "string" && role.sessionId !== "")
-    .map((role: any) => ({
-      id: typeof role.id === "string" ? role.id : "role",
-      name: typeof role.name === "string" ? role.name : String(role.id ?? "role"),
-      sessionId: role.sessionId,
-      sessionHistory: Array.isArray(role.sessionHistory) ? role.sessionHistory : [],
-      preset: role.preset === undefined || role.preset === null ? null : role.preset,
-      sandbox: typeof role.sandbox === "string" ? role.sandbox : "workspace-write",
-      ...(role.model === undefined ? {} : { model: role.model }),
-      reportCount: typeof role.reportCount === "number" ? role.reportCount : typeof role.rounds === "number" ? role.rounds : 0,
-      lastReport: role.lastReport === undefined || role.lastReport === null ? null : role.lastReport,
-    }));
-  return {
-    schemaVersion: typeof record.schemaVersion === "number" ? record.schemaVersion : 1,
-    teamId,
-    status: record.status === "degraded" ? "degraded" : "active",
-    rootCwd: typeof record.rootCwd === "string" && record.rootCwd !== "" ? record.rootCwd : cwd,
-    controllerSessionId: typeof record.controllerSessionId === "string"
-      ? record.controllerSessionId
-      : typeof record.executorSessionId === "string"
-        ? record.executorSessionId
-        : "",
-    controllerHistory: Array.isArray(record.controllerHistory) ? record.controllerHistory : [],
-    topologyRef:
-      record.topologyRef !== undefined && typeof record.topologyRef.id === "string"
-        ? record.topologyRef
-        : { id: typeof record.topology === "string" ? record.topology : "custom", source: "bundled" as const },
-    mission:
-      record.mission !== undefined && typeof record.mission === "object"
-        ? {
-            objective: typeof record.mission.objective === "string" ? record.mission.objective : "",
-            scope: Array.isArray(record.mission.scope) ? record.mission.scope : [],
-            constraints: Array.isArray(record.mission.constraints) ? record.mission.constraints : [],
-            acceptanceCriteria: Array.isArray(record.mission.acceptanceCriteria) ? record.mission.acceptanceCriteria : [],
-            nonGoals: Array.isArray(record.mission.nonGoals) ? record.mission.nonGoals : [],
-            context: typeof record.mission.context === "string" ? record.mission.context : "",
-          }
-        : { objective: "", scope: [], constraints: [], acceptanceCriteria: [], nonGoals: [], context: "" },
-    createdAt,
-    activatedFromArchiveId:
-      typeof record.activatedFromArchiveId === "string" && record.activatedFromArchiveId !== ""
-        ? record.activatedFromArchiveId
-        : null,
-    roles,
-    reports: Array.isArray(record.reports) ? record.reports : [],
-  };
-}
-
-async function loadTeam(ctx: Context, cwd: string): Promise<TeamState | undefined> {
-  try {
-    const target = await ctx.fs.resolve(`${cwd}/orchestra/state/team.json`, { cwd });
-    const raw = await loadJson(ctx, target);
-    return normalizeTeam(raw, cwd);
-  } catch (error) {
-    return undefined;
-  }
-}
-
-async function saveTeam(ctx: Context, cwd: string, team: TeamState, policy: SandboxExecutionPolicy): Promise<void> {
-  const target = await ctx.fs.resolve(`${cwd}/orchestra/state/team.json`, { cwd });
-  await ctx.fs.writeText(target, JSON.stringify(team, null, 2), undefined, undefined, policy);
-}
+export { normalizeTeam } from "./orchestra-state.js";
 
 /** Scan archive summaries (spec §7.2): live scan, dismissedAt desc, archiveId tie-breaker. */
 async function scanArchives(
@@ -906,6 +805,17 @@ async function loadArchive(
 function escrowPolicy(ctx: Context, exec: ToolExecutionInput): SandboxExecutionPolicy {
   const session = exec.agent === undefined ? undefined : exec.agent.session;
   return ctx.sandboxPolicy.resolve({ session, mode: "workspace-write" });
+}
+
+function throwIfBlocked(action: string, state: ActiveTeamRead): void {
+  if (state.kind !== "blocked") return;
+  throw new Error(`cannot ${action}: active team state is blocked (${state.diagnostic.code}): ${state.diagnostic.message}`);
+}
+
+function requireReadyTeam(action: string, state: ActiveTeamRead): TeamState {
+  throwIfBlocked(action, state);
+  if (state.kind === "ready") return state.team;
+  throw new Error(`cannot ${action}: no active team state is available (${state.diagnostic.message})`);
 }
 
 /** Role self-awareness protocol (spec §8.2): identity, reply, dispatch, handoff, decision rights, routes, completion. */
@@ -1053,6 +963,7 @@ const SECTION_ORDER = 119;
 export const Config = undefined;
 
 export function apply(ctx: Context): void {
+  const activeTeamState = createActiveTeamStateStore(ctx.fs);
   const roleItem = {
     type: "object",
     additionalProperties: false,
@@ -1154,10 +1065,11 @@ export function apply(ctx: Context): void {
         if (exec.agent === undefined) throw new Error("orchestra_create requires an agent caller");
         const cwd = exec.agent.session.header.cwd;
         if (cwd === undefined) throw new Error("current session has no working directory; cannot create a team");
-        const existing = await loadTeam(ctx, cwd);
-        if (existing !== undefined)
+        const existing = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("create a team", existing);
+        if (existing.kind === "ready")
           throw new Error(
-            `a team already exists here (team=${existing.teamId}, topology=${existing.topologyRef.id}); run orchestra_dismiss to close it, or use another working directory`,
+            `a team already exists here (team=${existing.team.teamId}, topology=${existing.team.topologyRef.id}); run orchestra_dismiss to close it, or use another working directory`,
           );
         const objective = String(args.goal ?? "").trim();
         if (objective === "") throw new Error("goal must not be empty");
@@ -1240,12 +1152,14 @@ export function apply(ctx: Context): void {
           roles,
           reports: [],
         };
-        await saveTeam(ctx, cwd, team, escrowPolicy(ctx, exec));
-        const stateTarget = await ctx.fs.resolve(`${cwd}/orchestra/state/team.json`, { cwd });
+        const written = await activeTeamState.create(cwd, team, {
+          policy: escrowPolicy(ctx, exec),
+          signal: exec.signal,
+        });
         return {
           team_id: team.teamId,
           topology: team.topologyRef.id,
-          state_path: ctx.fs.processPath(stateTarget),
+          state_path: written.statePath,
           created_at: team.createdAt,
           mission: team.mission,
           roles: team.roles.map((role) => ({
@@ -1356,8 +1270,10 @@ export function apply(ctx: Context): void {
           throw new Error("provider and model must be provided together (both or neither)");
         if (args.reasoningEffort !== undefined && (args.provider === undefined || args.model === undefined))
           throw new Error("reasoningEffort requires provider and model");
-        let team = await loadTeam(ctx, cwd);
-        if (team === undefined) {
+        const teamObservation = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("spawn a role", teamObservation);
+        let team: TeamState;
+        if (teamObservation.kind !== "ready") {
           let source: "project" | "global" | "bundled" = "bundled";
           if (args.templateId !== undefined) {
             try {
@@ -1381,6 +1297,7 @@ export function apply(ctx: Context): void {
             reports: [],
           };
         } else {
+          team = teamObservation.team;
           if (team.roles.some((role) => role.id.toLowerCase() === roleName.toLowerCase())) {
             throw new Error(
               `role id "${roleName}" already exists in this team; choose a distinct roleName (e.g. "${roleName}-2", numeric suffixes still inherit the matching template's sandbox/preset), or pass templateId+roleId / sandbox:"read-only" explicitly`,
@@ -1439,7 +1356,12 @@ export function apply(ctx: Context): void {
             : {}),
         };
         team.roles.push(record);
-        await saveTeam(ctx, cwd, team, escrowPolicy(ctx, exec));
+        const writeOptions = { policy: escrowPolicy(ctx, exec), signal: exec.signal };
+        if (teamObservation.kind === "ready") {
+          await activeTeamState.replace(teamObservation, team, writeOptions);
+        } else {
+          await activeTeamState.create(cwd, team, writeOptions);
+        }
         const protocolText = roleProtocolText(exec.agent.id, roleName, {
           ownership: templateProtocol?.ownership,
           routes: templateProtocol?.routes,
@@ -1543,7 +1465,8 @@ export function apply(ctx: Context): void {
         if (exec.agent === undefined) throw new Error("orchestra_team requires an agent caller");
         const cwd = exec.agent.session.header.cwd;
         if (cwd === undefined) throw new Error("current session has no working directory");
-        const team = await loadTeam(ctx, cwd);
+        const teamObservation = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("inspect the team", teamObservation);
         const archives = (await scanArchives(ctx, cwd)).map((a) => ({
           archive_id: a.archiveId,
           team_id: a.teamId,
@@ -1552,7 +1475,8 @@ export function apply(ctx: Context): void {
           dismissed_at: a.dismissedAt,
           archive_path: a.archivePath,
         }));
-        if (team === undefined) return { team: null, archives };
+        if (teamObservation.kind !== "ready") return { team: null, archives };
+        const team = teamObservation.team;
         return {
           team: {
             team_id: team.teamId,
@@ -1616,9 +1540,10 @@ export function apply(ctx: Context): void {
         if (exec.agent === undefined) throw new Error("orchestra_activate requires an agent caller");
         const cwd = exec.agent.session.header.cwd;
         if (cwd === undefined) throw new Error("current session has no working directory");
-        const existing = await loadTeam(ctx, cwd);
-        if (existing !== undefined)
-          throw new Error(`an active team already exists here (${existing.teamId}); dismiss it first or activate in another working directory`);
+        const existing = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("activate a team", existing);
+        if (existing.kind === "ready")
+          throw new Error(`an active team already exists here (${existing.team.teamId}); dismiss it first or activate in another working directory`);
         const loaded = await loadArchive(ctx, cwd, args.archiveId);
         if (loaded === undefined) {
           const available = (await scanArchives(ctx, cwd)).map((a) => a.archiveId);
@@ -1782,7 +1707,10 @@ export function apply(ctx: Context): void {
           }
         }
         if (degraded) newTeam.status = "degraded";
-        await saveTeam(ctx, cwd, newTeam, escrowPolicy(ctx, exec));
+        await activeTeamState.create(cwd, newTeam, {
+          policy: escrowPolicy(ctx, exec),
+          signal: exec.signal,
+        });
         return {
           team_id: newTeam.teamId,
           archive_id: archived.archiveId,
@@ -1821,8 +1749,8 @@ export function apply(ctx: Context): void {
         if (exec.agent === undefined) throw new Error("orchestra_dismiss requires an agent caller");
         const cwd = exec.agent.session.header.cwd;
         if (cwd === undefined) throw new Error("current session has no working directory");
-        const team = await loadTeam(ctx, cwd);
-        if (team === undefined) throw new Error("no active team yet; run orchestra_create or orchestra_spawn first");
+        const teamObservation = await activeTeamState.read(cwd, { signal: exec.signal });
+        const team = requireReadyTeam("dismiss the team", teamObservation);
         const archiveId = `team-${team.topologyRef.id}-${team.createdAt}`;
         const dismissedAt = Date.now();
         const archivePath = `${cwd}/orchestra/archive/${archiveId}.json`;
@@ -1913,29 +1841,28 @@ export function apply(ctx: Context): void {
         // backend's canonical execution-world path so lastReport/render/return
         // are real absolute paths (B5 fix).
         const canonical = ctx.fs.processPath(target);
+        const teamObservation = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("bookkeep the report", teamObservation);
         await ctx.fs.writeText(target, String(args.content ?? ""), undefined, undefined, escrowPolicy(ctx, exec));
         // Bookkeeping: record one delivered report on the calling role's team entry.
-        try {
-          const team = await loadTeam(ctx, cwd);
-          if (team !== undefined) {
-            const role = team.roles.find((entry) => entry.sessionId === agentId);
-            if (role !== undefined) {
-              role.reportCount = (role.reportCount ?? 0) + 1;
-              role.lastReport = canonical;
-              team.reports.push({
-                reportId: `report-${randomUUID().slice(0, 8)}`,
-                roleId: role.id,
-                sessionId: agentId,
-                path: canonical,
-                createdAt: Date.now(),
-              });
-              await saveTeam(ctx, cwd, team, escrowPolicy(ctx, exec));
-            }
+        if (teamObservation.kind === "ready") {
+          const team = teamObservation.team;
+          const role = team.roles.find((entry) => entry.sessionId === agentId);
+          if (role !== undefined) {
+            role.reportCount = (role.reportCount ?? 0) + 1;
+            role.lastReport = canonical;
+            team.reports.push({
+              reportId: `report-${randomUUID().slice(0, 8)}`,
+              roleId: role.id,
+              sessionId: agentId,
+              path: canonical,
+              createdAt: Date.now(),
+            });
+            await activeTeamState.replace(teamObservation, team, {
+              policy: escrowPolicy(ctx, exec),
+              signal: exec.signal,
+            });
           }
-        } catch (error) {
-          console.error(
-            `orchestra_report: team bookkeeping failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
         }
         return { path: canonical };
       },
@@ -2181,10 +2108,12 @@ export function apply(ctx: Context): void {
                 // no topologies directory
               }
               try {
-                const teamTarget = await ctx.fs.resolve(`${path}/orchestra/state/team.json`, { cwd: path });
-                const parsed = JSON.parse(await ctx.fs.readText(teamTarget)) as Record<string, any>;
-                const team = normalizeTeam(parsed, path);
-                if (team !== undefined) {
+                const teamObservation = await activeTeamState.read(path);
+                if (teamObservation.kind === "blocked") {
+                  console.warn(`orchestra: state route skipped blocked active team at ${path}: ${teamObservation.diagnostic.message}`);
+                }
+                if (teamObservation.kind === "ready") {
+                  const team = teamObservation.team;
                   const roles = await Promise.all(
                     team.roles.map(async (record) => {
                       const status = await roleStatus(ctx, record);

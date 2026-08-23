@@ -38,6 +38,7 @@
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && tsdown",
     "dev": "node --import tsx scripts/loader.mjs",
     "dev:harness": "dsh web --patch ./cordis.patch.yml",
+    "test": "npm run build && node --test scripts/test-v0.3.0.mjs scripts/test-orchestra-state.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.client.json",
     "prepare": "npm run build"
   },
