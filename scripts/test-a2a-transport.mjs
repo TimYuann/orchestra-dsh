@@ -218,6 +218,12 @@ test("message lifecycle reports only correlated accepted/claimed/answered facts"
   unrelated.events.unshift({ type: "user/message", data: { id: "non-a2a", role: "user", content: [], source: { kind: "user" } } });
   unrelated.events.push({ type: "assistant/message", data: { message: { id: "answer-2", role: "assistant", content: [], source: { kind: "model", replyTo: "non-a2a" } } } });
   assert.equal((await queryMessageStatus(env.context, "non-a2a", unrelated.id)).state, "unknown");
+  const outOfOrder = session("out-of-order");
+  const outOfOrderMessage = { id: "out-of-order-message", role: "user", content: [], source: { kind: "a2a", form: "relay" } };
+  outOfOrder.events.push({ type: "assistant/message", data: { message: { id: "answer", role: "assistant", content: [], source: { kind: "model", replyTo: outOfOrderMessage.id } } } });
+  outOfOrder.events.push({ type: "agent/inbox/spliced", data: { inserted: [outOfOrderMessage] } });
+  env.sessions.set(outOfOrder.id, outOfOrder);
+  assert.equal((await queryMessageStatus(env.context, outOfOrderMessage.id, outOfOrder.id)).state, "unknown", "a response before acceptance is not answered");
 });
 
 test("discovery stays progressive and host-visible when annotations fail", async () => {
@@ -291,4 +297,19 @@ test("orchestra_send resolves role address and reuses raw transport receipt", as
   assert.equal(result.resolved_session_id, "role-current");
   assert.equal(result.receipt.state, "accepted");
   await assert.rejects(() => sendGovernedRole(env.context, createGovernedRoleAddressResolver({ async read() { return teamState("active", "active", "driver"); } }), { teamId: "team-address", roleId: "reviewer", message: "self" }, { agent: env.agents.get(caller.id) }), /own Governed role/);
+});
+
+test("durable idempotency replay in a fresh context returns the original receipt facts", async () => {
+  const env = runtime();
+  const target = session("fresh-durable");
+  env.sessions.set(target.id, target);
+  const first = await deliverMessage(env.context, "sender", target.id, [{ type: "text", text: "retry" }], { idempotencyKey: "fresh-key", replyTo: "original" });
+  const freshContext = {
+    agents: { get() { return undefined; } },
+    sessions: { get() { return target; } },
+    get() { return undefined; },
+  };
+  const replay = await deliverMessage(freshContext, "sender", target.id, [{ type: "text", text: "retry" }], { idempotencyKey: "fresh-key", replyTo: "original" });
+  assert.deepEqual(replay, first);
+  assert.equal(target.events.filter((event) => event.type === "agent/inbox/spliced").length, 1);
 });

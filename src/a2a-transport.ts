@@ -15,6 +15,21 @@ import type { SessionEvent } from "@deepseek-ai/dsh-session";
 import { readGovernedBlueprint, readLightweightBlueprint } from "./session-blueprint.js";
 
 const SID = (value: string) => value as import("@deepseek-ai/dsh-session").SessionId;
+const A2A_ACCEPTED_EVENT = "orchestra/a2a-accepted" as const;
+
+declare module "@deepseek-ai/dsh-session/types" {
+  interface SessionEventMap {
+    "orchestra/a2a-accepted": {
+      message_id: string;
+      target_session_id: string;
+      accepted_at_ms: number;
+      delivery_mode: DeliveryMode;
+      state: "accepted";
+      interrupt?: boolean;
+      reply_to_message_id?: string;
+    };
+  }
+}
 
 export type DeliveryMode = "live_inbox" | "durable_inbox" | "resumed_inbox";
 
@@ -67,17 +82,41 @@ function acceptedReceipt(messageId: string, targetSessionId: string, deliveryMod
   return { message_id: messageId, target_session_id: targetSessionId, accepted_at_ms: acceptedAt, delivery_mode: deliveryMode, state: "accepted" };
 }
 
+function receiptFromEvents(events: readonly { type: string; data: any }[], messageId: string, targetSessionId: string): DeliverResult | undefined {
+  for (const event of events) {
+    if (event.type !== A2A_ACCEPTED_EVENT || event.data.message_id !== messageId || event.data.target_session_id !== targetSessionId) continue;
+    return {
+      message_id: event.data.message_id,
+      target_session_id: event.data.target_session_id,
+      accepted_at_ms: event.data.accepted_at_ms,
+      delivery_mode: event.data.delivery_mode,
+      state: "accepted",
+      ...(event.data.interrupt === undefined ? {} : { interrupt: event.data.interrupt }),
+      ...(event.data.reply_to_message_id === undefined ? {} : { reply_to_message_id: event.data.reply_to_message_id }),
+    };
+  }
+  return undefined;
+}
+
+function recordReceipt(session: { append(type: typeof A2A_ACCEPTED_EVENT, data: DeliverResult): unknown }, receipt: DeliverResult): void {
+  session.append(A2A_ACCEPTED_EVENT, receipt);
+}
+
 async function existingReceipt(ctx: Context, targetSessionId: string, messageId: string): Promise<DeliverResult | undefined> {
   const cached = receiptCache.get(ctx)?.get(`${targetSessionId}\0${messageId}`);
   if (cached !== undefined) return cached;
   const live = ctx.agents.get(SID(targetSessionId));
   if (live !== undefined) {
+    const recorded = receiptFromEvents(live.session.events, messageId, targetSessionId);
+    if (recorded !== undefined) return recorded;
     const pending = [...(live.inbox?.nextTurn ?? []), ...(live.inbox?.nextStep ?? [])];
     if (pending.some((message) => isA2AMessage(message, messageId)) || eventsContainA2AMessage(live.session.events, messageId)) {
       return acceptedReceipt(messageId, targetSessionId, "live_inbox");
     }
   }
   const session = ctx.sessions.get(SID(targetSessionId));
+  const recorded = session === undefined ? undefined : receiptFromEvents(session.events, messageId, targetSessionId);
+  if (recorded !== undefined) return recorded;
   if (session !== undefined && eventsContainA2AMessage(session.events, messageId)) {
     return acceptedReceipt(messageId, targetSessionId, "durable_inbox");
   }
@@ -85,6 +124,8 @@ async function existingReceipt(ctx: Context, targetSessionId: string, messageId:
     const query = ctx.get("sessionQuery");
     if (query !== undefined) {
       const snapshot = await query.readSession(SID(targetSessionId));
+      const recorded = receiptFromEvents(snapshot.events, messageId, targetSessionId);
+      if (recorded !== undefined) return recorded;
       if (eventsContainA2AMessage(snapshot.events, messageId)) return acceptedReceipt(messageId, targetSessionId, "durable_inbox");
     }
   } catch {
@@ -178,7 +219,7 @@ async function deliverMessageOnce(
   if (live !== undefined) {
     if (options.interrupt === true) {
       live.steer(message);
-      return {
+      const result: DeliverResult = {
         message_id: message.id,
         target_session_id: toSessionId,
         accepted_at_ms: acceptedAt,
@@ -187,10 +228,12 @@ async function deliverMessageOnce(
         interrupt: true,
         ...(options.replyTo === undefined ? {} : { reply_to_message_id: options.replyTo }),
       };
+      if (options.idempotencyKey !== undefined) recordReceipt(live.session, result);
+      return result;
     }
     if (wake) live.followup(message);
     else live.inject(message);
-    return {
+    const result: DeliverResult = {
       message_id: message.id,
       target_session_id: toSessionId,
       accepted_at_ms: acceptedAt,
@@ -198,13 +241,15 @@ async function deliverMessageOnce(
       state: "accepted",
       ...(options.replyTo === undefined ? {} : { reply_to_message_id: options.replyTo }),
     };
+    if (options.idempotencyKey !== undefined) recordReceipt(live.session, result);
+    return result;
   }
 
   const session = ctx.sessions.get(SID(toSessionId));
   if (session !== undefined) {
     const target = wake ? "next-turn" : "next-step";
     session.append("agent/inbox/spliced", { target, start: pendingLength(session, target), inserted: [message] });
-    return {
+    const result: DeliverResult = {
       message_id: message.id,
       target_session_id: toSessionId,
       accepted_at_ms: acceptedAt,
@@ -212,6 +257,8 @@ async function deliverMessageOnce(
       state: "accepted",
       ...(options.replyTo === undefined ? {} : { reply_to_message_id: options.replyTo }),
     };
+    if (options.idempotencyKey !== undefined) recordReceipt(session, result);
+    return result;
   }
 
   await tryResume(ctx, toSessionId);
@@ -219,7 +266,7 @@ async function deliverMessageOnce(
   if (resumed === undefined) throw new Error(`a2a transport: target ${toSessionId} could not be resumed`);
   if (wake) resumed.followup(message);
   else resumed.inject(message);
-  return {
+  const result: DeliverResult = {
     message_id: message.id,
     target_session_id: toSessionId,
     accepted_at_ms: acceptedAt,
@@ -227,6 +274,8 @@ async function deliverMessageOnce(
     state: "accepted",
     ...(options.replyTo === undefined ? {} : { reply_to_message_id: options.replyTo }),
   };
+  if (options.idempotencyKey !== undefined) recordReceipt(resumed.session, result);
+  return result;
 }
 
 /** Deliver one raw SessionId-addressed message. No Team/CWD/FS policy is consulted. */
@@ -297,16 +346,31 @@ export async function queryMessageStatus(ctx: Context, messageId: string, target
     let accepted = false;
     let claimed = false;
     let answered = false;
-    for (const event of events) {
-      if (event.type === "agent/inbox/spliced") {
-        if (event.data.inserted.some((message: unknown) => isA2AMessage(message, messageId))) accepted = true;
+    let firstAcceptedOrClaimed = Number.POSITIVE_INFINITY;
+    let firstAnswer = Number.POSITIVE_INFINITY;
+    for (const [index, event] of events.entries()) {
+      if (event.type === A2A_ACCEPTED_EVENT && event.data.message_id === messageId && event.data.target_session_id === targetSessionId) {
+        accepted = true;
+        firstAcceptedOrClaimed = Math.min(firstAcceptedOrClaimed, index);
+      } else if (event.type === "agent/inbox/spliced") {
+        if (event.data.inserted.some((message: unknown) => isA2AMessage(message, messageId))) {
+          accepted = true;
+          firstAcceptedOrClaimed = Math.min(firstAcceptedOrClaimed, index);
+        }
       } else if (event.type === "user/message") {
-        if (isA2AMessage(event.data, messageId)) claimed = true;
+        if (isA2AMessage(event.data, messageId)) {
+          claimed = true;
+          firstAcceptedOrClaimed = Math.min(firstAcceptedOrClaimed, index);
+        }
       } else if (event.type === "assistant/message") {
-        if (replyToOf(event.data.message) === messageId || replyToOf(event.data) === messageId) answered = true;
+        if (replyToOf(event.data.message) === messageId || replyToOf(event.data) === messageId) {
+          answered = true;
+          firstAnswer = Math.min(firstAnswer, index);
+        }
       }
     }
-    if (answered && (accepted || claimed)) return { message_id: messageId, target_session_id: targetSessionId, state: "answered", evidence: "correlated assistant response" };
+    if (answered && firstAnswer <= firstAcceptedOrClaimed) return { message_id: messageId, target_session_id: targetSessionId, state: "unknown", evidence: "assistant response precedes accepted/claimed fact" };
+    if (answered && (accepted || claimed) && firstAnswer > firstAcceptedOrClaimed) return { message_id: messageId, target_session_id: targetSessionId, state: "answered", evidence: "correlated assistant response after accepted/claimed" };
     if (claimed) return { message_id: messageId, target_session_id: targetSessionId, state: "claimed", evidence: "target A2A user/message event" };
     if (accepted) return { message_id: messageId, target_session_id: targetSessionId, state: "accepted", evidence: "durable inbox splice" };
     return { message_id: messageId, target_session_id: targetSessionId, state: "unknown", evidence: "no correlated lifecycle event" };
