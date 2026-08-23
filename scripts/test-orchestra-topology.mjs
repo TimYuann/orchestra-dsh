@@ -17,6 +17,7 @@ class TemporaryTopologyFs {
   constructor() {
     this.failProjectSource = false;
     this.failFile = undefined;
+    this.failReadFile = undefined;
   }
 
   async resolve(path, options = {}) {
@@ -57,6 +58,9 @@ class TemporaryTopologyFs {
   }
 
   async readText(target) {
+    if (this.failReadFile !== undefined && target.displayPath.endsWith(this.failReadFile.filename)) {
+      throw this.failReadFile.error;
+    }
     if (this.failFile !== undefined && target.displayPath.endsWith(this.failFile)) {
       throw new FsTestError("FS_IO_ERROR", "topology entry unreadable");
     }
@@ -140,6 +144,33 @@ test("project and global precedence are fail-loud and block lower sources", asyn
   });
 });
 
+test("project and global per-entry read failures are filesystem blocked with fsCode", async () => {
+  await withRoots(async ({ fs, projectRoot, globalRoot }) => {
+    await fs.seed(projectRoot, ".orchestra/topologies/project-read-error.json", topology("project-read-error"));
+    fs.failReadFile = { filename: "project-read-error.json", error: new FsTestError("FS_IO_ERROR", "project entry read failed") };
+    const catalog = createTopologyCatalog(fs, { globalRoot });
+    let result = await catalog.resolve(projectRoot, "project-read-error");
+    assert.equal(result.kind, "blocked");
+    assert.equal(result.diagnostic.code, "filesystem");
+    assert.equal(result.diagnostic.fsCode, "FS_IO_ERROR");
+
+    const globalPath = join(globalRoot, "topologies/global-read-error.json");
+    await mkdir(dirname(globalPath), { recursive: true });
+    await writeFile(globalPath, JSON.stringify(topology("global-read-error")), "utf8");
+    const globalCatalog = createTopologyCatalog(fs, {
+      globalRoot,
+      globalReadFile: async (path) => {
+        if (path.endsWith("global-read-error.json")) throw new FsTestError("FS_PERMISSION_DENIED", "global entry read denied");
+        return readFile(path, "utf8");
+      },
+    });
+    result = await globalCatalog.resolve(projectRoot, "global-read-error");
+    assert.equal(result.kind, "blocked");
+    assert.equal(result.diagnostic.code, "filesystem");
+    assert.equal(result.diagnostic.fsCode, "FS_PERMISSION_DENIED");
+  });
+});
+
 test("global broken source blocks bundled fallback and source failures are visible", async () => {
   await withRoots(async ({ fs, projectRoot, globalRoot }) => {
     await fs.seed(globalRoot, "topologies/trio.json", "{");
@@ -183,6 +214,29 @@ test("catalog classifies unsafe ids, filename mismatch, legacy, unsupported, and
     result = await catalog.resolve(projectRoot, "trio");
     assert.equal(result.kind, "blocked");
     assert.equal(result.diagnostic.code, "invalid_topology");
+  });
+});
+
+test("catalog total validation blocks malformed nested topology values", async () => {
+  await withRoots(async ({ fs, projectRoot, globalRoot }) => {
+    const malformed = [
+      { name: "routes string", config: { protocol: { routes: "bad" } } },
+      { name: "null route", config: { protocol: { routes: [null] } } },
+      { name: "completion null", config: { protocol: { completion: null } } },
+      { name: "ownership null", config: { protocol: { ownership: null } } },
+      { name: "runtime null", config: { roles: [{ id: "reviewer", runtime: null }] } },
+      { name: "controller scalar", config: { controller: "driver" } },
+      { name: "role null", config: { roles: [null] } },
+      { name: "route missing fields", config: { protocol: { routes: [{}] } } },
+    ];
+    const catalog = createTopologyCatalog(fs, { globalRoot });
+    for (const [index, entry] of malformed.entries()) {
+      const id = `malformed-${index}`;
+      await fs.seed(projectRoot, `.orchestra/topologies/${id}.json`, topology(id, entry.config));
+      const result = await catalog.resolve(projectRoot, id);
+      assert.equal(result.kind, "blocked", entry.name);
+      assert.equal(result.diagnostic.code, "invalid_shape", entry.name);
+    }
   });
 });
 

@@ -104,6 +104,7 @@ export interface TopologyCatalogFileSystem {
 
 export interface TopologyCatalogOptions {
   globalRoot?: string;
+  globalReadFile?: (path: string) => Promise<string>;
 }
 
 export interface TopologyCatalog {
@@ -292,10 +293,19 @@ function roleSummary(role: RoleConfig): TopologyRoleSummary {
   return summary;
 }
 
-export function validateTopology(config: TopologyConfig): string[] {
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
+export function validateTopology(config: unknown): string[] {
   const problems: string[] = [];
-  if (config.schemaVersion !== undefined && config.schemaVersion !== 1) {
-    problems.push(`schemaVersion ${config.schemaVersion} is not supported (expected 1)`);
+  if (!isRecord(config)) return ["shape: topology config must be an object"];
+  if (config.schemaVersion !== undefined && (typeof config.schemaVersion !== "number" || config.schemaVersion !== 1)) {
+    problems.push(`schemaVersion ${String(config.schemaVersion)} is not supported (expected 1)`);
   }
   if (typeof config.id !== "string" || config.id === "") {
     problems.push("topology id must be a non-empty string");
@@ -307,19 +317,34 @@ export function validateTopology(config: TopologyConfig): string[] {
     return problems;
   }
   const roleIds = new Set<string>();
-  for (const role of config.roles) {
+  for (const [index, rawRole] of config.roles.entries()) {
+    if (!isRecord(rawRole)) {
+      problems.push(`shape: role at index ${index} must be an object`);
+      continue;
+    }
+    const role = rawRole;
     if (typeof role.id !== "string" || role.id === "") {
       problems.push("every role must have a non-empty id");
       continue;
     }
+    if (role.name !== undefined && typeof role.name !== "string") problems.push(`shape: role "${role.id}" name must be a string`);
     const lower = role.id.toLowerCase();
     if (roleIds.has(lower)) problems.push(`role id "${role.id}" is duplicated (ids are case-insensitive unique)`);
     roleIds.add(lower);
-    if (role.sandbox !== undefined && role.sandbox !== "workspace-write" && role.sandbox !== "read-only") {
+    if (role.sandbox !== undefined && typeof role.sandbox !== "string") {
+      problems.push(`shape: role "${role.id}" sandbox must be a string`);
+    } else if (role.sandbox !== undefined && role.sandbox !== "workspace-write" && role.sandbox !== "read-only") {
       problems.push(`role "${role.id}" sandbox "${role.sandbox}" is invalid (workspace-write | read-only)`);
     }
     if (role.runtime !== undefined) {
+      if (!isRecord(role.runtime)) {
+        problems.push(`shape: role "${role.id}" runtime must be an object`);
+        continue;
+      }
       const runtime = role.runtime;
+      for (const field of ["provider", "model", "reasoningEffort"]) {
+        if (runtime[field] !== undefined && typeof runtime[field] !== "string") problems.push(`shape: role "${role.id}" runtime.${field} must be a string`);
+      }
       if ((runtime.provider === undefined) !== (runtime.model === undefined)) {
         problems.push(`role "${role.id}" runtime provider/model must be provided together`);
       }
@@ -328,29 +353,54 @@ export function validateTopology(config: TopologyConfig): string[] {
       }
     }
   }
-  const controllerId = config.controller?.id ?? "driver";
+  if (config.controller !== undefined && !isRecord(config.controller)) problems.push("shape: topology controller must be an object");
+  if (isRecord(config.controller) && config.controller.id !== undefined && typeof config.controller.id !== "string") {
+    problems.push("shape: topology controller.id must be a string");
+  }
+  const controllerId = isRecord(config.controller) && typeof config.controller.id === "string" ? config.controller.id : "driver";
   const known = (ref: string): boolean => ref === controllerId || roleIds.has(ref.toLowerCase());
   const protocol = config.protocol;
-  if (protocol?.ownership !== undefined) {
+  if (protocol !== undefined && !isRecord(protocol)) {
+    problems.push("shape: topology protocol must be an object");
+    return problems;
+  }
+  if (!isRecord(protocol)) return problems;
+  if (protocol.ownership !== undefined && !isRecord(protocol.ownership)) {
+    problems.push("shape: protocol.ownership must be an object");
+  } else if (isRecord(protocol.ownership)) {
     for (const [decision, owner] of Object.entries(protocol.ownership)) {
       if (typeof owner !== "string" || owner === "" || !known(owner)) {
         problems.push(`protocol.ownership.${decision} references unknown role "${owner}"`);
       }
     }
   }
-  if (Array.isArray(protocol?.routes)) {
-    for (const route of protocol.routes) {
+  if (protocol.routes !== undefined && !Array.isArray(protocol.routes)) {
+    problems.push("shape: protocol.routes must be an array");
+  } else if (Array.isArray(protocol.routes)) {
+    for (const [index, rawRoute] of protocol.routes.entries()) {
+      if (!isRecord(rawRoute)) {
+        problems.push(`shape: protocol.routes[${index}] must be an object`);
+        continue;
+      }
+      const route = rawRoute;
+      if (typeof route.kind !== "string" || route.kind === "") problems.push(`shape: protocol.routes[${index}].kind must be a non-empty string`);
+      const fromValid = typeof route.from === "string" || stringArray(route.from);
+      if (!fromValid) problems.push(`shape: protocol.routes[${index}].from must be a string or string array`);
+      if (!stringArray(route.to)) problems.push(`shape: protocol.routes[${index}].to must be a string array`);
+      if (!fromValid || !stringArray(route.to)) continue;
       const froms = Array.isArray(route.from) ? route.from : [route.from];
-      for (const from of froms) {
-        if (typeof from !== "string" || !known(from)) problems.push(`protocol.routes[${route.kind}] from references unknown role "${from}"`);
-      }
-      for (const to of route.to ?? []) {
-        if (typeof to !== "string" || !known(to)) problems.push(`protocol.routes[${route.kind}] to references unknown role "${to}"`);
-      }
+      for (const from of froms) if (!known(from)) problems.push(`protocol.routes[${route.kind}] from references unknown role "${from}"`);
+      for (const to of route.to) if (!known(to)) problems.push(`protocol.routes[${route.kind}] to references unknown role "${to}"`);
     }
   }
-  if (protocol?.completion !== undefined && !known(protocol.completion.owner)) {
-    problems.push(`protocol.completion.owner references unknown role "${protocol.completion.owner}"`);
+  if (protocol.completion !== undefined && !isRecord(protocol.completion)) {
+    problems.push("shape: protocol.completion must be an object");
+  } else if (isRecord(protocol.completion)) {
+    if (typeof protocol.completion.owner !== "string" || protocol.completion.owner === "") problems.push("shape: protocol.completion.owner must be a non-empty string");
+    if (typeof protocol.completion.rule !== "string" || protocol.completion.rule === "") problems.push("shape: protocol.completion.rule must be a non-empty string");
+    if (typeof protocol.completion.owner === "string" && protocol.completion.owner !== "" && !known(protocol.completion.owner)) {
+      problems.push(`protocol.completion.owner references unknown role "${protocol.completion.owner}"`);
+    }
   }
   return problems;
 }
@@ -425,7 +475,7 @@ export function createTopologyCatalog(fs: TopologyCatalogFileSystem, options: To
             filename: entry.name,
             type: entry.isFile() ? "file" : entry.isDirectory() ? "directory" : "other",
             path: join(directory, entry.name),
-            read: () => readFile(join(directory, entry.name), "utf8"),
+            read: () => (options.globalReadFile ?? ((path: string) => readFile(path, "utf8")))(join(directory, entry.name)),
           })),
       };
     } catch (error) {
@@ -444,9 +494,14 @@ export function createTopologyCatalog(fs: TopologyCatalogFileSystem, options: To
     }
     let raw: unknown;
     try {
-      raw = JSON.parse(await file.read());
+      const text = await file.read();
+      try {
+        raw = JSON.parse(text);
+      } catch (error) {
+        return { kind: "blocked", status: "blocked", id, filename: file.filename, source, warnings: [], diagnostic: topologyDiagnostic("invalid_json", `topology file ${file.path} contains invalid JSON: ${error instanceof Error ? error.message : String(error)}`) };
+      }
     } catch (error) {
-      return { kind: "blocked", status: "blocked", id, filename: file.filename, source, warnings: [], diagnostic: topologyDiagnostic("invalid_json", `topology file ${file.path} contains invalid JSON: ${error instanceof Error ? error.message : String(error)}`) };
+      return { kind: "blocked", status: "blocked", id, filename: file.filename, source, warnings: [], diagnostic: topologyDiagnostic("filesystem", `topology file ${file.path} could not be read: ${error instanceof Error ? error.message : String(error)}`, fsCodeOf(error)) };
     }
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
       return { kind: "blocked", status: "blocked", id, filename: file.filename, source, warnings: [], diagnostic: topologyDiagnostic("invalid_shape", "topology root must be a JSON object") };
@@ -475,7 +530,16 @@ export function createTopologyCatalog(fs: TopologyCatalogFileSystem, options: To
     }
     const problems = validateTopology(config);
     if (problems.length > 0) {
-      return { kind: "blocked", status: "blocked", id, filename: file.filename, source, warnings: [], diagnostic: topologyDiagnostic("invalid_topology", problems.join("; ")) };
+      const shapeProblem = problems.find((problem) => problem.startsWith("shape:"));
+      return {
+        kind: "blocked",
+        status: "blocked",
+        id,
+        filename: file.filename,
+        source,
+        warnings: [],
+        diagnostic: topologyDiagnostic(shapeProblem === undefined ? "invalid_topology" : "invalid_shape", problems.join("; ").replaceAll("shape: ", "")),
+      };
     }
     const warnings = config.schemaVersion === undefined ? ["legacy topology schema normalized in memory; source file was not rewritten"] : [];
     return {
