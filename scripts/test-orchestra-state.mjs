@@ -234,6 +234,27 @@ test("active state interface classifies inactive markers and preserves degraded 
   assert.equal(degraded.team.status, "degraded");
 });
 
+test("unsupported schema markers are blocked and cannot be replaced", async () => {
+  const cases = [
+    { schemaVersion: 2, archived: true },
+    { schemaVersion: 2, status: "dismissed", roles: [] },
+  ];
+  for (const raw of cases) {
+    const fs = new MemoryFs();
+    const store = createActiveTeamStateStore(fs);
+    fs.seed(raw);
+    const original = fs.content();
+    const observed = await store.read(cwd);
+    assert.equal(observed.kind, "blocked");
+    assert.equal(observed.diagnostic.code, "unsupported_schema");
+    await assert.rejects(
+      () => store.create(cwd, team(), writeOptions()),
+      (error) => error instanceof ActiveTeamStateError && error.code === "write_failed" && /schemaVersion 2/.test(error.message),
+    );
+    assert.equal(fs.content(), original);
+  }
+});
+
 test("create replaces an observed inactive marker without overwriting a concurrent change", async () => {
   const fs = new MemoryFs();
   const store = createActiveTeamStateStore(fs);

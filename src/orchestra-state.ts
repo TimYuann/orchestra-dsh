@@ -232,6 +232,13 @@ function classifyRaw(raw: unknown, cwd: string):
 
   const compatibility = compatibilityOf(record);
   const warnings = legacyWarnings(compatibility);
+  if (record.schemaVersion !== undefined && (typeof record.schemaVersion !== "number" || record.schemaVersion !== 1)) {
+    return {
+      kind: "blocked",
+      warnings,
+      diagnostic: diagnostic("unsupported_schema", `active team state schemaVersion ${String(record.schemaVersion)} is unsupported`),
+    };
+  }
   if (record.archived === true) {
     return {
       kind: "inactive",
@@ -248,13 +255,6 @@ function classifyRaw(raw: unknown, cwd: string):
       compatibility,
       warnings,
       diagnostic: diagnostic("inactive", "active team state contains a dismissed snapshot"),
-    };
-  }
-  if (record.schemaVersion !== undefined && (typeof record.schemaVersion !== "number" || record.schemaVersion !== 1)) {
-    return {
-      kind: "blocked",
-      warnings,
-      diagnostic: diagnostic("unsupported_schema", `active team state schemaVersion ${String(record.schemaVersion)} is unsupported`),
     };
   }
   if (record.status !== undefined && record.status !== "active" && record.status !== "degraded") {
