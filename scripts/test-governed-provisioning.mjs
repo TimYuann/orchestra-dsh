@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createActiveTeamStateStore, normalizeTeam } from "../lib/orchestra-state.js";
 import { prepareGovernedBlueprint, readGovernedBlueprint } from "../lib/session-blueprint.js";
-import { provisionGovernedPlans } from "../lib/orchestra.js";
+import { assertUniqueGovernedSessionIds, prepareGovernedRolePlan, provisionGovernedPlans } from "../lib/orchestra.js";
+import { preflightGovernedRequiredTools } from "../lib/session-blueprint.js";
 
 const cwd = "/tmp/orchestra-governed-test";
 
@@ -335,6 +336,44 @@ test("Governed required tool failure rolls setup back before publication", async
     },
     (error) => error?.code === "required_tools_missing",
   );
+});
+
+test("Governed create preflights required capabilities before reservation and fails closed for preset files", async () => {
+  const runtime = makeRuntime();
+  await assert.rejects(
+    () => prepareGovernedRolePlan(runtime.context, {
+      cwd,
+      teamId: "team-preflight",
+      controllerSessionId: "driver",
+      topologyId: "trio",
+      topologySource: "bundled",
+      role: { id: "reviewer", name: "reviewer", preset: "preset-reviewer", sandbox: "read-only", requiredTools: ["missing-tool"] },
+    }),
+    (error) => error?.code === "required_tools_unproven" && /reservation was not attempted/.test(error.message),
+  );
+  assert.equal(runtime.fs.files.size, 0, "preflight failure does not write active Team state");
+  assert.equal(runtime.agents.size, 0, "preflight failure does not create an Agent");
+  assert.throws(
+    () => preflightGovernedRequiredTools({ presetFile: { id: "preset-reviewer", trust: "user", path: "/tmp/preset.yml" }, requiredTools: ["missing-tool"] }),
+    (error) => error?.code === "required_tools_unproven",
+  );
+});
+
+test("role ids that normalize alike receive independent reserved SessionIds", async () => {
+  const runtime = makeRuntime();
+  const plans = [];
+  for (const roleId of ["a/b", "a-b"]) {
+    plans.push(await prepareGovernedRolePlan(runtime.context, {
+      cwd,
+      teamId: "team-collision",
+      controllerSessionId: "driver",
+      topologyId: "custom",
+      topologySource: "bundled",
+      role: { id: roleId, name: roleId, preset: "preset-reviewer", sandbox: "workspace-write" },
+    }));
+  }
+  assert.notEqual(plans[0].sessionId, plans[1].sessionId);
+  assert.doesNotThrow(() => assertUniqueGovernedSessionIds(plans));
 });
 
 test("transaction reserves all mappings before create, flushes before active CAS, and cleans failed roles", async () => {

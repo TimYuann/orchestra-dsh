@@ -171,6 +171,7 @@ export type BlueprintErrorCode =
   | "permission_unavailable"
   | "permission_mismatch"
   | "model_unavailable"
+  | "required_tools_unproven"
   | "required_tools_missing"
   | "composition_mismatch"
   | "session_unavailable";
@@ -256,6 +257,24 @@ function requiredTools(input: { requiredTools?: string[] }): string[] {
     throw new SessionBlueprintError("invalid_input", "requiredTools must be an array of non-empty strings");
   }
   return [...new Set(names)];
+}
+
+/**
+ * Non-publishing capability gate for Governed provisioning. DSH rc.6 exposes
+ * actual tool schemas only from a composed scope; a preset file/id alone is
+ * not a static capability proof. Keep commit-time validation as the second
+ * defense, but fail closed before team reservation when required tools cannot
+ * be proven without publishing an Agent.
+ */
+export function preflightGovernedRequiredTools(input: { requiredTools?: string[]; presetId?: string; presetFile?: BlueprintPresetFile }): void {
+  const required = requiredTools(input);
+  if (required.length === 0) return;
+  const source = input.presetFile?.path ?? input.presetId ?? "explicit preset";
+  throw new SessionBlueprintError(
+    "required_tools_unproven",
+    `required governed tools cannot be proven before Agent publication for ${source}; reservation was not attempted`,
+    { required, source },
+  );
 }
 
 function visibleToolNames(agentCtx: Context): string[] {

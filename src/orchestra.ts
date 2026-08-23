@@ -27,7 +27,7 @@ import type {} from "@deepseek-ai/dsh-system-prompt";
 import type {} from "@deepseek-ai/dsh-commands";
 import { createSession, installModelOverride, deliverMessage } from "./a2a.js";
 import type { ResolvedPresetFile } from "./a2a.js";
-import { prepareGovernedBlueprint } from "./session-blueprint.js";
+import { prepareGovernedBlueprint, preflightGovernedRequiredTools } from "./session-blueprint.js";
 import type { GovernedBlueprintReceipt, PreparedGovernedBlueprint } from "./session-blueprint.js";
 import { createActiveTeamStateStore } from "./orchestra-state.js";
 import type {
@@ -557,9 +557,18 @@ export interface GovernedRolePlan {
   blueprint: PreparedGovernedBlueprint;
 }
 
-function governedSessionId(teamId: string, roleId: string): string {
-  const safeRole = roleId.replace(/[^A-Za-z0-9_-]+/g, "-");
-  return `orchestra-${teamId}-${safeRole}`;
+function governedSessionId(teamId: string): string {
+  // Role ids are durable domain keys, not filesystem-safe session ids. Keep
+  // the mapping in team.json and give every reserved role an independent id.
+  return `orchestra-${teamId}-${randomUUID()}`;
+}
+
+export function assertUniqueGovernedSessionIds(plans: readonly Pick<GovernedRolePlan, "roleId" | "sessionId">[]): void {
+  const seen = new Set<string>();
+  for (const plan of plans) {
+    if (seen.has(plan.sessionId)) throw new Error(`governed role session id collision before reservation: ${plan.roleId} -> ${plan.sessionId}`);
+    seen.add(plan.sessionId);
+  }
 }
 
 function roleBlueprintFacts(receipt: GovernedBlueprintReceipt): TeamRoleBlueprintFacts {
@@ -628,7 +637,7 @@ async function disposeCreatedHandles(handles: AgentHandle[]): Promise<void> {
   }
 }
 
-async function prepareGovernedRolePlan(
+export async function prepareGovernedRolePlan(
   ctx: Context,
   options: {
     cwd: string;
@@ -659,7 +668,9 @@ async function prepareGovernedRolePlan(
     throw new Error(`governed role "${options.role.id}" has invalid sandbox "${requestedSandbox}"`);
   }
   const presetFile = await resolvePresetFile(ctx, options.cwd, presetId);
-  const sessionId = governedSessionId(options.teamId, options.role.id);
+  const requiredTools = (options.role as RoleConfig & { requiredTools?: string[] }).requiredTools;
+  preflightGovernedRequiredTools({ requiredTools, presetId, presetFile });
+  const sessionId = governedSessionId(options.teamId);
   const blueprint = await prepareGovernedBlueprint(ctx, {
     sessionId,
     teamId: options.teamId,
@@ -677,7 +688,7 @@ async function prepareGovernedRolePlan(
     model: options.model,
     reasoningEffort: options.reasoningEffort,
     runtime: options.role.runtime,
-    requiredTools: (options.role as RoleConfig & { requiredTools?: string[] }).requiredTools,
+    requiredTools,
     signal: options.signal,
   });
   return {
@@ -1040,6 +1051,7 @@ export function apply(ctx: Context): void {
             }),
           );
         }
+        assertUniqueGovernedSessionIds(plans);
         const team: TeamState = {
           schemaVersion: 1,
           teamId,
@@ -1269,6 +1281,7 @@ export function apply(ctx: Context): void {
           title: `${projectSlugFromCwd(cwd)} · ${roleName} · ${team.topologyRef.id}`,
           signal: exec.signal,
         });
+        assertUniqueGovernedSessionIds([plan]);
         const reservedTeam: TeamState = {
           ...team,
           status: "provisioning",
