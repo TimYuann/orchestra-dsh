@@ -162,15 +162,18 @@ Orchestra Human Gate 是产品协作决策层；DSH Permission/Approval 是工�
 
 ### 5.1 硬不变量
 
-0.4.0 的硬不变量是：任何由 `a2a_create`、`orchestra_create` 或 `orchestra_spawn` 派生的 Session，都不得是 rosterless、无 Agent Preset、无工具或只有半成品元数据的 Session。
+0.4.0 的硬不变量是：任何由 `a2a_create`、`orchestra_create` 或 `orchestra_spawn` 派生的 Session，都必须有与其运行模式相匹配的完整 Session Blueprint，不得是无 Agent Preset/完整 composition、无工具或只有半成品元数据的 Session。
+
+- Governed Orchestra 的每个 Role 必须绑定 `teamId + roleId` 并进入受治理 roster；不得留下 rosterless 的 Governed role。
+- Lightweight A2A 有意不属于 Governed roster，也不要求伪造 team/role/topology metadata；它必须携带明确的 lightweight identity marker，并满足本节定义的完整 Lightweight Blueprint。
 
 创建前必须完整解析 **Session Blueprint**，至少包括：
 
-- Agent Preset；
+- Agent Preset 或可恢复的实际 composition generation；
 - Permission Preset（sandbox + approval）；
 - provider、model、reasoningEffort；
 - cwd、title；
-- team/role/topology metadata；
+- mode-specific identity metadata：Governed 使用 team/role/topology metadata，Lightweight 使用 lightweight identity marker 并明确不属于 Governed roster；
 - required tool capabilities；
 - welcome/initial task 的 durable admission 计划。
 
@@ -186,23 +189,24 @@ Orchestra Human Gate 是产品协作决策层；DSH Permission/Approval 是工�
 
 ### 5.3 Lightweight 与 Governed 的解析规则
 
-- Lightweight A2A 未显式指定 Agent Preset 时，必须继承调用 Session **实际运行的 composition generation**；不能只读取当前 deployment default。调用方当前实际 preset、工具面、权限和模型事实应可被恢复和审计。
+- Lightweight A2A 未显式指定 Agent Preset 时，必须继承调用 Session **实际运行的 composition generation**；不能只读取当前 deployment default。它必须记录 lightweight identity marker、实际 preset/composition、工具面、权限、模型、cwd/title 和 durable admission 事实，但不得凭空创建 team/role/topology metadata 或 Governed roster。
 - Governed Orchestra 的每个 Role 必须有显式完整 Agent Preset，或由 Topology 明确指定并可解析的 base preset。preset 未定义、解析失败或只有 persona 文本时，不得继续创建。
 - professional role preset 必须建立在一个已知完整 composition 上，例如 `standard`、`minimal`、`code` 或明确完整的自定义 composition；不能只有 `persona` 而没有工具面。
 - resume 必须恢复该 Session 实际运行过的 preset/model/permission facts，不能套用新的默认配置覆盖历史事实。
 
 ### 5.4 Provisioning 状态
 
-只有在以下条件都验证通过后，Session 才能标记为 `active`：
+只有在以下通用条件，以及对应运行模式的身份条件都验证通过后，Session 才能标记为 `active`：
 
 1. preset composition 已解析并可加载；
 2. required tools 已满足；
 3. Permission Preset 已解析；
 4. Model Selection 已解析；
-5. cwd、title、team/role/topology metadata 已写入；
-6. welcome/initial task 已被 durable admission 接受并可追踪。
+5. cwd、title 已写入；
+6. Governed Session 已写入 team/role/topology metadata 并建立 roster 映射，或 Lightweight Session 已写入 lightweight identity marker 且明确不在 Governed roster；
+7. welcome/initial task 已被 durable admission 接受并可追踪。
 
-任一环节失败必须显式记录 `provisioning_failed` 或 `degraded`，并保留可恢复的失败原因；不得静默返回成功、留下无记录孤儿或把部分创建伪装成完整 active team。多角色创建必须具备 transactional multi-role provisioning 语义：部分失败要么可回滚/补偿并有记录，要么整个实例显式进入失败状态。
+任一环节失败必须显式记录 `provisioning_failed` 或 `degraded`，并保留可恢复的失败原因；不得静默返回成功、留下无记录孤儿或把部分创建伪装成完整 active Session。Governed 多角色创建必须具备 transactional multi-role provisioning 语义：部分失败要么可回滚/补偿并有记录，要么整个实例显式进入失败状态。
 
 ### 5.5 v0.3 已知缺口（必须修复）
 
@@ -287,7 +291,7 @@ Soft warning 不得被工具 render 的一句摘要吞掉；应进入 Draft/Free
 ### 8.1 状态和身份
 
 - 多角色 provisioning 必须是 transactional，部分失败不得留下无记录孤儿或假 active。
-- `teamId + roleId → sessionId` 是稳定映射；Session 被替换时保留 session history、replacement reason 和当前有效映射。
+- 对 Governed Orchestra，`teamId + roleId → sessionId` 是稳定映射；Session 被替换时保留 session history、replacement reason 和当前有效映射。Lightweight A2A 使用自身的 lightweight identity marker，不要求 team/role 映射。
 - display name/title/cwd 只能用于展示或上下文，不能作为身份、权限或恢复键。
 - `active`、`degraded`、`blocked`、`needs_retry`、`replan`、`failed`、`provisioning_failed` 等状态必须显式化；禁止 silent fallback/partial success。
 
@@ -355,8 +359,8 @@ Soft warning 不得被工具 render 的一句摘要吞掉；应进入 Draft/Free
 ### Checkpoint 2 · Session Blueprint 与 complete provisioning
 
 - **依赖**：Checkpoint 1 的类型和状态 seam。
-- **范围**：Agent Preset、Permission Preset、Model Selection、required tools、metadata、welcome/initial task durable admission 的完整解析与 transactional multi-role provisioning；修复无 preset 可生成无工具 Agent 的 v0.3 缺口。
-- **验收**：a2a/orchestra 的所有派生 Session 都能证明完整 Blueprint；失败显式为 provisioning_failed/degraded；resume 恢复历史运行事实；无 rosterless/假 active。
+- **范围**：按运行模式完整解析 Agent Preset/实际 composition generation、Permission Preset、Model Selection、required tools、mode-specific identity metadata、welcome/initial task durable admission；为 Governed 多角色实例提供 transactional multi-role provisioning；修复无 preset 可生成无工具 Agent 的 v0.3 缺口。
+- **验收**：所有 a2a/orchestra 派生 Session 都能证明与模式匹配的完整 Blueprint；Lightweight Session 有 lightweight identity marker 且不伪造 team/role/topology roster，Governed Role 有完整 roster 映射；失败显式为 provisioning_failed/degraded；resume 恢复历史运行事实；无未记录的 Governed role 或假 active。
 
 ### Checkpoint 3 · A2A transport/discovery 分层与 role addressing
 
