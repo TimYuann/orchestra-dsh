@@ -21,7 +21,7 @@ import { mountPreset, resolveSessionPreset } from "@deepseek-ai/dsh-agent-preset
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolExecutionInput } from "@deepseek-ai/dsh-tools";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
-import type {} from "@deepseek-ai/dsh-agent";
+import type { AgentSetup } from "@deepseek-ai/dsh-agent";
 import type {} from "@deepseek-ai/dsh-session";
 import type {} from "@deepseek-ai/dsh-session-title";
 import type { SessionId } from "@deepseek-ai/dsh-session";
@@ -29,6 +29,8 @@ import type {} from "@deepseek-ai/dsh-fs";
 import type {} from "@deepseek-ai/dsh-system-prompt";
 import type {} from "@deepseek-ai/cordis-plugin-timer";
 import { randomUUID } from "node:crypto";
+import { prepareLightweightBlueprint } from "./session-blueprint.js";
+import type { LightweightBlueprintReceipt } from "./session-blueprint.js";
 import "./relay-types.js";
 
 const SID = (value: string): SessionId => value as SessionId;
@@ -68,13 +70,13 @@ export interface ResolvedPresetFile {
 }
 
 /** Create one agent thread (session) with model default + preset composition. */
-export async function createSession(
-  ctx: Context,
-  options: {
+export interface CreateSessionOptions {
     sessionId?: string;
     cwd?: string;
     /** DSH-native preset id (resolved through ctx.agentPresets). */
     presetId?: string;
+    /** Lightweight alias for an explicit Agent Preset id. */
+    agentPresetId?: string;
     /** Orchestra-resolved preset file (project/global/builtin), takes precedence over presetId. */
     presetFile?: ResolvedPresetFile;
     currentSessionId?: string;
@@ -82,11 +84,41 @@ export async function createSession(
     provider?: string;
     model?: string;
     reasoningEffort?: string;
+    /** Provision through the complete lightweight Session Blueprint seam. */
+    mode?: "lightweight";
+    permissionPreset?: string;
+    requiredTools?: string[];
+    callerAgent?: import("@deepseek-ai/dsh-agent").Agent;
     /** Display title pinned on the new session (e.g. "my-project · implementer · trio"; slug = path.basename(cwd)). */
     title?: string;
     signal?: AbortSignal;
-  } = {},
-): Promise<{ sessionId: string; cwd?: string; agentPreset?: string }> {
+}
+
+export interface SessionCreateResult {
+  sessionId: string;
+  cwd?: string;
+  agentPreset?: string;
+  mode?: "lightweight";
+  permissionPreset?: string;
+  provider?: string;
+  model?: string;
+  reasoningEffort?: string;
+  title?: string;
+  tools?: { names: string[]; count: number };
+}
+
+export interface LightweightSessionCreateResult extends SessionCreateResult {
+  mode: "lightweight";
+  agentPreset: string;
+  permissionPreset: string;
+  provider: string;
+  model: string;
+  tools: { names: string[]; count: number };
+}
+
+export function createSession(ctx: Context, options: CreateSessionOptions & { mode: "lightweight" }): Promise<LightweightSessionCreateResult>;
+export function createSession(ctx: Context, options?: CreateSessionOptions): Promise<SessionCreateResult>;
+export async function createSession(ctx: Context, options: CreateSessionOptions = {}): Promise<SessionCreateResult> {
   const sessionId =
     typeof options.sessionId === "string" && options.sessionId !== ""
       ? options.sessionId
@@ -95,24 +127,49 @@ export async function createSession(
   if (ctx.agents.get(sid) !== undefined)
     throw new Error(`a2a: session "${sessionId}" already exists`);
   const cwd = typeof options.cwd === "string" && options.cwd !== "" ? options.cwd : undefined;
+  const lightweight = options.mode === "lightweight";
+  let agentOptions: { provider?: string; model?: string } = {};
+  let setup: AgentSetup | undefined;
+  let agentPreset: string | undefined;
+  let blueprintReceipt: LightweightBlueprintReceipt | undefined;
   const model = ctx.get("agentDefaultModel");
   const selection = model === undefined ? undefined : model.currentSelection();
-  const agentOptions =
-    options.provider !== undefined || options.model !== undefined
-      ? {
-          ...(options.provider !== undefined ? { provider: options.provider } : {}),
-          ...(options.model !== undefined ? { model: options.model } : {}),
-        }
-      : selection === undefined
-        ? {}
-        : { provider: selection.provider, model: selection.model };
   const modelOverride =
     options.provider !== undefined || options.model !== undefined || options.reasoningEffort !== undefined;
   const overrideProvider = options.provider ?? selection?.provider;
   const overrideModel = options.model ?? selection?.model;
-  let setup: ((agentCtx: Context) => Promise<void>) | undefined;
-  let agentPreset: string | undefined;
-  if (options.presetFile !== undefined) {
+  if (!lightweight) {
+    agentOptions =
+      options.provider !== undefined || options.model !== undefined
+        ? {
+            ...(options.provider !== undefined ? { provider: options.provider } : {}),
+            ...(options.model !== undefined ? { model: options.model } : {}),
+          }
+        : selection === undefined
+          ? {}
+          : { provider: selection.provider, model: selection.model };
+  }
+  if (lightweight) {
+    const blueprint = await prepareLightweightBlueprint(ctx, {
+      sessionId,
+      caller: options.callerAgent,
+      createdBySessionId: options.currentSessionId ?? options.callerAgent?.id,
+      cwd,
+      presetId: options.agentPresetId ?? options.presetId,
+      ...(options.presetFile === undefined ? {} : { presetFile: options.presetFile }),
+      permissionPreset: options.permissionPreset,
+      provider: options.provider,
+      model: options.model,
+      reasoningEffort: options.reasoningEffort,
+      title: options.title,
+      requiredTools: options.requiredTools,
+      signal: options.signal,
+    });
+    agentOptions = blueprint.agentOptions;
+    setup = blueprint.setup;
+    agentPreset = blueprint.receipt.agentPreset;
+    blueprintReceipt = blueprint.receipt;
+  } else if (options.presetFile !== undefined) {
     // Orchestra-resolved preset (project > global > builtin): mount the file
     // directly — no DSH resolver root registration needed (spec §5.3).
     const file = options.presetFile;
@@ -123,19 +180,15 @@ export async function createSession(
     };
   } else if (options.presetId !== undefined && options.presetId !== "") {
     const presets = ctx.get("agentPresets");
-    if (presets !== undefined) {
-      const resolved = await presets.resolve(options.presetId);
-      agentPreset = resolved.id;
-      setup = async (agentCtx) => {
-        await presets.mount(agentCtx, resolved.id);
-        installModelOverride(agentCtx, modelOverride, overrideProvider, overrideModel, options.reasoningEffort);
-      };
-    }
-  } else if (modelOverride && overrideProvider !== undefined && overrideModel !== undefined) {
-    setup = (agentCtx) => {
-      installModelOverride(agentCtx, true, overrideProvider, overrideModel, options.reasoningEffort);
-      return Promise.resolve();
+    if (presets === undefined) throw new Error(`a2a: agentPresets service is unavailable for preset "${options.presetId}"`);
+    const resolved = await presets.resolve(options.presetId);
+    agentPreset = resolved.id;
+    setup = async (agentCtx) => {
+      await presets.mount(agentCtx, resolved.id);
+      installModelOverride(agentCtx, modelOverride, overrideProvider, overrideModel, options.reasoningEffort);
     };
+  } else {
+    throw new Error("a2a: createSession requires a complete Agent Preset; mode=lightweight resolves one when no preset is explicit");
   }
   await ctx.agents.create({
     sessionId: sid,
@@ -147,7 +200,7 @@ export async function createSession(
     ...(setup === undefined ? {} : { setup }),
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   });
-  if (typeof options.title === "string" && options.title !== "") {
+  if (!lightweight && typeof options.title === "string" && options.title !== "") {
     const session = ctx.sessions.get(sid);
     if (session !== undefined) {
       // Pinned display title: log-only "session/title" event (kind:user pins it,
@@ -177,6 +230,17 @@ export async function createSession(
     sessionId: sid,
     ...(cwd === undefined ? {} : { cwd }),
     ...(agentPreset === undefined ? {} : { agentPreset }),
+    ...(blueprintReceipt === undefined
+      ? {}
+      : {
+          mode: blueprintReceipt.mode,
+          permissionPreset: blueprintReceipt.permissionPreset,
+          provider: blueprintReceipt.provider,
+          model: blueprintReceipt.model,
+          ...(blueprintReceipt.reasoningEffort === undefined ? {} : { reasoningEffort: blueprintReceipt.reasoningEffort }),
+          ...(blueprintReceipt.title === undefined ? {} : { title: blueprintReceipt.title }),
+          tools: blueprintReceipt.tools,
+        }),
   };
 }
 
@@ -909,10 +973,17 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "a2a_create",
       description:
-        "Open a new agent thread (session). The new session starts live, appears in the sidebar, and can be addressed with a2a_send / a2a_read. Working directory and agent preset default to the calling thread's; model follows the deployment default.",
+        "Open a complete lightweight agent Session. Before publication it resolves and installs an Agent Preset composition, pins a Permission Preset and Model Selection, records a lightweight blueprint marker, fixes the title, and verifies required tools. If the caller has a composed preset, the child joins that exact generation; a rosterless caller mounts the deployment default or fails loudly. The new session appears only after setup/commit succeeds.",
       parameters: {
         cwd: { type: "string", description: "Working directory for the new session. Defaults to the calling thread's cwd." },
-        presetId: { type: "string", description: "Agent preset id to mount on the new session. Defaults to the deployment default preset." },
+        presetId: { type: "string", description: "Legacy-compatible explicit Agent Preset id." },
+        agentPreset: { type: "string", description: "Explicit Agent Preset id; takes precedence over presetId." },
+        permissionPreset: { type: "string", description: "Permission Preset to pin; defaults to permissionPresets.defaultPreset." },
+        provider: { type: "string", description: "Explicit model provider; must be paired with model." },
+        model: { type: "string", description: "Explicit model id; must be paired with provider." },
+        reasoningEffort: { type: "string", description: "Optional reasoning effort; requires provider and model." },
+        title: { type: "string", description: "Title pinned before the Session is published." },
+        requiredTools: { type: "array", items: { type: "string" }, description: "Optional tool names that must be visible in the child scope before publication." },
       },
       output: {
         schema: {
@@ -921,21 +992,58 @@ export function apply(ctx: Context): void {
           properties: {
             sessionId: { type: "string", required: true },
             cwd: { type: "string" },
-            agentPreset: { type: "string" },
+            agentPreset: { type: "string", required: true },
+            mode: { type: "string", required: true },
+            permissionPreset: { type: "string", required: true },
+            provider: { type: "string", required: true },
+            model: { type: "string", required: true },
+            reasoningEffort: { type: "string" },
+            title: { type: "string" },
+            tools: {
+              type: "object",
+              additionalProperties: false,
+              required: true,
+              properties: {
+                names: { type: "array", items: { type: "string" }, required: true },
+                count: { type: "number", required: true },
+              },
+            },
           },
         },
         render: (_args, value) => [
           {
             type: "text",
-            text: `new session ${value.sessionId} opened${value.cwd === undefined ? "" : ` in ${value.cwd}`}${value.agentPreset === undefined ? "" : ` (${value.agentPreset})`}`,
+            text: `new lightweight session ${value.sessionId} opened${value.cwd === undefined ? "" : ` in ${value.cwd}`} (${value.agentPreset}, permission=${value.permissionPreset}, model=${value.provider}/${value.model}, tools=${value.tools.count})`,
           },
         ],
       },
-      execute(args: { cwd?: string; presetId?: string }, exec: ToolExecutionInput) {
+      execute(
+        args: {
+          cwd?: string;
+          presetId?: string;
+          agentPreset?: string;
+          permissionPreset?: string;
+          provider?: string;
+          model?: string;
+          reasoningEffort?: string;
+          title?: string;
+          requiredTools?: string[];
+        },
+        exec: ToolExecutionInput,
+      ) {
         if (exec.agent === undefined) throw new Error("a2a_create requires an agent caller");
         return createSession(ctx, {
+          mode: "lightweight",
           cwd: args.cwd ?? exec.agent.session.header.cwd,
-          presetId: args.presetId,
+          presetId: args.agentPreset ?? args.presetId,
+          agentPresetId: args.agentPreset,
+          permissionPreset: args.permissionPreset,
+          provider: args.provider,
+          model: args.model,
+          reasoningEffort: args.reasoningEffort,
+          title: args.title,
+          requiredTools: args.requiredTools,
+          callerAgent: exec.agent,
           currentSessionId: exec.agent.id,
           signal: exec.signal,
         });

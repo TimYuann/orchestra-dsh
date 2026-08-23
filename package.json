@@ -38,7 +38,7 @@
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && tsdown",
     "dev": "node --import tsx scripts/loader.mjs",
     "dev:harness": "dsh web --patch ./cordis.patch.yml",
-    "test": "npm run build && node --test scripts/test-v0.3.0.mjs scripts/test-orchestra-state.mjs scripts/test-orchestra-archive.mjs scripts/test-orchestra-topology.mjs",
+    "test": "npm run build && node --test scripts/test-v0.3.0.mjs scripts/test-orchestra-state.mjs scripts/test-orchestra-archive.mjs scripts/test-orchestra-topology.mjs scripts/test-session-blueprint.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.client.json",
     "prepare": "npm run build"
   },
@@ -69,6 +69,7 @@
     "@deepseek-ai/dsh-permission-presets": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-sandbox": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-sandbox-policy": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-scope": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-session": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-session-title": "0.1.0-rc.6",
     "@deepseek-ai/dsh-system-prompt": "^0.1.0-rc.6",
@@ -105,6 +106,7 @@
     "@deepseek-ai/dsh-permission-presets": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-sandbox": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-session": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-scope": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-system-prompt": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-tools": "^0.1.0-rc.6"
   }
