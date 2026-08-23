@@ -46,6 +46,8 @@ import type {
   TeamWelcomeReceipt,
 } from "./orchestra-state.js";
 import { createArchiveStore } from "./orchestra-archive.js";
+import { createGovernedRoleAddressResolver } from "./orchestra-address.js";
+import type { GovernedRoleAddressResolver } from "./orchestra-address.js";
 import { createTopologyCatalog } from "./orchestra-topology.js";
 import type { RoleConfig, TopologyCatalog, TopologyList, TopologyProtocol, TopologyResolution, TopologyRoleSummary } from "./orchestra-topology.js";
 export { validateTopology } from "./orchestra-topology.js";
@@ -943,6 +945,33 @@ export async function createGovernedTeam(
   };
 }
 
+export interface OrchestraSendArgs {
+  teamId: string;
+  roleId: string;
+  message: string;
+  wake?: boolean;
+  interrupt?: boolean;
+}
+
+/** Governed role-addressed send entrypoint; raw Transport remains shared. */
+export async function sendGovernedRole(
+  ctx: Context,
+  addressResolver: GovernedRoleAddressResolver,
+  args: OrchestraSendArgs,
+  exec: ToolExecutionInput,
+) {
+  if (exec.agent === undefined) throw new Error("orchestra_send requires an agent caller");
+  const cwd = exec.agent.session.header.cwd;
+  if (cwd === undefined) throw new Error("current session has no working directory");
+  const address = await addressResolver.resolve(cwd, args.teamId, args.roleId, { signal: exec.signal });
+  if (address.resolved_session_id === exec.agent.id) throw new Error("orchestra_send cannot target the caller's own Governed role");
+  const receipt = await deliverMessage(ctx, exec.agent.id, address.resolved_session_id, [
+    { type: "text", text: `Governed dispatch from ${exec.agent.id} to ${address.team_id}/${address.role_id}:` },
+    { type: "text", text: args.message },
+  ], { wake: args.wake, interrupt: args.interrupt === true });
+  return { team_id: address.team_id, role_id: address.role_id, resolved_session_id: address.resolved_session_id, receipt };
+}
+
 async function roleStatus(ctx: Context, role: TeamRole) {
   const agent = ctx.agents.get(SID(role.sessionId));
   const status: {
@@ -1017,6 +1046,7 @@ export function apply(ctx: Context): void {
   const activeTeamState = createActiveTeamStateStore(ctx.fs);
   const archiveStore = createArchiveStore(ctx.fs);
   const topologyCatalog = createTopologyCatalog(ctx.fs);
+  const governedAddress = createGovernedRoleAddressResolver(activeTeamState);
   const roleItem = {
     type: "object",
     additionalProperties: false,
@@ -1334,6 +1364,49 @@ export function apply(ctx: Context): void {
           phase: provisioned.team.roles.find((role) => role.id === plan.roleId)?.phase ?? "active",
           roles: provisioned.team.roles.map((role) => ({ id: role.id, sessionId: role.sessionId, phase: role.phase })),
         };
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
+      name: "orchestra_send",
+      description: "Send a message to a Governed role by stable teamId+roleId. Resolves the current active session mapping, then reuses raw A2A Transport; accepted does not mean claimed or answered.",
+      parameters: {
+        teamId: { type: "string", required: true, description: "Exact Governed Team id." },
+        roleId: { type: "string", required: true, description: "Governed role id; case-insensitive lookup returns the canonical role id." },
+        message: { type: "string", required: true, description: "Self-contained dispatch or handoff message." },
+        wake: { type: "boolean", description: "Wake the role; defaults to true." },
+        interrupt: { type: "boolean", description: "Best-effort steering interrupt; defaults to false." },
+      },
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            team_id: { type: "string", required: true },
+            role_id: { type: "string", required: true },
+            resolved_session_id: { type: "string", required: true },
+            receipt: {
+              type: "object",
+              additionalProperties: false,
+              required: true,
+              properties: {
+                message_id: { type: "string", required: true },
+                target_session_id: { type: "string", required: true },
+                accepted_at_ms: { type: "number", required: true },
+                delivery_mode: { type: "string", required: true },
+                state: { type: "string", required: true },
+                interrupt: { type: "boolean" },
+                reply_to_message_id: { type: "string" },
+              },
+            },
+          },
+        },
+        render: (_args, value) => [{ type: "text", text: `role ${value.team_id}/${value.role_id} resolved to ${value.resolved_session_id}; message ${value.receipt.message_id} ${value.receipt.state} (accepted only)` }],
+      },
+      async execute(args: { teamId: string; roleId: string; message: string; wake?: boolean; interrupt?: boolean }, exec: ToolExecutionInput) {
+        return sendGovernedRole(ctx, governedAddress, args, exec);
       },
     }),
   );
@@ -2094,16 +2167,16 @@ export function apply(ctx: Context): void {
         "3. Context: read the project context relevant to the goal (files, docs) to ground your understanding.\n" +
         "4. Proposal: report to the user — your understanding of the work, the topology you propose, and why this setup helps. A proposal IS a collaboration charter (编排 = 协作宪章): it must answer all seven questions — who does what; who owns each decision (ownership, one final owner per decision); where work goes when done (routes); what handoffs must carry; where disputes go (escalation); when loops end (round limits); who declares the team complete (closure). You MUST define routes and ownership; the number of roles (3 or 10) is entirely up to what the task needs — use your judgment, never add roles the user did not ask for, and self-check the six completeness tests: reachability, unique power, every output has a consumer, every loop has an exit, disputes have a destination, completion has a single owner.\n" +
         "5. Approval: wait for the user's explicit go-ahead BEFORE creating any role sessions. A proposal is NOT approval: end your proposal turn with an explicit question/request for approval (e.g. ask whether they 放行). Until the user explicitly approves (e.g. replies \"放行\"), you must NOT create/spawn any role session.\n" +
-        "6. Execute: create roles (orchestra_create for a matching template, orchestra_spawn per role otherwise), then dispatch self-contained tasks via a2a_send.\n" +
+        "6. Execute: create roles (orchestra_create for a matching template, orchestra_spawn per role otherwise), then dispatch Governed roles via orchestra_send(teamId+roleId); use raw a2a_send only for explicit free SessionId communication.\n" +
         "Dispatch tightness: dispatch every spawned role's task immediately — in the same round, or the round right after spawning. Never leave a spawned role taskless (a spawn-to-dispatch vacuum makes roles start working on their own).\n" +
         "Parallelism discipline: parallelize everything that CAN run in parallel (dispatch independent tasks together in one round; never serialize independent work) but NEVER parallelize anything that would BLOCK or conflict (dependency-aware: wait for that specific signal — orchestra_team / a2a_read / report path — before dispatching, and declare the dependency explicitly in the task).\n" +
         "No filler messages: creation injects the welcome; injection IS the confirmation. Do NOT send extra confirmation/ack messages after a role is created or a delivery is confirmed — they pile up in the target's inbox (queue buildup). To check session state use orchestra_team (activity, reportCount, lastReport) or a2a_read (history) — never send a message to ask. Dispatch each task once; use interrupt:true only when a message must surface mid-turn.\n" +
-        "Lightweight mode: for one-off collaboration (check a session, ask a question, read history) use the A2A tools directly (a2a_list/a2a_send/a2a_reply/a2a_read) — no team needed. Teams are for multi-role coordinated work.\n" +
+        "Lightweight mode: for one-off collaboration (check a session, ask a question, read history) use the A2A tools directly (a2a_list/a2a_send/a2a_reply/a2a_read/a2a_status) — no team needed. Governed role dispatch uses orchestra_send so replacement mappings remain current.\n" +
         "Stay in your role: you are the driver, not an implementer or a reviewer. Never fix, polish, or take over any role's work — implementation issues loop back to the implementer (via the implementer-reviewer flow), review findings go to the reviewer. Your job is decisions, dispatch, and coordination, not edits.\n" +
         "Deterministic routing (no mindless relaying): you are NOT an information hub. Messages inside a fixed flow go directly between roles — never through you. Example flow: implementer finishes and hands the result directly to reviewer; reviewer finds issues and sends them directly back to implementer for another round; reviewer's targeted re-check passes and THEN reviewer notifies you to advance. You only receive decision points: advances, blockers, new directions, cross-flow coordination. Do not forward what you do not need to know. Roles may call orchestra_team themselves to check team progress (team transparency).\n" +
         "All created roles are told to reply to you (their driver) via a2a_reply, never directly to the user; users interact with roles only through you. Track progress with orchestra_team; recover after restart or after dismissal with orchestra_activate (archive_id required — list archives via orchestra_team); close the instance with orchestra_dismiss (archives the team, notifies roles, frees the cwd); list templates with orchestra_topologies.\n" +
-        "Review flow: to task a reviewer, send via a2a_send a review_request message stating scope, changed locations, and the goal; fix findings one by one; at most two rounds (R2 only re-checks R1 findings); stop after R2 regardless of outcome; new issues go to the backlog for the user to decide. Read handoff reports (paths returned by roles) under orchestra/reports/. All cross-role messages must be self-contained.\n" +
-        "Delivery contract: an a2a_send/a2a_reply to a running role is durable and NEVER lost — it is processed when that role's current turn ends (roles are single-threaded, one turn at a time). Receipts: live_inbox (accepted into the target's inbox — NOT yet processed), durable_inbox (recorded for a suspended thread), resumed_inbox (cold thread resumed first); a failed resume makes the call fail — never assume delivery from a queued state. Do NOT send pure confirmation/ack messages once delivery is confirmed (message storms).\n" +
+        "Review flow: to task a reviewer, send via orchestra_send using teamId+roleId a review_request message stating scope, changed locations, and the goal; fix findings one by one; at most two rounds (R2 only re-checks R1 findings); stop after R2 regardless of outcome; new issues go to the backlog for the user to decide. Read handoff reports (paths returned by roles) under orchestra/reports/. All cross-role messages must be self-contained.\n" +
+        "Delivery contract: a raw a2a_send/a2a_reply receipt state=accepted means the Transport accepted the message, not that it was claimed or answered; use a2a_status for proven lifecycle facts. orchestra_send adds the resolved teamId/roleId mapping but has the same accepted-only semantics.\n" +
         "Concurrency discipline (avoid information blocking): you are the bottleneck — every role report lands in your context. Minimize fan-in: ask roles to return concise summaries plus report paths, not full dumps; read report files only when needed. Do not over-orchestrate: if one session can do the job, do not spawn roles.",
     });
   }

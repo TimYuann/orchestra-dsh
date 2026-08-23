@@ -15,9 +15,9 @@
  */
 
 import type { Context } from "@deepseek-ai/cordis";
-import { createUserMessage, ReasoningEffortId } from "@deepseek-ai/dsh-llm";
-import type { ContentBlock, MessageSource } from "@deepseek-ai/dsh-llm";
-import { mountPreset, resolveSessionPreset } from "@deepseek-ai/dsh-agent-presets";
+import { ReasoningEffortId } from "@deepseek-ai/dsh-llm";
+import type { ContentBlock } from "@deepseek-ai/dsh-llm";
+import { mountPreset } from "@deepseek-ai/dsh-agent-presets";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolExecutionInput } from "@deepseek-ai/dsh-tools";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
@@ -31,6 +31,9 @@ import type {} from "@deepseek-ai/cordis-plugin-timer";
 import { randomUUID } from "node:crypto";
 import { prepareLightweightBlueprint } from "./session-blueprint.js";
 import type { GovernedBlueprintReceipt, PreparedGovernedBlueprint, LightweightBlueprintReceipt } from "./session-blueprint.js";
+import { deliverMessage, queryMessageStatus } from "./a2a-transport.js";
+export { deliverMessage, queryMessageStatus } from "./a2a-transport.js";
+export type { DeliverResult, MessageLifecycleState, MessageStatusResult } from "./a2a-transport.js";
 import "./relay-types.js";
 
 const SID = (value: string): SessionId => value as SessionId;
@@ -266,146 +269,6 @@ export async function createSession(ctx: Context, options: CreateSessionOptions 
   };
 }
 
-/** Resume a cold session so a message can be delivered to a live agent. Throws on failure (spec §10.3). */
-async function tryResume(ctx: Context, sessionId: string): Promise<void> {
-  const presets = ctx.get("agentPresets");
-  const query = ctx.get("sessionQuery");
-  if (presets === undefined || query === undefined)
-    throw new Error(`a2a: cannot resume ${sessionId} — sessionQuery/agentPresets services unavailable`);
-  const snapshot = await query.readSession(SID(sessionId));
-  const presetId = resolveSessionPreset({ header: snapshot.session, events: snapshot.events });
-  const resolved = await presets.resolve(presetId);
-  const model = ctx.get("agentDefaultModel");
-  const selection = model === undefined ? undefined : model.currentSelection();
-  await ctx.agents.resume({
-    resumeSessionId: SID(sessionId),
-    agentOptions: selection === undefined ? {} : { provider: selection.provider, model: selection.model },
-    setup: async (agentCtx) => {
-      await presets.mount(agentCtx, resolved.id);
-    },
-  });
-}
-
-/** Pending length of one inbox target list in the durable log (mirror of Inbox.apply). */
-function pendingLength(session: { events: readonly { type: string; data: any }[]; header: { seedLength?: number } }, target: string): number {
-  let length = 0;
-  const events = session.events;
-  const start = session.header.seedLength ?? 0;
-  for (let i = start; i < events.length; i++) {
-    const event = events[i];
-    if (event.type !== "agent/inbox/spliced") continue;
-    const splice = event.data;
-    if (splice.target !== target) continue;
-    length += splice.inserted.length - (splice.removedCount ?? 0);
-  }
-  return Math.max(length, 0);
-}
-
-/** Delivery receipt returned by a2a_send / a2a_reply (spec §10.3). */
-export interface DeliverResult {
-  message_id: string;
-  target_session_id: string;
-  accepted_at_ms: number;
-  delivery_mode: "live_inbox" | "durable_inbox" | "resumed_inbox";
-  /** Present when delivery used the interrupt (steer) path — best-effort mid-turn steering. */
-  interrupt?: boolean;
-  /** Present on replies: the message id this reply answers. */
-  reply_to_message_id?: string;
-}
-
-/**
- * Core delivery: live agent → followup/inject (interrupt → steer); attached →
- * durable inbox splice; truly cold → await resume then deliver, or throw.
- *
- * Turn-model contract: DSH sessions are single-threaded — a message to a live
- * agent that is currently working is claimed at the agent's next step/turn
- * boundary and is NEVER dropped (the inbox is durable). Setting `interrupt`
- * delivers through DSH's native steering path (`agent.steer` = next-step +
- * wake): an idle target still starts a fresh turn, but a running target picks
- * the message up at its nearest step boundary within the current turn instead
- * of waiting for the turn to end. This is the closest physically possible
- * "mid-turn interrupt" — an in-flight model generation cannot be preempted.
- */
-export async function deliverMessage(
-  ctx: Context,
-  senderSessionId: string | undefined,
-  toSessionId: string,
-  contentBlocks: ContentBlock[],
-  options: { wake?: boolean; replyTo?: string; interrupt?: boolean } = {},
-): Promise<DeliverResult> {
-  const wake = options.wake !== false;
-  const acceptedAt = Date.now();
-  const message = createUserMessage({
-    content: contentBlocks,
-    source: Object.assign(
-      { kind: "a2a", form: "relay", senderSessionId },
-      options.replyTo === undefined ? {} : { replyTo: options.replyTo },
-    ) as MessageSource,
-  });
-  const live = ctx.agents.get(SID(toSessionId));
-  if (live !== undefined) {
-    if (options.interrupt === true) {
-      live.steer(message);
-      return {
-        message_id: message.id,
-        target_session_id: toSessionId,
-        accepted_at_ms: acceptedAt,
-        delivery_mode: "live_inbox",
-        interrupt: true,
-        ...(options.replyTo === undefined ? {} : { reply_to_message_id: options.replyTo }),
-      };
-    }
-    if (wake) live.followup(message);
-    else live.inject(message);
-    return {
-      message_id: message.id,
-      target_session_id: toSessionId,
-      accepted_at_ms: acceptedAt,
-      delivery_mode: "live_inbox",
-      ...(options.replyTo === undefined ? {} : { reply_to_message_id: options.replyTo }),
-    };
-  }
-  // Attached but not live: append a durable inbox splice (delivered on resume).
-  const session = ctx.sessions.get(SID(toSessionId));
-  if (session !== undefined && ctx.agents.get(SID(toSessionId)) === undefined) {
-    const target = wake ? "next-turn" : "next-step";
-    session.append("agent/inbox/spliced", {
-      target,
-      start: pendingLength(session, target),
-      inserted: [message],
-    });
-    return {
-      message_id: message.id,
-      target_session_id: toSessionId,
-      accepted_at_ms: acceptedAt,
-      delivery_mode: "durable_inbox",
-      ...(options.replyTo === undefined ? {} : { reply_to_message_id: options.replyTo }),
-    };
-  }
-  // Truly cold: await the resume — success means the message enters the inbox
-  // now (resumed_inbox); failure throws and the message is NOT delivered
-  // (no fire-and-forget queue, no fake "queued" success — spec §10.3).
-  await tryResume(ctx, toSessionId);
-  const agent = ctx.agents.get(SID(toSessionId));
-  if (agent === undefined) throw new Error(`a2a: target ${toSessionId} could not be resumed`);
-  try {
-    if (wake) agent.followup(message);
-    else agent.inject(message);
-  } catch (error) {
-    console.error(
-      `a2a: post-resume delivery to ${toSessionId} failed: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    throw error;
-  }
-  return {
-    message_id: message.id,
-    target_session_id: toSessionId,
-    accepted_at_ms: acceptedAt,
-    delivery_mode: "resumed_inbox",
-    ...(options.replyTo === undefined ? {} : { reply_to_message_id: options.replyTo }),
-  };
-}
-
 function textOf(message: { content?: unknown } | undefined | null): string {
   const content = message === undefined || message === null ? undefined : message.content;
   if (!Array.isArray(content)) return "";
@@ -521,7 +384,12 @@ async function scanTeamRoster(
   unknownCwds: Set<string>,
 ): Promise<Map<string, { cwd: string; category: "active" | "archived" }>> {
   const map = new Map<string, { cwd: string; category: "active" | "archived" }>();
-  const fs = ctx.get("fs");
+  let fs;
+  try {
+    fs = ctx.get("fs");
+  } catch {
+    return map;
+  }
   if (fs === undefined) return map;
   for (const cwd of unknownCwds) {
     try {
@@ -570,7 +438,12 @@ async function scanTeamRoster(
 async function readCurrentCwdTeam(ctx: Context, cwd: string | undefined): Promise<Map<string, { team_id: string; role_id: string }>> {
   const map = new Map<string, { team_id: string; role_id: string }>();
   if (typeof cwd !== "string" || cwd === "") return map;
-  const fs = ctx.get("fs");
+  let fs;
+  try {
+    fs = ctx.get("fs");
+  } catch {
+    return map;
+  }
   if (fs === undefined) return map;
   try {
     const target = await fs.resolve(`${cwd}/orchestra/state/team.json`, { cwd });
@@ -601,7 +474,7 @@ export interface ThreadEntry {
   status: string;
   live: boolean;
   archived?: boolean;
-  /** active | archived | other (cross-cwd) — "other" only when includeOtherCwds. */
+  /** active | archived | other (cross-cwd); annotation, never an ACL. */
   category?: "active" | "archived" | "other";
   /** caller-relative team membership (spec §11): non-null only for the caller's cwd ACTIVE team. */
   current_cwd_team?: { team_id: string; role_id: string } | null;
@@ -614,13 +487,11 @@ export interface ThreadEntry {
  * - Sorting: the caller's cwd group first, other cwds after (only when
  *   includeOtherCwds); within a group, live entries first, then cold entries
  *   in newest-first session-corpus order.
- * - Default return: the caller's cwd active-team roles + other live sessions
- *   of that cwd + recent cold sessions, capped by `limit`.
+ * - Default return: all host sessions, caller cwd first, capped by `limit`.
  * - Archived roles are folded away by default; pass includeArchived to reveal
  *   them (labeled archived).
- * - Lightweight mode: when the caller's cwd has no orchestra footprint
- *   (no active team and no archive), no cwd filtering applies — the full
- *   session corpus is listed (limit/offset still apply).
+ * - `includeOtherCwds` remains a compatibility input but never acts as a
+ *   Transport ACL; annotations distinguish other cwd and wild sessions.
  */
 export async function listThreads(
   ctx: Context,
@@ -629,9 +500,10 @@ export async function listThreads(
   const limit = Math.max(1, Math.min(options.limit ?? 30, 100));
   const offset = Math.max(0, options.offset ?? 0);
   const driverCwd = options.driverCwd;
-  const includeOtherCwds = options.includeOtherCwds === true;
+  // Kept in the input for compatibility; raw transport/discovery visibility
+  // is host-wide and cannot be narrowed by Team/CWD policy.
+  void options.includeOtherCwds;
   const includeArchived = options.includeArchived === true;
-  const query = ctx.get("sessionQuery");
   const live = ctx.agents.list();
   const liveEntries = live.map((agent) => ({
     sessionId: agent.id,
@@ -639,13 +511,30 @@ export async function listThreads(
     status: agent.status,
     live: true,
   }));
+  let query;
+  try {
+    query = ctx.get("sessionQuery");
+  } catch {
+    return { threads: liveEntries };
+  }
   if (query === undefined) return { threads: liveEntries };
-  const records = await query.listSessions();
+  let records: any[];
+  try {
+    records = await query.listSessions();
+  } catch {
+    // Discovery is progressive: a failed corpus adapter must not hide live reachability.
+    return { threads: liveEntries };
+  }
   const cold = records
     .filter((record: any) => record.live !== true && !liveEntries.some((entry: any) => entry.sessionId === record.header.id))
     .slice(0, 200);
   const ids = [...liveEntries.map((entry: any) => entry.sessionId), ...cold.map((record: any) => record.header.id)];
-  const observations = await query.readTitleSnapshots(ids);
+  let observations: any[] = [];
+  try {
+    observations = await query.readTitleSnapshots(ids);
+  } catch {
+    // Titles are optional annotations; keep the session rows visible.
+  }
   const titles = new Map<string, string>();
   for (const observation of observations) {
     if (observation.status === "fulfilled" && observation.value.title !== undefined) {
@@ -661,37 +550,19 @@ export async function listThreads(
   const roster = await scanTeamRoster(ctx, unknownCwds);
   // Caller-relative annotation: only the caller's cwd ACTIVE team.
   const teamMembership = await readCurrentCwdTeam(ctx, driverCwd);
-  // Lightweight-mode check: does the caller's cwd have any orchestra footprint
-  // (an active team or an archive)? Only then does cwd filtering apply.
-  const hasOrchestra = driverCwd === undefined || driverCwd === ""
-    ? false
-    : [...roster.values()].some((v) => v.cwd === driverCwd);
-  const filterMode = hasOrchestra;
-
   const classified = (sid: string): {
     keep: boolean;
     archived: boolean;
     category?: "active" | "archived" | "other";
   } => {
     const found = roster.get(sid);
-    if (found !== undefined) {
-      if (!filterMode) {
-        return { keep: true, archived: found.category === "archived", category: found.category };
-      }
-      if (found.cwd === driverCwd) {
-        if (found.category === "archived" && !includeArchived) {
-          return { keep: false, archived: true };
-        }
-        return { keep: true, archived: found.category === "archived", category: found.category };
-      }
-      if (includeOtherCwds) {
-        return { keep: true, archived: found.category === "archived", category: "other" };
-      }
-      return { keep: false, archived: found.category === "archived" };
-    }
-    if (!filterMode) return { keep: true, archived: false };
-    // Wild session (no team backing at any known cwd): dropped in filter mode.
-    return { keep: false, archived: false };
+    if (found === undefined) return { keep: true, archived: false };
+    if (found.category === "archived" && !includeArchived) return { keep: false, archived: true };
+    return {
+      keep: true,
+      archived: found.category === "archived",
+      category: found.cwd === driverCwd ? found.category : "other",
+    };
   };
 
   const threads: ThreadEntry[] = [];
@@ -727,16 +598,19 @@ export async function listThreads(
   // Progressive-disclosure ordering (spec §11):
   // caller cwd first (live before cold, corpus newest-first within), then
   // other cwds grouped by cwd, then archived (when included).
-  const rank = (t: ThreadEntry): [number, number, number] => {
+  const liveOrder = new Map<string, number>(liveEntries.map((entry, index) => [String(entry.sessionId), index]));
+  const coldOrder = new Map<string, number>(cold.map((record: any, index: number) => [String(record.header.id), index]));
+  const rank = (t: ThreadEntry): [number, number, number, number] => {
     const sameCwd = driverCwd !== undefined && t.cwd === driverCwd ? 0 : 1;
     const liveRank = t.live ? 0 : 1;
     const archivedRank = t.archived === true ? 1 : 0;
-    return [sameCwd, liveRank, archivedRank];
+    const recency = t.live ? liveOrder.get(t.sessionId) ?? Number.MAX_SAFE_INTEGER : coldOrder.get(t.sessionId) ?? Number.MAX_SAFE_INTEGER;
+    return [sameCwd, liveRank, archivedRank, recency];
   };
   threads.sort((a, b) => {
     const ra = rank(a);
     const rb = rank(b);
-    for (let i = 0; i < 3; i++) if (ra[i] !== rb[i]) return ra[i] - rb[i];
+    for (let i = 0; i < 4; i++) if (ra[i] !== rb[i]) return ra[i] - rb[i];
     return a.sessionId.localeCompare(b.sessionId);
   });
   return { threads: threads.slice(offset, offset + limit) };
@@ -747,6 +621,23 @@ const SECTION_ORDER = 118;
 
 export const Config = undefined;
 
+export interface RawA2ASendArgs {
+  to: string;
+  message: string;
+  wake?: boolean;
+  interrupt?: boolean;
+}
+
+/** Bounded raw-send entrypoint shared by a2a_send and its cross-cwd harness. */
+export async function sendRawA2A(ctx: Context, args: RawA2ASendArgs, exec: ToolExecutionInput) {
+  if (exec.agent === undefined) throw new Error("a2a_send requires an agent caller");
+  if (args.to === exec.agent.id) throw new Error("a2a: cannot send a message to yourself");
+  return deliverMessage(ctx, exec.agent.id, args.to, [
+    { type: "text", text: `Message from agent ${exec.agent.id}:` },
+    { type: "text", text: args.message },
+  ], { wake: args.wake, interrupt: args.interrupt === true });
+}
+
 export function apply(ctx: Context): void {
   const outputSchema = {
     type: "object",
@@ -756,6 +647,7 @@ export function apply(ctx: Context): void {
       target_session_id: { type: "string", required: true },
       accepted_at_ms: { type: "number", required: true },
       delivery_mode: { type: "string", required: true },
+      state: { type: "string", required: true },
       interrupt: { type: "boolean" },
       reply_to_message_id: { type: "string" },
     },
@@ -767,6 +659,7 @@ export function apply(ctx: Context): void {
       target_session_id: string;
       accepted_at_ms: number;
       delivery_mode: string;
+      state: string;
       interrupt?: boolean;
       reply_to_message_id?: string;
     },
@@ -774,7 +667,9 @@ export function apply(ctx: Context): void {
     {
       type: "text",
       text:
-        value.delivery_mode === "live_inbox"
+        value.state === "accepted"
+          ? `message ${value.message_id} accepted for ${value.target_session_id} (${value.delivery_mode}${value.interrupt === true ? ", interrupt" : ""}); no answer awaited`
+          : value.delivery_mode === "live_inbox"
           ? value.interrupt === true
             ? `message ${value.message_id} steered to agent ${value.target_session_id} (mid-turn interrupt)`
             : `message ${value.message_id} accepted into agent ${value.target_session_id}'s inbox (live)`
@@ -788,18 +683,17 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "a2a_list",
       description:
-        "List agent threads that can receive A2A messages: session id, title, working directory, status, whether the thread is live, its current_cwd_team annotation (non-null only when the session belongs to the caller's cwd ACTIVE team), and whether it belongs to a dismissed (archived) orchestra instance. Progressive disclosure: by default only the caller's cwd threads are shown (archived folded away, capped by limit); pass includeOtherCwds:true to reveal other workspaces, includeArchived:true to reveal archived role sessions, limit/offset to page. When the caller's cwd has no orchestra footprint at all, the full session corpus is listed (lightweight mode). Use the session id with a2a_send / a2a_reply / a2a_read / a2a_create.",
+        "List the host's A2A sessions with session id, title, working directory, status, liveness, and honest Team/archive annotations. The caller cwd sorts first, but other cwd and wild sessions remain visible; annotations are not Transport ACLs. Archived roles are folded unless includeArchived:true. includeOtherCwds is retained for compatibility and does not hide sessions. Use the session id with a2a_send / a2a_reply / a2a_read / a2a_create.",
       parameters: {
         limit: { type: "number", description: "Max threads returned. Defaults to 30, max 100." },
         offset: { type: "number", description: "Pagination offset. Defaults to 0." },
         includeOtherCwds: {
           type: "boolean",
-          description:
-            "When true, also surface threads from cwds other than the calling driver's cwd (each labeled with its cwd). Defaults to false.",
+          description: "Compatibility input; other cwd sessions are visible by default and this flag does not act as an ACL.",
         },
         includeArchived: {
           type: "boolean",
-          description: "When true, also surface archived role sessions of the caller's cwd (labeled archived). Defaults to false.",
+          description: "When true, surface archived role sessions (labeled archived). Defaults to false.",
         },
       },
       output: {
@@ -930,7 +824,7 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "a2a_send",
       description:
-        "Send a message to another agent thread. The message becomes that thread's next turn: the receiving agent reads it like a user prompt, attributed to your session id. Find session ids with a2a_list. Returns immediately after the target accepts the message; it does NOT wait for or return the target's answer. To get an answer, tell the recipient to use a2a_reply and expect the reply as your own later turn (you can also a2a_read the target later). Live targets are woken; attached-but-idle targets receive a durable inbox splice; truly cold targets are resumed first — resume failure makes the call fail (no queued fallback). Sending to yourself is rejected. wake=false queues the message as context for the target's next step without waking it. Messages on the default next-turn path are NEVER dropped — a message to a working thread is claimed at its next turn boundary. interrupt=true steers the message into a running target's nearest step boundary (mid-turn) instead of waiting; it is best-effort steering (a rejected/cancelled step may discard pending steering), so use it only for urgent interrupts, not routine task dispatch (which should stay a clean task boundary).",
+        "Send a raw SessionId-addressed A2A message across the host. Transport does not require an Orchestra Team or same cwd; use orchestra_send when addressing a Governed role by teamId+roleId. The message becomes the target's next turn and returns state=accepted without waiting for claimed/answered. Live targets are woken; attached targets receive a durable inbox splice; cold targets are resumed first and resume failure is loud. Sending to yourself is rejected. wake=false queues context without waking; interrupt=true is best-effort steering.",
       parameters: {
         to: { type: "string", required: true, description: "Target session id (see a2a_list)." },
         message: { type: "string", required: true, description: "The message text for the target agent." },
@@ -938,32 +832,8 @@ export function apply(ctx: Context): void {
         interrupt: { type: "boolean", description: "Deliver as an immediate mid-turn interrupt (steering into the target's nearest step boundary) when the target is running. Idle targets are woken immediately either way. Defaults to false." },
       },
       output: { schema: outputSchema, render: renderResult },
-      async execute(args: { to: string; message: string; wake?: boolean; interrupt?: boolean }, exec: ToolExecutionInput) {
-        if (exec.agent === undefined) throw new Error("a2a_send requires an agent caller");
-        if (args.to === exec.agent.id) throw new Error("a2a: cannot send a message to yourself");
-        // Bug #1 — reject cross-cwd dispatch: the target sessionId must belong
-        // to a team (active or archived) at the calling driver's cwd. Sessions
-        // that simply *happen* to be live here but were created in another
-        // cwd's orchestra instance cannot be addressed silently; the driver
-        // gets an explicit error listing every legal sessionId so it can pick
-        // one. Wild sessions (a2a_create outside orchestra) are not rejected
-        // when the caller's cwd has NO team footprint at all (lightweight
-        // mode) — the legal set is empty then and everything passes.
-        const driverCwd = exec.agent.session.header.cwd;
-        if (typeof driverCwd === "string" && driverCwd !== "") {
-          const legalIds = await collectTeamSessionIds(ctx, driverCwd);
-          if (legalIds.size > 0 && !legalIds.has(args.to)) {
-            const sample = [...legalIds].slice(0, 12).join(", ");
-            const more = legalIds.size > 12 ? ` (and ${legalIds.size - 12} more)` : "";
-            throw new Error(
-              `a2a_send: target ${args.to} does not belong to any team at cwd=${driverCwd}; legal sessionIds: ${sample}${more}`,
-            );
-          }
-        }
-        return deliverMessage(ctx, exec.agent.id, args.to, [
-          { type: "text", text: `Message from agent ${exec.agent.id}:` },
-          { type: "text", text: args.message },
-        ], { wake: args.wake, interrupt: args.interrupt === true });
+      async execute(args: RawA2ASendArgs, exec: ToolExecutionInput) {
+        return sendRawA2A(ctx, args, exec);
       },
     }),
   );
@@ -987,6 +857,33 @@ export function apply(ctx: Context): void {
           { type: "text", text: `Reply from agent ${exec.agent.id} (to message ${args.reply_to}):` },
           { type: "text", text: args.message },
         ], { replyTo: args.reply_to, interrupt: args.interrupt === true });
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
+      name: "a2a_status",
+      description: "Inspect the reconstructable lifecycle facts for one accepted A2A message. Status is monotonic accepted → claimed → answered only when correlated Session events prove the transition; otherwise it remains unknown. Query failure never affects delivery.",
+      parameters: {
+        messageId: { type: "string", required: true, description: "The message_id returned by a2a_send or a2a_reply." },
+        targetSessionId: { type: "string", required: true, description: "The target session id used for delivery." },
+      },
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            message_id: { type: "string", required: true },
+            target_session_id: { type: "string", required: true },
+            state: { type: "string", required: true },
+            evidence: { type: "string" },
+          },
+        },
+        render: (_args, value) => [{ type: "text", text: `message ${value.message_id} for ${value.target_session_id}: ${value.state}${value.evidence === undefined ? "" : ` (${value.evidence})`}` }] as ContentBlock[],
+      },
+      execute(args: { messageId: string; targetSessionId: string }) {
+        return queryMessageStatus(ctx, args.messageId, args.targetSessionId);
       },
     }),
   );
@@ -1078,7 +975,7 @@ export function apply(ctx: Context): void {
     systemPrompt.section({
       name: SECTION_NAME,
       order: SECTION_ORDER,
-      text: "A2A: you can exchange messages with other agent threads. a2a_list shows the threads (progressive disclosure: your cwd first, archived folded by default); a2a_send delivers a message that becomes the target's next turn; a2a_reply answers a specific message you received; a2a_read inspects another thread's recent conversation; a2a_create opens a new thread. A delivered message does not wait for the target's answer: request a reply explicitly and expect it later as your own new turn. Receipts: send/reply return delivery_mode live_inbox (accepted into the target's inbox, NOT yet processed) / durable_inbox (recorded for a suspended thread) / resumed_inbox (cold thread resumed first). Delivery contract: a message to a thread that is currently working is claimed at its next turn boundary and is NEVER dropped on the default next-turn path; interrupt:true steers it into the target's nearest step boundary (mid-turn) instead — best-effort steering rather than a durable guarantee, so keep routine dispatch on the clean next-turn path.",
+      text: "A2A: you can exchange messages with other agent threads. a2a_list shows all host-visible sessions with caller-cwd-first ordering and annotations that are not ACLs; a2a_send delivers by explicit SessionId across cwd; a2a_reply answers a specific message; a2a_read inspects history; a2a_status reports only proven accepted/claimed/answered lifecycle facts; a2a_create opens a complete lightweight session. A delivered message does not wait for the target's answer: request a reply explicitly and expect it later as your own new turn. Governed Team role dispatch uses orchestra_send(teamId+roleId), while raw a2a_send is for explicit free SessionId communication. Receipts state=accepted means no answer was awaited.",
     });
   }
 }
