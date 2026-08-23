@@ -152,12 +152,28 @@ test("rosterless default missing/broken and explicit permission/model inputs fai
   const brokenDefault = makeRuntime({ defaultId: "broken", brokenPreset: "broken" });
   await assert.rejects(
     () => prepareLightweightBlueprint(brokenDefault.context, { sessionId: "child", caller: brokenDefault.caller, createdBySessionId: "caller" }),
-    /broken preset/,
+    (error) => error instanceof SessionBlueprintError && error.code === "preset_unavailable",
   );
   const unknownExplicit = makeRuntime({ unknownPreset: "missing-explicit" });
   await assert.rejects(
     () => prepareLightweightBlueprint(unknownExplicit.context, { sessionId: "child", caller: unknownExplicit.caller, createdBySessionId: "caller", presetId: "missing-explicit" }),
-    /unknown preset/,
+    (error) => error instanceof SessionBlueprintError && error.code === "preset_unavailable",
+  );
+  const brokenExplicit = makeRuntime({ brokenPreset: "broken-explicit" });
+  await assert.rejects(
+    () => prepareLightweightBlueprint(brokenExplicit.context, { sessionId: "child", caller: brokenExplicit.caller, createdBySessionId: "caller", presetId: "broken-explicit" }),
+    (error) => error instanceof SessionBlueprintError && error.code === "preset_unavailable" && error.cause?.message === "broken preset broken-explicit",
+  );
+  const brokenFile = makeRuntime();
+  const filePrepared = await prepareLightweightBlueprint(brokenFile.context, {
+    sessionId: "child",
+    caller: brokenFile.caller,
+    createdBySessionId: "caller",
+    presetFile: { id: "file-preset", trust: "user", path: "/missing/preset.json" },
+  });
+  await assert.rejects(
+    () => filePrepared.setup(brokenFile.childContext),
+    (error) => error instanceof SessionBlueprintError && error.code === "preset_unavailable",
   );
   const invalidPair = makeRuntime();
   await assert.rejects(
@@ -226,4 +242,40 @@ test("createSession lightweight output carries complete receipt and rollback doe
 
 test("old sessions without a marker remain unknown rather than gaining invented facts", () => {
   assert.equal(readLightweightBlueprint([{ type: "session/end-seed", data: {}, seq: 0, time: 1 }]), undefined);
+});
+
+test("malformed durable markers are rejected without throwing or inventing facts", () => {
+  const valid = {
+    schemaVersion: 1,
+    mode: "lightweight",
+    agentPreset: "preset",
+    permissionPreset: "permission",
+    provider: "provider",
+    model: "model",
+    createdBySessionId: "caller",
+    createdAt: 1,
+  };
+  const malformed = [
+    ["null", null],
+    ["array", []],
+    ["empty agentPreset", { ...valid, agentPreset: "" }],
+    ["empty permissionPreset", { ...valid, permissionPreset: "" }],
+    ["empty provider", { ...valid, provider: "" }],
+    ["empty model", { ...valid, model: "" }],
+    ["empty createdBySessionId", { ...valid, createdBySessionId: "" }],
+    ["wrong reasoningEffort", { ...valid, reasoningEffort: 1 }],
+    ["wrong cwd", { ...valid, cwd: 1 }],
+    ["wrong title", { ...valid, title: false }],
+    ["NaN createdAt", { ...valid, createdAt: NaN }],
+    ["Infinity createdAt", { ...valid, createdAt: Infinity }],
+    ["teamId", { ...valid, teamId: "team" }],
+    ["roleId", { ...valid, roleId: "role" }],
+    ["topologyId", { ...valid, topologyId: "topology" }],
+  ];
+  for (const [label, data] of malformed) {
+    const event = { type: "orchestra/blueprint", data, seq: 0, time: 1 };
+    assert.doesNotThrow(() => readLightweightBlueprint([event]), label);
+    assert.equal(readLightweightBlueprint([event]), undefined, label);
+  }
+  assert.deepEqual(readLightweightBlueprint([{ type: "orchestra/blueprint", data: valid, seq: 0, time: 1 }]), valid);
 });

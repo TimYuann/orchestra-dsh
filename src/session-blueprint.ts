@@ -103,8 +103,8 @@ export class SessionBlueprintError extends Error {
   readonly code: BlueprintErrorCode;
   readonly details?: Record<string, unknown>;
 
-  constructor(code: BlueprintErrorCode, message: string, details?: Record<string, unknown>) {
-    super(message);
+  constructor(code: BlueprintErrorCode, message: string, details?: Record<string, unknown>, cause?: unknown) {
+    super(message, cause === undefined ? undefined : { cause });
     this.name = "SessionBlueprintError";
     this.code = code;
     this.details = details;
@@ -113,6 +113,24 @@ export class SessionBlueprintError extends Error {
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value !== "" ? value : undefined;
+}
+
+function presetUnavailable(presetId: string, source: "explicit" | "default" | "file", operation: string, error: unknown, details?: Record<string, unknown>): SessionBlueprintError {
+  const reason = error instanceof Error ? error.message : String(error);
+  return new SessionBlueprintError(
+    "preset_unavailable",
+    `agent preset "${presetId}" could not be ${operation}: ${reason}`,
+    { presetId, source, ...details },
+    error,
+  );
+}
+
+async function resolvePresetOrThrow<T extends { resolve(id?: string): Promise<{ id: string }> }>(presets: T, id: string, source: "explicit" | "default"): Promise<{ id: string }> {
+  try {
+    return await presets.resolve(id);
+  } catch (error) {
+    throw presetUnavailable(id, source, "resolved", error);
+  }
 }
 
 function sessionFrom(ctx: Context, agentCtx: Context, sessionId: string): Session | undefined {
@@ -188,7 +206,7 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
     agentPreset = input.presetFile.id;
     presetStrategy = "file";
   } else if (asString(input.presetId) !== undefined) {
-    const resolved = await presets.resolve(input.presetId);
+    const resolved = await resolvePresetOrThrow(presets, input.presetId as string, "explicit");
     agentPreset = resolved.id;
     resolvedPreset = resolved;
     presetStrategy = "explicit";
@@ -200,7 +218,7 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
     } else {
       const defaultId = asString(presets.defaultId);
       if (defaultId === undefined) throw new SessionBlueprintError("preset_unavailable", "agentPresets has no default preset for a rosterless caller");
-      const resolved = await presets.resolve(defaultId);
+      const resolved = await resolvePresetOrThrow(presets, defaultId, "default");
       agentPreset = resolved.id;
       resolvedPreset = resolved;
       presetStrategy = "default";
@@ -249,7 +267,11 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
   const setup = async (agentCtx: Context): Promise<AgentSetupCommit> => {
     const agentPresets = agentCtx.get("agentPresets") ?? presets;
     if (presetStrategy === "file") {
-      await mountPreset(agentCtx, input.presetFile as BlueprintPresetFile);
+      try {
+        await mountPreset(agentCtx, input.presetFile as BlueprintPresetFile);
+      } catch (error) {
+        throw presetUnavailable(agentPreset, "file", "mounted", error, { path: input.presetFile?.path });
+      }
     } else if (presetStrategy === "inherit") {
       if (input.caller === undefined) throw new SessionBlueprintError("composition_mismatch", "inherit strategy has no caller agent");
       const joined = agentPresets.composeFrom(agentCtx, input.caller.ctx);
@@ -296,15 +318,44 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
   };
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+const GOVERNED_IDENTITY_FIELDS = [
+  "teamId",
+  "roleId",
+  "topologyId",
+  "team",
+  "role",
+  "roles",
+  "topology",
+  "topologyRef",
+] as const;
+
 /** Read a lightweight marker without inventing facts for old sessions. */
 export function readLightweightBlueprint(events: readonly SessionEvent[]): LightweightBlueprintMarker | undefined {
   for (let index = events.length - 1; index >= 0; index--) {
     const event = events[index];
     if (event.type !== LIGHTWEIGHT_BLUEPRINT_EVENT) continue;
-    const marker = event.data as Partial<LightweightBlueprintMarker>;
-    if (marker.schemaVersion !== 1 || marker.mode !== "lightweight" || typeof marker.agentPreset !== "string" || typeof marker.permissionPreset !== "string" || typeof marker.provider !== "string" || typeof marker.model !== "string" || typeof marker.createdBySessionId !== "string" || typeof marker.createdAt !== "number") return undefined;
-    if ("teamId" in marker || "roleId" in marker || "topologyId" in marker) return undefined;
-    return marker as LightweightBlueprintMarker;
+    try {
+      const marker = event.data;
+      if (!isPlainObject(marker)) return undefined;
+      if (marker.schemaVersion !== LIGHTWEIGHT_BLUEPRINT_SCHEMA_VERSION || marker.mode !== "lightweight") return undefined;
+      if (!nonEmptyString(marker.agentPreset) || !nonEmptyString(marker.permissionPreset) || !nonEmptyString(marker.provider) || !nonEmptyString(marker.model) || !nonEmptyString(marker.createdBySessionId)) return undefined;
+      if (typeof marker.createdAt !== "number" || !Number.isFinite(marker.createdAt)) return undefined;
+      if (("reasoningEffort" in marker && typeof marker.reasoningEffort !== "string") || ("cwd" in marker && typeof marker.cwd !== "string") || ("title" in marker && typeof marker.title !== "string")) return undefined;
+      if (GOVERNED_IDENTITY_FIELDS.some((field) => field in marker)) return undefined;
+      return marker as LightweightBlueprintMarker;
+    } catch {
+      return undefined;
+    }
   }
   return undefined;
 }
