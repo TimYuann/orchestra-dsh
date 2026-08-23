@@ -19,7 +19,6 @@ import type {} from "@deepseek-ai/dsh-agent";
 import type {} from "@deepseek-ai/dsh-session";
 import type { SessionId } from "@deepseek-ai/dsh-session";
 import type {} from "@deepseek-ai/dsh-fs";
-import type { FsTarget } from "@deepseek-ai/dsh-fs";
 import type {} from "@deepseek-ai/dsh-sandbox";
 import type { SandboxExecutionPolicy } from "@deepseek-ai/dsh-sandbox";
 import type {} from "@deepseek-ai/dsh-sandbox-policy";
@@ -30,19 +29,24 @@ import { createSession, installModelOverride, deliverMessage } from "./a2a.js";
 import type { ResolvedPresetFile } from "./a2a.js";
 import { createActiveTeamStateStore } from "./orchestra-state.js";
 import type {
+  ArchiveList,
+} from "./orchestra-archive.js";
+import type {
   ActiveTeamArchivedMarker,
   ActiveTeamRead,
   TeamRole,
   TeamState,
 } from "./orchestra-state.js";
 import { createArchiveStore } from "./orchestra-archive.js";
-import type { ArchiveList } from "./orchestra-archive.js";
+import { createTopologyCatalog } from "./orchestra-topology.js";
+import type { TopologyCatalog, TopologyList, TopologyProtocol, TopologyResolution, TopologyRoleSummary } from "./orchestra-topology.js";
+export { validateTopology } from "./orchestra-topology.js";
 import { mountPreset } from "@deepseek-ai/dsh-agent-presets";
 import "./relay-types.js";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { mkdir, writeFile, stat as fsStat, readFile as fsReadFile, readdir } from "node:fs/promises";
+import { mkdir, writeFile, stat as fsStat } from "node:fs/promises";
 
 const SID = (value: string): SessionId => value as SessionId;
 
@@ -79,38 +83,6 @@ export const name = "orchestra-manager";
 
 /** Required services. */
 export const inject = ["agents", "sessions", "fs", "sandboxPolicy", "tools", "timer"];
-
-/** Topology schema v0.1 (spec §4.2). */
-interface RoleConfig {
-  id: string;
-  name: string;
-  preset?: string | null;
-  sandbox?: string;
-  runtime?: { provider?: string; model?: string; reasoningEffort?: string };
-  maxRounds?: number;
-  welcome?: string;
-}
-
-interface TopologyProtocol {
-  ownership?: Record<string, string>;
-  routes?: { kind: string; from: string | string[]; to: string[] }[];
-  completion?: { owner: string; rule: string };
-}
-
-interface TopologyConfig {
-  schemaVersion?: number;
-  id: string;
-  name?: string;
-  description?: string;
-  controller?: { id: string; source?: string };
-  roles: RoleConfig[];
-  protocol?: TopologyProtocol;
-}
-
-interface ResolvedTopology {
-  config: TopologyConfig;
-  source: "project" | "global" | "bundled";
-}
 
 /** Builtin preset behavior packages (spec §5): written to the global root on install. */
 interface BuiltinPreset {
@@ -292,325 +264,6 @@ const BUILTIN_PRESETS: BuiltinPreset[] = [
   },
 ];
 
-/** Bundled topology templates (spec §4.2, new schema). Old v0.2 trio/oracle are rewritten; no legacy fields. */
-const BUILTIN_TEMPLATES: TopologyConfig[] = [
-  {
-    schemaVersion: 1,
-    id: "duo",
-    name: "Duo 开发",
-    description: "driver + reviewer（只读评审）最小闭环：评审闭环，适合快速验收",
-    controller: { id: "driver", source: "caller" },
-    roles: [
-      {
-        id: "reviewer",
-        name: "Reviewer",
-        preset: "orchestra-reviewer",
-        sandbox: "read-only",
-        maxRounds: 2,
-        welcome:
-          "你已被 orchestra 团队录用为 Reviewer。职责：只审不修，最多两轮（R1 全量 → R2 只核对 R1 findings），每轮结束用 orchestra_report 工具把 review report 写入 orchestra/reports/，回复 driver 时返回报告路径。R2 中发现的新问题不追加本轮，记入 backlog，由 driver 决定是否另开评审。",
-      },
-    ],
-    protocol: {
-      ownership: {
-        scope: "driver",
-        review_verdict: "reviewer",
-        closure: "driver",
-      },
-      routes: [
-        { kind: "candidate", from: "driver", to: ["reviewer"] },
-        { kind: "verdict", from: "reviewer", to: ["driver"] },
-      ],
-      completion: { owner: "driver", rule: "Review PASS or explicit user override" },
-    },
-  },
-  {
-    schemaVersion: 1,
-    id: "trio",
-    name: "Trio 开发",
-    description: "driver + implementer（实现）+ reviewer（只读两轮评审）的实现-评审闭环，适合严肃开发任务",
-    controller: { id: "driver", source: "caller" },
-    roles: [
-      {
-        id: "implementer",
-        name: "Implementer",
-        preset: "orchestra-implementer",
-        sandbox: "workspace-write",
-        welcome:
-          "你已被 orchestra 团队录用为 Implementer。职责：实现 driver 派发的任务，产出可运行代码与验证记录；完成后用 orchestra_report 写交付说明到 orchestra/reports/，并回复 driver 报告路径。",
-      },
-      {
-        id: "reviewer",
-        name: "Reviewer",
-        preset: "orchestra-reviewer",
-        sandbox: "read-only",
-        maxRounds: 2,
-        welcome:
-          "你已被 orchestra 团队录用为 Reviewer。职责：只审不修，最多两轮（R1 全量 → R2 只核对 R1 findings），每轮结束用 orchestra_report 工具把 review report 写入 orchestra/reports/，回复 driver 时返回报告路径。R2 中发现的新问题不追加本轮，记入 backlog，由 driver 决定是否另开评审。",
-      },
-    ],
-    protocol: {
-      ownership: {
-        scope: "driver",
-        implementation: "implementer",
-        review_verdict: "reviewer",
-        closure: "driver",
-      },
-      routes: [
-        { kind: "mission", from: "driver", to: ["implementer", "reviewer"] },
-        { kind: "candidate", from: "implementer", to: ["reviewer"] },
-        { kind: "findings", from: "reviewer", to: ["implementer", "driver"] },
-        { kind: "verdict", from: "reviewer", to: ["driver"] },
-      ],
-      completion: { owner: "driver", rule: "Review PASS or explicit user override" },
-    },
-  },
-  {
-    schemaVersion: 1,
-    id: "oracle",
-    name: "Oracle 推演",
-    description: "driver + oracle（深度推演搭档）：对话式推演方案（讨论即计划），收敛后把结论作为自包含任务派给执行角色",
-    controller: { id: "driver", source: "caller" },
-    roles: [
-      {
-        id: "oracle",
-        name: "Oracle",
-        preset: "orchestra-oracle",
-        sandbox: "read-only",
-        welcome:
-          "你已被 orchestra 团队录用为 Oracle。职责：与 driver 深入推演——分析目标、权衡方案、识别风险、产出可执行的设计结论；推演过程即计划，收敛后用 orchestra_report 把设计结论写入 orchestra/reports/，并回复 driver 结论路径。",
-      },
-    ],
-    protocol: {
-      ownership: {
-        scope: "driver",
-        advice: "oracle",
-        closure: "driver",
-      },
-      routes: [
-        { kind: "escalation", from: ["driver"], to: ["oracle"] },
-        { kind: "advice", from: "oracle", to: ["driver"] },
-      ],
-      completion: { owner: "driver", rule: "Driver acceptance" },
-    },
-  },
-  {
-    schemaVersion: 1,
-    id: "four-role-dev",
-    name: "Four-role development team",
-    description: "driver + implementer ⇄ reviewer 主回路 + oracle 按需升级通道，适合复杂开发任务",
-    controller: { id: "driver", source: "caller" },
-    roles: [
-      {
-        id: "implementer",
-        name: "Implementer",
-        preset: "orchestra-implementer",
-        sandbox: "workspace-write",
-        welcome:
-          "你已被 orchestra 团队录用为 Implementer。职责：实现 driver 派发的任务，产出可运行代码与验证记录；完成后用 orchestra_report 写交付说明到 orchestra/reports/，并回复 driver 报告路径。",
-      },
-      {
-        id: "reviewer",
-        name: "Reviewer",
-        preset: "orchestra-reviewer",
-        sandbox: "read-only",
-        maxRounds: 2,
-        welcome:
-          "你已被 orchestra 团队录用为 Reviewer。职责：只审不修，最多两轮（R1 全量 → R2 只核对 R1 findings），每轮结束用 orchestra_report 工具把 review report 写入 orchestra/reports/，回复 driver 时返回报告路径。R2 中发现的新问题不追加本轮，记入 backlog，由 driver 决定是否另开评审。",
-      },
-      {
-        id: "oracle",
-        name: "Oracle",
-        preset: "orchestra-oracle",
-        sandbox: "read-only",
-        welcome:
-          "你已被 orchestra 团队录用为 Oracle。职责：按需咨询——处理 mission 解释冲突、架构争议与高影响取舍；只提供建议不拍板；推演收敛后用 orchestra_report 把结论写入 orchestra/reports/。",
-      },
-    ],
-    protocol: {
-      ownership: {
-        scope: "driver",
-        implementation: "implementer",
-        review_verdict: "reviewer",
-        closure: "driver",
-        advice: "oracle",
-      },
-      routes: [
-        { kind: "mission", from: "driver", to: ["implementer", "reviewer"] },
-        { kind: "candidate", from: "implementer", to: ["reviewer"] },
-        { kind: "findings", from: "reviewer", to: ["implementer", "driver"] },
-        { kind: "verdict", from: "reviewer", to: ["driver"] },
-        { kind: "escalation", from: ["driver", "implementer", "reviewer"], to: ["oracle"] },
-        { kind: "advice", from: "oracle", to: ["driver"] },
-      ],
-      completion: { owner: "driver", rule: "Review PASS or explicit user override" },
-    },
-  },
-];
-
-/** One template role as listed by orchestra_topologies (null preset → omitted). */
-function templateRoleEntry(role: RoleConfig): {
-  id: string;
-  name: string;
-  preset?: string;
-  sandbox?: string;
-  maxRounds?: number;
-  runtime?: Record<string, JsonValue>;
-} {
-  const entry: {
-    id: string;
-    name: string;
-    preset?: string;
-    sandbox?: string;
-    maxRounds?: number;
-    runtime?: Record<string, JsonValue>;
-  } = {
-    id: role.id,
-    name: role.name ?? role.id,
-  };
-  if (role.preset !== undefined && role.preset !== null) entry.preset = role.preset;
-  if (role.sandbox !== undefined) entry.sandbox = role.sandbox;
-  if (role.maxRounds !== undefined) entry.maxRounds = role.maxRounds;
-  if (role.runtime !== undefined) entry.runtime = role.runtime as Record<string, JsonValue>;
-  return entry;
-}
-
-/** Lower-cased role id/name with a trailing numeric suffix stripped ("reviewer-2" → "reviewer"). */
-function templateBaseName(roleName: string): string {
-  return roleName.replace(/-\d+$/, "").toLowerCase();
-}
-
-async function templateRoleForSpawn(ctx: Context, cwd: string, roleName: string): Promise<RoleConfig | undefined> {
-  const exact = roleName.toLowerCase();
-  const base = templateBaseName(roleName);
-  const candidates: TopologyConfig[] = [];
-  try {
-    const dir = await ctx.fs.resolve(`${cwd}/.orchestra/topologies`, { cwd });
-    const entries = await ctx.fs.listDir(dir);
-    for (const entry of entries) {
-      if (entry.type !== "file" || !entry.name.endsWith(".json")) continue;
-      try {
-        const parsed = JSON.parse(await ctx.fs.readText(entry.target)) as TopologyConfig;
-        if (Array.isArray(parsed.roles)) candidates.push(parsed);
-      } catch {
-        // skip unparseable user templates
-      }
-    }
-  } catch {
-    // no user topologies directory
-  }
-  for (const template of BUILTIN_TEMPLATES) {
-    if (!candidates.some((candidate) => candidate.id === template.id)) candidates.push(template);
-  }
-  for (const topology of candidates) {
-    for (const role of topology.roles) {
-      const id = role.id.toLowerCase();
-      const name = String(role.name ?? role.id).toLowerCase();
-      if (id === exact || name === exact || id === base || name === base) return role;
-    }
-  }
-  return undefined;
-}
-
-async function loadJson(ctx: Context, target: FsTarget): Promise<unknown> {
-  const fs = ctx.fs;
-  return JSON.parse(await fs.readText(target));
-}
-
-/**
- * Load a topology by id with the spec §4.1 lookup order:
- * project (.orchestra/topologies) > global (~/.dsh/orchestra/topologies) > bundled.
- */
-async function loadTopology(ctx: Context, cwd: string, id: string): Promise<ResolvedTopology> {
-  try {
-    const target = await ctx.fs.resolve(`${cwd}/.orchestra/topologies/${id}.json`, { cwd });
-    const parsed = (await loadJson(ctx, target)) as TopologyConfig;
-    if (parsed.id === id) return { config: parsed, source: "project" };
-  } catch {
-    // fall through
-  }
-  try {
-    const globalTarget = join(orchestraGlobalRoot(), "topologies", `${id}.json`);
-    const parsed = JSON.parse(await fsReadFile(globalTarget, "utf8")) as TopologyConfig;
-    if (parsed.id === id) return { config: parsed, source: "global" };
-  } catch {
-    // fall through
-  }
-  const embedded = BUILTIN_TEMPLATES.find((template) => template.id === id);
-  if (embedded !== undefined) return { config: embedded, source: "bundled" };
-  throw new Error(`unknown topology "${id}"`);
-}
-
-/** Hard validation of a topology (spec §4.4): returns a list of problems; empty = valid. */
-export function validateTopology(config: TopologyConfig): string[] {
-  const problems: string[] = [];
-  if (config.schemaVersion !== undefined && config.schemaVersion !== 1) {
-    problems.push(`schemaVersion ${config.schemaVersion} is not supported (expected 1)`);
-  }
-  if (typeof config.id !== "string" || config.id === "") {
-    problems.push("topology id must be a non-empty string");
-  }
-  if (!Array.isArray(config.roles) || config.roles.length === 0) {
-    problems.push("topology must declare at least one role");
-    return problems;
-  }
-  const roleIds = new Set<string>();
-  for (const role of config.roles) {
-    if (typeof role.id !== "string" || role.id === "") {
-      problems.push("every role must have a non-empty id");
-      continue;
-    }
-    const lower = role.id.toLowerCase();
-    if (roleIds.has(lower)) {
-      problems.push(`role id "${role.id}" is duplicated (ids are case-insensitive unique)`);
-    }
-    roleIds.add(lower);
-    if (role.sandbox !== undefined && role.sandbox !== "workspace-write" && role.sandbox !== "read-only") {
-      problems.push(`role "${role.id}" sandbox "${role.sandbox}" is invalid (workspace-write | read-only)`);
-    }
-    if (role.runtime !== undefined) {
-      const rt = role.runtime;
-      if ((rt.provider === undefined) !== (rt.model === undefined)) {
-        problems.push(`role "${role.id}" runtime provider/model must be provided together`);
-      }
-      if (rt.reasoningEffort !== undefined && (rt.provider === undefined || rt.model === undefined)) {
-        problems.push(`role "${role.id}" runtime reasoningEffort requires provider and model`);
-      }
-    }
-  }
-  const controllerId = config.controller?.id ?? "driver";
-  const known = (ref: string): boolean => ref === controllerId || roleIds.has(ref.toLowerCase());
-  const protocol = config.protocol;
-  if (protocol !== undefined) {
-    if (protocol.ownership !== undefined) {
-      for (const [decision, owner] of Object.entries(protocol.ownership)) {
-        if (typeof owner !== "string" || owner === "" || !known(owner)) {
-          problems.push(`protocol.ownership.${decision} references unknown role "${owner}"`);
-        }
-      }
-    }
-    if (Array.isArray(protocol.routes)) {
-      for (const route of protocol.routes) {
-        const froms = Array.isArray(route.from) ? route.from : [route.from];
-        for (const from of froms) {
-          if (typeof from !== "string" || !known(from)) {
-            problems.push(`protocol.routes[${route.kind}] from references unknown role "${from}"`);
-          }
-        }
-        for (const to of route.to ?? []) {
-          if (typeof to !== "string" || !known(to)) {
-            problems.push(`protocol.routes[${route.kind}] to references unknown role "${to}"`);
-          }
-        }
-      }
-    }
-    if (protocol.completion !== undefined && protocol.completion.owner !== undefined && !known(protocol.completion.owner)) {
-      problems.push(`protocol.completion.owner references unknown role "${protocol.completion.owner}"`);
-    }
-  }
-  return problems;
-}
-
 /**
  * Resolve a preset id to a concrete composition file (spec §5.3):
  * project (.orchestra/presets) > global (~/.dsh/orchestra/presets) >
@@ -670,8 +323,8 @@ async function ensureBuiltinPresetOnDisk(preset: BuiltinPreset): Promise<string>
   }
 }
 
-/** Ensure every builtin preset and template exists under the global root (install-time, idempotent, never overwrites). */
-async function ensureBuiltinArtifacts(): Promise<void> {
+/** Ensure builtin presets and Catalog-owned topology artifacts exist (install-time, idempotent). */
+async function ensureBuiltinArtifacts(topologyCatalog: TopologyCatalog): Promise<void> {
   const root = orchestraGlobalRoot();
   for (const preset of BUILTIN_PRESETS) {
     try {
@@ -689,23 +342,7 @@ async function ensureBuiltinArtifacts(): Promise<void> {
       );
     }
   }
-  for (const template of BUILTIN_TEMPLATES) {
-    try {
-      const target = join(root, "topologies", `${template.id}.json`);
-      try {
-        await fsStat(target);
-        continue; // user content wins — never overwrite
-      } catch {
-        // absent → install
-      }
-      await mkdir(join(root, "topologies"), { recursive: true });
-      await writeFile(target, JSON.stringify(template, null, 2), "utf8");
-    } catch (error) {
-      console.warn(
-        `orchestra: could not install builtin topology ${template.id}: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-  }
+  await topologyCatalog.ensureBundledArtifacts();
 }
 
 export { normalizeTeam } from "./orchestra-state.js";
@@ -730,6 +367,54 @@ function escrowPolicy(ctx: Context, exec: ToolExecutionInput): SandboxExecutionP
 function throwIfBlocked(action: string, state: ActiveTeamRead): void {
   if (state.kind !== "blocked") return;
   throw new Error(`cannot ${action}: active team state is blocked (${state.diagnostic.code}): ${state.diagnostic.message}`);
+}
+
+export function topologyResolutionError(action: string, resolution: TopologyResolution, availableIds: string[] = []): Error {
+  if (resolution.kind === "blocked") {
+    return new Error(`cannot ${action}: topology "${resolution.id}" is blocked (${resolution.diagnostic.code}): ${resolution.diagnostic.message}`);
+  }
+  if (resolution.kind === "missing") {
+    return new Error(`cannot ${action}: topology "${resolution.id}" was not found; available: ${availableIds.length === 0 ? "(none)" : availableIds.join(", ")}`);
+  }
+  return new Error(`cannot ${action}: topology resolution returned an unexpected ready state for "${resolution.config.id}"`);
+}
+
+export interface OrchestraTopologyToolEntry {
+  id: string;
+  name: string;
+  description?: string;
+  source: string;
+  status: "ready" | "blocked";
+  filename: string;
+  controller?: Record<string, JsonValue>;
+  protocol?: Record<string, JsonValue>;
+  roles: TopologyRoleSummary[];
+  diagnostic?: { code: string; message: string; fsCode?: string };
+}
+
+export function topologyListForTool(list: TopologyList): OrchestraTopologyToolEntry[] {
+  return [
+    ...list.ready.map((entry) => ({
+      id: entry.config.id,
+      name: entry.config.name ?? entry.config.id,
+      ...(entry.config.description === undefined ? {} : { description: entry.config.description }),
+      source: entry.source,
+      status: entry.status,
+      filename: entry.filename,
+      ...(entry.config.controller === undefined ? {} : { controller: entry.config.controller as Record<string, JsonValue> }),
+      ...(entry.config.protocol === undefined ? {} : { protocol: entry.config.protocol as Record<string, JsonValue> }),
+      roles: entry.roles,
+    })),
+    ...list.blocked.map((entry) => ({
+      id: entry.id,
+      name: entry.id === "" ? entry.filename : entry.id,
+      source: entry.source,
+      status: entry.status,
+      filename: entry.filename,
+      roles: [],
+      diagnostic: entry.diagnostic,
+    })),
+  ];
 }
 
 export interface OrchestraArchiveToolEntry {
@@ -918,6 +603,7 @@ export const Config = undefined;
 export function apply(ctx: Context): void {
   const activeTeamState = createActiveTeamStateStore(ctx.fs);
   const archiveStore = createArchiveStore(ctx.fs);
+  const topologyCatalog = createTopologyCatalog(ctx.fs);
   const roleItem = {
     type: "object",
     additionalProperties: false,
@@ -936,7 +622,7 @@ export function apply(ctx: Context): void {
 
   // Install-time artifact seeding (spec §5.3): write builtin presets/topologies
   // to the global root when absent; never overwrites user content.
-  void ensureBuiltinArtifacts().catch((error) => {
+  void ensureBuiltinArtifacts(topologyCatalog).catch((error) => {
     console.error(`orchestra: builtin artifact install failed: ${error instanceof Error ? error.message : String(error)}`);
   });
 
@@ -1027,11 +713,12 @@ export function apply(ctx: Context): void {
           );
         const objective = String(args.goal ?? "").trim();
         if (objective === "") throw new Error("goal must not be empty");
-        const topology = await loadTopology(ctx, cwd, args.topology ?? "duo");
-        const problems = validateTopology(topology.config);
-        if (problems.length > 0) {
-          throw new Error(`topology "${topology.config.id}" is invalid: ${problems.join("; ")}`);
+        const topologyResolution = await topologyCatalog.resolve(cwd, args.topology ?? "duo", { signal: exec.signal });
+        if (topologyResolution.kind !== "ready") {
+          const available = (await topologyCatalog.list(cwd, { signal: exec.signal })).ready.map((entry) => entry.config.id);
+          throw topologyResolutionError("create a team", topologyResolution, available);
         }
+        const topology = topologyResolution;
         const roles: TeamRole[] = [];
         if ((args.provider === undefined) !== (args.model === undefined))
           throw new Error("provider and model must be provided together (both or neither)");
@@ -1201,7 +888,12 @@ export function apply(ctx: Context): void {
         if (args.templateId !== undefined || args.roleId !== undefined) {
           if (args.templateId === undefined || args.roleId === undefined)
             throw new Error("templateId and roleId must be provided together");
-          const topology = await loadTopology(ctx, cwd, args.templateId);
+          const topologyResolution = await topologyCatalog.resolve(cwd, args.templateId, { signal: exec.signal });
+          if (topologyResolution.kind !== "ready") {
+            const available = (await topologyCatalog.list(cwd, { signal: exec.signal })).ready.map((entry) => entry.config.id);
+            throw topologyResolutionError("spawn a role from a template", topologyResolution, available);
+          }
+          const topology = topologyResolution;
           const source = topology.config.roles.find((role) => role.id === args.roleId);
           if (source === undefined) throw new Error(`template ${args.templateId} has no role ${args.roleId}`);
           templatePreset = source.preset;
@@ -1210,12 +902,13 @@ export function apply(ctx: Context): void {
           templateMaxRounds = source.maxRounds;
           templateProtocol = topology.config.protocol;
         } else {
-          const matched = await templateRoleForSpawn(ctx, cwd, roleName);
+          const matched = await topologyCatalog.findRole(cwd, roleName, { signal: exec.signal });
           if (matched !== undefined) {
-            templatePreset = matched.preset;
-            templateSandbox = matched.sandbox;
-            templateWelcome = matched.welcome;
-            templateMaxRounds = matched.maxRounds;
+            templatePreset = matched.role.preset;
+            templateSandbox = matched.role.sandbox;
+            templateWelcome = matched.role.welcome;
+            templateMaxRounds = matched.role.maxRounds;
+            templateProtocol = matched.topology.config.protocol;
           }
         }
         const effectivePreset = args.presetId !== undefined && args.presetId !== "" ? args.presetId : templatePreset;
@@ -1230,11 +923,12 @@ export function apply(ctx: Context): void {
         if (teamObservation.kind !== "ready") {
           let source: "project" | "global" | "bundled" = "bundled";
           if (args.templateId !== undefined) {
-            try {
-              source = (await loadTopology(ctx, cwd, args.templateId)).source;
-            } catch {
-              // unknown blueprint: keep bundled
+            const topologyResolution = await topologyCatalog.resolve(cwd, args.templateId, { signal: exec.signal });
+            if (topologyResolution.kind !== "ready") {
+              const available = (await topologyCatalog.list(cwd, { signal: exec.signal })).ready.map((entry) => entry.config.id);
+              throw topologyResolutionError("create a team for spawned role", topologyResolution, available);
             }
+            source = topologyResolution.source;
           }
           team = {
             schemaVersion: 1,
@@ -1258,16 +952,16 @@ export function apply(ctx: Context): void {
             );
           }
           if (team.topologyRef.id !== "custom") {
-            try {
-              const blueprint = await loadTopology(ctx, cwd, team.topologyRef.id);
-              const base = templateBaseName(roleName);
-              const inBlueprint = blueprint.config.roles.some(
-                (role) => role.id.toLowerCase() === base || String(role.name ?? role.id).toLowerCase() === base,
-              );
-              if (!inBlueprint) team.topologyRef = { id: "custom", source: "bundled" };
-            } catch {
-              // unknown blueprint topology: leave the recorded value untouched
+            const blueprint = await topologyCatalog.resolve(cwd, team.topologyRef.id, { signal: exec.signal });
+            if (blueprint.kind !== "ready") {
+              const available = (await topologyCatalog.list(cwd, { signal: exec.signal })).ready.map((entry) => entry.config.id);
+              throw topologyResolutionError("check the team topology", blueprint, available);
             }
+            const base = roleName.replace(/-\d+$/, "").toLowerCase();
+            const inBlueprint = blueprint.config.roles.some(
+              (role) => role.id.toLowerCase() === base || String(role.name ?? role.id).toLowerCase() === base,
+            );
+            if (!inBlueprint) team.topologyRef = { id: "custom", source: "bundled" };
           }
         }
         const hasModelOverride =
@@ -1859,8 +1553,19 @@ export function apply(ctx: Context): void {
                   name: { type: "string", required: true },
                   description: { type: "string" },
                   source: { type: "string", required: true },
+                  status: { type: "string", required: true },
+                  filename: { type: "string", required: true },
                   controller: { type: "object", additionalProperties: true },
                   protocol: { type: "object", additionalProperties: true },
+                  diagnostic: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                      code: { type: "string", required: true },
+                      message: { type: "string", required: true },
+                      fsCode: { type: "string" },
+                    },
+                  },
                   roles: {
                     type: "array",
                     required: true,
@@ -1891,7 +1596,9 @@ export function apply(ctx: Context): void {
                 : value.templates
                     .map(
                       (t) =>
-                        `${t.id} (${t.source})${t.description === undefined ? "" : `: ${t.description}`} [roles: ${t.roles.map((r) => r.id).join(", ")}]`,
+                        t.status === "blocked"
+                          ? `${t.id || t.filename} (${t.source}, blocked: ${t.diagnostic?.code ?? "unknown"})`
+                          : `${t.id} (${t.source})${t.description === undefined ? "" : `: ${t.description}`} [roles: ${t.roles.map((r) => r.id).join(", ")}]`,
                     )
                     .join("; "),
           },
@@ -1901,71 +1608,8 @@ export function apply(ctx: Context): void {
         if (exec.agent === undefined) throw new Error("orchestra_topologies requires an agent caller");
         const cwd = exec.agent.session.header.cwd;
         if (cwd === undefined) throw new Error("current session has no working directory");
-        const templates: {
-          id: string;
-          name: string;
-          description?: string;
-          source: string;
-          controller?: Record<string, JsonValue>;
-          protocol?: Record<string, JsonValue>;
-          roles: ReturnType<typeof templateRoleEntry>[];
-        }[] = [];
-        const seen = new Set<string>();
-        const pushTemplate = (config: TopologyConfig, source: "project" | "global" | "bundled") => {
-          if (seen.has(config.id)) return;
-          seen.add(config.id);
-          templates.push({
-            id: config.id,
-            name: config.name ?? config.id,
-            ...(config.description === undefined ? {} : { description: config.description }),
-            source,
-            ...(config.controller === undefined ? {} : { controller: config.controller as Record<string, JsonValue> }),
-            ...(config.protocol === undefined ? {} : { protocol: config.protocol as Record<string, JsonValue> }),
-            roles: (config.roles ?? []).map(templateRoleEntry),
-          });
-        };
-        // Project-level templates.
-        try {
-          const dirTarget = await ctx.fs.resolve(`${cwd}/.orchestra/topologies`, { cwd });
-          const info = await ctx.fs.stat(dirTarget);
-          if (info !== undefined) {
-            const entries = await ctx.fs.listDir(dirTarget);
-            for (const entry of entries) {
-              if (entry.type !== "file" || !entry.name.endsWith(".json")) continue;
-              try {
-                const raw = JSON.parse(await ctx.fs.readText(entry.target)) as TopologyConfig;
-                if (typeof raw.id !== "string" || raw.id === "") continue;
-                pushTemplate(raw, "project");
-              } catch {
-                // skip unparseable template files
-              }
-            }
-          }
-        } catch {
-          // topologies directory missing
-        }
-        // Global templates.
-        try {
-          const globalDir = join(orchestraGlobalRoot(), "topologies");
-          const entries = await readdir(globalDir, { withFileTypes: true });
-          for (const entry of entries) {
-            if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-            try {
-              const raw = JSON.parse(await fsReadFile(join(globalDir, entry.name), "utf8")) as TopologyConfig;
-              if (typeof raw.id !== "string" || raw.id === "") continue;
-              pushTemplate(raw, "global");
-            } catch {
-              // skip unparseable template files
-            }
-          }
-        } catch {
-          // no global topologies directory
-        }
-        // Bundled fallback.
-        for (const embedded of BUILTIN_TEMPLATES) {
-          pushTemplate(embedded, "bundled");
-        }
-        return { templates };
+        const topologyList = await topologyCatalog.list(cwd, { signal: exec.signal });
+        return { templates: topologyListForTool(topologyList) };
       },
     }),
   );
@@ -1985,29 +1629,7 @@ export function apply(ctx: Context): void {
           kind: "exact",
           path: "/plugins/orchestra-dsh/state",
           handler: async (req: unknown, res: { writeHead: (code: number, headers?: Record<string, string>) => void; end: (body: string) => void }) => {
-            const templates: {
-              id: string;
-              name: string;
-              description?: string;
-              source: string;
-              controller?: Record<string, JsonValue>;
-              protocol?: Record<string, JsonValue>;
-              roles: ReturnType<typeof templateRoleEntry>[];
-            }[] = [];
-            const seen = new Set<string>();
-            const pushTemplate = (config: TopologyConfig, source: "project" | "global" | "bundled") => {
-              if (seen.has(config.id)) return;
-              seen.add(config.id);
-              templates.push({
-                id: config.id,
-                name: config.name ?? config.id,
-                ...(config.description === undefined ? {} : { description: config.description }),
-                source,
-                ...(config.controller === undefined ? {} : { controller: config.controller as Record<string, JsonValue> }),
-                ...(config.protocol === undefined ? {} : { protocol: config.protocol as Record<string, JsonValue> }),
-                roles: (config.roles ?? []).map(templateRoleEntry),
-              });
-            };
+            const templatesById = new Map<string, OrchestraTopologyToolEntry>();
             const teams: {
               workspacePath: string;
               workspaceTitle?: string;
@@ -2057,23 +1679,19 @@ export function apply(ctx: Context): void {
             for (const root of roots) {
               const path = root.path;
               try {
-                const dir = await ctx.fs.resolve(`${path}/.orchestra/topologies`, { cwd: path });
-                const info = await ctx.fs.stat(dir);
-                if (info !== undefined) {
-                  const entries = await ctx.fs.listDir(dir);
-                  for (const entry of entries) {
-                    if (entry.type !== "file" || !entry.name.endsWith(".json")) continue;
-                    try {
-                      const raw = JSON.parse(await ctx.fs.readText(entry.target)) as TopologyConfig;
-                      if (typeof raw.id !== "string" || raw.id === "" || seen.has(raw.id)) continue;
-                      pushTemplate(raw, "project");
-                    } catch {
-                      // skip unparseable template files
-                    }
-                  }
+                const topologyList = await topologyCatalog.list(path);
+                for (const template of topologyListForTool(topologyList)) {
+                  const id = typeof template.id === "string" ? template.id : "";
+                  const filename = typeof template.filename === "string" ? template.filename : "";
+                  const key = id === "" ? `blocked:${filename}` : id;
+                  if (!templatesById.has(key)) templatesById.set(key, template);
+                }
+                for (const blocked of topologyList.blocked) {
+                  console.warn(`orchestra: state route observed blocked topology ${blocked.filename} at ${path}: ${blocked.diagnostic.message}`);
                 }
               } catch {
-                // no topologies directory
+                // Topology observation is optional for the GUI projection; the
+                // core catalog/tool surfaces list failures directly.
               }
               try {
                 const teamObservation = await activeTeamState.read(path);
@@ -2140,11 +1758,8 @@ export function apply(ctx: Context): void {
                 // core team/archive tools surface list failures directly.
               }
             }
-            for (const embedded of BUILTIN_TEMPLATES) {
-              pushTemplate(embedded, "bundled");
-            }
             res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-            res.end(JSON.stringify({ templates, teams }));
+            res.end(JSON.stringify({ templates: [...templatesById.values()], teams }));
           },
         }),
       "orchestra: state route",
