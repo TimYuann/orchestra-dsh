@@ -28,21 +28,19 @@ import type {} from "@deepseek-ai/dsh-system-prompt";
 import type {} from "@deepseek-ai/dsh-commands";
 import { createSession, installModelOverride, deliverMessage } from "./a2a.js";
 import type { ResolvedPresetFile } from "./a2a.js";
-import {
-  createActiveTeamStateStore,
-  normalizeTeam,
-} from "./orchestra-state.js";
+import { createActiveTeamStateStore } from "./orchestra-state.js";
 import type {
+  ActiveTeamArchivedMarker,
   ActiveTeamRead,
   TeamRole,
   TeamState,
 } from "./orchestra-state.js";
+import { createArchiveStore } from "./orchestra-archive.js";
 import { mountPreset } from "@deepseek-ai/dsh-agent-presets";
 import "./relay-types.js";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { unlink } from "node:fs/promises";
 import { mkdir, writeFile, stat as fsStat, readFile as fsReadFile, readdir } from "node:fs/promises";
 
 const SID = (value: string): SessionId => value as SessionId;
@@ -111,13 +109,6 @@ interface TopologyConfig {
 interface ResolvedTopology {
   config: TopologyConfig;
   source: "project" | "global" | "bundled";
-}
-
-/** Archive snapshot: the team state plus dismissal bookkeeping (spec §7.2). */
-interface ArchiveTeam extends Omit<TeamState, "status"> {
-  archiveId: string;
-  status: "dismissed";
-  dismissedAt: number;
 }
 
 /** Builtin preset behavior packages (spec §5): written to the global root on install. */
@@ -718,78 +709,6 @@ async function ensureBuiltinArtifacts(): Promise<void> {
 
 export { normalizeTeam } from "./orchestra-state.js";
 
-/** Scan archive summaries (spec §7.2): live scan, dismissedAt desc, archiveId tie-breaker. */
-async function scanArchives(
-  ctx: Context,
-  cwd: string,
-): Promise<{ archiveId: string; teamId: string; goal: string; topology: string; dismissedAt: number; archivePath: string }[]> {
-  const archives: { archiveId: string; teamId: string; goal: string; topology: string; dismissedAt: number; archivePath: string }[] = [];
-  try {
-    const dir = await ctx.fs.resolve(`${cwd}/orchestra/archive`, { cwd });
-    const info = await ctx.fs.stat(dir);
-    if (info === undefined) return archives;
-    const entries = await ctx.fs.listDir(dir);
-    for (const entry of entries) {
-      if (entry.type !== "file" || !entry.name.endsWith(".json")) continue;
-      const archiveId = entry.name.replace(/\.json$/, "");
-      try {
-        const raw = (await loadJson(ctx, entry.target)) as Record<string, any>;
-        const dismissedAt =
-          typeof raw.dismissedAt === "number"
-            ? raw.dismissedAt
-            : typeof raw.archivedAt === "number"
-              ? raw.archivedAt
-              : 0;
-        archives.push({
-          archiveId,
-          teamId: typeof raw.teamId === "string" && raw.teamId !== "" ? raw.teamId : `team-${raw.createdAt ?? 0}`,
-          goal:
-            typeof raw.mission?.objective === "string" && raw.mission.objective !== ""
-              ? raw.mission.objective
-              : "",
-          topology: typeof raw.topologyRef?.id === "string" ? raw.topologyRef.id : typeof raw.topology === "string" ? raw.topology : "custom",
-          dismissedAt,
-          archivePath: `${cwd}/orchestra/archive/${entry.name}`,
-        });
-      } catch {
-        // skip unparseable archive files (must not fail the whole scan — spec §7.2)
-      }
-    }
-  } catch {
-    // no archive directory
-  }
-  archives.sort((a, b) => b.dismissedAt - a.dismissedAt || a.archiveId.localeCompare(b.archiveId));
-  return archives;
-}
-
-/** Load one archive snapshot by archiveId (base name of the file). */
-async function loadArchive(
-  ctx: Context,
-  cwd: string,
-  archiveId: string,
-): Promise<{ team: ArchiveTeam; archivePath: string } | undefined> {
-  if (typeof archiveId !== "string" || archiveId === "" || archiveId.includes("/") || archiveId.includes("..")) {
-    throw new Error(`invalid archive_id "${archiveId}"`);
-  }
-  try {
-    const target = await ctx.fs.resolve(`${cwd}/orchestra/archive/${archiveId}.json`, { cwd });
-    const raw = (await loadJson(ctx, target)) as Record<string, any>;
-    const base = normalizeTeam(raw, cwd, { allowDismissed: true });
-    if (base === undefined) throw new Error(`archive "${archiveId}" does not contain a team snapshot`);
-    const dismissedAt = typeof raw.dismissedAt === "number" ? raw.dismissedAt : Date.now();
-    const team: ArchiveTeam = {
-      ...base,
-      archiveId,
-      status: "dismissed",
-      dismissedAt,
-    };
-    return { team, archivePath: `${cwd}/orchestra/archive/${archiveId}.json` };
-  } catch (error) {
-    if (error instanceof Error && error.message.startsWith("invalid archive_id")) throw error;
-    return undefined;
-  }
-}
-
 /**
  * The plugin's escrow write policy for its own state/report/archive paths:
  * an explicit workspace-write mode override (outranks a read-only session's
@@ -810,12 +729,6 @@ function escrowPolicy(ctx: Context, exec: ToolExecutionInput): SandboxExecutionP
 function throwIfBlocked(action: string, state: ActiveTeamRead): void {
   if (state.kind !== "blocked") return;
   throw new Error(`cannot ${action}: active team state is blocked (${state.diagnostic.code}): ${state.diagnostic.message}`);
-}
-
-function requireReadyTeam(action: string, state: ActiveTeamRead): TeamState {
-  throwIfBlocked(action, state);
-  if (state.kind === "ready") return state.team;
-  throw new Error(`cannot ${action}: no active team state is available (${state.diagnostic.message})`);
 }
 
 /** Role self-awareness protocol (spec §8.2): identity, reply, dispatch, handoff, decision rights, routes, completion. */
@@ -964,6 +877,7 @@ export const Config = undefined;
 
 export function apply(ctx: Context): void {
   const activeTeamState = createActiveTeamStateStore(ctx.fs);
+  const archiveStore = createArchiveStore(ctx.fs);
   const roleItem = {
     type: "object",
     additionalProperties: false,
@@ -1433,11 +1347,21 @@ export function apply(ctx: Context): void {
                 additionalProperties: false,
                 properties: {
                   archive_id: { type: "string", required: true },
+                  filename: { type: "string", required: true },
+                  status: { type: "string", required: true },
                   team_id: { type: "string", required: true },
                   goal: { type: "string", required: true },
                   topology: { type: "string", required: true },
                   dismissed_at: { type: "number", required: true },
                   archive_path: { type: "string", required: true },
+                  diagnostic: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                      code: { type: "string", required: true },
+                      message: { type: "string", required: true },
+                    },
+                  },
                 },
               },
             },
@@ -1448,7 +1372,11 @@ export function apply(ctx: Context): void {
             value.archives.length === 0
               ? "no archives"
               : value.archives
-                  .map((a) => `${a.archive_id}${a.goal === "" ? "" : ` (${a.goal})`}`)
+                  .map((a) =>
+                    a.status === "blocked"
+                      ? `${a.filename} (blocked: ${a.diagnostic?.code ?? "unknown"})`
+                      : `${a.archive_id}${a.goal === "" ? "" : ` (${a.goal})`}`,
+                  )
                   .join(", ");
           if (value.team == null) return [{ type: "text", text: `no active team; archives: ${archiveText}` }];
           return [
@@ -1467,14 +1395,30 @@ export function apply(ctx: Context): void {
         if (cwd === undefined) throw new Error("current session has no working directory");
         const teamObservation = await activeTeamState.read(cwd, { signal: exec.signal });
         throwIfBlocked("inspect the team", teamObservation);
-        const archives = (await scanArchives(ctx, cwd)).map((a) => ({
-          archive_id: a.archiveId,
-          team_id: a.teamId,
-          goal: a.goal,
-          topology: a.topology,
-          dismissed_at: a.dismissedAt,
-          archive_path: a.archivePath,
-        }));
+        const archiveList = await archiveStore.list(cwd, { signal: exec.signal });
+        const archives = [
+          ...archiveList.ready.map((a) => ({
+            archive_id: a.archiveId,
+            filename: a.filename,
+            status: a.status,
+            team_id: a.teamId,
+            goal: a.goal,
+            topology: a.topology,
+            dismissed_at: a.dismissedAt,
+            archive_path: a.archivePath,
+          })),
+          ...archiveList.blocked.map((a) => ({
+            archive_id: a.archiveId,
+            filename: a.filename,
+            status: a.status,
+            team_id: "",
+            goal: "",
+            topology: "",
+            dismissed_at: 0,
+            archive_path: a.archivePath,
+            diagnostic: a.diagnostic,
+          })),
+        ];
         if (teamObservation.kind !== "ready") return { team: null, archives };
         const team = teamObservation.team;
         return {
@@ -1544,14 +1488,19 @@ export function apply(ctx: Context): void {
         throwIfBlocked("activate a team", existing);
         if (existing.kind === "ready")
           throw new Error(`an active team already exists here (${existing.team.teamId}); dismiss it first or activate in another working directory`);
-        const loaded = await loadArchive(ctx, cwd, args.archiveId);
-        if (loaded === undefined) {
-          const available = (await scanArchives(ctx, cwd)).map((a) => a.archiveId);
+        const loaded = await archiveStore.read(cwd, args.archiveId, { signal: exec.signal });
+        if (loaded.kind === "blocked") {
+          throw new Error(
+            `archive "${args.archiveId}" is blocked (${loaded.diagnostic.code}): ${loaded.diagnostic.message}; repair or remove the archive before activation`,
+          );
+        }
+        if (loaded.kind === "missing") {
+          const available = (await archiveStore.list(cwd, { signal: exec.signal })).ready.map((a) => a.archiveId);
           throw new Error(
             `archive "${args.archiveId}" not found at ${cwd}/orchestra/archive/; available: ${available.length === 0 ? "(none)" : available.join(", ")}`,
           );
         }
-        const { team: archived } = loaded;
+        const archived = loaded.snapshot;
         // Rebuild the active state from the archive snapshot (archive stays immutable).
         const query = ctx.get("sessionQuery");
         const newTeam: TeamState = {
@@ -1725,7 +1674,7 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "orchestra_dismiss",
       description:
-        "Close the current orchestra instance: archive state/team.json to orchestra/archive/<archive_id>.json (full snapshot, immutable), delete the active state file, and notify every live role session that the team is archived (stop waiting for new tasks). Role sessions are independent assets and stay alive. Requires an instance created by orchestra_create or orchestra_spawn in this working directory.",
+        "Close the current orchestra instance: publish an immutable archive, CAS the active state into an archived marker, then notify every live role session that the team is archived (stop waiting for new tasks). Role sessions are independent assets and stay alive. Requires an instance created by orchestra_create or orchestra_spawn in this working directory.",
       parameters: {},
       output: {
         schema: {
@@ -1750,34 +1699,34 @@ export function apply(ctx: Context): void {
         const cwd = exec.agent.session.header.cwd;
         if (cwd === undefined) throw new Error("current session has no working directory");
         const teamObservation = await activeTeamState.read(cwd, { signal: exec.signal });
-        const team = requireReadyTeam("dismiss the team", teamObservation);
-        const archiveId = `team-${team.topologyRef.id}-${team.createdAt}`;
+        throwIfBlocked("dismiss the team", teamObservation);
+        if (teamObservation.kind !== "ready") throw new Error(`cannot dismiss the team: ${teamObservation.diagnostic.message}`);
+        const team = teamObservation.team;
         const dismissedAt = Date.now();
-        const archivePath = `${cwd}/orchestra/archive/${archiveId}.json`;
-        const archiveTarget = await ctx.fs.resolve(archivePath, { cwd });
-        const archive: ArchiveTeam = {
-          ...team,
-          archiveId,
-          status: "dismissed",
+        const archived = await archiveStore.create(cwd, team, {
           dismissedAt,
+          policy: escrowPolicy(ctx, exec),
+          signal: exec.signal,
+        });
+        const archiveId = archived.summary.archiveId;
+        const archivePath = archived.summary.archivePath;
+        const marker: ActiveTeamArchivedMarker = {
+          schemaVersion: 1,
+          archived: true,
+          status: "dismissed",
+          archiveId,
+          archivePath,
+          archivedAt: dismissedAt,
+          teamId: team.teamId,
         };
-        await ctx.fs.writeText(archiveTarget, JSON.stringify(archive, null, 2), undefined, undefined, escrowPolicy(ctx, exec));
-        // Delete the active state file (spec §7.1: no marker). Fall back to a
-        // Node unlink because ctx.fs has no remove API; the path is confined to
-        // <cwd>/orchestra/state/team.json.
-        const stateTarget = await ctx.fs.resolve(`${cwd}/orchestra/state/team.json`, { cwd });
-        let deleted = false;
         try {
-          await unlink(ctx.fs.processPath(stateTarget));
-          deleted = true;
+          await activeTeamState.archive(teamObservation, marker, {
+            policy: escrowPolicy(ctx, exec),
+            signal: exec.signal,
+          });
         } catch (error) {
-          console.error(
-            `orchestra_dismiss: failed to delete ${ctx.fs.processPath(stateTarget)}: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-        if (!deleted) {
           throw new Error(
-            `team archived but state file could not be deleted (${ctx.fs.processPath(stateTarget)}); delete it manually before creating a new team`,
+            `archive ${archiveId} was created at ${archivePath}, but active team CAS failed; the team was not dismissed and no role retirement notice was sent: ${error instanceof Error ? error.message : String(error)}`,
           );
         }
         // Archive notice to live roles (spec §8.3): cold roles are skipped —
@@ -2148,8 +2097,8 @@ export function apply(ctx: Context): void {
                 // no active team
               }
               try {
-                const archives = await scanArchives(ctx, path);
-                for (const archive of archives) {
+                const archiveList = await archiveStore.list(path);
+                for (const archive of archiveList.ready) {
                   teams.push({
                     workspacePath: path,
                     ...(root.title === undefined ? {} : { workspaceTitle: root.title }),
@@ -2164,8 +2113,12 @@ export function apply(ctx: Context): void {
                     roles: [],
                   });
                 }
+                for (const blocked of archiveList.blocked) {
+                  console.warn(`orchestra: state route skipped blocked archive ${blocked.filename} at ${path}: ${blocked.diagnostic.message}`);
+                }
               } catch {
-                // no archive directory
+                // Archive observation is optional for the GUI projection; the
+                // core team/archive tools surface list failures directly.
               }
             }
             for (const embedded of BUILTIN_TEMPLATES) {

@@ -55,6 +55,19 @@ export interface TeamState {
   reports: { reportId: string; roleId: string; sessionId: string; path: string; createdAt: number }[];
 }
 
+/** Inactive marker written after an immutable archive has been published. */
+export interface ActiveTeamArchivedMarker {
+  schemaVersion: 1;
+  archived: true;
+  status: "dismissed";
+  archiveId: string;
+  archivePath: string;
+  archivedAt: number;
+  teamId?: string;
+}
+
+export type ActiveTeamStatePayload = TeamState | ActiveTeamArchivedMarker;
+
 export interface ActiveTeamCompatibility {
   source: "v1.0" | "v1.1";
   legacy: boolean;
@@ -148,7 +161,7 @@ export interface ActiveTeamWriteOptions {
 
 export interface ActiveTeamWriteResult {
   operation: "created" | "replaced";
-  team: TeamState;
+  state: ActiveTeamStatePayload;
   version: ActiveTeamVersion;
   /** Canonical path for user-facing tool output; callers do not resolve the state path themselves. */
   statePath: string;
@@ -173,6 +186,7 @@ export interface ActiveTeamStateStore {
   read(cwd: string, options?: { signal?: AbortSignal }): Promise<ActiveTeamRead>;
   create(cwd: string, team: TeamState, options: ActiveTeamWriteOptions): Promise<ActiveTeamWriteResult>;
   replace(snapshot: ActiveTeamReady, team: TeamState, options: ActiveTeamWriteOptions): Promise<ActiveTeamWriteResult>;
+  archive(snapshot: ActiveTeamReady, marker: ActiveTeamArchivedMarker, options: ActiveTeamWriteOptions): Promise<ActiveTeamWriteResult>;
 }
 
 const ACTIVE_STATE_PATH = "orchestra/state/team.json";
@@ -475,20 +489,20 @@ export function createActiveTeamStateStore(fs: ActiveTeamStateFileSystem): Activ
 
   async function write(
     cwd: string,
-    team: TeamState,
+    state: ActiveTeamStatePayload,
     expected: FsWriteIntent,
     options: ActiveTeamWriteOptions,
   ): Promise<ActiveTeamWriteResult> {
     let target: FsTarget;
     try {
       target = await resolve(cwd, options.signal);
-      const outcome = await fs.writeText(target, JSON.stringify(team, null, 2), expected, options.signal, options.policy);
+      const outcome = await fs.writeText(target, JSON.stringify(state, null, 2), expected, options.signal, options.policy);
       if (outcome.version === undefined) {
         throw new ActiveTeamStateError("write_failed", "active team state write returned no version");
       }
       return {
         operation: expected.kind === "createIfAbsent" ? "created" : "replaced",
-        team,
+        state,
         version: wrapVersion(outcome.version),
         statePath: fs.processPath(target),
       };
@@ -527,5 +541,23 @@ export function createActiveTeamStateStore(fs: ActiveTeamStateFileSystem): Activ
     return write(snapshot.cwd, team, { kind: "replaceIfVersion", version }, options);
   }
 
-  return { read, create, replace };
+  async function archive(
+    snapshot: ActiveTeamReady,
+    marker: ActiveTeamArchivedMarker,
+    options: ActiveTeamWriteOptions,
+  ): Promise<ActiveTeamWriteResult> {
+    if (snapshot.kind !== "ready") {
+      throw new ActiveTeamStateError("invalid_snapshot", "active team archive requires a ready snapshot");
+    }
+    if (marker.archived !== true || marker.status !== "dismissed" || marker.archiveId === "" || marker.archivePath === "") {
+      throw new ActiveTeamStateError("invalid_snapshot", "active team archive marker is incomplete");
+    }
+    const version = unwrapVersion(snapshot.version);
+    if (version === undefined) {
+      throw new ActiveTeamStateError("invalid_snapshot", "active team archive received an unknown version token");
+    }
+    return write(snapshot.cwd, marker, { kind: "replaceIfVersion", version }, options);
+  }
+
+  return { read, create, replace, archive };
 }
