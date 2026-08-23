@@ -190,7 +190,8 @@ test("active state interface classifies missing and ready current state", async 
   assert.equal(ready.kind, "ready");
   assert.equal(ready.team.teamId, "team-test");
   assert.equal(ready.compatibility.source, "v1.1");
-  assert.deepEqual(ready.warnings, []);
+  assert.ok(ready.compatibility.migratedFields.includes("roles.phase→active"));
+  assert.match(ready.warnings[0], /roles\.phase→active/);
   assert.notEqual(ready.version, undefined);
 });
 

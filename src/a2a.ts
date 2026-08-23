@@ -21,7 +21,7 @@ import { mountPreset, resolveSessionPreset } from "@deepseek-ai/dsh-agent-preset
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolExecutionInput } from "@deepseek-ai/dsh-tools";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
-import type { AgentSetup } from "@deepseek-ai/dsh-agent";
+import type { AgentHandle, AgentSetup } from "@deepseek-ai/dsh-agent";
 import type {} from "@deepseek-ai/dsh-session";
 import type {} from "@deepseek-ai/dsh-session-title";
 import type { SessionId } from "@deepseek-ai/dsh-session";
@@ -30,7 +30,7 @@ import type {} from "@deepseek-ai/dsh-system-prompt";
 import type {} from "@deepseek-ai/cordis-plugin-timer";
 import { randomUUID } from "node:crypto";
 import { prepareLightweightBlueprint } from "./session-blueprint.js";
-import type { LightweightBlueprintReceipt } from "./session-blueprint.js";
+import type { GovernedBlueprintReceipt, PreparedGovernedBlueprint, LightweightBlueprintReceipt } from "./session-blueprint.js";
 import "./relay-types.js";
 
 const SID = (value: string): SessionId => value as SessionId;
@@ -84,11 +84,15 @@ export interface CreateSessionOptions {
     provider?: string;
     model?: string;
     reasoningEffort?: string;
-    /** Provision through the complete lightweight Session Blueprint seam. */
-    mode?: "lightweight";
+    /** Provision through a complete mode-specific Session Blueprint seam. */
+    mode?: "lightweight" | "governed";
     permissionPreset?: string;
     requiredTools?: string[];
     callerAgent?: import("@deepseek-ai/dsh-agent").Agent;
+    /** Prepared Governed role Blueprint; only orchestra provisioning supplies this. */
+    governedBlueprint?: PreparedGovernedBlueprint;
+    /** Return the owned handle to a transactional caller for explicit cleanup. */
+    returnHandle?: boolean;
     /** Display title pinned on the new session (e.g. "my-project · implementer · trio"; slug = path.basename(cwd)). */
     title?: string;
     signal?: AbortSignal;
@@ -98,7 +102,9 @@ export interface SessionCreateResult {
   sessionId: string;
   cwd?: string;
   agentPreset?: string;
-  mode?: "lightweight";
+  mode?: "lightweight" | "governed";
+  governedBlueprint?: GovernedBlueprintReceipt;
+  handle?: AgentHandle;
   permissionPreset?: string;
   provider?: string;
   model?: string;
@@ -128,10 +134,13 @@ export async function createSession(ctx: Context, options: CreateSessionOptions 
     throw new Error(`a2a: session "${sessionId}" already exists`);
   const cwd = typeof options.cwd === "string" && options.cwd !== "" ? options.cwd : undefined;
   const lightweight = options.mode === "lightweight";
+  const governed = options.mode === "governed";
   let agentOptions: { provider?: string; model?: string } = {};
   let setup: AgentSetup | undefined;
   let agentPreset: string | undefined;
   let blueprintReceipt: LightweightBlueprintReceipt | undefined;
+  let governedReceipt: GovernedBlueprintReceipt | undefined;
+  let governedMeta: { cwd: string; agentPreset: string } | undefined;
   const model = ctx.get("agentDefaultModel");
   const selection = model === undefined ? undefined : model.currentSelection();
   const modelOverride =
@@ -169,6 +178,15 @@ export async function createSession(ctx: Context, options: CreateSessionOptions 
     setup = blueprint.setup;
     agentPreset = blueprint.receipt.agentPreset;
     blueprintReceipt = blueprint.receipt;
+  } else if (governed) {
+    const blueprint = options.governedBlueprint;
+    if (blueprint === undefined) throw new Error("a2a: governed createSession requires a prepared Governed Session Blueprint");
+    if (blueprint.receipt.sessionId !== sessionId) throw new Error(`a2a: governed Blueprint session id ${blueprint.receipt.sessionId} does not match ${sessionId}`);
+    agentOptions = blueprint.agentOptions;
+    setup = blueprint.setup;
+    agentPreset = blueprint.receipt.agentPreset;
+    governedReceipt = blueprint.receipt;
+    governedMeta = blueprint.meta;
   } else if (options.presetFile !== undefined) {
     // Orchestra-resolved preset (project > global > builtin): mount the file
     // directly — no DSH resolver root registration needed (spec §5.3).
@@ -190,17 +208,17 @@ export async function createSession(ctx: Context, options: CreateSessionOptions 
   } else {
     throw new Error("a2a: createSession requires a complete Agent Preset; mode=lightweight resolves one when no preset is explicit");
   }
-  await ctx.agents.create({
+  const handle = await ctx.agents.create({
     sessionId: sid,
     agentOptions,
     meta: {
-      ...(cwd === undefined ? {} : { cwd }),
-      ...(agentPreset === undefined ? {} : { agentPreset }),
+      ...(governedMeta === undefined ? (cwd === undefined ? {} : { cwd }) : governedMeta),
+      ...(governedMeta === undefined && agentPreset !== undefined ? { agentPreset } : {}),
     },
     ...(setup === undefined ? {} : { setup }),
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   });
-  if (!lightweight && typeof options.title === "string" && options.title !== "") {
+  if (!lightweight && !governed && typeof options.title === "string" && options.title !== "") {
     const session = ctx.sessions.get(sid);
     if (session !== undefined) {
       // Pinned display title: log-only "session/title" event (kind:user pins it,
@@ -241,6 +259,8 @@ export async function createSession(ctx: Context, options: CreateSessionOptions 
           ...(blueprintReceipt.title === undefined ? {} : { title: blueprintReceipt.title }),
           tools: blueprintReceipt.tools,
         }),
+    ...(governedReceipt === undefined ? {} : { mode: governedReceipt.mode, governedBlueprint: governedReceipt }),
+    ...(options.returnHandle ? { handle } : {}),
   };
 }
 

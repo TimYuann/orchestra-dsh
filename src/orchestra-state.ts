@@ -17,11 +17,50 @@ import type {
 } from "@deepseek-ai/dsh-fs";
 import type { SandboxExecutionPolicy } from "@deepseek-ai/dsh-sandbox";
 
+export type TeamRolePhase = "reserved" | "provisioning" | "active" | "failed";
+export type TeamStatus = "provisioning" | "active" | "degraded" | "blocked" | "failed";
+
+export interface TeamRoleDiagnostic {
+  code: string;
+  message: string;
+}
+
+/** Durable facts needed to reconstruct a Governed role Blueprint. */
+export interface TeamRoleBlueprintFacts {
+  mode: "governed";
+  teamId: string;
+  roleId: string;
+  topologyId: string;
+  topologySource: "project" | "global" | "bundled";
+  controllerSessionId: string;
+  agentPreset: string;
+  permissionPreset: string;
+  effectivePermissionPreset: string;
+  approval: string;
+  sandbox: string;
+  provider: string;
+  model: string;
+  reasoningEffort?: string;
+  cwd?: string;
+  title?: string;
+  tools: { names: string[]; count: number };
+}
+
+export interface TeamWelcomeReceipt {
+  messageId: string;
+  sessionId: string;
+  acceptedAt: number;
+}
+
 /** team.json v1.1 role record. */
 export interface TeamRole {
   id: string;
   name: string;
   sessionId: string;
+  phase: TeamRolePhase;
+  diagnostic?: TeamRoleDiagnostic;
+  blueprint?: TeamRoleBlueprintFacts;
+  welcome?: TeamWelcomeReceipt;
   /** Replacement history: previous session ids this role was bound to. */
   sessionHistory: { sessionId: string; replacedAt: number; reason: string }[];
   preset: string | null;
@@ -36,7 +75,7 @@ export interface TeamRole {
 export interface TeamState {
   schemaVersion: number;
   teamId: string;
-  status: "active" | "degraded";
+  status: TeamStatus;
   rootCwd: string;
   controllerSessionId: string;
   controllerHistory: { sessionId: string; replacedAt: number; reason: string }[];
@@ -163,6 +202,8 @@ export interface ActiveTeamWriteResult {
   operation: "created" | "replaced";
   state: ActiveTeamStatePayload;
   version: ActiveTeamVersion;
+  /** New ready snapshot for TeamState writes; callers can continue CAS without rereading. */
+  snapshot?: ActiveTeamReady;
   /** Canonical path for user-facing tool output; callers do not resolve the state path themselves. */
   statePath: string;
 }
@@ -210,6 +251,9 @@ function compatibilityOf(record: Record<string, any>): ActiveTeamCompatibility {
   if (Array.isArray(record.roles) && record.roles.some((role: any) => role?.reportCount === undefined && typeof role?.rounds === "number")) {
     migratedFields.push("roles.rounds→roles.reportCount");
   }
+  if (Array.isArray(record.roles) && record.roles.some((role: any) => role?.phase === undefined)) {
+    migratedFields.push("roles.phase→active");
+  }
   return {
     source: legacy ? "v1.0" : "v1.1",
     legacy,
@@ -218,9 +262,11 @@ function compatibilityOf(record: Record<string, any>): ActiveTeamCompatibility {
 }
 
 function legacyWarnings(compatibility: ActiveTeamCompatibility): string[] {
-  return compatibility.legacy
-    ? ["legacy active team state normalized in memory; the source file was not rewritten"]
-    : [];
+  if (compatibility.legacy) return ["legacy active team state normalized in memory; the source file was not rewritten"];
+  if (compatibility.migratedFields.length > 0) {
+    return [`active team state compatibility fields normalized in memory (${compatibility.migratedFields.join(", ")}); the source file was not rewritten`];
+  }
+  return [];
 }
 
 function diagnostic(code: ActiveTeamDiagnosticCode, message: string, fsCode?: string): ActiveTeamDiagnostic {
@@ -271,7 +317,7 @@ function classifyRaw(raw: unknown, cwd: string):
       diagnostic: diagnostic("inactive", "active team state contains a dismissed snapshot"),
     };
   }
-  if (record.status !== undefined && record.status !== "active" && record.status !== "degraded") {
+  if (record.status !== undefined && !["provisioning", "active", "degraded", "blocked", "failed"].includes(record.status)) {
     return {
       kind: "blocked",
       warnings,
@@ -291,6 +337,13 @@ function classifyRaw(raw: unknown, cwd: string):
         kind: "blocked",
         warnings,
         diagnostic: diagnostic("unrecoverable_identity", `active team role at index ${index} has no recoverable sessionId`),
+      };
+    }
+    if (role.phase !== undefined && !["reserved", "provisioning", "active", "failed"].includes(role.phase)) {
+      return {
+        kind: "blocked",
+        warnings,
+        diagnostic: diagnostic("invalid_shape", `active team role at index ${index} has invalid provisioning phase`),
       };
     }
   }
@@ -341,6 +394,14 @@ export function normalizeTeam(raw: unknown, cwd: string, options: { allowDismiss
       id: typeof role.id === "string" ? role.id : "role",
       name: typeof role.name === "string" ? role.name : String(role.id ?? "role"),
       sessionId: role.sessionId,
+      phase: role.phase === "reserved" || role.phase === "provisioning" || role.phase === "failed" ? role.phase : "active",
+      ...(asRecord(role.diagnostic) && typeof role.diagnostic.code === "string" && typeof role.diagnostic.message === "string"
+        ? { diagnostic: { code: role.diagnostic.code, message: role.diagnostic.message } }
+        : {}),
+      ...(asRecord(role.blueprint) ? { blueprint: role.blueprint as TeamRoleBlueprintFacts } : {}),
+      ...(asRecord(role.welcome) && typeof role.welcome.messageId === "string" && typeof role.welcome.sessionId === "string" && typeof role.welcome.acceptedAt === "number"
+        ? { welcome: role.welcome as TeamWelcomeReceipt }
+        : {}),
       sessionHistory: Array.isArray(role.sessionHistory) ? role.sessionHistory : [],
       preset: role.preset === undefined || role.preset === null ? null : role.preset,
       sandbox: typeof role.sandbox === "string" ? role.sandbox : "workspace-write",
@@ -351,7 +412,10 @@ export function normalizeTeam(raw: unknown, cwd: string, options: { allowDismiss
   return {
     schemaVersion: typeof record.schemaVersion === "number" ? record.schemaVersion : 1,
     teamId,
-    status: record.status === "degraded" ? "degraded" : "active",
+    status:
+      record.status === "provisioning" || record.status === "degraded" || record.status === "blocked" || record.status === "failed"
+        ? record.status
+        : "active",
     rootCwd: typeof record.rootCwd === "string" && record.rootCwd !== "" ? record.rootCwd : cwd,
     controllerSessionId:
       typeof record.controllerSessionId === "string"
@@ -500,10 +564,23 @@ export function createActiveTeamStateStore(fs: ActiveTeamStateFileSystem): Activ
       if (outcome.version === undefined) {
         throw new ActiveTeamStateError("write_failed", "active team state write returned no version");
       }
+      const version = wrapVersion(outcome.version);
+      const snapshot = "roles" in state
+        ? {
+            kind: "ready" as const,
+            cwd,
+            team: state,
+            compatibility: { source: "v1.1" as const, legacy: false, migratedFields: [] },
+            warnings: [],
+            diagnostic: diagnostic("filesystem", "active team state is ready"),
+            version,
+          }
+        : undefined;
       return {
         operation: expected.kind === "createIfAbsent" ? "created" : "replaced",
         state,
-        version: wrapVersion(outcome.version),
+        version,
+        ...(snapshot === undefined ? {} : { snapshot }),
         statePath: fs.processPath(target),
       };
     } catch (error) {

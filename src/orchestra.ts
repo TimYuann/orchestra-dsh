@@ -15,7 +15,7 @@ import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import type { ContentBlock, MessageSource } from "@deepseek-ai/dsh-llm";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolExecutionInput, JsonValue } from "@deepseek-ai/dsh-tools";
-import type {} from "@deepseek-ai/dsh-agent";
+import type { AgentHandle } from "@deepseek-ai/dsh-agent";
 import type {} from "@deepseek-ai/dsh-session";
 import type { SessionId } from "@deepseek-ai/dsh-session";
 import type {} from "@deepseek-ai/dsh-fs";
@@ -27,6 +27,8 @@ import type {} from "@deepseek-ai/dsh-system-prompt";
 import type {} from "@deepseek-ai/dsh-commands";
 import { createSession, installModelOverride, deliverMessage } from "./a2a.js";
 import type { ResolvedPresetFile } from "./a2a.js";
+import { prepareGovernedBlueprint } from "./session-blueprint.js";
+import type { GovernedBlueprintReceipt, PreparedGovernedBlueprint } from "./session-blueprint.js";
 import { createActiveTeamStateStore } from "./orchestra-state.js";
 import type {
   ArchiveList,
@@ -34,12 +36,18 @@ import type {
 import type {
   ActiveTeamArchivedMarker,
   ActiveTeamRead,
+  ActiveTeamReady,
+  ActiveTeamStateStore,
   TeamRole,
   TeamState,
+  TeamRoleBlueprintFacts,
+  TeamRoleDiagnostic,
+  TeamRolePhase,
+  TeamWelcomeReceipt,
 } from "./orchestra-state.js";
 import { createArchiveStore } from "./orchestra-archive.js";
 import { createTopologyCatalog } from "./orchestra-topology.js";
-import type { TopologyCatalog, TopologyList, TopologyProtocol, TopologyResolution, TopologyRoleSummary } from "./orchestra-topology.js";
+import type { RoleConfig, TopologyCatalog, TopologyList, TopologyProtocol, TopologyResolution, TopologyRoleSummary } from "./orchestra-topology.js";
 export { validateTopology } from "./orchestra-topology.js";
 import { mountPreset } from "@deepseek-ai/dsh-agent-presets";
 import "./relay-types.js";
@@ -514,24 +522,296 @@ function roleProtocolText(
   return lines.join("\n");
 }
 
-/** 向角色会话发送开场消息：协议段 + 可选自定义欢迎/任务说明。目标必须在线。 */
-function sendRoleWelcome(
+/** 向角色会话发送开场消息：协议段 + 可选自定义欢迎说明，并等待 durable admission。 */
+async function sendRoleWelcome(
   ctx: Context,
   fromSessionId: string,
   toSessionId: string,
   roleName: string,
   extra?: string,
-): string {
+  protocol: Parameters<typeof roleProtocolText>[2] = {},
+): Promise<TeamWelcomeReceipt> {
   const agent = ctx.agents.get(SID(toSessionId));
   if (agent === undefined) throw new Error(`role session ${toSessionId} is not live; cannot deliver`);
-  const parts = [roleProtocolText(fromSessionId, roleName)];
+  const parts = [roleProtocolText(fromSessionId, roleName, protocol)];
   if (typeof extra === "string" && extra !== "") parts.push(extra);
   const message = createUserMessage({
     content: [{ type: "text", text: parts.join("\n\n") }] as ContentBlock[],
     source: { kind: "a2a", form: "relay", senderSessionId: fromSessionId },
   });
   agent.followup(message);
-  return message.id;
+  const accepted = await ctx.sessions.flush(agent.session);
+  if (!accepted) throw new Error(`welcome for role ${roleName} was queued but no durable session flush participated`);
+  return { messageId: message.id, sessionId: toSessionId, acceptedAt: Date.now() };
+}
+
+export interface GovernedRolePlan {
+  roleId: string;
+  roleName: string;
+  sessionId: string;
+  presetId: string;
+  sandbox: "read-only" | "workspace-write" | "danger-full-access";
+  welcome?: string;
+  maxRounds?: number;
+  protocol?: TopologyProtocol;
+  blueprint: PreparedGovernedBlueprint;
+}
+
+function governedSessionId(teamId: string, roleId: string): string {
+  const safeRole = roleId.replace(/[^A-Za-z0-9_-]+/g, "-");
+  return `orchestra-${teamId}-${safeRole}`;
+}
+
+function roleBlueprintFacts(receipt: GovernedBlueprintReceipt): TeamRoleBlueprintFacts {
+  return {
+    mode: "governed",
+    teamId: receipt.teamId,
+    roleId: receipt.roleId,
+    topologyId: receipt.topologyId,
+    topologySource: receipt.topologySource,
+    controllerSessionId: receipt.controllerSessionId,
+    agentPreset: receipt.agentPreset,
+    permissionPreset: receipt.permissionPreset,
+    effectivePermissionPreset: receipt.effectivePermissionPreset,
+    approval: receipt.approval,
+    sandbox: receipt.sandbox,
+    provider: receipt.provider,
+    model: receipt.model,
+    ...(receipt.reasoningEffort === undefined ? {} : { reasoningEffort: receipt.reasoningEffort }),
+    cwd: receipt.cwd,
+    ...(receipt.title === undefined ? {} : { title: receipt.title }),
+    tools: receipt.tools,
+  };
+}
+
+function reservedRole(plan: GovernedRolePlan): TeamRole {
+  return {
+    id: plan.roleId,
+    name: plan.roleName,
+    sessionId: plan.sessionId,
+    phase: "reserved",
+    sessionHistory: [],
+    preset: plan.presetId,
+    sandbox: plan.sandbox,
+    model: {
+      provider: plan.blueprint.receipt.provider,
+      model: plan.blueprint.receipt.model,
+      ...(plan.blueprint.receipt.reasoningEffort === undefined ? {} : { reasoningEffort: plan.blueprint.receipt.reasoningEffort }),
+    },
+    blueprint: roleBlueprintFacts(plan.blueprint.receipt),
+    reportCount: 0,
+    lastReport: null,
+  };
+}
+
+function updateTeamRole(team: TeamState, roleId: string, patch: Partial<TeamRole>): TeamState {
+  return {
+    ...team,
+    roles: team.roles.map((role) => (role.id === roleId ? { ...role, ...patch } : role)),
+  };
+}
+
+function provisioningDiagnostic(error: unknown): TeamRoleDiagnostic {
+  const code = error instanceof Error && "code" in error && typeof (error as { code?: unknown }).code === "string"
+    ? String((error as { code: string }).code)
+    : "provisioning_failed";
+  return { code, message: error instanceof Error ? error.message : String(error) };
+}
+
+async function disposeCreatedHandles(handles: AgentHandle[]): Promise<void> {
+  for (const handle of handles.reverse()) {
+    try {
+      await handle.dispose();
+    } catch {
+      // The durable failed/blocked state is the source of truth even if cleanup reports a secondary error.
+    }
+  }
+}
+
+async function prepareGovernedRolePlan(
+  ctx: Context,
+  options: {
+    cwd: string;
+    teamId: string;
+    controllerSessionId: string;
+    topologyId: string;
+    topologySource: "project" | "global" | "bundled";
+    role: RoleConfig;
+    presetId?: string | null;
+    sandbox?: string;
+    welcome?: string;
+    protocol?: TopologyProtocol;
+    maxRounds?: number;
+    permissionPreset?: string;
+    provider?: string;
+    model?: string;
+    reasoningEffort?: string;
+    title?: string;
+    signal?: AbortSignal;
+  },
+): Promise<GovernedRolePlan> {
+  const presetId = options.presetId ?? options.role.preset;
+  if (typeof presetId !== "string" || presetId === "") {
+    throw new Error(`governed role "${options.role.id}" requires an explicit complete Agent Preset`);
+  }
+  const requestedSandbox = options.sandbox ?? options.role.sandbox;
+  if (requestedSandbox !== undefined && requestedSandbox !== "read-only" && requestedSandbox !== "workspace-write" && requestedSandbox !== "danger-full-access") {
+    throw new Error(`governed role "${options.role.id}" has invalid sandbox "${requestedSandbox}"`);
+  }
+  const presetFile = await resolvePresetFile(ctx, options.cwd, presetId);
+  const sessionId = governedSessionId(options.teamId, options.role.id);
+  const blueprint = await prepareGovernedBlueprint(ctx, {
+    sessionId,
+    teamId: options.teamId,
+    roleId: options.role.id,
+    roleName: options.role.name,
+    topologyId: options.topologyId,
+    topologySource: options.topologySource,
+    controllerSessionId: options.controllerSessionId,
+    cwd: options.cwd,
+    ...(options.title === undefined ? {} : { title: options.title }),
+    presetFile,
+    permissionPreset: options.permissionPreset,
+    ...(requestedSandbox === undefined ? {} : { sandbox: requestedSandbox as "read-only" | "workspace-write" | "danger-full-access" }),
+    provider: options.provider,
+    model: options.model,
+    reasoningEffort: options.reasoningEffort,
+    runtime: options.role.runtime,
+    requiredTools: (options.role as RoleConfig & { requiredTools?: string[] }).requiredTools,
+    signal: options.signal,
+  });
+  return {
+    roleId: options.role.id,
+    roleName: options.role.name,
+    sessionId,
+    presetId: blueprint.receipt.agentPreset,
+    sandbox: blueprint.receipt.sandbox,
+    ...(options.welcome === undefined ? {} : { welcome: options.welcome }),
+    ...(options.maxRounds === undefined ? {} : { maxRounds: options.maxRounds }),
+    ...(options.protocol === undefined ? {} : { protocol: options.protocol }),
+    blueprint,
+  };
+}
+
+async function readySnapshotAfterWrite(
+  activeTeamState: ActiveTeamStateStore,
+  cwd: string,
+  result: { snapshot?: ActiveTeamReady },
+  signal?: AbortSignal,
+): Promise<ActiveTeamReady> {
+  if (result.snapshot !== undefined) return result.snapshot;
+  const observed = await activeTeamState.read(cwd, { signal });
+  if (observed.kind === "ready") return observed;
+  throw new Error(`active team write did not return a ready snapshot (${observed.kind})`);
+}
+
+interface GovernedProvisionResult {
+  team: TeamState;
+  snapshot: ActiveTeamReady;
+  handles: AgentHandle[];
+}
+
+/** Reserve-first role provisioning transaction shared by create and spawn. */
+export async function provisionGovernedPlans(
+  ctx: Context,
+  activeTeamState: ActiveTeamStateStore,
+  exec: ToolExecutionInput,
+  cwd: string,
+  initialSnapshot: ActiveTeamReady,
+  plans: GovernedRolePlan[],
+  finalStatus: "active" | "degraded",
+  failureStatus: "failed" | "degraded",
+): Promise<GovernedProvisionResult> {
+  let snapshot = initialSnapshot;
+  let team = snapshot.team;
+  let snapshotUsable = true;
+  let failedRoleId: string | undefined;
+  const handles: AgentHandle[] = [];
+  const writeOptions = { policy: escrowPolicy(ctx, exec), signal: exec.signal };
+  try {
+    for (const plan of plans) {
+      failedRoleId = plan.roleId;
+      const provisioningTeam = updateTeamRole(team, plan.roleId, { phase: "provisioning", diagnostic: undefined });
+      let written;
+      try {
+        written = await activeTeamState.replace(snapshot, provisioningTeam, writeOptions);
+      } catch (error) {
+        snapshotUsable = false;
+        throw error;
+      }
+      snapshot = await readySnapshotAfterWrite(activeTeamState, cwd, written, exec.signal);
+      team = snapshot.team;
+
+      const created = await createSession(ctx, {
+        mode: "governed",
+        sessionId: plan.sessionId,
+        cwd,
+        governedBlueprint: plan.blueprint,
+        currentSessionId: exec.agent?.id,
+        returnHandle: true,
+        signal: exec.signal,
+      });
+      if (created.handle !== undefined) handles.push(created.handle);
+      const welcome = await sendRoleWelcome(
+        ctx,
+        exec.agent?.id ?? team.controllerSessionId,
+        created.sessionId,
+        plan.roleName,
+        plan.welcome,
+        {
+          ownership: plan.protocol?.ownership,
+          routes: plan.protocol?.routes,
+          completion: plan.protocol?.completion,
+          maxRounds: plan.maxRounds,
+        },
+      );
+      const activeRoleTeam = updateTeamRole(team, plan.roleId, {
+        phase: "active",
+        diagnostic: undefined,
+        welcome,
+        blueprint: roleBlueprintFacts(plan.blueprint.receipt),
+      });
+      try {
+        written = await activeTeamState.replace(snapshot, activeRoleTeam, writeOptions);
+      } catch (error) {
+        snapshotUsable = false;
+        throw error;
+      }
+      snapshot = await readySnapshotAfterWrite(activeTeamState, cwd, written, exec.signal);
+      team = snapshot.team;
+    }
+
+    failedRoleId = undefined;
+    const completedTeam: TeamState = { ...team, status: finalStatus };
+    let written;
+    try {
+      written = await activeTeamState.replace(snapshot, completedTeam, writeOptions);
+    } catch (error) {
+      snapshotUsable = false;
+      throw error;
+    }
+    snapshot = await readySnapshotAfterWrite(activeTeamState, cwd, written, exec.signal);
+    return { team: snapshot.team, snapshot, handles };
+  } catch (error) {
+    await disposeCreatedHandles(handles);
+    if (!snapshotUsable) {
+      throw new Error(`governed provisioning stopped after stale state CAS: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const diagnostic = provisioningDiagnostic(error);
+    const failedTeam = {
+      ...updateTeamRole(team, failedRoleId ?? "", failedRoleId === undefined ? {} : { phase: "failed", diagnostic }),
+      status: failureStatus,
+    } satisfies TeamState;
+    try {
+      const written = await activeTeamState.replace(snapshot, failedTeam, writeOptions);
+      snapshot = await readySnapshotAfterWrite(activeTeamState, cwd, written, exec.signal);
+    } catch (stateError) {
+      throw new Error(
+        `governed provisioning failed (${diagnostic.code}) and failure state could not be recorded: ${stateError instanceof Error ? stateError.message : String(stateError)}`,
+      );
+    }
+    throw error;
+  }
 }
 
 async function roleStatus(ctx: Context, role: TeamRole) {
@@ -542,8 +822,10 @@ async function roleStatus(ctx: Context, role: TeamRole) {
     sessionId: string;
     live: boolean;
     status: string;
+    phase: TeamRolePhase;
     reportCount: number;
     lastReport: string | null;
+    diagnostic?: TeamRoleDiagnostic;
     lastActivityAt?: number;
     lastActivity?: string;
   } = {
@@ -552,8 +834,10 @@ async function roleStatus(ctx: Context, role: TeamRole) {
     sessionId: role.sessionId,
     live: agent !== undefined,
     status: agent === undefined ? "cold" : agent.status,
+    phase: role.phase,
     reportCount: role.reportCount ?? 0,
     lastReport: role.lastReport ?? null,
+    ...(role.diagnostic === undefined ? {} : { diagnostic: role.diagnostic }),
   };
   try {
     const query = ctx.get("sessionQuery");
@@ -613,8 +897,17 @@ export function apply(ctx: Context): void {
       sessionId: { type: "string", required: true },
       live: { type: "boolean", required: true },
       status: { type: "string", required: true },
+      phase: { type: "string", required: true },
       reportCount: { type: "number", required: true },
       lastReport: { oneOf: [{ type: "string" }, { type: "null" }], required: true },
+      diagnostic: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          code: { type: "string", required: true },
+          message: { type: "string", required: true },
+        },
+      },
       lastActivityAt: { type: "number" },
       lastActivity: { type: "string" },
     },
@@ -639,6 +932,7 @@ export function apply(ctx: Context): void {
         acceptanceCriteria: { type: "array", items: { type: "string" }, description: "Optional acceptance criteria." },
         nonGoals: { type: "array", items: { type: "string" }, description: "Optional explicit non-goals." },
         context: { type: "string", description: "Optional project context." },
+        permissionPreset: { type: "string", description: "Base Permission Preset applied to every governed role; defaults to the deployment default." },
         provider: { type: "string", description: "Model provider override applied to every role session. Must be paired with model." },
         model: { type: "string", description: "Model override applied to every role session. Must be paired with provider." },
         reasoningEffort: { type: "string", description: "Reasoning effort override applied to every role session (e.g. \"medium\"). Requires provider and model." },
@@ -650,6 +944,7 @@ export function apply(ctx: Context): void {
           properties: {
             team_id: { type: "string", required: true },
             topology: { type: "string", required: true },
+            status: { type: "string", required: true },
             state_path: { type: "string", required: true },
             created_at: { type: "number", required: true },
             mission: {
@@ -675,6 +970,7 @@ export function apply(ctx: Context): void {
                   id: { type: "string", required: true },
                   sessionId: { type: "string", required: true },
                   live: { type: "boolean", required: true },
+                  phase: { type: "string", required: true },
                 },
               },
             },
@@ -696,6 +992,7 @@ export function apply(ctx: Context): void {
           acceptanceCriteria?: string[];
           nonGoals?: string[];
           context?: string;
+          permissionPreset?: string;
           provider?: string;
           model?: string;
           reasoningEffort?: string;
@@ -719,63 +1016,34 @@ export function apply(ctx: Context): void {
           throw topologyResolutionError("create a team", topologyResolution, available);
         }
         const topology = topologyResolution;
-        const roles: TeamRole[] = [];
-        if ((args.provider === undefined) !== (args.model === undefined))
-          throw new Error("provider and model must be provided together (both or neither)");
-        if (args.reasoningEffort !== undefined && (args.provider === undefined || args.model === undefined))
-          throw new Error("reasoningEffort requires provider and model");
-        const hasModelOverride =
-          args.provider !== undefined || args.model !== undefined || args.reasoningEffort !== undefined;
+        const teamId = `team-${randomUUID().slice(0, 8)}`;
+        const plans: GovernedRolePlan[] = [];
         for (const role of topology.config.roles) {
-          const presetFile =
-            role.preset === undefined || role.preset === null ? undefined : await resolvePresetFile(ctx, cwd, role.preset);
-          const created = await createSession(ctx, {
-            cwd,
-            ...(presetFile === undefined ? {} : { presetFile }),
-            ...(args.provider === undefined ? {} : { provider: args.provider }),
-            ...(args.model === undefined ? {} : { model: args.model }),
-            ...(args.reasoningEffort === undefined ? {} : { reasoningEffort: args.reasoningEffort }),
-            currentSessionId: exec.agent.id,
-            title: `${projectSlugFromCwd(cwd)} · ${role.name} · ${topology.config.id}`,
-            signal: exec.signal,
-          });
-          if (role.sandbox === "read-only") {
-            const session = ctx.sessions.get(SID(created.sessionId));
-            if (session !== undefined) session.append("sandbox/mode", { mode: "read-only" });
-          }
-          const record: TeamRole = {
-            id: role.id,
-            name: role.name,
-            sessionId: created.sessionId,
-            sessionHistory: [],
-            preset: role.preset === undefined || role.preset === null ? null : role.preset,
-            sandbox: role.sandbox ?? "workspace-write",
-            reportCount: 0,
-            lastReport: null,
-            ...(hasModelOverride
-              ? {
-                  model: {
-                    ...(args.provider === undefined ? {} : { provider: args.provider }),
-                    ...(args.model === undefined ? {} : { model: args.model }),
-                    ...(args.reasoningEffort === undefined ? {} : { reasoningEffort: args.reasoningEffort }),
-                  },
-                }
-              : {}),
-          };
-          roles.push(record);
-          const protocolText = roleProtocolText(exec.agent.id, role.name, {
-            ownership: topology.config.protocol?.ownership,
-            routes: topology.config.protocol?.routes,
-            completion: topology.config.protocol?.completion,
-            maxRounds: role.maxRounds,
-          });
-          const extra = [protocolText, role.welcome].filter((part) => typeof part === "string" && part !== "").join("\n\n");
-          sendRoleWelcome(ctx, exec.agent.id, created.sessionId, role.name, extra);
+          plans.push(
+            await prepareGovernedRolePlan(ctx, {
+              cwd,
+              teamId,
+              controllerSessionId: exec.agent.id,
+              topologyId: topology.config.id,
+              topologySource: topology.source,
+              role,
+              sandbox: role.sandbox,
+              welcome: role.welcome,
+              protocol: topology.config.protocol,
+              maxRounds: role.maxRounds,
+              permissionPreset: args.permissionPreset,
+              provider: args.provider,
+              model: args.model,
+              reasoningEffort: args.reasoningEffort,
+              title: `${projectSlugFromCwd(cwd)} · ${role.name} · ${topology.config.id}`,
+              signal: exec.signal,
+            }),
+          );
         }
         const team: TeamState = {
           schemaVersion: 1,
-          teamId: `team-${randomUUID().slice(0, 8)}`,
-          status: "active",
+          teamId,
+          status: "provisioning",
           rootCwd: cwd,
           controllerSessionId: exec.agent.id,
           controllerHistory: [],
@@ -790,23 +1058,27 @@ export function apply(ctx: Context): void {
           },
           createdAt: Date.now(),
           activatedFromArchiveId: null,
-          roles,
+          roles: plans.map(reservedRole),
           reports: [],
         };
-        const written = await activeTeamState.create(cwd, team, {
+        const reservation = await activeTeamState.create(cwd, team, {
           policy: escrowPolicy(ctx, exec),
           signal: exec.signal,
         });
+        const initialSnapshot = await readySnapshotAfterWrite(activeTeamState, cwd, reservation, exec.signal);
+        const provisioned = await provisionGovernedPlans(ctx, activeTeamState, exec, cwd, initialSnapshot, plans, "active", "failed");
         return {
-          team_id: team.teamId,
-          topology: team.topologyRef.id,
-          state_path: written.statePath,
-          created_at: team.createdAt,
-          mission: team.mission,
-          roles: team.roles.map((role) => ({
+          team_id: provisioned.team.teamId,
+          status: provisioned.team.status,
+          topology: provisioned.team.topologyRef.id,
+          state_path: reservation.statePath,
+          created_at: provisioned.team.createdAt,
+          mission: provisioned.team.mission,
+          roles: provisioned.team.roles.map((role) => ({
             id: role.id,
             sessionId: role.sessionId,
             live: ctx.agents.get(SID(role.sessionId)) !== undefined,
+            phase: role.phase,
           })),
         };
       },
@@ -822,7 +1094,8 @@ export function apply(ctx: Context): void {
         roleName: { type: "string", description: "Role name, e.g. \"implementer\" (required unless templateId+roleId are given)." },
         mission: { type: "string", description: "Role duties or current task summary; appended to the injected welcome." },
         presetId: { type: "string", description: "Agent preset id to mount; defaults to the deployment default." },
-        sandbox: { type: "string", enum: ["read-only"], description: "Optional sandbox mode for the role session." },
+        sandbox: { type: "string", enum: ["read-only", "workspace-write"], description: "Optional sandbox mode for the role session." },
+        permissionPreset: { type: "string", description: "Base Permission Preset for the governed role; defaults to the deployment default." },
         templateId: { type: "string", description: "Topology template id to source the role from (with roleId)." },
         roleId: { type: "string", description: "Role id inside the template to source preset/sandbox/welcome from." },
         provider: { type: "string", description: "Model provider override for the role session. Must be paired with model." },
@@ -837,6 +1110,8 @@ export function apply(ctx: Context): void {
             sessionId: { type: "string", required: true },
             roleName: { type: "string", required: true },
             topology: { type: "string", required: true },
+            status: { type: "string", required: true },
+            phase: { type: "string", required: true },
             roles: {
               type: "array",
               required: true,
@@ -846,6 +1121,7 @@ export function apply(ctx: Context): void {
                 properties: {
                   id: { type: "string", required: true },
                   sessionId: { type: "string", required: true },
+                  phase: { type: "string", required: true },
                 },
               },
             },
@@ -864,6 +1140,7 @@ export function apply(ctx: Context): void {
           mission?: string;
           presetId?: string;
           sandbox?: string;
+          permissionPreset?: string;
           templateId?: string;
           roleId?: string;
           provider?: string;
@@ -884,7 +1161,10 @@ export function apply(ctx: Context): void {
         let templateSandbox: string | undefined;
         let templateWelcome: string | undefined;
         let templateMaxRounds: number | undefined;
+        let templateRuntime: RoleConfig["runtime"] | undefined;
         let templateProtocol: TopologyProtocol | undefined;
+        let templateTopologyId: string | undefined;
+        let templateTopologySource: "project" | "global" | "bundled" | undefined;
         if (args.templateId !== undefined || args.roleId !== undefined) {
           if (args.templateId === undefined || args.roleId === undefined)
             throw new Error("templateId and roleId must be provided together");
@@ -900,7 +1180,10 @@ export function apply(ctx: Context): void {
           templateSandbox = source.sandbox;
           templateWelcome = source.welcome;
           templateMaxRounds = source.maxRounds;
+          templateRuntime = source.runtime;
           templateProtocol = topology.config.protocol;
+          templateTopologyId = topology.config.id;
+          templateTopologySource = topology.source;
         } else {
           const matched = await topologyCatalog.findRole(cwd, roleName, { signal: exec.signal });
           if (matched !== undefined) {
@@ -908,36 +1191,30 @@ export function apply(ctx: Context): void {
             templateSandbox = matched.role.sandbox;
             templateWelcome = matched.role.welcome;
             templateMaxRounds = matched.role.maxRounds;
+            templateRuntime = matched.role.runtime;
             templateProtocol = matched.topology.config.protocol;
+            templateTopologyId = matched.topology.config.id;
+            templateTopologySource = matched.topology.source;
           }
         }
         const effectivePreset = args.presetId !== undefined && args.presetId !== "" ? args.presetId : templatePreset;
         const effectiveSandbox = args.sandbox ?? templateSandbox;
-        if ((args.provider === undefined) !== (args.model === undefined))
-          throw new Error("provider and model must be provided together (both or neither)");
-        if (args.reasoningEffort !== undefined && (args.provider === undefined || args.model === undefined))
-          throw new Error("reasoningEffort requires provider and model");
         const teamObservation = await activeTeamState.read(cwd, { signal: exec.signal });
         throwIfBlocked("spawn a role", teamObservation);
+        if (teamObservation.kind === "ready" && teamObservation.team.status !== "active" && teamObservation.team.status !== "degraded") {
+          throw new Error(`cannot spawn a role while team status is ${teamObservation.team.status}; inspect the failed/provisioning state first`);
+        }
         let team: TeamState;
+        let existingStatus: "active" | "degraded" = "active";
         if (teamObservation.kind !== "ready") {
-          let source: "project" | "global" | "bundled" = "bundled";
-          if (args.templateId !== undefined) {
-            const topologyResolution = await topologyCatalog.resolve(cwd, args.templateId, { signal: exec.signal });
-            if (topologyResolution.kind !== "ready") {
-              const available = (await topologyCatalog.list(cwd, { signal: exec.signal })).ready.map((entry) => entry.config.id);
-              throw topologyResolutionError("create a team for spawned role", topologyResolution, available);
-            }
-            source = topologyResolution.source;
-          }
           team = {
             schemaVersion: 1,
             teamId: `team-${randomUUID().slice(0, 8)}`,
-            status: "active",
+            status: "provisioning",
             rootCwd: cwd,
             controllerSessionId: exec.agent.id,
             controllerHistory: [],
-            topologyRef: { id: args.templateId ?? "custom", source },
+            topologyRef: { id: templateTopologyId ?? args.templateId ?? "custom", source: templateTopologySource ?? "bundled" },
             mission: { objective: "", scope: [], constraints: [], acceptanceCriteria: [], nonGoals: [], context: "" },
             createdAt: Date.now(),
             activatedFromArchiveId: null,
@@ -946,6 +1223,7 @@ export function apply(ctx: Context): void {
           };
         } else {
           team = teamObservation.team;
+          existingStatus = team.status === "degraded" ? "degraded" : "active";
           if (team.roles.some((role) => role.id.toLowerCase() === roleName.toLowerCase())) {
             throw new Error(
               `role id "${roleName}" already exists in this team; choose a distinct roleName (e.g. "${roleName}-2", numeric suffixes still inherit the matching template's sandbox/preset), or pass templateId+roleId / sandbox:"read-only" explicitly`,
@@ -961,68 +1239,63 @@ export function apply(ctx: Context): void {
             const inBlueprint = blueprint.config.roles.some(
               (role) => role.id.toLowerCase() === base || String(role.name ?? role.id).toLowerCase() === base,
             );
-            if (!inBlueprint) team.topologyRef = { id: "custom", source: "bundled" };
+            if (!inBlueprint) team = { ...team, topologyRef: { id: "custom", source: "bundled" } };
           }
         }
-        const hasModelOverride =
-          args.provider !== undefined || args.model !== undefined || args.reasoningEffort !== undefined;
-        const presetFile =
-          effectivePreset === undefined || effectivePreset === null
-            ? undefined
-            : await resolvePresetFile(ctx, cwd, effectivePreset);
-        const created = await createSession(ctx, {
+        const roleConfig: RoleConfig = {
+          id: roleName,
+          name: roleName,
+          preset: effectivePreset,
+          sandbox: effectiveSandbox,
+          runtime: templateRuntime,
+          welcome: templateWelcome,
+        };
+        const plan = await prepareGovernedRolePlan(ctx, {
           cwd,
-          ...(presetFile === undefined ? {} : { presetFile }),
-          ...(args.provider === undefined ? {} : { provider: args.provider }),
-          ...(args.model === undefined ? {} : { model: args.model }),
-          ...(args.reasoningEffort === undefined ? {} : { reasoningEffort: args.reasoningEffort }),
-          currentSessionId: exec.agent.id,
+          teamId: team.teamId,
+          controllerSessionId: team.controllerSessionId,
+          topologyId: team.topologyRef.id,
+          topologySource: team.topologyRef.source,
+          role: roleConfig,
+          presetId: effectivePreset,
+          sandbox: effectiveSandbox,
+          welcome: [templateWelcome, args.mission].filter((part) => typeof part === "string" && part !== "").join("\n\n") || undefined,
+          protocol: templateProtocol,
+          maxRounds: templateMaxRounds,
+          permissionPreset: args.permissionPreset,
+          provider: args.provider,
+          model: args.model,
+          reasoningEffort: args.reasoningEffort,
           title: `${projectSlugFromCwd(cwd)} · ${roleName} · ${team.topologyRef.id}`,
           signal: exec.signal,
         });
-        if (effectiveSandbox === "read-only") {
-          const session = ctx.sessions.get(SID(created.sessionId));
-          if (session !== undefined) session.append("sandbox/mode", { mode: "read-only" });
-        }
-        const record: TeamRole = {
-          id: roleName,
-          name: roleName,
-          sessionId: created.sessionId,
-          sessionHistory: [],
-          preset: effectivePreset === undefined || effectivePreset === null ? null : effectivePreset,
-          sandbox: effectiveSandbox ?? "workspace-write",
-          reportCount: 0,
-          lastReport: null,
-          ...(hasModelOverride
-            ? {
-                model: {
-                  ...(args.provider === undefined ? {} : { provider: args.provider }),
-                  ...(args.model === undefined ? {} : { model: args.model }),
-                  ...(args.reasoningEffort === undefined ? {} : { reasoningEffort: args.reasoningEffort }),
-                },
-              }
-            : {}),
+        const reservedTeam: TeamState = {
+          ...team,
+          status: "provisioning",
+          roles: [...team.roles, reservedRole(plan)],
         };
-        team.roles.push(record);
         const writeOptions = { policy: escrowPolicy(ctx, exec), signal: exec.signal };
-        if (teamObservation.kind === "ready") {
-          await activeTeamState.replace(teamObservation, team, writeOptions);
-        } else {
-          await activeTeamState.create(cwd, team, writeOptions);
-        }
-        const protocolText = roleProtocolText(exec.agent.id, roleName, {
-          ownership: templateProtocol?.ownership,
-          routes: templateProtocol?.routes,
-          completion: templateProtocol?.completion,
-          maxRounds: templateMaxRounds,
-        });
-        const extra = [protocolText, templateWelcome, args.mission].filter((part) => typeof part === "string" && part !== "").join("\n\n");
-        sendRoleWelcome(ctx, exec.agent.id, created.sessionId, roleName, extra);
+        const reservation = teamObservation.kind === "ready"
+          ? await activeTeamState.replace(teamObservation, reservedTeam, writeOptions)
+          : await activeTeamState.create(cwd, reservedTeam, writeOptions);
+        const initialSnapshot = await readySnapshotAfterWrite(activeTeamState, cwd, reservation, exec.signal);
+        const provisioned = await provisionGovernedPlans(
+          ctx,
+          activeTeamState,
+          exec,
+          cwd,
+          initialSnapshot,
+          [plan],
+          existingStatus,
+          teamObservation.kind === "ready" ? "degraded" : "failed",
+        );
         return {
-          sessionId: created.sessionId,
+          sessionId: plan.sessionId,
           roleName,
-          topology: team.topologyRef.id,
-          roles: team.roles.map((role) => ({ id: role.id, sessionId: role.sessionId })),
+          topology: provisioned.team.topologyRef.id,
+          status: provisioned.team.status,
+          phase: provisioned.team.roles.find((role) => role.id === plan.roleId)?.phase ?? "active",
+          roles: provisioned.team.roles.map((role) => ({ id: role.id, sessionId: role.sessionId, phase: role.phase })),
         };
       },
     }),
@@ -1242,7 +1515,7 @@ export function apply(ctx: Context): void {
           const agent = ctx.agents.get(SID(role.sessionId));
           if (agent !== undefined) {
             // Step 5a: live → reused
-            sendRoleWelcome(ctx, exec.agent.id, role.sessionId, role.name, activationNotice);
+            await sendRoleWelcome(ctx, exec.agent.id, role.sessionId, role.name, activationNotice);
             results.push({ role_id: role.id, session_id: role.sessionId, action: "reused" });
             continue;
           }
@@ -1301,7 +1574,7 @@ export function apply(ctx: Context): void {
                 `IMPORTANT: your old conversation history was NOT inherited.`,
                 "The team has been reactivated. Wait for driver dispatch before starting new work.",
               ].join("\n");
-              sendRoleWelcome(ctx, exec.agent.id, role.sessionId, role.name, recoveryPacket);
+              await sendRoleWelcome(ctx, exec.agent.id, role.sessionId, role.name, recoveryPacket);
               results.push({ role_id: role.id, session_id: created.sessionId, action: "replaced", replaced_session_id: oldSessionId });
             } catch (error) {
               degraded = true;
@@ -1354,7 +1627,7 @@ export function apply(ctx: Context): void {
               ...(setup === undefined ? {} : { setup }),
               ...(exec.signal === undefined ? {} : { signal: exec.signal }),
             });
-            sendRoleWelcome(ctx, exec.agent.id, role.sessionId, role.name, activationNotice);
+            await sendRoleWelcome(ctx, exec.agent.id, role.sessionId, role.name, activationNotice);
             results.push({ role_id: role.id, session_id: role.sessionId, action: "resumed" });
           } catch (error) {
             degraded = true;
