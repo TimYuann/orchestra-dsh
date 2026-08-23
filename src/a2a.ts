@@ -67,6 +67,8 @@ export interface ResolvedPresetFile {
   trust: "system" | "user";
   /** Absolute path to the preset's agent.cordis.yml. */
   path: string;
+  /** Resolution layer; Governed Blueprint uses DSH-native ids through AgentPresets.mount. */
+  source?: "project" | "global" | "dsh" | "builtin";
 }
 
 /** Create one agent thread (session) with model default + preset composition. */

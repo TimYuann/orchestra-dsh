@@ -283,7 +283,7 @@ async function resolvePresetFile(ctx: Context, cwd: string, presetId: string): P
   try {
     const target = await ctx.fs.resolve(`${cwd}/.orchestra/presets/${presetId}/agent.cordis.yml`, { cwd });
     const info = await ctx.fs.stat(target);
-    if (info !== undefined) return { id: presetId, trust: "user", path: ctx.fs.processPath(target) };
+    if (info !== undefined) return { id: presetId, trust: "user", path: ctx.fs.processPath(target), source: "project" };
   } catch {
     // fall through
   }
@@ -291,7 +291,7 @@ async function resolvePresetFile(ctx: Context, cwd: string, presetId: string): P
   try {
     const presetPath = join(orchestraGlobalRoot(), "presets", presetId, "agent.cordis.yml");
     await fsStat(presetPath);
-    return { id: presetId, trust: "user", path: presetPath };
+    return { id: presetId, trust: "user", path: presetPath, source: "global" };
   } catch {
     // fall through
   }
@@ -300,7 +300,7 @@ async function resolvePresetFile(ctx: Context, cwd: string, presetId: string): P
   if (presets !== undefined) {
     try {
       const resolved = await presets.resolve(presetId);
-      return { id: resolved.id, trust: resolved.trust, path: resolved.path };
+      return { id: resolved.id, trust: resolved.trust, path: resolved.path, source: "dsh" };
     } catch {
       // fall through
     }
@@ -311,7 +311,7 @@ async function resolvePresetFile(ctx: Context, cwd: string, presetId: string): P
     throw new Error(`preset "${presetId}" not found (checked project .orchestra, global ${orchestraGlobalRoot()}, DSH presets, builtin)`);
   }
   const file = await ensureBuiltinPresetOnDisk(builtin);
-  return { id: builtin.id, trust: "user", path: file };
+  return { id: builtin.id, trust: "user", path: file, source: "builtin" };
 }
 
 /** Write one builtin preset to the global root if absent (install behavior; never overwrites). */
@@ -671,6 +671,7 @@ export async function prepareGovernedRolePlan(
   const requiredTools = (options.role as RoleConfig & { requiredTools?: string[] }).requiredTools;
   preflightGovernedRequiredTools({ requiredTools, presetId, presetFile });
   const sessionId = governedSessionId(options.teamId);
+  const presetInput = presetFile.source === "dsh" ? { presetId } : { presetFile };
   const blueprint = await prepareGovernedBlueprint(ctx, {
     sessionId,
     teamId: options.teamId,
@@ -681,7 +682,7 @@ export async function prepareGovernedRolePlan(
     controllerSessionId: options.controllerSessionId,
     cwd: options.cwd,
     ...(options.title === undefined ? {} : { title: options.title }),
-    presetFile,
+    ...presetInput,
     permissionPreset: options.permissionPreset,
     ...(requestedSandbox === undefined ? {} : { sandbox: requestedSandbox as "read-only" | "workspace-write" | "danger-full-access" }),
     provider: options.provider,
@@ -722,6 +723,11 @@ interface GovernedProvisionResult {
   handles: AgentHandle[];
 }
 
+export interface GovernedProvisionDependencies {
+  createSession?: typeof createSession;
+  sendRoleWelcome?: (ctx: Context, fromSessionId: string, toSessionId: string, roleName: string, extra?: string, protocol?: Parameters<typeof roleProtocolText>[2]) => Promise<TeamWelcomeReceipt>;
+}
+
 /** Reserve-first role provisioning transaction shared by create and spawn. */
 export async function provisionGovernedPlans(
   ctx: Context,
@@ -732,12 +738,15 @@ export async function provisionGovernedPlans(
   plans: GovernedRolePlan[],
   finalStatus: "active" | "degraded",
   failureStatus: "failed" | "degraded",
+  dependencies: GovernedProvisionDependencies = {},
 ): Promise<GovernedProvisionResult> {
   let snapshot = initialSnapshot;
   let team = snapshot.team;
   let snapshotUsable = true;
   let failedRoleId: string | undefined;
   const handles: AgentHandle[] = [];
+  const createRoleSession = dependencies.createSession ?? createSession;
+  const deliverRoleWelcome = dependencies.sendRoleWelcome ?? sendRoleWelcome;
   const writeOptions = { policy: escrowPolicy(ctx, exec), signal: exec.signal };
   try {
     for (const plan of plans) {
@@ -753,7 +762,7 @@ export async function provisionGovernedPlans(
       snapshot = await readySnapshotAfterWrite(activeTeamState, cwd, written, exec.signal);
       team = snapshot.team;
 
-      const created = await createSession(ctx, {
+      const created = await createRoleSession(ctx, {
         mode: "governed",
         sessionId: plan.sessionId,
         cwd,
@@ -763,7 +772,7 @@ export async function provisionGovernedPlans(
         signal: exec.signal,
       });
       if (created.handle !== undefined) handles.push(created.handle);
-      const welcome = await sendRoleWelcome(
+      const welcome = await deliverRoleWelcome(
         ctx,
         exec.agent?.id ?? team.controllerSessionId,
         created.sessionId,
@@ -823,6 +832,115 @@ export async function provisionGovernedPlans(
     }
     throw error;
   }
+}
+
+export interface OrchestraCreateArgs {
+  goal: string;
+  topology?: string;
+  scope?: string[];
+  constraints?: string[];
+  acceptanceCriteria?: string[];
+  nonGoals?: string[];
+  context?: string;
+  permissionPreset?: string;
+  provider?: string;
+  model?: string;
+  reasoningEffort?: string;
+}
+
+/** Bounded entrypoint used by orchestra_create and its integration harness. */
+export async function createGovernedTeam(
+  ctx: Context,
+  activeTeamState: ActiveTeamStateStore,
+  topologyCatalog: TopologyCatalog,
+  args: OrchestraCreateArgs,
+  exec: ToolExecutionInput,
+  dependencies: GovernedProvisionDependencies = {},
+) {
+  if (exec.agent === undefined) throw new Error("orchestra_create requires an agent caller");
+  const cwd = exec.agent.session.header.cwd;
+  if (cwd === undefined) throw new Error("current session has no working directory; cannot create a team");
+  const existing = await activeTeamState.read(cwd, { signal: exec.signal });
+  throwIfBlocked("create a team", existing);
+  if (existing.kind === "ready") {
+    throw new Error(
+      `a team already exists here (team=${existing.team.teamId}, topology=${existing.team.topologyRef.id}); run orchestra_dismiss to close it, or use another working directory`,
+    );
+  }
+  const objective = String(args.goal ?? "").trim();
+  if (objective === "") throw new Error("goal must not be empty");
+  const topologyResolution = await topologyCatalog.resolve(cwd, args.topology ?? "duo", { signal: exec.signal });
+  if (topologyResolution.kind !== "ready") {
+    const available = (await topologyCatalog.list(cwd, { signal: exec.signal })).ready.map((entry) => entry.config.id);
+    throw topologyResolutionError("create a team", topologyResolution, available);
+  }
+  const topology = topologyResolution;
+  const teamId = `team-${randomUUID().slice(0, 8)}`;
+  const plans: GovernedRolePlan[] = [];
+  for (const role of topology.config.roles) {
+    plans.push(
+      await prepareGovernedRolePlan(ctx, {
+        cwd,
+        teamId,
+        controllerSessionId: exec.agent.id,
+        topologyId: topology.config.id,
+        topologySource: topology.source,
+        role,
+        sandbox: role.sandbox,
+        welcome: role.welcome,
+        protocol: topology.config.protocol,
+        maxRounds: role.maxRounds,
+        permissionPreset: args.permissionPreset,
+        provider: args.provider,
+        model: args.model,
+        reasoningEffort: args.reasoningEffort,
+        title: `${projectSlugFromCwd(cwd)} · ${role.name} · ${topology.config.id}`,
+        signal: exec.signal,
+      }),
+    );
+  }
+  assertUniqueGovernedSessionIds(plans);
+  const team: TeamState = {
+    schemaVersion: 1,
+    teamId,
+    status: "provisioning",
+    rootCwd: cwd,
+    controllerSessionId: exec.agent.id,
+    controllerHistory: [],
+    topologyRef: { id: topology.config.id, source: topology.source },
+    mission: {
+      objective,
+      scope: args.scope ?? [],
+      constraints: args.constraints ?? [],
+      acceptanceCriteria: args.acceptanceCriteria ?? [],
+      nonGoals: args.nonGoals ?? [],
+      context: args.context ?? "",
+    },
+    createdAt: Date.now(),
+    activatedFromArchiveId: null,
+    roles: plans.map(reservedRole),
+    reports: [],
+  };
+  const reservation = await activeTeamState.create(cwd, team, {
+    policy: escrowPolicy(ctx, exec),
+    signal: exec.signal,
+  });
+  const initialSnapshot = await readySnapshotAfterWrite(activeTeamState, cwd, reservation, exec.signal);
+  const provisioned = await provisionGovernedPlans(ctx, activeTeamState, exec, cwd, initialSnapshot, plans, "active", "failed", dependencies);
+  return {
+    team_id: provisioned.team.teamId,
+    status: provisioned.team.status,
+    topology: provisioned.team.topologyRef.id,
+    state_path: reservation.statePath,
+    created_at: provisioned.team.createdAt,
+    mission: provisioned.team.mission,
+    roles: provisioned.team.roles.map((role) => ({
+      id: role.id,
+      sessionId: role.sessionId,
+      live: ctx.agents.get(SID(role.sessionId)) !== undefined,
+      phase: role.phase,
+    })),
+  };
 }
 
 async function roleStatus(ctx: Context, role: TeamRole) {
@@ -995,104 +1113,10 @@ export function apply(ctx: Context): void {
         ],
       },
       async execute(
-        args: {
-          goal: string;
-          topology?: string;
-          scope?: string[];
-          constraints?: string[];
-          acceptanceCriteria?: string[];
-          nonGoals?: string[];
-          context?: string;
-          permissionPreset?: string;
-          provider?: string;
-          model?: string;
-          reasoningEffort?: string;
-        },
+        args: OrchestraCreateArgs,
         exec: ToolExecutionInput,
       ) {
-        if (exec.agent === undefined) throw new Error("orchestra_create requires an agent caller");
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory; cannot create a team");
-        const existing = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("create a team", existing);
-        if (existing.kind === "ready")
-          throw new Error(
-            `a team already exists here (team=${existing.team.teamId}, topology=${existing.team.topologyRef.id}); run orchestra_dismiss to close it, or use another working directory`,
-          );
-        const objective = String(args.goal ?? "").trim();
-        if (objective === "") throw new Error("goal must not be empty");
-        const topologyResolution = await topologyCatalog.resolve(cwd, args.topology ?? "duo", { signal: exec.signal });
-        if (topologyResolution.kind !== "ready") {
-          const available = (await topologyCatalog.list(cwd, { signal: exec.signal })).ready.map((entry) => entry.config.id);
-          throw topologyResolutionError("create a team", topologyResolution, available);
-        }
-        const topology = topologyResolution;
-        const teamId = `team-${randomUUID().slice(0, 8)}`;
-        const plans: GovernedRolePlan[] = [];
-        for (const role of topology.config.roles) {
-          plans.push(
-            await prepareGovernedRolePlan(ctx, {
-              cwd,
-              teamId,
-              controllerSessionId: exec.agent.id,
-              topologyId: topology.config.id,
-              topologySource: topology.source,
-              role,
-              sandbox: role.sandbox,
-              welcome: role.welcome,
-              protocol: topology.config.protocol,
-              maxRounds: role.maxRounds,
-              permissionPreset: args.permissionPreset,
-              provider: args.provider,
-              model: args.model,
-              reasoningEffort: args.reasoningEffort,
-              title: `${projectSlugFromCwd(cwd)} · ${role.name} · ${topology.config.id}`,
-              signal: exec.signal,
-            }),
-          );
-        }
-        assertUniqueGovernedSessionIds(plans);
-        const team: TeamState = {
-          schemaVersion: 1,
-          teamId,
-          status: "provisioning",
-          rootCwd: cwd,
-          controllerSessionId: exec.agent.id,
-          controllerHistory: [],
-          topologyRef: { id: topology.config.id, source: topology.source },
-          mission: {
-            objective,
-            scope: args.scope ?? [],
-            constraints: args.constraints ?? [],
-            acceptanceCriteria: args.acceptanceCriteria ?? [],
-            nonGoals: args.nonGoals ?? [],
-            context: args.context ?? "",
-          },
-          createdAt: Date.now(),
-          activatedFromArchiveId: null,
-          roles: plans.map(reservedRole),
-          reports: [],
-        };
-        const reservation = await activeTeamState.create(cwd, team, {
-          policy: escrowPolicy(ctx, exec),
-          signal: exec.signal,
-        });
-        const initialSnapshot = await readySnapshotAfterWrite(activeTeamState, cwd, reservation, exec.signal);
-        const provisioned = await provisionGovernedPlans(ctx, activeTeamState, exec, cwd, initialSnapshot, plans, "active", "failed");
-        return {
-          team_id: provisioned.team.teamId,
-          status: provisioned.team.status,
-          topology: provisioned.team.topologyRef.id,
-          state_path: reservation.statePath,
-          created_at: provisioned.team.createdAt,
-          mission: provisioned.team.mission,
-          roles: provisioned.team.roles.map((role) => ({
-            id: role.id,
-            sessionId: role.sessionId,
-            live: ctx.agents.get(SID(role.sessionId)) !== undefined,
-            phase: role.phase,
-          })),
-        };
+        return createGovernedTeam(ctx, activeTeamState, topologyCatalog, args, exec);
       },
     }),
   );
