@@ -36,6 +36,7 @@ import type {
   TeamState,
 } from "./orchestra-state.js";
 import { createArchiveStore } from "./orchestra-archive.js";
+import type { ArchiveList } from "./orchestra-archive.js";
 import { mountPreset } from "@deepseek-ai/dsh-agent-presets";
 import "./relay-types.js";
 import { basename, join } from "node:path";
@@ -731,6 +732,45 @@ function throwIfBlocked(action: string, state: ActiveTeamRead): void {
   throw new Error(`cannot ${action}: active team state is blocked (${state.diagnostic.code}): ${state.diagnostic.message}`);
 }
 
+export interface OrchestraArchiveToolEntry {
+  archive_id: string;
+  filename: string;
+  status: "ready" | "blocked";
+  team_id: string;
+  goal: string;
+  topology: string;
+  dismissed_at: number;
+  archive_path: string;
+  diagnostic?: { code: string; message: string; fsCode?: string };
+}
+
+/** Canonical archive projection consumed by orchestra_team and its output schema. */
+export function archiveListForTeamTool(list: ArchiveList): OrchestraArchiveToolEntry[] {
+  return [
+    ...list.ready.map((archive) => ({
+      archive_id: archive.archiveId,
+      filename: archive.filename,
+      status: archive.status,
+      team_id: archive.teamId,
+      goal: archive.goal,
+      topology: archive.topology,
+      dismissed_at: archive.dismissedAt,
+      archive_path: archive.archivePath,
+    })),
+    ...list.blocked.map((archive) => ({
+      archive_id: archive.archiveId,
+      filename: archive.filename,
+      status: archive.status,
+      team_id: "",
+      goal: "",
+      topology: "",
+      dismissed_at: 0,
+      archive_path: archive.archivePath,
+      diagnostic: archive.diagnostic,
+    })),
+  ];
+}
+
 /** Role self-awareness protocol (spec §8.2): identity, reply, dispatch, handoff, decision rights, routes, completion. */
 function roleProtocolText(
   executorSessionId: string,
@@ -1360,6 +1400,7 @@ export function apply(ctx: Context): void {
                     properties: {
                       code: { type: "string", required: true },
                       message: { type: "string", required: true },
+                      fsCode: { type: "string" },
                     },
                   },
                 },
@@ -1396,29 +1437,7 @@ export function apply(ctx: Context): void {
         const teamObservation = await activeTeamState.read(cwd, { signal: exec.signal });
         throwIfBlocked("inspect the team", teamObservation);
         const archiveList = await archiveStore.list(cwd, { signal: exec.signal });
-        const archives = [
-          ...archiveList.ready.map((a) => ({
-            archive_id: a.archiveId,
-            filename: a.filename,
-            status: a.status,
-            team_id: a.teamId,
-            goal: a.goal,
-            topology: a.topology,
-            dismissed_at: a.dismissedAt,
-            archive_path: a.archivePath,
-          })),
-          ...archiveList.blocked.map((a) => ({
-            archive_id: a.archiveId,
-            filename: a.filename,
-            status: a.status,
-            team_id: "",
-            goal: "",
-            topology: "",
-            dismissed_at: 0,
-            archive_path: a.archivePath,
-            diagnostic: a.diagnostic,
-          })),
-        ];
+        const archives = archiveListForTeamTool(archiveList);
         if (teamObservation.kind !== "ready") return { team: null, archives };
         const team = teamObservation.team;
         return {

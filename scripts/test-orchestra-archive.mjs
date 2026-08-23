@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { ActiveTeamStateError, createActiveTeamStateStore } from "../lib/orchestra-state.js";
 import { ArchiveStoreError, createArchiveStore } from "../lib/orchestra-archive.js";
+import { archiveListForTeamTool } from "../lib/orchestra.js";
 
 const cwd = "/archive-test-workspace";
 
@@ -20,6 +21,7 @@ class TemporaryArchiveFs {
     this.root = root;
     this.lastExpected = undefined;
     this.failList = undefined;
+    this.failEntry = undefined;
   }
 
   absolute(path) {
@@ -40,6 +42,9 @@ class TemporaryArchiveFs {
   }
 
   async stat(target) {
+    if (this.failEntry !== undefined && target.displayPath.endsWith(this.failEntry.filename)) {
+      throw this.failEntry.error;
+    }
     try {
       const info = await stat(target.displayPath);
       const type = info.isFile() ? "file" : info.isDirectory() ? "directory" : "other";
@@ -243,6 +248,28 @@ test("archive directory IO failure is not reported as an empty list", async () =
       () => store.list(cwd),
       (error) => error instanceof ArchiveStoreError && error.code === "list_failed" && error.fsCode === "FS_IO_ERROR",
     );
+  });
+});
+
+test("orchestra_team archive projection preserves per-entry fs diagnostics and schema shape", async () => {
+  await withTempFs(async (fs) => {
+    await fs.seed("orchestra/archive/fs-error.json", { schemaVersion: 1, status: "dismissed", ...team() });
+    fs.failEntry = { filename: "fs-error.json", error: new FsTestError("FS_IO_ERROR", "entry stat failed") };
+    const store = createArchiveStore(fs);
+    const archiveList = await store.list(cwd);
+    const output = archiveListForTeamTool(archiveList);
+    const blocked = output.find((entry) => entry.filename === "fs-error.json");
+    assert.notEqual(blocked, undefined);
+    assert.equal(blocked.archive_id, "fs-error");
+    assert.equal(blocked.filename, "fs-error.json");
+    assert.equal(blocked.status, "blocked");
+    assert.equal(blocked.diagnostic.code, "filesystem");
+    assert.equal(blocked.diagnostic.fsCode, "FS_IO_ERROR");
+    assert.deepEqual(
+      Object.keys(blocked).sort(),
+      ["archive_id", "archive_path", "diagnostic", "dismissed_at", "filename", "goal", "status", "team_id", "topology"].sort(),
+    );
+    assert.deepEqual(Object.keys(blocked.diagnostic).sort(), ["code", "fsCode", "message"].sort());
   });
 });
 
