@@ -7,7 +7,7 @@
  */
 
 import type { Context } from "@deepseek-ai/cordis";
-import { createUserMessage, ReasoningEffortId } from "@deepseek-ai/dsh-llm";
+import { createUserMessage, freezeMessage, MessageId, ReasoningEffortId } from "@deepseek-ai/dsh-llm";
 import type { ContentBlock, MessageSource } from "@deepseek-ai/dsh-llm";
 import { mountPreset, resolveSessionPreset } from "@deepseek-ai/dsh-agent-presets";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
@@ -37,6 +37,62 @@ export interface MessageStatusResult {
   evidence?: string;
 }
 
+type TransportOptions = { wake?: boolean; replyTo?: string; interrupt?: boolean; idempotencyKey?: string };
+
+const receiptCache = new WeakMap<object, Map<string, DeliverResult>>();
+const inflightCache = new WeakMap<object, Map<string, Promise<DeliverResult>>>();
+
+function keyOf(options: TransportOptions): string | undefined {
+  if (options.idempotencyKey === undefined) return undefined;
+  if (typeof options.idempotencyKey !== "string" || options.idempotencyKey === "" || options.idempotencyKey.length > 256) {
+    throw new Error("a2a transport: idempotencyKey must be a non-empty string of at most 256 characters");
+  }
+  return options.idempotencyKey;
+}
+
+function isA2AMessage(value: unknown, messageId: string): boolean {
+  if (typeof value !== "object" || value === null || (value as { id?: unknown }).id !== messageId) return false;
+  const source = (value as { source?: unknown }).source;
+  return typeof source === "object" && source !== null && (source as { kind?: unknown }).kind === "a2a" && (source as { form?: unknown }).form === "relay";
+}
+
+function eventsContainA2AMessage(events: readonly { type: string; data: any }[], messageId: string): boolean {
+  return events.some((event) => {
+    if (event.type === "agent/inbox/spliced") return event.data.inserted.some((message: unknown) => isA2AMessage(message, messageId));
+    return event.type === "user/message" && isA2AMessage(event.data, messageId);
+  });
+}
+
+function acceptedReceipt(messageId: string, targetSessionId: string, deliveryMode: DeliveryMode, acceptedAt = Date.now()): DeliverResult {
+  return { message_id: messageId, target_session_id: targetSessionId, accepted_at_ms: acceptedAt, delivery_mode: deliveryMode, state: "accepted" };
+}
+
+async function existingReceipt(ctx: Context, targetSessionId: string, messageId: string): Promise<DeliverResult | undefined> {
+  const cached = receiptCache.get(ctx)?.get(`${targetSessionId}\0${messageId}`);
+  if (cached !== undefined) return cached;
+  const live = ctx.agents.get(SID(targetSessionId));
+  if (live !== undefined) {
+    const pending = [...(live.inbox?.nextTurn ?? []), ...(live.inbox?.nextStep ?? [])];
+    if (pending.some((message) => isA2AMessage(message, messageId)) || eventsContainA2AMessage(live.session.events, messageId)) {
+      return acceptedReceipt(messageId, targetSessionId, "live_inbox");
+    }
+  }
+  const session = ctx.sessions.get(SID(targetSessionId));
+  if (session !== undefined && eventsContainA2AMessage(session.events, messageId)) {
+    return acceptedReceipt(messageId, targetSessionId, "durable_inbox");
+  }
+  try {
+    const query = ctx.get("sessionQuery");
+    if (query !== undefined) {
+      const snapshot = await query.readSession(SID(targetSessionId));
+      if (eventsContainA2AMessage(snapshot.events, messageId)) return acceptedReceipt(messageId, targetSessionId, "durable_inbox");
+    }
+  } catch {
+    // A status/duplicate lookup failure must not make a new raw delivery fail.
+  }
+  return undefined;
+}
+
 async function tryResume(ctx: Context, sessionId: string): Promise<void> {
   const presets = ctx.get("agentPresets");
   const query = ctx.get("sessionQuery");
@@ -47,7 +103,12 @@ async function tryResume(ctx: Context, sessionId: string): Promise<void> {
   const governed = readGovernedBlueprint(snapshot.events);
   const lightweight = readLightweightBlueprint(snapshot.events);
   const presetId = governed?.agentPreset ?? lightweight?.agentPreset ?? resolveSessionPreset({ header: snapshot.session, events: snapshot.events });
-  const resolved = await presets.resolve(presetId);
+  if (typeof presetId !== "string" || presetId === "") throw new Error(`a2a transport: session ${sessionId} has no recoverable Agent Preset`);
+  const marker = governed ?? lightweight;
+  const presetFile = marker?.presetSource === "file" && marker.presetPath !== undefined
+    ? { id: presetId, trust: marker.presetTrust ?? "user", path: marker.presetPath }
+    : undefined;
+  const resolved = presetFile === undefined ? await presets.resolve(presetId) : undefined;
   const model = ctx.get("agentDefaultModel");
   const selection = model === undefined ? undefined : model.currentSelection();
   const provider = governed?.provider ?? lightweight?.provider ?? selection?.provider;
@@ -57,7 +118,12 @@ async function tryResume(ctx: Context, sessionId: string): Promise<void> {
     resumeSessionId: SID(sessionId),
     agentOptions: provider === undefined || modelId === undefined ? {} : { provider, model: modelId },
     setup: async (agentCtx) => {
-      await presets.mount(agentCtx, resolved.id);
+      if (presetFile === undefined) {
+        if (resolved === undefined) throw new Error(`a2a transport: preset ${presetId} was not resolved`);
+        await presets.mount(agentCtx, resolved.id);
+      } else {
+        await mountPreset(agentCtx, presetFile);
+      }
       if (provider !== undefined && modelId !== undefined) {
         installModelSelection(agentCtx, {
           current: {
@@ -83,24 +149,31 @@ function pendingLength(session: { events: readonly { type: string; data: any }[]
   return Math.max(length, 0);
 }
 
-/** Deliver one raw SessionId-addressed message. No Team/CWD/FS policy is consulted. */
-export async function deliverMessage(
+async function deliverMessageOnce(
   ctx: Context,
   senderSessionId: string | undefined,
   toSessionId: string,
   contentBlocks: ContentBlock[],
-  options: { wake?: boolean; replyTo?: string; interrupt?: boolean } = {},
+  options: TransportOptions = {},
 ): Promise<DeliverResult> {
   if (typeof toSessionId !== "string" || toSessionId === "") throw new Error("a2a transport: target session id must be non-empty");
   const wake = options.wake !== false;
   const acceptedAt = Date.now();
-  const message = createUserMessage({
-    content: contentBlocks,
-    source: Object.assign(
-      { kind: "a2a", form: "relay", senderSessionId },
-      options.replyTo === undefined ? {} : { replyTo: options.replyTo },
-    ) as MessageSource,
-  });
+  const source = Object.assign(
+    { kind: "a2a", form: "relay", senderSessionId },
+    options.replyTo === undefined ? {} : { replyTo: options.replyTo },
+  ) as MessageSource;
+  const message = options.idempotencyKey === undefined
+    ? createUserMessage({
+        content: contentBlocks,
+        source,
+      })
+    : freezeMessage({
+        id: MessageId(options.idempotencyKey),
+        role: "user" as const,
+        content: contentBlocks,
+        source,
+      });
   const live = ctx.agents.get(SID(toSessionId));
   if (live !== undefined) {
     if (options.interrupt === true) {
@@ -156,6 +229,45 @@ export async function deliverMessage(
   };
 }
 
+/** Deliver one raw SessionId-addressed message. No Team/CWD/FS policy is consulted. */
+export async function deliverMessage(
+  ctx: Context,
+  senderSessionId: string | undefined,
+  toSessionId: string,
+  contentBlocks: ContentBlock[],
+  options: TransportOptions = {},
+): Promise<DeliverResult> {
+  const key = keyOf(options);
+  if (key === undefined) return deliverMessageOnce(ctx, senderSessionId, toSessionId, contentBlocks, options);
+  const cacheKey = `${toSessionId}\0${key}`;
+  const inflight = inflightCache.get(ctx) ?? new Map<string, Promise<DeliverResult>>();
+  const prior = inflight.get(cacheKey);
+  if (prior !== undefined) return prior;
+  const promise = (async () => {
+    const cached = receiptCache.get(ctx)?.get(cacheKey);
+    if (cached !== undefined) return cached;
+    const existing = await existingReceipt(ctx, toSessionId, key);
+    if (existing !== undefined) {
+      const cache = receiptCache.get(ctx) ?? new Map<string, DeliverResult>();
+      cache.set(cacheKey, existing);
+      receiptCache.set(ctx, cache);
+      return existing;
+    }
+    const result = await deliverMessageOnce(ctx, senderSessionId, toSessionId, contentBlocks, options);
+    const cache = receiptCache.get(ctx) ?? new Map<string, DeliverResult>();
+    cache.set(cacheKey, result);
+    receiptCache.set(ctx, cache);
+    return result;
+  })();
+  inflight.set(cacheKey, promise);
+  inflightCache.set(ctx, inflight);
+  try {
+    return await promise;
+  } finally {
+    inflight.delete(cacheKey);
+  }
+}
+
 function idOf(value: unknown): string | undefined {
   return typeof value === "object" && value !== null && typeof (value as { id?: unknown }).id === "string" ? (value as { id: string }).id : undefined;
 }
@@ -187,15 +299,15 @@ export async function queryMessageStatus(ctx: Context, messageId: string, target
     let answered = false;
     for (const event of events) {
       if (event.type === "agent/inbox/spliced") {
-        if (event.data.inserted.some((message: unknown) => idOf(message) === messageId)) accepted = true;
+        if (event.data.inserted.some((message: unknown) => isA2AMessage(message, messageId))) accepted = true;
       } else if (event.type === "user/message") {
-        if (idOf(event.data) === messageId) claimed = true;
+        if (isA2AMessage(event.data, messageId)) claimed = true;
       } else if (event.type === "assistant/message") {
         if (replyToOf(event.data.message) === messageId || replyToOf(event.data) === messageId) answered = true;
       }
     }
-    if (answered) return { message_id: messageId, target_session_id: targetSessionId, state: "answered", evidence: "correlated assistant response" };
-    if (claimed) return { message_id: messageId, target_session_id: targetSessionId, state: "claimed", evidence: "target user/message event" };
+    if (answered && (accepted || claimed)) return { message_id: messageId, target_session_id: targetSessionId, state: "answered", evidence: "correlated assistant response" };
+    if (claimed) return { message_id: messageId, target_session_id: targetSessionId, state: "claimed", evidence: "target A2A user/message event" };
     if (accepted) return { message_id: messageId, target_session_id: targetSessionId, state: "accepted", evidence: "durable inbox splice" };
     return { message_id: messageId, target_session_id: targetSessionId, state: "unknown", evidence: "no correlated lifecycle event" };
   } catch (error) {

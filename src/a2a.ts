@@ -626,6 +626,7 @@ export interface RawA2ASendArgs {
   message: string;
   wake?: boolean;
   interrupt?: boolean;
+  idempotencyKey?: string;
 }
 
 /** Bounded raw-send entrypoint shared by a2a_send and its cross-cwd harness. */
@@ -635,7 +636,7 @@ export async function sendRawA2A(ctx: Context, args: RawA2ASendArgs, exec: ToolE
   return deliverMessage(ctx, exec.agent.id, args.to, [
     { type: "text", text: `Message from agent ${exec.agent.id}:` },
     { type: "text", text: args.message },
-  ], { wake: args.wake, interrupt: args.interrupt === true });
+  ], { wake: args.wake, interrupt: args.interrupt === true, idempotencyKey: args.idempotencyKey });
 }
 
 export function apply(ctx: Context): void {
@@ -830,6 +831,7 @@ export function apply(ctx: Context): void {
         message: { type: "string", required: true, description: "The message text for the target agent." },
         wake: { type: "boolean", description: "Wake the target to process the message now. Defaults to true." },
         interrupt: { type: "boolean", description: "Deliver as an immediate mid-turn interrupt (steering into the target's nearest step boundary) when the target is running. Idle targets are woken immediately either way. Defaults to false." },
+        idempotencyKey: { type: "string", description: "Optional retry key; repeated delivery with the same target and key returns the original accepted receipt." },
       },
       output: { schema: outputSchema, render: renderResult },
       async execute(args: RawA2ASendArgs, exec: ToolExecutionInput) {
@@ -848,15 +850,16 @@ export function apply(ctx: Context): void {
         reply_to: { type: "string", required: true, description: "Message id you are answering, or a short marker such as \"your last message\". Note: the argument name is reply_to (underscore)." },
         message: { type: "string", required: true, description: "Your reply text." },
         interrupt: { type: "boolean", description: "Deliver as an immediate mid-turn interrupt (steering into the target's nearest step boundary) when the target is running. Defaults to false." },
+        idempotency_key: { type: "string", description: "Optional retry key; repeated delivery with the same target and key returns the original accepted receipt." },
       },
       output: { schema: outputSchema, render: renderResult },
-      async execute(args: { to: string; reply_to: string; message: string; interrupt?: boolean }, exec: ToolExecutionInput) {
+      async execute(args: { to: string; reply_to: string; message: string; interrupt?: boolean; idempotency_key?: string }, exec: ToolExecutionInput) {
         if (exec.agent === undefined) throw new Error("a2a_reply requires an agent caller");
         if (args.to === exec.agent.id) throw new Error("a2a: cannot reply to yourself");
         return deliverMessage(ctx, exec.agent.id, args.to, [
           { type: "text", text: `Reply from agent ${exec.agent.id} (to message ${args.reply_to}):` },
           { type: "text", text: args.message },
-        ], { replyTo: args.reply_to, interrupt: args.interrupt === true });
+        ], { replyTo: args.reply_to, interrupt: args.interrupt === true, idempotencyKey: args.idempotency_key });
       },
     }),
   );

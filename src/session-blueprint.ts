@@ -30,6 +30,9 @@ export interface LightweightBlueprintMarker {
   schemaVersion: 1;
   mode: "lightweight";
   agentPreset: string;
+  presetSource?: "file" | "dsh";
+  presetPath?: string;
+  presetTrust?: "system" | "user";
   permissionPreset: string;
   provider: string;
   model: string;
@@ -49,6 +52,9 @@ export interface GovernedBlueprintMarker {
   topologySource: "project" | "global" | "bundled";
   controllerSessionId: string;
   agentPreset: string;
+  presetSource?: "file" | "dsh";
+  presetPath?: string;
+  presetTrust?: "system" | "user";
   permissionPreset: string;
   effectivePermissionPreset: string;
   approval: string;
@@ -298,6 +304,7 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
   let presetStrategy: "file" | "explicit" | "inherit" | "default";
   let resolvedPreset: { id: string } | undefined;
   if (input.presetFile !== undefined) {
+    if (typeof input.presetFile.path !== "string" || input.presetFile.path === "") throw new SessionBlueprintError("preset_unavailable", "lightweight presetFile path must be non-empty");
     agentPreset = input.presetFile.id;
     presetStrategy = "file";
   } else if (asString(input.presetId) !== undefined) {
@@ -335,6 +342,9 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
     schemaVersion: LIGHTWEIGHT_BLUEPRINT_SCHEMA_VERSION,
     mode: "lightweight",
     agentPreset,
+    ...(input.presetFile === undefined
+      ? { presetSource: "dsh" as const }
+      : { presetSource: "file" as const, presetPath: input.presetFile.path, presetTrust: input.presetFile.trust }),
     permissionPreset,
     provider: model.provider,
     model: model.model,
@@ -350,6 +360,9 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
     sessionId,
     ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
     agentPreset,
+    ...(input.presetFile === undefined
+      ? { presetSource: "dsh" as const }
+      : { presetSource: "file" as const, presetPath: input.presetFile.path, presetTrust: input.presetFile.trust }),
     permissionPreset,
     provider: model.provider,
     model: model.model,
@@ -498,6 +511,7 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
   let resolvedPreset: { id: string } | undefined;
   if (input.presetFile !== undefined) {
     if (typeof input.presetFile.id !== "string" || input.presetFile.id === "") throw new SessionBlueprintError("preset_unavailable", "governed presetFile id must be non-empty");
+    if (typeof input.presetFile.path !== "string" || input.presetFile.path === "") throw new SessionBlueprintError("preset_unavailable", "governed presetFile path must be non-empty");
     agentPreset = input.presetFile.id;
     presetStrategy = "file";
   } else if (asString(input.presetId) !== undefined) {
@@ -590,6 +604,9 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
       topologySource: input.topologySource,
       controllerSessionId: input.controllerSessionId,
       agentPreset,
+      ...(input.presetFile === undefined
+        ? { presetSource: "dsh" as const }
+        : { presetSource: "file" as const, presetPath: input.presetFile.path, presetTrust: input.presetFile.trust }),
       permissionPreset,
       effectivePermissionPreset,
       approval: permissionSpec.approval,
@@ -655,6 +672,10 @@ export function readLightweightBlueprint(events: readonly SessionEvent[]): Light
       if (!nonEmptyString(marker.agentPreset) || !nonEmptyString(marker.permissionPreset) || !nonEmptyString(marker.provider) || !nonEmptyString(marker.model) || !nonEmptyString(marker.createdBySessionId)) return undefined;
       if (typeof marker.createdAt !== "number" || !Number.isFinite(marker.createdAt)) return undefined;
       if (("reasoningEffort" in marker && typeof marker.reasoningEffort !== "string") || ("cwd" in marker && typeof marker.cwd !== "string") || ("title" in marker && typeof marker.title !== "string")) return undefined;
+      if (marker.presetSource !== undefined && marker.presetSource !== "file" && marker.presetSource !== "dsh") return undefined;
+      if (marker.presetSource === "file" && (!nonEmptyString(marker.presetPath) || (marker.presetTrust !== "system" && marker.presetTrust !== "user"))) return undefined;
+      if (marker.presetPath !== undefined && typeof marker.presetPath !== "string") return undefined;
+      if (marker.presetTrust !== undefined && marker.presetTrust !== "system" && marker.presetTrust !== "user") return undefined;
       if (GOVERNED_IDENTITY_FIELDS.some((field) => field in marker)) return undefined;
       return marker as LightweightBlueprintMarker;
     } catch {
@@ -681,6 +702,10 @@ export function readGovernedBlueprint(events: readonly SessionEvent[]): Governed
       if (typeof marker.createdAt !== "number" || !Number.isFinite(marker.createdAt)) return undefined;
       if (!nonEmptyString(marker.cwd)) return undefined;
       if (("reasoningEffort" in marker && typeof marker.reasoningEffort !== "string") || ("title" in marker && typeof marker.title !== "string")) return undefined;
+      if (marker.presetSource !== undefined && marker.presetSource !== "file" && marker.presetSource !== "dsh") return undefined;
+      if (marker.presetSource === "file" && (!nonEmptyString(marker.presetPath) || (marker.presetTrust !== "system" && marker.presetTrust !== "user"))) return undefined;
+      if (marker.presetPath !== undefined && typeof marker.presetPath !== "string") return undefined;
+      if (marker.presetTrust !== undefined && marker.presetTrust !== "system" && marker.presetTrust !== "user") return undefined;
       if ("createdBySessionId" in marker || "topology" in marker || "roles" in marker) return undefined;
       return marker as GovernedBlueprintMarker;
     } catch {

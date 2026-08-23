@@ -951,6 +951,7 @@ export interface OrchestraSendArgs {
   message: string;
   wake?: boolean;
   interrupt?: boolean;
+  idempotencyKey?: string;
 }
 
 /** Governed role-addressed send entrypoint; raw Transport remains shared. */
@@ -968,7 +969,7 @@ export async function sendGovernedRole(
   const receipt = await deliverMessage(ctx, exec.agent.id, address.resolved_session_id, [
     { type: "text", text: `Governed dispatch from ${exec.agent.id} to ${address.team_id}/${address.role_id}:` },
     { type: "text", text: args.message },
-  ], { wake: args.wake, interrupt: args.interrupt === true });
+  ], { wake: args.wake, interrupt: args.interrupt === true, idempotencyKey: args.idempotencyKey });
   return { team_id: address.team_id, role_id: address.role_id, resolved_session_id: address.resolved_session_id, receipt };
 }
 
@@ -1378,6 +1379,7 @@ export function apply(ctx: Context): void {
         message: { type: "string", required: true, description: "Self-contained dispatch or handoff message." },
         wake: { type: "boolean", description: "Wake the role; defaults to true." },
         interrupt: { type: "boolean", description: "Best-effort steering interrupt; defaults to false." },
+        idempotencyKey: { type: "string", description: "Optional retry key; repeated delivery to this role with the same key returns the original accepted receipt." },
       },
       output: {
         schema: {
@@ -1405,7 +1407,7 @@ export function apply(ctx: Context): void {
         },
         render: (_args, value) => [{ type: "text", text: `role ${value.team_id}/${value.role_id} resolved to ${value.resolved_session_id}; message ${value.receipt.message_id} ${value.receipt.state} (accepted only)` }],
       },
-      async execute(args: { teamId: string; roleId: string; message: string; wake?: boolean; interrupt?: boolean }, exec: ToolExecutionInput) {
+      async execute(args: OrchestraSendArgs, exec: ToolExecutionInput) {
         return sendGovernedRole(ctx, governedAddress, args, exec);
       },
     }),
