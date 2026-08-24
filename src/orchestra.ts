@@ -702,6 +702,34 @@ export async function preparseDraftRoleFacts(ctx: Context, cwd: string, role: Ro
   };
 }
 
+/** Markdown table cells; missing/empty values render as "-" for a stable grid. */
+function tableCell(value: string | undefined): string {
+  return value === undefined || value === "" ? "-" : value;
+}
+
+/**
+ * Render the per-role blueprint preview as a Markdown table (rendered as a
+ * table card by the GUI). Header + separator + one row per role; an empty
+ * preview yields just the header and separator.
+ */
+export function renderDraftBlueprintTable(preview: readonly DraftRoleFacts[]): string {
+  const header = "| 角色 | preset | sandbox | permission | model | reasoningEffort | compositionTools | orchestraTools |";
+  const separator = "| --- | --- | --- | --- | --- | --- | --- | --- |";
+  const rows = preview.map((role) =>
+    `| ${[
+      tableCell(role.roleId),
+      tableCell(role.preset),
+      tableCell(role.sandbox),
+      tableCell(role.effectivePermissionPreset),
+      `${tableCell(role.provider)}/${tableCell(role.model)}`,
+      tableCell(role.reasoningEffort),
+      (role.compositionTools ?? []).join(", "),
+      (role.orchestraTools ?? []).join(", "),
+    ].join(" | ")} |`,
+  );
+  return [header, separator, ...rows].join("\n");
+}
+
 async function readySnapshotAfterWrite(
   activeTeamState: ActiveTeamStateStore,
   cwd: string,
@@ -2141,14 +2169,10 @@ export function apply(ctx: Context): void {
           },
         },
         render: (_args, value) => {
-          const lines = [`charter draft ${value.draft_id}@${value.revision} (${value.approval_status}) digest=${value.digest}`];
-          for (const rawRole of value.role_blueprint_preview ?? []) {
-            const role = rawRole as unknown as DraftRoleFacts;
-            lines.push(
-              `role ${role.roleId}: preset=${role.preset}${role.presetSource === undefined ? "" : ` (${role.presetSource})`} sandbox=${role.sandbox} permission=${role.permissionPreset} model=${role.provider}/${role.model}${role.reasoningEffort === undefined ? "" : ` reasoningEffort=${role.reasoningEffort}`} compositionTools=[${(role.compositionTools ?? []).join(", ")}] orchestraTools=[${(role.orchestraTools ?? []).join(", ")}]`,
-            );
-          }
-          return [{ type: "text", text: lines.join("\n") }];
+          const preview = (value.role_blueprint_preview ?? []) as unknown as DraftRoleFacts[];
+          const table = renderDraftBlueprintTable(preview);
+          const summary = `charter draft ${value.draft_id}@${value.revision} (${value.approval_status}) digest=${value.digest}`;
+          return [{ type: "text", text: `${table}\n${summary}` }];
         },
       },
       async execute(args: CharterDraftToolArgs, exec: ToolExecutionInput) {
@@ -3184,6 +3208,40 @@ export function apply(ctx: Context): void {
                     graph_status: { type: "string" },
                     graph_runtime_revision: { type: "number" },
                     graph_stale: { type: "boolean" },
+                    graph: {
+                      oneOf: [
+                        {
+                          type: "object",
+                          additionalProperties: false,
+                          properties: {
+                            status: { type: "string", required: true },
+                            runtime_revision: { type: "number", required: true },
+                            stale: { type: "boolean", required: true },
+                            current_loop: {
+                              oneOf: [
+                                {
+                                  type: "object",
+                                  additionalProperties: false,
+                                  properties: {
+                                    loop_id: { type: "string", required: true },
+                                    attempt: { type: "number" },
+                                    status: { type: "string", required: true },
+                                  },
+                                },
+                                { type: "null" },
+                              ],
+                              required: true,
+                            },
+                            pending_handoffs: { type: "number", required: true },
+                            cap_exhausted: { type: "number", required: true },
+                            open_gates: { type: "number", required: true },
+                            closure_status: { type: "string", required: true },
+                            closure_outcome: { type: "string" },
+                          },
+                        },
+                        { type: "null" },
+                      ],
+                    },
                     last_decision: {
                       type: "object",
                       additionalProperties: false,
@@ -3239,12 +3297,16 @@ export function apply(ctx: Context): void {
                   )
                   .join(", ");
           if (value.team == null) return [{ type: "text", text: `no active team; archives: ${archiveText}` }];
+          const graphText =
+            value.team.graph == null
+              ? "graph: none"
+              : `graph: ${value.team.graph.status}${value.team.graph.stale ? " (stale)" : ""} (rev ${value.team.graph.runtime_revision}) | ${value.team.graph.current_loop == null ? "no active loop" : `loop=${value.team.graph.current_loop.loop_id} attempt=${value.team.graph.current_loop.attempt ?? "-"} ${value.team.graph.current_loop.status}`} | pending handoffs=${value.team.graph.pending_handoffs} | cap exhausted=${value.team.graph.cap_exhausted} | open gates=${value.team.graph.open_gates} | closure=${value.team.graph.closure_status}${value.team.graph.closure_outcome === undefined ? "" : ` (${value.team.graph.closure_outcome})`}`;
           return [
             {
               type: "text",
               text: `team ${value.team.team_id} (${value.team.topology}, ${value.team.status}): ${value.team.roles
                 .map((r) => `${r.id}(${r.status},R${r.reportCount}${r.lastReport === null ? "" : `, report=${r.lastReport}`}${r.lastActivity === undefined ? "" : `, last="${r.lastActivity}"`})`)
-                .join(", ")} | archives: ${archiveText}`,
+                .join(", ")} | archives: ${archiveText}\n${graphText}`,
             },
           ];
         },
@@ -3281,6 +3343,29 @@ export function apply(ctx: Context): void {
             ...(documentSummaryValue.currentCharterDigest === undefined ? {} : { charter_digest: documentSummaryValue.currentCharterDigest }),
             ...(documentSummaryValue.approvalRef === undefined ? {} : { approval_ref: documentSummaryValue.approvalRef }),
             ...(graph === undefined ? {} : { graph_status: graph.status, graph_runtime_revision: graph.runtimeRevision, graph_stale: graph.stale }),
+            ...(graph === undefined
+              ? {}
+              : {
+                  graph: {
+                    status: graph.status,
+                    runtime_revision: graph.runtimeRevision ?? 0,
+                    stale: graph.stale,
+                    ...(graph.currentLoop === undefined
+                      ? { current_loop: null }
+                      : {
+                          current_loop: {
+                            loop_id: graph.currentLoop.loopId,
+                            ...(graph.currentLoop.attempt === undefined ? {} : { attempt: graph.currentLoop.attempt }),
+                            status: graph.currentLoop.status,
+                          },
+                        }),
+                    pending_handoffs: graph.pendingHandoffs.length,
+                    cap_exhausted: graph.capExhausted.length,
+                    open_gates: graph.openGates.length,
+                    closure_status: graph.closure.status,
+                    ...(graph.closure.outcome === undefined ? {} : { closure_outcome: graph.closure.outcome }),
+                  },
+                }),
             ...(documentSummaryValue.lastDecision === undefined
               ? {}
               : {
