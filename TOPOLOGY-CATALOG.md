@@ -159,9 +159,11 @@ orchestra-implementer、orchestra-reviewer、orchestra-oracle 三个。它们
 - 三者显式不含 plan mode、goal、subagent、workflow、web、compaction 和
   PTY；a2a_* / orchestra_* 等插件/宿主工具不应被误报成角色 composition
   rows；
-- 来源优先级是 project .orchestra/presets > global orchestra preset
-  root > DSH-native preset > built-in fallback；自定义文件需要按现有
-  Topology Catalog 与 Session Blueprint 规则解析。
+- 来源优先级是 project .orchestra/presets > user/global orchestra preset
+  root > DSH-native preset > catalog builtin fallback。catalog builtin 物理
+  位于独立的 catalog-presets root，不伪装成 user/global source，因此安装
+  fallback 不会 shadow DSH-native preset；自定义文件需要按现有 Topology
+  Catalog 与 Session Blueprint 规则解析。
 
 因此“当前 scope”准确说是：每个角色拥有自己的 full Session 和最小角色
 工具/纪律 composition，权限由 topology/Blueprint 独立 pin；它不是 DSH
@@ -654,9 +656,14 @@ required evidence kinds。architect 拥有推荐/决策稿，不拥有用户 app
 | roleId | Role Preset | sandbox / permission | model strategy | compositionTools | orchestraTools | write boundary |
 | --- | --- | --- | --- | --- | --- | --- |
 | driver | controller session | caller-selected；无隐式升级 | deployment default pinned | caller Agent Preset；不由 topology 追加 | orchestration、report、handoff、decision command | charter/graph/journal；不冒充用户 |
-| researcher | researcher | read-only / workspace-write + ask base | deployment default pinned | tool-web、tool-fs-search、tool-fs | orchestra_report、orchestra_handoff | 只写 source/evidence report |
-| architect | architect | read-only / workspace-write + ask base | deployment default pinned；可显式 override | tool-web、tool-fs-search、tool-fs | orchestra_report、orchestra_handoff | 只写 decision brief/report，不改代码 |
-| reviewer | reviewer | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-web | orchestra_report、orchestra_verdict、orchestra_handoff | 只写 review report；评估 decision evidence |
+| researcher | researcher | read-only / workspace-write + ask base | deployment default pinned | tool-fs-search、tool-fs | orchestra_report、orchestra_handoff | 只写 source/evidence report |
+| architect | architect | read-only / workspace-write + ask base | deployment default pinned；可显式 override | tool-fs-search、tool-fs | orchestra_report、orchestra_handoff | 只写 decision brief/report，不改代码 |
+| reviewer | reviewer | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-bash | orchestra_report、orchestra_verdict、orchestra_handoff | 只写 review report；评估 decision evidence |
+
+Architecture research is local-only in the base composition. A topology that
+declares web as required must select an explicit web variant and run capability
+preflight before reservation; missing web remains blocked/deferred, never an
+implicit pending mount.
 
 **Graph / routes / ownership**
 
@@ -773,7 +780,10 @@ migration slice 必须能回答旧行为如何验证、何时允许切换、失�
 | roleId | Role Preset | sandbox / permission | model strategy | compositionTools | orchestraTools | write boundary |
 | --- | --- | --- | --- | --- | --- | --- |
 | driver | controller session | caller-selected；无隐式升级 | deployment default pinned | caller Agent Preset；不由 topology 追加 | orchestration、report、handoff | migration contract、graph/journal |
-| architect | architect | read-only / workspace-write + ask base | deployment default pinned；可显式 override | tool-fs、tool-fs-search、tool-web | orchestra_report、orchestra_handoff | 只写 migration plan/compat report |
+| architect | architect | read-only / workspace-write + ask base | deployment default pinned；可显式 override | tool-fs、tool-fs-search | orchestra_report、orchestra_handoff | 只写 migration plan/compat report |
+
+Migration planning is local-only by default. External web research is an
+explicit variant and cannot be silently inferred from the architect role.
 | implementer | implementer | workspace-write / workspace-write + ask | deployment default pinned | tool-bash、tool-fs、tool-fs-search | orchestra_report、orchestra_handoff | 当前 slice 的源码/测试；不得改 baseline evidence |
 | verifier | verifier | read-only / workspace-write + ask base | deployment default pinned | tool-bash、tool-fs-search | orchestra_report、orchestra_handoff | 只写 compatibility/rollback evidence |
 | reviewer | reviewer | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-bash | orchestra_report、orchestra_verdict、orchestra_handoff | 只写 review report；唯一 evaluator |
@@ -1148,10 +1158,10 @@ Blueprint/Loader 验证，绝不因版本升级覆盖。legacy Topology 的 pres
   语义写权；不拥有用户最终选项、review verdict 或 code mutation 权。
 - prohibitions：不能把推荐写成已批准、不能直接修改源码/roster、不能省略
   alternatives/risks/evidence。
-- DSH base composition：standard copy 的 analysis variant；保留 tool-web、
-  tool-fs、tool-fs-search、skills、compaction、report/handoff；移除 bash、
-  editor、delegation、goal 和 Code Mode。
-- compositionTools：tool-web、tool-fs、tool-fs-search。
+- DSH base composition：standard copy 的 analysis variant；保留 tool-fs、
+  tool-fs-search、skills、compaction、report/handoff；移除 bash、editor、
+  delegation、goal、web 和 Code Mode。web 是显式 variant。
+- compositionTools：tool-fs、tool-fs-search。
 - orchestraTools：orchestra_report、orchestra_handoff。
 - sandbox/permission/model：read-only；workspace-write + ask base；
   deployment default pinned，强模型必须显式 override。
@@ -1173,10 +1183,10 @@ Blueprint/Loader 验证，绝不因版本升级覆盖。legacy Topology 的 pres
   architecture option、发 PASS 或改变 mission。
 - prohibitions：不能以二手资料支撑关键事实、不能写源码、不能把 source
   availability 当作 correctness、不能伪造用户批准。
-- DSH base composition：standard copy 的 research variant；保留 tool-web、
-  tool-fs-search、tool-fs、skills、report/handoff；移除 bash、editor、
-  delegation、goal 和 Code Mode。
-- compositionTools：tool-web、tool-fs-search、tool-fs。
+- DSH base composition：standard copy 的 research variant；保留
+  tool-fs-search、tool-fs、skills、compaction、report/handoff；移除 bash、
+  editor、delegation、goal、web 和 Code Mode。web 是显式 variant。
+- compositionTools：tool-fs-search、tool-fs。
 - orchestraTools：orchestra_report、orchestra_handoff。
 - sandbox/permission/model：read-only；workspace-write + ask base；
   deployment default pinned。

@@ -274,15 +274,30 @@ test("list dedupes by precedence and bare role lookup follows effective ready te
 test("orchestra_topologies projection has ready and blocked entries with declared keys", async () => {
   await withRoots(async ({ fs, projectRoot, globalRoot }) => {
     await fs.seed(projectRoot, ".orchestra/topologies/duo.json", "{");
+    await fs.seed(projectRoot, ".orchestra/topologies/capability.json", topology("capability", {
+      roles: [{
+        id: "reviewer",
+        name: "Reviewer",
+        preset: "orchestra-v04-reviewer-v1",
+        sandbox: "read-only",
+        compositionTools: ["tool-fs", "tool-fs-search"],
+        orchestraTools: ["orchestra_report", "orchestra_verdict"],
+        optionalCapabilities: ["web"],
+      }],
+    }));
     const catalog = createTopologyCatalog(fs, { globalRoot });
     const output = topologyListForTool(await catalog.list(projectRoot));
     const ready = output.find((entry) => entry.id === "trio");
+    const capability = output.find((entry) => entry.id === "capability");
     const blocked = output.find((entry) => entry.id === "duo");
     assert.equal(ready.status, "ready");
     assert.equal(ready.source, "bundled");
     assert.equal(blocked.status, "blocked");
     assert.equal(blocked.filename, "duo.json");
     assert.equal(blocked.diagnostic.code, "invalid_json");
+    assert.deepEqual(capability.roles[0].compositionTools, ["tool-fs", "tool-fs-search"]);
+    assert.deepEqual(capability.roles[0].orchestraTools, ["orchestra_report", "orchestra_verdict"]);
+    assert.deepEqual(capability.roles[0].optionalCapabilities, ["web"]);
     assert.deepEqual(Object.keys(blocked).sort(), ["diagnostic", "filename", "id", "name", "roles", "source", "status"].sort());
   });
 });

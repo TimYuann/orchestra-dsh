@@ -72,6 +72,8 @@ export interface ResolvedPresetFile {
   path: string;
   /** Resolution layer; Governed Blueprint uses DSH-native ids through AgentPresets.mount. */
   source?: "project" | "global" | "dsh" | "builtin";
+  /** Parsed row ids used as a static proof for a custom file-backed role. */
+  compositionRowIds?: string[];
 }
 
 /** Create one agent thread (session) with model default + preset composition. */

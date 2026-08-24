@@ -21,6 +21,7 @@ export interface RoleConfig {
   preset?: string | null;
   compositionTools?: string[];
   orchestraTools?: string[];
+  optionalCapabilities?: string[];
   sandbox?: string;
   runtime?: { provider?: string; model?: string; reasoningEffort?: string };
   maxRounds?: number;
@@ -105,6 +106,9 @@ export interface TopologyRoleSummary {
   sandbox?: string;
   maxRounds?: number;
   runtime?: Record<string, JsonValue>;
+  compositionTools?: string[];
+  orchestraTools?: string[];
+  optionalCapabilities?: string[];
 }
 
 export interface TopologyReadyEntry extends ResolvedTopology {
@@ -341,6 +345,9 @@ function roleSummary(role: RoleConfig): TopologyRoleSummary {
   if (role.sandbox !== undefined) summary.sandbox = role.sandbox;
   if (role.maxRounds !== undefined) summary.maxRounds = role.maxRounds;
   if (role.runtime !== undefined) summary.runtime = role.runtime as Record<string, JsonValue>;
+  if (role.compositionTools !== undefined) summary.compositionTools = [...role.compositionTools];
+  if (role.orchestraTools !== undefined) summary.orchestraTools = [...role.orchestraTools];
+  if (role.optionalCapabilities !== undefined) summary.optionalCapabilities = [...role.optionalCapabilities];
   return summary;
 }
 
@@ -391,6 +398,9 @@ export function validateTopology(config: unknown): string[] {
       if (role[field] !== undefined && !stringArray(role[field])) {
         problems.push("shape: role \"" + role.id + "\" " + field + " must be an array of strings");
       }
+    }
+    if (role.optionalCapabilities !== undefined && !stringArray(role.optionalCapabilities)) {
+      problems.push("shape: role \"" + role.id + "\" optionalCapabilities must be an array of strings");
     }
     if (stringArray(role.compositionTools) && role.compositionTools.some((tool) => tool.startsWith("orchestra_") || tool.startsWith("a2a_"))) {
       problems.push("role \"" + role.id + "\" compositionTools cannot contain host transport/orchestra tools");

@@ -27,7 +27,7 @@ import type {} from "@deepseek-ai/dsh-system-prompt";
 import type {} from "@deepseek-ai/dsh-commands";
 import { createSession, installModelOverride, deliverMessage, readDeliveryReceipt } from "./a2a.js";
 import type { ResolvedPresetFile } from "./a2a.js";
-import { hostToolNamesForPreflight, prepareGovernedBlueprint, preflightGovernedRequiredTools } from "./session-blueprint.js";
+import { hostToolNamesForPreflight, prepareGovernedBlueprint, preflightGovernedRequiredTools, SessionBlueprintError } from "./session-blueprint.js";
 import type { GovernedBlueprintReceipt, PreparedGovernedBlueprint } from "./session-blueprint.js";
 import {
   ensureBuiltinRolePresetArtifacts,
@@ -159,6 +159,7 @@ async function resolvePresetFile(ctx: Context, cwd: string, presetId: string): P
     trust: resolved.trust,
     path: resolved.path,
     source: resolved.source,
+    ...(resolved.composition === undefined ? {} : { compositionRowIds: resolved.composition.rowIds }),
   };
 }
 
@@ -500,6 +501,13 @@ export async function prepareGovernedRolePlan(
   const compositionTools = options.compositionTools ?? roleConfig.compositionTools ?? roleSpec?.compositionTools;
   const orchestraTools = options.orchestraTools ?? roleConfig.orchestraTools ?? roleSpec?.orchestraTools;
   const requiredTools = roleConfig.requiredTools;
+  if (roleSpec === undefined && presetFile.path !== "" && compositionTools === undefined && (requiredTools === undefined || requiredTools.length === 0)) {
+    throw new SessionBlueprintError(
+      "composition_tools_unproven",
+      "Governed role preset " + presetId + " is not cataloged and has no explicit static compositionTools proof; reservation was not attempted",
+      { presetId, source: presetFile.source, plane: "composition" },
+    );
+  }
   preflightGovernedRequiredTools({
     requiredTools,
     compositionTools,
@@ -507,6 +515,7 @@ export async function prepareGovernedRolePlan(
     presetId,
     presetFile,
     rolePresetSpec: roleSpec,
+    staticCompositionTools: presetFile.compositionRowIds,
     hostToolNames: hostToolNamesForPreflight(ctx),
   });
   const sessionId = governedSessionId(options.teamId);
@@ -3285,6 +3294,9 @@ export function apply(ctx: Context): void {
                         name: { type: "string", required: true },
                         preset: { type: "string" },
                         sandbox: { type: "string" },
+                        compositionTools: { type: "array", items: { type: "string" } },
+                        orchestraTools: { type: "array", items: { type: "string" } },
+                        optionalCapabilities: { type: "array", items: { type: "string" } },
                         maxRounds: { type: "number" },
                         runtime: { type: "object", additionalProperties: true },
                       },

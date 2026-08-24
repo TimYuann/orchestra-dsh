@@ -316,6 +316,7 @@ export function preflightGovernedRequiredTools(input: {
   presetId?: string;
   presetFile?: BlueprintPresetFile;
   rolePresetSpec?: { compositionTools: string[]; orchestraTools: string[] };
+  staticCompositionTools?: string[];
   hostToolNames?: string[];
 }): void {
   const capabilities = capabilityTools(input);
@@ -328,7 +329,7 @@ export function preflightGovernedRequiredTools(input: {
     );
   }
   if (capabilities.composition.length > 0) {
-    const declared = input.rolePresetSpec?.compositionTools;
+    const declared = input.rolePresetSpec?.compositionTools ?? input.staticCompositionTools;
     if (declared === undefined) {
       throw new SessionBlueprintError(
         "composition_tools_unproven",

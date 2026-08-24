@@ -24,6 +24,7 @@ export const ROLE_PRESET_VERSION = 1 as const;
 export const V04_ROLE_PRESET_ID_PREFIX = "orchestra-v04-" as const;
 export const ROLE_PRESET_COMPOSITION_FILE = "agent.cordis.yml" as const;
 export const ROLE_PRESET_METADATA_FILE = "preset.yml" as const;
+export const ROLE_PRESET_BUILTIN_DIRECTORY = "catalog-presets" as const;
 
 export type RolePresetRole =
   | "implementer"
@@ -48,6 +49,8 @@ export type RolePresetCapability =
 export interface RolePresetHandoffContract {
   requiredPayloadFields: string[];
   requiredEvidenceKinds: string[];
+  postRemediationPayloadFields?: string[];
+  postRemediationEvidenceKinds?: string[];
 }
 
 export interface RolePresetSpec {
@@ -67,6 +70,8 @@ export interface RolePresetSpec {
   optionalCapabilities: RolePresetCapability[];
   skills: boolean;
   compaction: boolean;
+  planMode: boolean;
+  todo: boolean;
   reportHandoff: RolePresetHandoffContract;
   reuse: {
     initial: string[];
@@ -132,17 +137,20 @@ function validPresetId(id: string): boolean {
   return /^[a-z0-9][a-z0-9-]*$/.test(id);
 }
 
-function rolePrompt(role: RolePresetRole, purpose: string, write: boolean): string {
+function rolePrompt(role: RolePresetRole, purpose: string, write: boolean, baseStrategy: RolePresetBase, handoff: RolePresetHandoffContract): string {
   const writeRule = write
     ? "You may edit only the explicitly dispatched write scope; do not expand it."
     : "You are read-only for repository files; your only durable write is the Orchestra report channel.";
   return [
     "You are the Orchestra v0.4 " + role + " role.",
+    "Base DSH composition strategy: " + baseStrategy + ".",
     purpose,
     writeRule,
     "Wait for a concrete driver dispatch; a welcome is not a task.",
     "Do not change the canonical Charter, Document, Graph, Journal or role roster.",
     "Do not claim another role's verdict, user approval or closure decision.",
+    "Handoff payload fields: " + handoff.requiredPayloadFields.join(", ") + ".",
+    "Required evidence kinds: " + handoff.requiredEvidenceKinds.join(", ") + ".",
     "Use orchestra_report for durable evidence and orchestra_handoff for typed milestones.",
   ].join(" ");
 }
@@ -150,16 +158,21 @@ function rolePrompt(role: RolePresetRole, purpose: string, write: boolean): stri
 function renderComposition(options: {
   role: RolePresetRole;
   purpose: string;
+  baseStrategy: RolePresetBase;
   compositionTools: readonly string[];
   skills: boolean;
   compaction: boolean;
+  planMode: boolean;
+  todo: boolean;
+  optionalCapabilities: readonly RolePresetCapability[];
+  reportHandoff: RolePresetHandoffContract;
   write: boolean;
 }): string {
   const rows: string[] = [
     "- id: persona",
     "  name: '@deepseek-ai/dsh-persona'",
     "  config:",
-    "    text: " + JSON.stringify(rolePrompt(options.role, options.purpose, options.write)),
+    "    text: " + JSON.stringify(rolePrompt(options.role, options.purpose, options.write, options.baseStrategy, options.reportHandoff)),
     "    complete: false",
     "    includeRuntimeContext: true",
     "- id: agent-instructions",
@@ -186,6 +199,25 @@ function renderComposition(options: {
     rows.push(
       "- id: tool-bash",
       "  name: '@deepseek-ai/dsh-tool-bash'",
+    );
+  }
+
+  if (options.planMode) {
+    rows.push(
+      "- id: planning",
+      "  name: cordis:group",
+      "  group: true",
+      "  isolate:",
+      "    planMode: true",
+      "  config:",
+      "    - id: plan-mode",
+      "      name: '@deepseek-ai/dsh-plan-mode'",
+    );
+  }
+  if (options.todo) {
+    rows.push(
+      "- id: tool-todo",
+      "  name: '@deepseek-ai/dsh-tool-todo'",
     );
   }
 
@@ -218,6 +250,20 @@ function renderComposition(options: {
       "        tailChars: 1024",
     );
   }
+  if (options.optionalCapabilities.includes("web")) {
+    rows.push(
+      "- id: tool-web",
+      "  name: '@deepseek-ai/dsh-tool-web'",
+    );
+  }
+  if (options.optionalCapabilities.includes("code-mode")) {
+    rows.push(
+      "- id: tool-presentation",
+      "  name: '@deepseek-ai/dsh-agent-tool-presentation'",
+      "  config:",
+      "    mode: code",
+    );
+  }
 
   return rows.join("\n") + "\n";
 }
@@ -241,7 +287,10 @@ function makeSpec(input: {
   sandbox: SandboxMode;
   skills: boolean;
   compaction: boolean;
+  planMode?: boolean;
+  todo?: boolean;
   optionalCapabilities?: RolePresetCapability[];
+  reportHandoff?: RolePresetHandoffContract;
   legacyIds?: string[];
   presetYml?: string;
   cordisYml?: string;
@@ -250,6 +299,10 @@ function makeSpec(input: {
   const compositionTools = unique(input.compositionTools);
   const orchestraTools = unique(input.orchestraTools);
   const write = input.sandbox === "workspace-write";
+  const reportHandoff = input.reportHandoff ?? {
+    requiredPayloadFields: ["summary", "artifactRefs", "knownRisks"],
+    requiredEvidenceKinds: ["report", "message"],
+  };
   return {
     id: input.id,
     version: ROLE_PRESET_VERSION,
@@ -267,19 +320,23 @@ function makeSpec(input: {
     optionalCapabilities: unique(input.optionalCapabilities ?? []),
     skills: input.skills,
     compaction: input.compaction,
-    reportHandoff: {
-      requiredPayloadFields: ["summary", "artifactRefs", "knownRisks"],
-      requiredEvidenceKinds: ["report", "message"],
-    },
+    planMode: input.planMode ?? false,
+    todo: input.todo ?? false,
+    reportHandoff,
     reuse: input.reuse,
     legacyIds: unique(input.legacyIds ?? []),
     presetYml: input.presetYml ?? metadata(input.name, input.purpose),
     cordisYml: input.cordisYml ?? renderComposition({
       role: input.role,
       purpose: input.purpose,
+      baseStrategy: input.baseStrategy,
       compositionTools,
       skills: input.skills,
       compaction: input.compaction,
+      planMode: input.planMode ?? false,
+      todo: input.todo ?? false,
+      optionalCapabilities: [],
+      reportHandoff,
       write,
     }),
   };
@@ -298,8 +355,14 @@ const V04_ROLE_PRESETS: RolePresetSpec[] = [
     sandbox: "workspace-write",
     skills: true,
     compaction: true,
+    planMode: true,
+    todo: true,
     optionalCapabilities: ["code-mode", "web", "subagent"],
     legacyIds: ["orchestra-implementer"],
+    reportHandoff: {
+      requiredPayloadFields: ["summary", "changedFiles", "knownRisks"],
+      requiredEvidenceKinds: ["commit", "diff", "test", "report"],
+    },
     reuse: {
       initial: ["feature-development", "bug-diagnosis-and-fix", "refactor-and-migration", "audit-and-hardening"],
       remediationOnly: ["architecture-decision"],
@@ -320,6 +383,10 @@ const V04_ROLE_PRESETS: RolePresetSpec[] = [
     compaction: true,
     optionalCapabilities: ["web"],
     legacyIds: ["orchestra-reviewer"],
+    reportHandoff: {
+      requiredPayloadFields: ["summary", "verdict", "unresolvedFindings"],
+      requiredEvidenceKinds: ["report", "diff", "test"],
+    },
     reuse: {
       initial: ["feature-development", "bug-diagnosis-and-fix", "refactor-and-migration", "architecture-decision", "audit-and-hardening"],
       remediationOnly: [],
@@ -339,6 +406,10 @@ const V04_ROLE_PRESETS: RolePresetSpec[] = [
     skills: true,
     compaction: true,
     optionalCapabilities: ["web"],
+    reportHandoff: {
+      requiredPayloadFields: ["symptom", "reproduction", "rootCause", "repairScope", "knownRisks"],
+      requiredEvidenceKinds: ["report", "test", "message", "file"],
+    },
     reuse: {
       initial: ["bug-diagnosis-and-fix", "audit-and-hardening"],
       remediationOnly: ["feature-development"],
@@ -356,7 +427,11 @@ const V04_ROLE_PRESETS: RolePresetSpec[] = [
     orchestraTools: ["orchestra_report", "orchestra_handoff"],
     sandbox: "read-only",
     skills: false,
-    compaction: false,
+    compaction: true,
+    reportHandoff: {
+      requiredPayloadFields: ["command", "exit", "scope", "evidenceRefs", "unexecuted"],
+      requiredEvidenceKinds: ["test", "diff", "report"],
+    },
     reuse: {
       initial: ["feature-development", "bug-diagnosis-and-fix", "refactor-and-migration", "audit-and-hardening"],
       remediationOnly: [],
@@ -376,6 +451,10 @@ const V04_ROLE_PRESETS: RolePresetSpec[] = [
     skills: true,
     compaction: true,
     optionalCapabilities: ["web"],
+    reportHandoff: {
+      requiredPayloadFields: ["decisionQuestion", "alternatives", "recommendation", "tradeoffs", "constraints", "migrationImpact", "unknowns"],
+      requiredEvidenceKinds: ["report", "file", "url"],
+    },
     reuse: {
       initial: ["architecture-decision", "refactor-and-migration"],
       remediationOnly: ["feature-development", "bug-diagnosis-and-fix", "audit-and-hardening"],
@@ -395,6 +474,10 @@ const V04_ROLE_PRESETS: RolePresetSpec[] = [
     skills: true,
     compaction: true,
     optionalCapabilities: ["web"],
+    reportHandoff: {
+      requiredPayloadFields: ["sourceRefs", "facts", "unknowns", "factInference", "nextQuestions"],
+      requiredEvidenceKinds: ["url", "file", "report"],
+    },
     reuse: {
       initial: ["architecture-decision"],
       remediationOnly: ["bug-diagnosis-and-fix", "refactor-and-migration"],
@@ -414,6 +497,12 @@ const V04_ROLE_PRESETS: RolePresetSpec[] = [
     skills: true,
     compaction: true,
     optionalCapabilities: ["web", "sast", "dast"],
+    reportHandoff: {
+      requiredPayloadFields: ["fingerprint", "asset", "location", "impact", "severity", "fix", "reproductionOrWhyNot"],
+      requiredEvidenceKinds: ["report", "file", "message"],
+      postRemediationPayloadFields: ["originalFinding", "rescan", "regression", "residualRisk"],
+      postRemediationEvidenceKinds: ["test", "diff", "report"],
+    },
     reuse: {
       initial: ["audit-and-hardening"],
       remediationOnly: [],
@@ -505,6 +594,42 @@ export function rolePresetIdIsSafe(id: string): boolean {
   return validPresetId(id);
 }
 
+export function renderRolePresetComposition(
+  spec: RolePresetSpec,
+  enabledOptionalCapabilities: readonly RolePresetCapability[] = [],
+): string {
+  const enabled = unique(enabledOptionalCapabilities);
+  const unsupported = enabled.filter((capability) => !["web", "code-mode"].includes(capability));
+  if (unsupported.length > 0) {
+    throw new RolePresetError(
+      "invalid_spec",
+      "optional capability variant is not implemented in 6B-0: " + unsupported.join(", "),
+      { id: spec.id, unsupported },
+    );
+  }
+  const undeclared = enabled.filter((capability) => !spec.optionalCapabilities.includes(capability));
+  if (undeclared.length > 0) {
+    throw new RolePresetError(
+      "invalid_spec",
+      "optional capability is not declared by " + spec.id + ": " + undeclared.join(", "),
+      { id: spec.id, undeclared },
+    );
+  }
+  return renderComposition({
+    role: spec.role,
+    purpose: spec.purpose,
+    baseStrategy: spec.baseStrategy,
+    compositionTools: spec.compositionTools,
+    skills: spec.skills,
+    compaction: spec.compaction,
+    planMode: spec.planMode,
+    todo: spec.todo,
+    optionalCapabilities: enabled,
+    reportHandoff: spec.reportHandoff,
+    write: spec.sandbox === "workspace-write",
+  });
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -550,6 +675,21 @@ export function parseRolePresetComposition(text: string): ParsedRolePresetCompos
   return { rows, rowIds, pluginNames };
 }
 
+function commonCompositionProblems(composition: ParsedRolePresetComposition): string[] {
+  const problems: string[] = [];
+  if (!composition.rowIds.includes("persona")) problems.push("persona row is required");
+  if (!composition.rowIds.includes("agent-instructions")) problems.push("agent-instructions row is required");
+  const hasToolRow = composition.rowIds.some((id) => id.startsWith("tool-")) || composition.pluginNames.some((name) => name.includes("dsh-tool-"));
+  if (!hasToolRow) problems.push("at least one model-facing tool row is required");
+  for (const id of composition.rowIds) {
+    if (id.startsWith("orchestra_") || id.startsWith("a2a_")) problems.push("host row id cannot be in DSH composition: " + id);
+  }
+  for (const name of composition.pluginNames) {
+    if (name.startsWith("orchestra_") || name.startsWith("a2a_")) problems.push("host plugin cannot be in DSH composition: " + name);
+  }
+  return problems;
+}
+
 export function validateRolePresetSpec(spec: RolePresetSpec): string[] {
   const problems: string[] = [];
   if (!validPresetId(spec.id)) problems.push("invalid preset id");
@@ -562,6 +702,10 @@ export function validateRolePresetSpec(spec: RolePresetSpec): string[] {
   if (spec.orchestraTools.some((name) => name.startsWith("orchestra_") === false)) problems.push("orchestraTools must use Orchestra host names");
   if (spec.compositionTools.some((name) => name.startsWith("orchestra_") || name.startsWith("a2a_"))) problems.push("host tools cannot be compositionTools");
   if (spec.reportHandoff.requiredPayloadFields.length === 0 || spec.reportHandoff.requiredEvidenceKinds.length === 0) problems.push("report/handoff contract is incomplete");
+  if (spec.status === "v04") {
+    const expected = expectedRoleHandoff(spec.role);
+    if (JSON.stringify(spec.reportHandoff) !== JSON.stringify(expected)) problems.push("report/handoff contract does not match the frozen role contract");
+  }
   let composition: ParsedRolePresetComposition;
   try {
     composition = parseRolePresetComposition(spec.cordisYml);
@@ -569,6 +713,7 @@ export function validateRolePresetSpec(spec: RolePresetSpec): string[] {
     problems.push(error instanceof Error ? error.message : String(error));
     return problems;
   }
+  problems.push(...commonCompositionProblems(composition));
   for (const tool of spec.compositionTools) {
     if (!composition.rowIds.includes(tool)) problems.push("composition tool row is missing: " + tool);
   }
@@ -579,9 +724,37 @@ export function validateRolePresetSpec(spec: RolePresetSpec): string[] {
     problems.push("skills rows are required");
   }
   if (spec.compaction && !composition.rowIds.includes("compaction")) problems.push("compaction row is required");
+  if (spec.planMode && !composition.rowIds.includes("planning")) problems.push("plan-mode row is required");
+  if (spec.todo && !composition.rowIds.includes("tool-todo")) problems.push("todo row is required");
   const forbidden = ["delegation", "tool-subagent", "tool-goal", "tool-presentation"];
   for (const id of forbidden) if (composition.rowIds.includes(id)) problems.push("forbidden default row is present: " + id);
   return problems;
+}
+
+function expectedRoleHandoff(role: RolePresetRole): RolePresetHandoffContract {
+  switch (role) {
+    case "implementer":
+      return { requiredPayloadFields: ["summary", "changedFiles", "knownRisks"], requiredEvidenceKinds: ["commit", "diff", "test", "report"] };
+    case "reviewer":
+      return { requiredPayloadFields: ["summary", "verdict", "unresolvedFindings"], requiredEvidenceKinds: ["report", "diff", "test"] };
+    case "investigator":
+      return { requiredPayloadFields: ["symptom", "reproduction", "rootCause", "repairScope", "knownRisks"], requiredEvidenceKinds: ["report", "test", "message", "file"] };
+    case "verifier":
+      return { requiredPayloadFields: ["command", "exit", "scope", "evidenceRefs", "unexecuted"], requiredEvidenceKinds: ["test", "diff", "report"] };
+    case "architect":
+      return { requiredPayloadFields: ["decisionQuestion", "alternatives", "recommendation", "tradeoffs", "constraints", "migrationImpact", "unknowns"], requiredEvidenceKinds: ["report", "file", "url"] };
+    case "researcher":
+      return { requiredPayloadFields: ["sourceRefs", "facts", "unknowns", "factInference", "nextQuestions"], requiredEvidenceKinds: ["url", "file", "report"] };
+    case "hardening-auditor":
+      return {
+        requiredPayloadFields: ["fingerprint", "asset", "location", "impact", "severity", "fix", "reproductionOrWhyNot"],
+        requiredEvidenceKinds: ["report", "file", "message"],
+        postRemediationPayloadFields: ["originalFinding", "rescan", "regression", "residualRisk"],
+        postRemediationEvidenceKinds: ["test", "diff", "report"],
+      };
+    case "oracle":
+      return { requiredPayloadFields: ["summary", "artifactRefs", "knownRisks"], requiredEvidenceKinds: ["report", "message"] };
+  }
 }
 
 export function validateAllRolePresetSpecs(): string[] {
@@ -625,7 +798,17 @@ function validateCandidate(spec: RolePresetSpec | undefined, candidate: Candidat
       error,
     );
   }
-  if (spec === undefined) return composition;
+  const commonProblems = commonCompositionProblems(composition);
+  if (spec === undefined) {
+    if (commonProblems.length > 0) {
+      throw new RolePresetError(
+        "preset_unavailable",
+        "custom preset " + candidate.path + " is not a complete composition: " + commonProblems.join("; "),
+        { source: candidate.source, path: candidate.path, problems: commonProblems },
+      );
+    }
+    return composition;
+  }
   const expectedProblems = validateRolePresetSpec({ ...spec, cordisYml: candidate.text });
   if (expectedProblems.length > 0) {
     throw new RolePresetError(
@@ -691,7 +874,7 @@ async function writeIfAbsent(path: string, text: string): Promise<"created" | "e
 }
 
 export async function ensureBuiltinRolePresetArtifact(globalRoot: string, spec: RolePresetSpec): Promise<string> {
-  const directory = join(globalRoot, "presets", spec.id);
+  const directory = join(globalRoot, ROLE_PRESET_BUILTIN_DIRECTORY, spec.id);
   await mkdir(directory, { recursive: true });
   await writeIfAbsent(join(directory, ROLE_PRESET_METADATA_FILE), spec.presetYml);
   const path = join(directory, ROLE_PRESET_COMPOSITION_FILE);
