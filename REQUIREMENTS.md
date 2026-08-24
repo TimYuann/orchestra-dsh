@@ -259,9 +259,10 @@ catalog；catalog 的“冻结”仍不是“已实现”。
 
 五个首发模板必须分别冻结 graph、typed handoff、bounded Loop、evaluator、
 hard cap、Human Gate、single Closure owner、Permission/Model 边界、完整
-Role Preset composition、示例任务和真实 full-session E2E。首发数量限制为
-五个，是在扩大覆盖面的同时保留可重复维护的实现批次；Agency Agents 的
-大量 standalone persona 不直接转成 Orchestra roster。
+Role Preset composition、示例任务、本地 contract/integration tests 与交给
+外部 DSH 验收 Session 的真实 full-session E2E scenario。首发数量限制为
+五个，是在扩大覆盖面的同时保留可重复维护的实现批次；Agency Agents 的大量
+standalone persona 不直接转成 Orchestra roster。
 
 ### 6.5 实现状态与兼容约束
 
@@ -413,12 +414,13 @@ Soft warning 不得被工具 render 的一句摘要吞掉；应进入 Draft/Free
 - **范围**：只实现 6A 冻结的五个任务型 Topology 与七个 Role Preset；补齐
   完整 Agent composition、Permission/Model/sandbox 边界、分平面的
   compositionTools/orchestraTools capability preflight、graph/loop/gate/
-  role-preset 定义、示例任务和真实 full-session E2E。Agency Agents 的
+  role-preset 定义、示例任务和本地 contract/integration tests。Agency Agents 的
   standalone persona 只能作为角色设计参考，不是
   直接依赖或批量导入格式。
-- **验收**：每个纳入的内置 Topology 都有真实 E2E；延期候选保持明确未
-  实现；Preset 不再是 persona-only；缺失 optional/required capability
-  fail loud；模板修改不重写已 Freeze 实例。
+- **验收**：延期候选保持明确未实现；Preset 不再是 persona-only；缺失
+  optional/required capability fail loud；模板修改不重写已 Freeze 实例；
+  每个首发 Topology 都提供由外部 DSH 验收 Session执行的成功/失败 E2E
+  scenario，但开发团队不在本 Checkpoint运行真实 full-session E2E。
 
 ### Checkpoint 7 · recovery / activate / dismiss
 
@@ -432,11 +434,19 @@ Soft warning 不得被工具 render 的一句摘要吞掉；应进入 Draft/Free
 - **范围**：将 Template、Frozen revision、Runtime Projection、pending Gate、Loop/attempt、角色状态和 archive 以只读观察面呈现；GUI 是可选 adapter，不拥有语义写权限。
 - **验收**：观察层停用时核心 runtime 仍工作；界面显示 active/degraded/blocked/failed 和 evidence 引用，不把 accepted 渲染成 answered；不引入第二套状态源。
 
-### Checkpoint 9 · E2E、pack/profile 防崩与发布收尾
+### Checkpoint 9 · Update Note、pack/profile 防崩与外部 E2E 交接
 
 - **依赖**：Checkpoint 1–8。
-- **范围**：覆盖 Lightweight A2A、Draft→Freeze→provision→Loop→Gate→Closure、cap-exhausted remediation、resume/replacement、兼容读取、GUI projection；验证 pack/profile 安装和 peer dependency 红线。
-- **验收**：真实 full-session E2E 可重复；失败路径有显式状态和 evidence；`@deepseek-ai/*` 不进入 dependencies 或重复实例；构建、打包、profile smoke 和发布材料与 v0.4 规格一致。
+- **范围**：完成构建、打包、profile/peer dependency 防崩检查，并交付
+  `UPDATE-v0.4.0.md`：记录能力与兼容变化、安装/更新方式、已运行验证、已知
+  风险、未运行的真实 full-session E2E，以及 Lightweight A2A、
+  Draft→Freeze→provision→Loop→Gate→Closure、cap-exhausted、
+  resume/replacement、GUI projection 和五个首发 Topology 的可复制 E2E
+  success/failure prompts与 evidence 要求。
+- **验收**：`@deepseek-ai/*` 不进入 dependencies 或重复实例；构建、打包和
+  profile smoke 与 v0.4 规格一致；Update Note 能让用户在 DSH 中另开“创造
+  模式”Session，阅读代码状态后独立设计并执行 E2E。开发团队不把未运行的真实
+  E2E 写成 PASS，也不在本 Checkpoint替该外部 Session运行它。
 
 ## 12. 开放问题（不改变已拍板合同）
 
@@ -450,6 +460,7 @@ Soft warning 不得被工具 render 的一句摘要吞掉；应进入 Draft/Free
 6. interactive/checkpointed/autonomous 的默认提示与超时 UX，只要最终满足 Human Gate scope/fallback 合同；
 7. GUI 所需的 observation/query adapter 具体协议，只要观察面不成为核心 runtime 依赖；
 8. 6A 已冻结五个首发 Topology；仍开放的是 6B 的具体实现批次、profile
-   capability 证明和每个批次的真实 E2E 任务样例，不得借此扩大到延期候选。
+   capability 证明和交给外部 DSH 验收 Session 的 E2E scenario/prompt细节，
+   不得借此扩大到延期候选，也不得把外部 E2E 写成开发团队已完成事实。
 
 开放问题不允许削弱本文件已经冻结的硬不变量；如果答案改变产品语义，必须通过新的 Topology/document revision 和明确的 Driver/用户批准记录。

@@ -2,13 +2,15 @@
 
 > 状态：Checkpoint 6A research/design freeze。本文冻结 v0.4.0 首发任务型
 > Topology 与 Role Pool 的产品合同，尚未表示 JSON、Preset 文件或 runtime
-> 已实现。6B 才能按本文实现，并且每个批次都必须有真实 full-session E2E。
+> 已实现。6B 才能按本文实现，并为每个批次提供本地 contract/integration
+> tests 与外部 full-session E2E scenario；真实 E2E 由用户另开的 DSH
+> “创造模式”验收 Session执行。
 >
 > 研究截止：2026-08-24。DSH 官方仓库事实使用
 > dsh 0.1.1-rc.2 release commit
 > b150a551b8d465e31e418e1b2eaf5e79bbb7d28e；本仓库 package manifest 仍以
-> 0.1.0-rc.6 public seam 为实现兼容基线。两者之间的差异必须在 6B/集成
-> E2E 显式验证，不能由本文假定兼容。
+> 0.1.0-rc.6 public seam 为实现兼容基线。两者之间的差异必须在 6B 本地
+> contract tests 与最终外部 E2E 交接中显式列出，不能由本文假定兼容。
 
 ## 0. 冻结结论
 
@@ -1221,39 +1223,43 @@ list、persona/instructions、所需 tool rows、compaction/skills（如合同
 
 - 集成 topology catalog、Frozen Charter、2B provisioning、5A/5B graph；
 - 验证 implementation-review Loop、human gate、closure 和 cap packet；
-- 用临时 fixture repo 做 candidate → verify → review → terminal E2E。
+- 用临时 fixture repo 做 candidate → verify → review → terminal 的
+  contract/integration tests；真实 full-session E2E 由外部 DSH 验收 Session
+  根据 v0.4.0 Update Note 执行。
 
 ### 6B-2 · bug-diagnosis-and-fix
 
 - 复用 6B-0 与 verifier/reviewer；
 - 增加 reproduction/rootCause/repairScope typed handoff；
-- 验证错误诊断、缺证据、越界写和 cap exhaustion 的负面 E2E。
+- 以 contract/integration tests 验证错误诊断、缺证据、越界写和 cap
+  exhaustion；真实 full-session 负面路径交由外部 DSH 验收 Session。
 
 ### 6B-3 · architecture-decision
 
 - 集成 researcher/architect/reviewer 的 read-only graph；
 - 验证 stable source refs、decision brief、review Loop 和 direct user choice；
-- 验证 Frozen snapshot 与 source file 后续变化隔离。
+- 以 deterministic/contract tests 验证 Frozen snapshot 与 source file 后续
+  变化隔离；真实多 Session 执行由外部 DSH 验收 Session覆盖。
 
 ### 6B-4 · refactor-and-migration
 
 - 复用 implementer/architect/verifier/reviewer；
 - 增加 baseline、compatibility window、slice、rollback typed handoff；
-- 验证 old/new contract 与 rollback smoke 的负面路径。
+- 以 fixture/integration tests 验证 old/new contract 与 rollback smoke；真实
+  full-session 迁移路径交由外部 DSH 验收 Session。
 
 ### 6B-5 · audit-and-hardening
 
 - 集成 hardening-auditor/investigator/implementer/verifier/reviewer；
 - 增加 finding fingerprint、threat boundary、rescan 和 residual-risk Gate；
-- 验证缺少 rescan、风险伪造、secret 泄漏和 closure 后续写入的负面路径。
+- 以 contract/integration tests 验证缺少 rescan、风险伪造、secret 泄漏和
+  closure 后续写入；真实 full-session 路径交由外部 DSH 验收 Session。
 
-### 6B-6 · catalog/E2E qualification
-
-- 每个 ship topology 至少一个真实 full-session scenario 和一个主要失败
-  scenario；
-- 验证旧 duo/trio/oracle/four-role-dev 仍能读取，新的 topology 不无提示替换；
-- 验证输出 schema、tool projection、Markdown/Document graph 摘要；
-- 只有完成上述证据，才能把某个模板标记为 implemented。
+完成 6B-0 至 6B-5 后，开发团队不执行真实 full-session E2E。最终必须交付
+`UPDATE-v0.4.0.md`，说明代码状态、安装/更新方式、能力与兼容变化、已运行的
+本地验证、未运行的真实 E2E、每个首发 Topology 的成功/失败场景与可复制验收
+入口。用户将在 DSH 中另开“创造模式”Session，先阅读该 Update Note 和当前
+代码，再独立设计并执行 E2E；该 Session 的结果不回写为本 Catalog 的既成事实。
 
 ### Deferred roadmap
 
