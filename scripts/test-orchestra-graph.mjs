@@ -95,6 +95,10 @@ test("Graph runtime rejects stale charter, malformed parents, and keeps handoff 
   assert.equal(appendHandoffResult(runtime, currentTeam, { handoffId: "handoff-1", actorSessionId: "driver", accepted: true, now: 5 }).kind, "noop");
   assert.throws(() => startLoop(runtime, { ...currentTeam, document: { currentCharterRevision: 2, charterRevisions: [{ charterRevision: 2, digest: "new" }] } }, loopContract(), { actorSessionId: "driver", now: 6 }), (error) => error instanceof GraphRuntimeError && error.code === "stale_charter");
   assert.equal(readGraphRuntime({ ...runtime, events: [{ ...runtime.events[0], parents: ["future"] }] }, currentTeam.teamId, 1, "digest").kind, "blocked");
+  const malformedHandoff = { schemaVersion: 1, runtimeRevision: 1, teamId: currentTeam.teamId, charterRevision: 1, charterDigest: "digest", updatedAt: 7, events: [{ eventId: "handoff:bad", seq: 1, type: "handoff_pending", actorSessionId: "implementer-session", nodeId: "handoff:bad", parents: [], createdAt: 7, payload: {}, evidence: [] }] };
+  assert.equal(readGraphRuntime(malformedHandoff, currentTeam.teamId, 1, "digest").kind, "blocked");
+  const malformedClosure = { schemaVersion: 1, runtimeRevision: 1, teamId: currentTeam.teamId, charterRevision: 1, charterDigest: "digest", updatedAt: 7, events: [{ eventId: "closure", seq: 1, type: "closure_recorded", actorSessionId: "driver", nodeId: "closure", parents: [], createdAt: 7, payload: {}, evidence: [] }] };
+  assert.equal(readGraphRuntime(malformedClosure, currentTeam.teamId, 1, "digest").kind, "blocked");
   assert.equal(graphSummary(runtime).pendingHandoffs.length, 0);
 });
 
@@ -117,6 +121,10 @@ test("Human Gate blocks only its declared scope, supports direct decision/fallba
   assert.throws(() => applyGateFallback(runtime, currentTeam, fallbackGate, { gateInstanceId: "gate-2", actorSessionId: "driver", now: 7, unavailableConfirmed: false, reason: "early", evidence: [] }), (error) => error?.code === "handoff_invalid");
   runtime = applyGateFallback(runtime, currentTeam, fallbackGate, { gateInstanceId: "gate-2", actorSessionId: "driver", now: 7, unavailableConfirmed: true, reason: "user unavailable", evidence: [{ kind: "message", ref: "unavailable" }] }).runtime;
   assert.equal(graphGates(runtime).find((gateState) => gateState.gateInstanceId === "gate-2").status, "fallback_applied");
+  const globalGate = { ...gate, gateId: "global-gate", decisionScope: ["global"], blockingScope: ["global"], expiresAt: 100 };
+  runtime = openGate(runtime, currentTeam, globalGate, { gateInstanceId: "gate-global", actorSessionId: "driver", now: 7, humanMode: "checkpointed" }).runtime;
+  assert.throws(() => appendHandoffPending(runtime, currentTeam, { kind: "candidate", from: "implementer", to: ["reviewer"] }, { handoffId: "handoff-blocked", kind: "candidate", fromRole: "implementer", toRole: "reviewer", summary: "blocked", payload: { summary: "blocked" }, actorSessionId: "implementer-session", now: 8, evidence: [{ kind: "report", ref: "blocked.md" }] }), (error) => error?.code === "handoff_invalid");
+  runtime = resolveGate(runtime, currentTeam, globalGate, { gateInstanceId: "gate-global", option: "approve", approvingSessionId: "driver", commandId: "global-decision", source: "user-command", now: 8 }).runtime;
 
   runtime = startAttempt(runtime, currentTeam, independentContract, { loopInstanceId: "independent-1", actorSessionId: "driver", participantRoleId: "implementer", now: 8, evidence: [{ kind: "report", ref: "candidate.md" }] }).runtime;
   runtime = recordVerdict(runtime, currentTeam, independentContract, { loopInstanceId: "independent-1", actorSessionId: "reviewer-session", evaluatorRole: "reviewer", verdict: "PASS", now: 9, evidence: [{ kind: "report", ref: "review.md" }] }).runtime;
@@ -124,4 +132,34 @@ test("Human Gate blocks only its declared scope, supports direct decision/fallba
   runtime = recordClosure(runtime, currentTeam, closure, { outcome: "completed", actorSessionId: "driver", now: 10, evidence: [{ kind: "report", ref: "closure.md" }] }).runtime;
   assert.equal(graphClosure(runtime).status, "recorded");
   assert.throws(() => startLoop(runtime, currentTeam, independentContract, { actorSessionId: "driver", loopInstanceId: "after-close", now: 11, evidence: [{ kind: "report", ref: "late.md" }] }), (error) => error?.code === "loop_terminal");
+});
+
+test("Gate timeoutPolicy and blocked/safe-stop outcomes keep required scope blocked", () => {
+  const currentTeam = team();
+  const contract = { ...loopContract(1), loopId: "timeout-lane" };
+  let runtime = initializeGraphRuntime(currentTeam.teamId, 1, "digest", 1);
+  const timeoutGate = { gateId: "timeout-gate", decisionScope: ["loop:timeout-lane"], blockingScope: ["loop:timeout-lane"], options: ["continue", "stop"], required: true, onUnavailable: "fallback", fallbackOption: "continue", timeoutPolicy: "blocked", expiresAt: 5 };
+  runtime = openGate(runtime, currentTeam, timeoutGate, { gateInstanceId: "timeout-1", actorSessionId: "driver", now: 2, humanMode: "checkpointed" }).runtime;
+  runtime = applyGateFallback(runtime, currentTeam, timeoutGate, { gateInstanceId: "timeout-1", actorSessionId: "driver", now: 5, unavailableConfirmed: false, reason: "expired", evidence: [{ kind: "message", ref: "timeout" }] }).runtime;
+  assert.equal(graphGates(runtime).find((gateState) => gateState.gateInstanceId === "timeout-1").status, "expired");
+  assert.throws(() => startLoop(runtime, currentTeam, contract, { actorSessionId: "driver", loopInstanceId: "timeout-loop", now: 6, evidence: [{ kind: "report", ref: "start.md" }] }), (error) => error?.code === "handoff_invalid");
+  const blockedGate = { ...timeoutGate, gateId: "blocked-gate", blockingScope: ["loop:blocked-lane"], decisionScope: ["loop:blocked-lane"], onUnavailable: "safe_stop", timeoutPolicy: "safe_stop", expiresAt: 100 };
+  const blockedContract = { ...loopContract(1), loopId: "blocked-lane" };
+  runtime = openGate(runtime, currentTeam, blockedGate, { gateInstanceId: "blocked-1", actorSessionId: "driver", now: 7, humanMode: "checkpointed" }).runtime;
+  runtime = applyGateFallback(runtime, currentTeam, blockedGate, { gateInstanceId: "blocked-1", actorSessionId: "driver", now: 8, unavailableConfirmed: true, reason: "safe stop", evidence: [{ kind: "message", ref: "stop" }] }).runtime;
+  assert.throws(() => startLoop(runtime, currentTeam, blockedContract, { actorSessionId: "driver", loopInstanceId: "blocked-loop", now: 9, evidence: [{ kind: "report", ref: "start.md" }] }), (error) => error?.code === "handoff_invalid");
+});
+
+test("allow_failed closure policy never lets completed bypass an open required Gate", () => {
+  const currentTeam = team();
+  let runtime = initializeGraphRuntime(currentTeam.teamId, 1, "digest", 1);
+  const gate = { gateId: "approval-gate", decisionScope: ["global"], blockingScope: ["global"], options: ["approve", "reject"], required: true, onUnavailable: "blocked" };
+  runtime = openGate(runtime, currentTeam, gate, { gateInstanceId: "approval-1", actorSessionId: "driver", now: 2, humanMode: "checkpointed" }).runtime;
+  const closure = { owner: "driver", openGatePolicy: "allow_failed", allowedOutcomes: ["completed", "failed", "abandoned"] };
+  const completed = recordClosure(runtime, currentTeam, closure, { outcome: "completed", actorSessionId: "driver", now: 3, evidence: [{ kind: "report", ref: "close.md" }] });
+  assert.equal(completed.accepted, false);
+  runtime = completed.runtime;
+  const failed = recordClosure(runtime, currentTeam, closure, { outcome: "failed", actorSessionId: "driver", reason: "required user decision unavailable", now: 4, evidence: [{ kind: "report", ref: "failed.md" }] });
+  assert.equal(failed.accepted, true);
+  assert.equal(graphClosure(failed.runtime).outcome, "failed");
 });

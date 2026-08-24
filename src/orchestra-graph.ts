@@ -267,6 +267,7 @@ export function readGraphRuntime(raw: unknown, teamId: string, charterRevision?:
   try {
     deriveGraph(raw as GraphRuntimeState);
     gatesFromEvents(raw.events as GraphEvent[]);
+    graphHandoffs(raw as GraphRuntimeState);
     closureFromEvents(raw.events as GraphEvent[]);
   } catch (error) {
     return diagnostic(error instanceof GraphRuntimeError ? error.code : "invalid_event", error instanceof Error ? error.message : String(error));
@@ -383,7 +384,7 @@ function deriveGraph(runtime: GraphRuntimeState): Map<string, LoopSummary> {
 }
 
 function validGateDefinition(value: unknown): value is TopologyGateDefinition {
-  return record(value) && nonEmpty(value.gateId) && Array.isArray(value.decisionScope) && value.decisionScope.length > 0 && value.decisionScope.every(nonEmpty) && Array.isArray(value.blockingScope) && value.blockingScope.length > 0 && value.blockingScope.every(nonEmpty) && Array.isArray(value.options) && value.options.length > 0 && new Set(value.options).size === value.options.length && value.options.every(nonEmpty) && typeof value.required === "boolean" && ["fallback", "blocked", "failed", "safe_stop"].includes(value.onUnavailable) && (value.fallbackOption === undefined || value.options.includes(value.fallbackOption)) && (value.expiresAt === undefined || finite(value.expiresAt));
+  return record(value) && nonEmpty(value.gateId) && Array.isArray(value.decisionScope) && value.decisionScope.length > 0 && value.decisionScope.every(nonEmpty) && Array.isArray(value.blockingScope) && value.blockingScope.length > 0 && value.blockingScope.every(nonEmpty) && Array.isArray(value.options) && value.options.length > 0 && new Set(value.options).size === value.options.length && value.options.every(nonEmpty) && typeof value.required === "boolean" && ["fallback", "blocked", "failed", "safe_stop"].includes(value.onUnavailable) && (value.fallbackOption === undefined || value.options.includes(value.fallbackOption)) && (value.timeoutPolicy !== "fallback" || (value.fallbackOption !== undefined && value.options.includes(value.fallbackOption))) && (value.expiresAt === undefined || finite(value.expiresAt));
 }
 
 function gatesFromEvents(events: readonly GraphEvent[]): Map<string, GateSummary> {
@@ -416,22 +417,22 @@ function closureFromEvents(events: readonly GraphEvent[]): ClosureSummary {
   let result: ClosureSummary = { status: "none", evidence: [] };
   for (const event of events) {
     if (event.type === "closure_requested") {
-      if (result.status === "recorded") throw new GraphRuntimeError("invalid_event", "closure requested after terminal closure");
-      result = { status: "requested", owner: typeof event.payload.owner === "string" ? event.payload.owner : undefined, outcome: event.payload.outcome as ClosureSummary["outcome"], reason: typeof event.payload.reason === "string" ? event.payload.reason : undefined, evidence: clone(event.evidence) };
+      if (result.status === "recorded" || result.status === "requested") throw new GraphRuntimeError("invalid_event", "closure requested after an unresolved closure request or terminal closure");
+      if (typeof event.payload.owner !== "string" || event.payload.owner === "" || typeof event.payload.outcome !== "string" || !["completed", "failed", "abandoned"].includes(event.payload.outcome) || typeof event.payload.reason !== "string") throw new GraphRuntimeError("invalid_event", `closure request ${event.eventId} is malformed`);
+      result = { status: "requested", owner: event.payload.owner, outcome: event.payload.outcome as ClosureSummary["outcome"], reason: event.payload.reason, evidence: clone(event.evidence) };
     } else if (event.type === "closure_rejected") {
-      if (result.status === "recorded") throw new GraphRuntimeError("invalid_event", "closure rejected after terminal closure");
-      result = { ...result, status: "rejected", reason: typeof event.payload.reason === "string" ? event.payload.reason : "closure requirements rejected", evidence: clone(event.evidence) };
+      if (result.status !== "requested" || typeof event.payload.reason !== "string" || event.payload.reason === "") throw new GraphRuntimeError("invalid_event", `closure rejection ${event.eventId} is out of order or malformed`);
+      result = { ...result, status: "rejected", reason: event.payload.reason, evidence: clone(event.evidence) };
     } else if (event.type === "closure_recorded") {
-      if (result.status === "recorded") throw new GraphRuntimeError("duplicate_event", "closure recorded twice");
-      if (event.payload.outcome !== "completed" && event.payload.outcome !== "failed" && event.payload.outcome !== "abandoned") throw new GraphRuntimeError("invalid_event", "closure outcome is invalid");
-      result = { status: "recorded", owner: typeof event.payload.owner === "string" ? event.payload.owner : undefined, outcome: event.payload.outcome, reason: typeof event.payload.reason === "string" ? event.payload.reason : undefined, evidence: clone(event.evidence) };
+      if (result.status !== "requested" || typeof event.payload.owner !== "string" || event.payload.owner === "" || typeof event.payload.outcome !== "string" || !["completed", "failed", "abandoned"].includes(event.payload.outcome) || typeof event.payload.reason !== "string") throw new GraphRuntimeError("invalid_event", `closure record ${event.eventId} is out of order or malformed`);
+      result = { status: "recorded", owner: event.payload.owner, outcome: event.payload.outcome as ClosureSummary["outcome"], reason: event.payload.reason, evidence: clone(event.evidence) };
     }
   }
   return result;
 }
 
 function openBlockingGates(runtime: GraphRuntimeState, scopes: string[]): GateSummary[] {
-  return [...gatesFromEvents(runtime.events).values()].filter((gate) => gate.status === "open" && gate.required && (gate.blockingScope.includes("global") || gate.blockingScope.some((scope) => scopes.includes(scope))));
+  return [...gatesFromEvents(runtime.events).values()].filter((gate) => ["open", "blocked", "expired"].includes(gate.status) && gate.required && (gate.blockingScope.includes("global") || gate.blockingScope.some((scope) => scopes.includes(scope))));
 }
 
 function assertScopesOpen(runtime: GraphRuntimeState, scopes: string[]): void {
@@ -453,7 +454,7 @@ function closureReadiness(runtime: GraphRuntimeState, definition: TopologyClosur
   const loops = graphLoops(runtime);
   if (graphHandoffs(runtime).some((handoff) => handoff.status === "pending")) return "pending handoff requires reconcile";
   if (loops.some((loop) => loop.status === "running")) return "active Loop attempt remains";
-  if (definition.openGatePolicy === "reject" && [...gatesFromEvents(runtime.events).values()].some((gate) => gate.status === "open" && gate.required)) return "required Human Gate remains open";
+  if ([...gatesFromEvents(runtime.events).values()].some((gate) => ["open", "blocked", "expired"].includes(gate.status) && gate.required) && (definition.openGatePolicy === "reject" || outcome !== "failed")) return "required Human Gate remains unresolved";
   if (definition.requiredLoopOutcomes !== undefined) {
     for (const required of definition.requiredLoopOutcomes) {
       const [loopId, expected] = required.split(":");
@@ -576,6 +577,7 @@ export function appendHandoffPending(runtime: GraphRuntimeState, team: TeamState
     if (input.attempt !== undefined && input.attempt !== currentAttempt) throw new GraphRuntimeError("attempt_conflict", `handoff attempt ${input.attempt} is not the current attempt ${currentAttempt ?? "none"}`);
     assertScopesOpen(runtime, [loop.loopId, `loop:${loop.loopId}`, `role:${from.id}`, `role:${to.id}`]);
   }
+  if (input.loopInstanceId === undefined) assertScopesOpen(runtime, [`role:${from.id}`, `role:${to.id}`]);
   const existing = graphHandoffs(runtime).find((handoff) => handoff.handoffId === input.handoffId);
   if (existing !== undefined) {
     const event = runtime.events.find((candidate) => candidate.type === "handoff_pending" && candidate.payload.handoffId === input.handoffId);
@@ -599,6 +601,12 @@ export function appendHandoffResult(runtime: GraphRuntimeState, team: TeamState,
   currentCharterMatches(runtime, team);
   const existing = graphHandoffs(runtime).find((handoff) => handoff.handoffId === input.handoffId);
   if (existing === undefined) throw new GraphRuntimeError("handoff_invalid", `handoff ${input.handoffId} has no pending intent`);
+  const scopes = [`role:${existing.fromRole}`, `role:${existing.toRole}`];
+  if (existing.loopInstanceId !== undefined) {
+    const loop = graphLoops(runtime).find((entry) => entry.loopInstanceId === existing.loopInstanceId);
+    if (loop !== undefined) scopes.push(loop.loopId, `loop:${loop.loopId}`);
+  }
+  assertScopesOpen(runtime, scopes);
   if (existing.status === "accepted" || existing.status === "failed") return { kind: "noop", runtime, events: [] };
   return appendOne(runtime, { type: input.accepted ? "handoff_accepted" : "handoff_failed", actorSessionId: input.actorSessionId, roleId: existing.fromRole, nodeId: `handoff:${input.handoffId}`, loopInstanceId: existing.loopInstanceId, createdAt: input.now, eventId: `handoff:${input.handoffId}:${input.accepted ? "accepted" : "failed"}`, payload: { handoffId: input.handoffId, ...(input.receipt === undefined ? {} : { receipt: input.receipt }), ...(input.error === undefined ? {} : { error: input.error }) }, evidence: [] });
 }
@@ -607,13 +615,16 @@ export function graphHandoffs(runtime: GraphRuntimeState): HandoffSummary[] {
   const handoffs = new Map<string, HandoffSummary>();
   for (const event of runtime.events) {
     if (!["handoff_pending", "handoff_accepted", "handoff_failed"].includes(event.type)) continue;
-    const id = typeof event.payload.handoffId === "string" ? event.payload.handoffId : undefined;
-    if (id === undefined) continue;
+    const id = typeof event.payload.handoffId === "string" && event.payload.handoffId !== "" ? event.payload.handoffId : undefined;
+    if (id === undefined) throw new GraphRuntimeError("invalid_event", `handoff event ${event.eventId} has no handoffId`);
     if (event.type === "handoff_pending") {
+      if (handoffs.has(id) || typeof event.payload.kind !== "string" || typeof event.payload.fromRole !== "string" || typeof event.payload.toRole !== "string" || typeof event.payload.toSessionId !== "string" || typeof event.payload.summary !== "string" || !record(event.payload.payload)) throw new GraphRuntimeError("invalid_event", `handoff pending event ${event.eventId} is malformed or duplicated`);
       handoffs.set(id, { handoffId: id, ...(event.loopInstanceId === undefined ? {} : { loopInstanceId: event.loopInstanceId }), ...(typeof event.payload.attempt === "number" ? { attempt: event.payload.attempt } : {}), fromRole: String(event.payload.fromRole ?? event.roleId ?? ""), toRole: String(event.payload.toRole ?? ""), ...(typeof event.payload.toSessionId === "string" ? { targetSessionId: event.payload.toSessionId } : {}), status: "pending", summary: String(event.payload.summary ?? ""), evidence: clone(event.evidence) });
     } else {
       const current = handoffs.get(id);
-      if (current === undefined) continue;
+      if (current === undefined || current.status !== "pending") throw new GraphRuntimeError("invalid_event", `handoff result ${event.eventId} has no pending intent`);
+      if (event.type === "handoff_accepted" && !record(event.payload.receipt)) throw new GraphRuntimeError("invalid_event", `handoff accepted event ${event.eventId} has no receipt`);
+      if (event.type === "handoff_failed" && (typeof event.payload.error !== "string" || event.payload.error === "")) throw new GraphRuntimeError("invalid_event", `handoff failed event ${event.eventId} has no error`);
       current.status = event.type === "handoff_accepted" ? "accepted" : "failed";
       if (record(event.payload.receipt)) current.receipt = clone(event.payload.receipt);
       if (typeof event.payload.error === "string") current.error = event.payload.error;
@@ -628,13 +639,14 @@ export function graphSummary(runtime: GraphRuntimeState, stale = false): GraphPr
   const pending = graphHandoffs(runtime).filter((handoff) => handoff.status === "pending");
   const gates = gatesFromEvents(runtime.events);
   const closure = closureFromEvents(runtime.events);
+  const blockedGates = [...gates.values()].filter((gate) => ["open", "blocked", "expired"].includes(gate.status) && gate.required);
   return {
-    status: stale ? "stale" : current === undefined ? "idle" : current.status === "cap_exhausted" ? "cap_exhausted" : current.status,
+    status: stale ? "stale" : blockedGates.length > 0 ? "blocked" : current === undefined ? "idle" : current.status === "cap_exhausted" ? "cap_exhausted" : current.status,
     ...(current === undefined ? {} : { currentLoop: { loopInstanceId: current.loopInstanceId, loopId: current.loopId, ...(current.attempts.at(-1) === undefined ? {} : { attempt: current.attempts.at(-1)?.attempt }), status: current.status } }),
     pendingHandoffs: pending,
     capExhausted: loops.filter((loop) => loop.capExhausted).map((loop) => loop.loopInstanceId),
-    openGates: [...gates.values()].filter((gate) => gate.status === "open"),
-    blockedScopes: [...gates.values()].filter((gate) => gate.status === "open" && gate.required).flatMap((gate) => gate.blockingScope),
+    openGates: [...gates.values()].filter((gate) => ["open", "blocked", "expired"].includes(gate.status)),
+    blockedScopes: blockedGates.flatMap((gate) => gate.blockingScope),
     closure,
     runtimeRevision: runtime.runtimeRevision,
     stale,
@@ -654,7 +666,7 @@ export function openGate(runtime: GraphRuntimeState, team: TeamState, definition
   assertGraphOpen(runtime);
   if (input.actorSessionId !== team.controllerSessionId) throw new GraphRuntimeError("permission_denied", "only the Team controller may open a Human Gate");
   if (!validGateDefinition(definition) || !nonEmpty(input.gateInstanceId)) throw new GraphRuntimeError("invalid_shape", "Gate definition or instance id is invalid");
-  if (input.humanMode === "autonomous" && definition.required && definition.onUnavailable !== "fallback") throw new GraphRuntimeError("handoff_invalid", "autonomous required Human Gate must have a pre-approved fallback");
+  if (input.humanMode === "autonomous" && definition.required && (definition.onUnavailable !== "fallback" || (definition.timeoutPolicy !== undefined && definition.timeoutPolicy !== "fallback"))) throw new GraphRuntimeError("handoff_invalid", "autonomous required Human Gate must have a pre-approved fallback");
   const existing = gatesFromEvents(runtime.events).get(input.gateInstanceId);
   if (existing !== undefined) {
     if (existing.gateId !== definition.gateId || stable(existing.blockingScope) !== stable(definition.blockingScope)) throw new GraphRuntimeError("duplicate_event", `Gate instance ${input.gateInstanceId} conflicts with existing scope`);
@@ -684,8 +696,10 @@ export function applyGateFallback(runtime: GraphRuntimeState, team: TeamState, d
   if (gate.status !== "open") return { kind: "noop", runtime, events: [] };
   const expired = gate.expiresAt !== undefined && input.now >= gate.expiresAt;
   if (!expired && !input.unavailableConfirmed) throw new GraphRuntimeError("handoff_invalid", "Gate fallback is not allowed before expiry without an explicit unavailable fact");
-  const type: GraphEventType = definition.onUnavailable === "fallback" ? "gate_fallback_applied" : expired ? "gate_expired" : "gate_blocked";
-  const payload = { gateInstanceId: input.gateInstanceId, gateId: definition.gateId, reason: input.reason, action: definition.onUnavailable, ...(definition.fallbackOption === undefined ? {} : { option: definition.fallbackOption }) };
+  const action = expired && definition.timeoutPolicy !== undefined ? definition.timeoutPolicy : definition.onUnavailable;
+  if (action === "fallback" && definition.fallbackOption === undefined) throw new GraphRuntimeError("handoff_invalid", "Gate fallback action has no pre-approved fallback option");
+  const type: GraphEventType = action === "fallback" ? "gate_fallback_applied" : expired ? "gate_expired" : "gate_blocked";
+  const payload = { gateInstanceId: input.gateInstanceId, gateId: definition.gateId, reason: input.reason, action, ...(action === "fallback" && definition.fallbackOption === undefined ? {} : action === "fallback" ? { option: definition.fallbackOption } : {}) };
   return appendOne(runtime, { type, actorSessionId: input.actorSessionId, nodeId: `gate:${input.gateInstanceId}`, createdAt: input.now, eventId: `gate:${input.gateInstanceId}:${type}`, payload, evidence: input.evidence });
 }
 

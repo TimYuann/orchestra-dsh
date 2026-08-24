@@ -319,3 +319,14 @@ test("orchestra_spawn direct gate rejects both new and existing frozen Team path
   assert.throws(() => rejectDirectGovernedSpawn(), /approval_required/);
   assert.equal(existingFs.content("orchestra/state/team.json"), before);
 });
+
+test("terminal completed and abandoned Teams remain readable and reconcileable", () => {
+  for (const status of ["completed", "abandoned"]) {
+    const source = team({ status });
+    const document = initializeOrchestrationDocument(source, 400);
+    const read = readOrchestrationDocument(document, source.teamId);
+    assert.equal(read.kind, "ready");
+    const reconciled = reconcileOrchestrationDocument(read.document, source, source.controllerSessionId, 401);
+    assert.equal(readOrchestrationDocument(reconciled.document, source.teamId).kind, "ready");
+  }
+});

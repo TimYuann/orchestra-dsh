@@ -149,7 +149,7 @@ function evidence(value: unknown): value is EvidenceRef {
 }
 
 function projection(value: unknown): value is RuntimeProjection {
-  if (!record(value) || !nonEmpty(value.teamId) || !nonEmpty(value.controllerSessionId) || !["provisioning", "active", "degraded", "blocked", "failed"].includes(value.status) || !nonEmpty(value.status)) return false;
+  if (!record(value) || !nonEmpty(value.teamId) || !nonEmpty(value.controllerSessionId) || !["provisioning", "active", "degraded", "blocked", "failed", "completed", "abandoned"].includes(value.status) || !nonEmpty(value.status)) return false;
   if (!record(value.topologyRef) || !nonEmpty(value.topologyRef.id) || !["project", "global", "bundled"].includes(value.topologyRef.source)) return false;
   if (!record(value.mission) || !Array.isArray(value.roles) || !Array.isArray(value.reports) || !finiteNumber(value.projectionAt)) return false;
   if (typeof value.mission.objective !== "string" || !stringArray(value.mission.scope) || !stringArray(value.mission.constraints) || !stringArray(value.mission.acceptanceCriteria) || !stringArray(value.mission.nonGoals) || typeof value.mission.context !== "string") return false;
