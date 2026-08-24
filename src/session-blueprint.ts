@@ -511,8 +511,13 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
     session.append(LIGHTWEIGHT_BLUEPRINT_EVENT, marker);
     return {
       commit() {
+        // file strategy mounts the preset tree directly into the agent scope
+        // (mountPreset already awaited the tree and validated its rows and
+        // services), which by design records no standing parent — so
+        // composedPreset is undefined. Only the roster strategies (explicit /
+        // default) are expected to resolve a composed preset id here.
         const actualPreset = agentPresets.composedPreset(agentCtx);
-        if (actualPreset !== agentPreset) throw new SessionBlueprintError("composition_mismatch", `published composition "${String(actualPreset)}" does not match blueprint "${agentPreset}"`);
+        if (presetStrategy !== "file" && actualPreset !== agentPreset) throw new SessionBlueprintError("composition_mismatch", `published composition "${String(actualPreset)}" does not match blueprint "${agentPreset}"`);
         const actualPermission = permissionService.current(session.events);
         if (actualPermission !== permissionPreset) throw new SessionBlueprintError("permission_mismatch", `published permission "${actualPermission}" does not match blueprint "${permissionPreset}"`);
         const names = visibleToolNames(agentCtx);
@@ -750,8 +755,11 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
     session.append(GOVERNED_BLUEPRINT_EVENT, marker);
     return {
       commit() {
+        // See the lightweight commit: the file strategy (catalog presets,
+        // outside the roster roots) mounts directly into the agent scope and
+        // records no standing parent, so composedPreset is undefined there.
         const actualPreset = agentPresets.composedPreset(agentCtx);
-        if (actualPreset !== agentPreset) throw new SessionBlueprintError("composition_mismatch", `published governed composition "${String(actualPreset)}" does not match blueprint "${agentPreset}"`);
+        if (presetStrategy !== "file" && actualPreset !== agentPreset) throw new SessionBlueprintError("composition_mismatch", `published governed composition "${String(actualPreset)}" does not match blueprint "${agentPreset}"`);
         const actualPermission = permissionService.current(session.events);
         if (actualPermission !== effectivePermissionPreset) throw new SessionBlueprintError("permission_mismatch", `published governed permission "${actualPermission}" does not match blueprint "${effectivePermissionPreset}"`);
         const actualSandbox = effectiveSandboxMode(session.events);
