@@ -111,9 +111,9 @@ test("catalog resolves all bundled topologies and installs the same builtin trut
     assert.equal(duo.kind, "ready");
     assert.equal(duo.source, "bundled");
     const list = await catalog.list(projectRoot);
-    assert.deepEqual(list.ready.map((entry) => entry.config.id), ["bug-diagnosis-and-fix", "duo", "feature-development", "four-role-dev", "oracle", "trio"]);
+    assert.deepEqual(list.ready.map((entry) => entry.config.id), ["architecture-decision", "bug-diagnosis-and-fix", "duo", "feature-development", "four-role-dev", "oracle", "trio"]);
     await catalog.ensureBundledArtifacts();
-    assert.deepEqual((await readdir(join(globalRoot, "topologies"))).sort(), ["bug-diagnosis-and-fix.json", "duo.json", "feature-development.json", "four-role-dev.json", "oracle.json", "trio.json"]);
+    assert.deepEqual((await readdir(join(globalRoot, "topologies"))).sort(), ["architecture-decision.json", "bug-diagnosis-and-fix.json", "duo.json", "feature-development.json", "four-role-dev.json", "oracle.json", "trio.json"]);
   });
 });
 

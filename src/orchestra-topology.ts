@@ -510,6 +510,105 @@ export const BUILTIN_TOPOLOGIES: TopologyConfig[] = [
       },
     },
   },
+  {
+    schemaVersion: 1,
+    id: "architecture-decision",
+    name: "Architecture Decision",
+    description:
+      "在约束、证据和候选方案之间形成可审查、可执行的架构决策：researcher 收集 source facts → architect 综合候选与推荐 → reviewer 评估 decision brief；Loop PASS 且用户 Gate accept 后才收束",
+    controller: { id: "driver", source: "caller" },
+    roles: [
+      {
+        id: "researcher",
+        name: "Researcher",
+        preset: "orchestra-v04-researcher-v1",
+        sandbox: "read-only",
+        compositionTools: ["tool-fs-search", "tool-fs"],
+        orchestraTools: ["orchestra_report", "orchestra_handoff"],
+        welcome:
+          "你作为 researcher（研究者）：收集 source-backed facts、unknowns 和 option 输入，不做最终选择。\n1) 只读沙箱，不改代码；唯一写通道是 orchestra_report。\n2) research brief 必须保留 source URL/访问版本、fact/inference 标签、unknowns 和 evidence refs；二手资料不能支撑关键事实。\n3) 不能把 source availability 当作 correctness，不能伪造用户批准。\n4) 对 driver 的汇报经 a2a_reply；角色间 typed 交接走 orchestra_handoff（research-brief → architect）。",
+      },
+      {
+        id: "architect",
+        name: "Architect",
+        preset: "orchestra-v04-architect-v1",
+        sandbox: "read-only",
+        compositionTools: ["tool-fs-search", "tool-fs"],
+        orchestraTools: ["orchestra_report", "orchestra_handoff"],
+        welcome:
+          "你作为 architect（架构师）：把约束、候选、权衡与影响综合为 decision brief 与推荐。\n1) 只读沙箱，只写 report/evidence，不改 runtime code。\n2) decision brief 必须列 decision question、alternatives、tradeoffs、impact、constraints、migration impact、unknowns 与 evidence refs。\n3) 推荐不等于已批准：你不拥有用户 approval 或 runtime PASS 的伪造权。\n4) 对 driver 的汇报经 a2a_reply；角色间 typed 交接走 orchestra_handoff（decision-brief → reviewer、recommendation → driver）。",
+      },
+      {
+        id: "reviewer",
+        name: "Reviewer",
+        preset: "orchestra-v04-reviewer-v1",
+        sandbox: "read-only",
+        compositionTools: ["tool-fs", "tool-fs-search", "tool-bash"],
+        orchestraTools: ["orchestra_report", "orchestra_verdict", "orchestra_handoff"],
+        welcome:
+          "你作为 reviewer（评审者）：唯一有权记录 PASS/FAIL/BLOCKED 的 evaluator，评估 decision evidence。\n1) 只读沙箱，只审不修；PASS 只表示 decision brief 满足 evidence/structure 合同，不等于用户已选择方案。\n2) 第一轮缺失 evidence 必须返回 findings（missingEvidence、risks、requiredRevision），不能放行。\n3) findings 交接可回 researcher 或 architect；verdict 交接走 orchestra_handoff（verdict → driver）。\n4) 用 orchestra_verdict 记录 PASS/FAIL/BLOCKED；对 driver 的汇报经 a2a_reply；不伪造用户 Gate、不改 charter/graph。",
+      },
+    ],
+    protocol: {
+      ownership: {
+        source_gathering: "researcher",
+        synthesis: "architect",
+        review_verdict: "reviewer",
+        user_decision: "driver",
+        closure: "driver",
+      },
+      routes: [
+        { kind: "question", from: "driver", to: ["researcher"] },
+        { kind: "research-brief", from: "researcher", to: ["architect"] },
+        { kind: "decision-brief", from: "architect", to: ["reviewer"] },
+        { kind: "findings", from: "reviewer", to: ["researcher", "architect"] },
+        { kind: "verdict", from: "reviewer", to: ["driver"] },
+        { kind: "recommendation", from: "architect", to: ["driver"] },
+      ],
+      completion: { owner: "driver", rule: "decision-validation Loop PASS + 用户 Gate accept 后由 driver 收束（completed/failed/abandoned）" },
+      handoffs: [
+        { kind: "research-brief", from: "researcher", to: ["architect"], requiredPayloadFields: ["question", "options", "facts", "unknowns"], requiredEvidenceKinds: ["url", "file", "report"] },
+        { kind: "decision-brief", from: "architect", to: ["reviewer"], requiredPayloadFields: ["decision", "alternatives", "tradeoffs", "impact"], requiredEvidenceKinds: ["report", "file", "url"] },
+        { kind: "findings", from: "reviewer", to: ["researcher", "architect"], requiredPayloadFields: ["missingEvidence", "risks", "requiredRevision"], requiredEvidenceKinds: ["report", "message", "url"] },
+        { kind: "recommendation", from: "architect", to: ["driver"], requiredPayloadFields: ["recommendedOption", "reasons", "migrationImpact"], requiredEvidenceKinds: ["report", "file", "url"] },
+        { kind: "verdict", from: "reviewer", to: ["driver"], requiredPayloadFields: ["verdict", "unresolvedFindings"], requiredEvidenceKinds: ["report", "message", "url"] },
+      ],
+      loops: [
+        {
+          loopId: "decision-validation",
+          entry: { role: "researcher", event: "research_ready" },
+          participants: ["researcher", "architect", "reviewer"],
+          evaluatorRole: "reviewer",
+          candidateKind: "decision-brief",
+          verdictKind: "PASS|FAIL|BLOCKED",
+          maxAttempts: 2,
+          passRoute: "user decision gate → closure",
+          retryRoute: "findings → researcher/architect → reviewer",
+          capExhaustedRoute: "cap_exhausted → driver requests user/replan",
+          requiredEvidenceKinds: ["report", "file", "url", "message"],
+        },
+      ],
+      gates: [
+        {
+          gateId: "architecture-decision-approval",
+          decisionScope: ["loop:decision-validation"],
+          blockingScope: ["closure"],
+          options: ["accept", "revise", "stop"],
+          required: true,
+          onUnavailable: "blocked",
+        },
+      ],
+      closure: {
+        owner: "driver",
+        requiredLoopOutcomes: ["decision-validation:passed"],
+        requiredVerdicts: ["PASS"],
+        requiredEvidenceKinds: ["report", "file", "url"],
+        openGatePolicy: "reject",
+        allowedOutcomes: ["completed", "failed", "abandoned"],
+        userOverride: false,
+      },
+    },
+  },
 ];
 
 const TOPOLOGY_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
