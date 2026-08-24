@@ -230,6 +230,13 @@ async function resolvePresetOrThrow<T extends { resolve(id?: string): Promise<{ 
 }
 
 function sessionFrom(ctx: Context, agentCtx: Context, sessionId: string): Session | undefined {
+  // The agent factory runs setup on the prepared (unpublished) agent's ctx, so
+  // the agent — and its session — are already constructed, while the sessions
+  // service only registers the session at publish. Prefer agentCtx.agent.session
+  // (authoritative identity: agent.id === agent.session.id), then fall back to
+  // the sessions service for tests/agentless callers.
+  const agent = (agentCtx as { agent?: { session?: Session } }).agent;
+  if (agent?.session !== undefined && agent.session.id === sessionId) return agent.session;
   const scopedSessions = agentCtx.get("sessions");
   const session = scopedSessions?.get(sessionId as never);
   if (session !== undefined) return session;
