@@ -138,11 +138,13 @@ ls node_modules | grep '^@deepseek-ai'   # 期望无输出（*.dup-bak 残留允
 ## 7. 风险与边界
 
 1. **rc.6 public seam 与官方 rc.2 的差异**（TOPOLOGY-CATALOG G.1 兼容矩阵）：本插件针对 `@deepseek-ai/*` rc.6 开发；若目标 DSH profile 是官方 rc.2，peer 版本不匹配可能导致 mount/工具面不一致——升级前核对 profile 的 DSH 版本与 peerDependencies 版本对齐。
-2. **本机 profile 同步状态（CP9 任务 2 结果，如实记录）**：`npm pack` 产出 `orchestra-dsh-0.4.0.tgz`，防崩静态检查全绿（dependencies 仅 js-yaml；15 个 peerDependencies 与 devDependencies 全部对齐；tgz 无 @deepseek-ai 副本、无 src/scripts/reports/orchestra）。**profile 同步已中止**：web profile 的 `pnpm install` 因**既有破坏的第三方引用**失败（`file:.../talk-like-a-pro-dsh-0.1.1.tgz` 指向的目录已不存在，与 v0.4.0 无关）；按防崩流程「报错立即停止」处理，三个 profile 已恢复原状（仍为 0.3.0 运行态）。要同步 v0.4.0 需先修复该引用（或移除 talk-like-a-pro-dsh），再把 profile 依赖改为 `file:<orchestra-dsh-0.4.0.tgz 路径>` + `minimumReleaseAgeExclude: orchestra-dsh@0.4.0` + 删 pnpm 状态文件后 `pnpm install`，并执行三件套验证（无 `@deepseek-ai` 实体副本、`require.resolve('@deepseek-ai/dsh-tools', {paths:['<profile>/node_modules/orchestra-dsh/lib']})` 指向 host、health 200）。
+2. **本机 profile 同步状态（CP9 任务 2 结果，如实记录）**：`npm pack` 产出 `orchestra-dsh-0.4.0.tgz`，防崩静态检查全绿（dependencies 仅 js-yaml；15 个 peerDependencies 与 devDependencies 全部对齐；tgz 无 @deepseek-ai 副本、无 src/scripts/reports/orchestra）。三个 profile（web / dev / dev-headless）已同步 v0.4.0：profile 依赖改为 `file:<orchestra-dsh-0.4.0.tgz>`（本地 tgz 模式，与仓库既有本地插件一致）+ `minimumReleaseAgeExclude: orchestra-dsh@0.4.0` + 删除全部 lock/state 文件（含 `node_modules/.pnpm/lock.yaml`）后 `pnpm install` 成功。**前置清理**：web profile 曾因既有破坏引用（`talk-like-a-pro-dsh` / `learn-as-you-go-dsh` 的 tgz 路径已迁移）导致 install 失败——按用户指示卸载 talk-like-a-pro-dsh，并把 learn-as-you-go-dsh 路径修复到 `/Users/yuantian/Documents/Developer/learn-as-you-go-dsh/`。三件套验证全部通过：三个 profile 的 node_modules 无 `@deepseek-ai` 实体副本（dev 中 hoisted 的 cosmokit/schemastery 已按文档模式隔离为 `.dup-bak`，回退 host）；`require.resolve('@deepseek-ai/dsh-tools', {paths:['<profile>/node_modules/orchestra-dsh/lib']})` 全部指向 host 路径；dev 实例（4600）health 200 且保持运行（供浏览器验证）。主实例 4599 未重启。
 3. **主实例 4599 未重启**（磁盘同步即可，进程保持旧版）。
 4. **双实例红线**：任何 `@deepseek-ai/*` 进入 dependencies 或 profile 出现实体副本都会导致 `reading 'prepare'` 崩溃；已污染会话不可修复，需新会话。
 
 ## 8. 浏览器验证清单（dash / 4600）
+
+dev 实例已运行于 http://127.0.0.1:4600（v0.4.0 已同步）；主实例 4599 保持旧版进程。
 
 1. `orchestra_draft` 卡片渲染成 8 列 Markdown 表格（角色/preset/sandbox/permission/model/reasoningEffort/compositionTools/orchestraTools）+ 摘要行 `charter draft <id>@<rev> (<status>) digest=...`。
 2. 角色执行 handoff/report/verdict 后，driver 会话收到一行 `orchestra: <teamId> <kind> ...` 提醒（新 turn）；`/team decide` 与 `orchestra_close` 不自嗨。
