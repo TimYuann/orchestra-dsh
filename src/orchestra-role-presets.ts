@@ -212,12 +212,17 @@ function renderComposition(options: {
       "  config:",
       "    - id: plan-mode",
       "      name: '@deepseek-ai/dsh-plan-mode'",
+      "      config:",
+      "        section: |",
+      "          You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Explore with non-mutating reads and searches; do not edit or write files, run formatters, or carry out the plan. A user's conversational agreement approves nothing and does not end plan mode; fold confirmed decisions into the plan and submit it through exit_plan_mode.",
     );
   }
   if (options.todo) {
     rows.push(
       "- id: tool-todo",
       "  name: '@deepseek-ai/dsh-tool-todo'",
+      "  config:",
+      "    allowParallelInProgress: true",
     );
   }
 
