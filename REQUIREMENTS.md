@@ -251,6 +251,14 @@ catalog；catalog 的“冻结”仍不是“已实现”。
 - `researcher`；
 - `hardening-auditor`。
 
+对应的 v0.4 versioned Role Preset IDs 为
+`orchestra-v04-implementer-v1`、`orchestra-v04-reviewer-v1`、
+`orchestra-v04-investigator-v1`、`orchestra-v04-verifier-v1`、
+`orchestra-v04-architect-v1`、`orchestra-v04-researcher-v1` 和
+`orchestra-v04-hardening-auditor-v1`。旧
+`orchestra-implementer`/`orchestra-reviewer`/`orchestra-oracle` 继续是
+legacy 输入；不自动映射、不覆盖用户文件，新 Topology 只引用 versioned IDs。
+
 6A 明确延期、不得在 6B 偷渡实现的候选为：
 
 - `product-or-ui-design`；

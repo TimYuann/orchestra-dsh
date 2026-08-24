@@ -1024,6 +1024,26 @@ list、persona/instructions、所需 tool rows、compaction/skills（如合同
   返回稳定 provisioning diagnostic；后者不能通过向 DSH composition 加 row
   来绕过。
 
+### E.0.1 最终 ID 与 legacy mapping
+
+v0.4 使用新的 versioned lower-kebab IDs，避免把 v0.3 的 minimal composition
+误认成完整 Role Preset。旧 ID 继续可解析，但不自动迁移、不覆盖用户文件：
+
+| 语义角色 | v0.4 stable ID | legacy ID | 处理 |
+| --- | --- | --- | --- |
+| implementer | orchestra-v04-implementer-v1 | orchestra-implementer | legacy 保留；新 Topology 只引用 v0.4 ID |
+| reviewer | orchestra-v04-reviewer-v1 | orchestra-reviewer | legacy 保留；新 Topology 只引用 v0.4 ID |
+| investigator | orchestra-v04-investigator-v1 | 无 | 新增 v0.4 ID |
+| verifier | orchestra-v04-verifier-v1 | 无 | 新增 v0.4 ID |
+| architect | orchestra-v04-architect-v1 | 无；oracle 不自动映射 | 新增 v0.4 ID；旧 oracle 继续 legacy |
+| researcher | orchestra-v04-researcher-v1 | 无 | 新增 v0.4 ID |
+| hardening-auditor | orchestra-v04-hardening-auditor-v1 | 无 | 新增 v0.4 ID |
+
+项目级/全局级同名文件优先于 catalog builtin；已存在文件只读解析并由
+Blueprint/Loader 验证，绝不因版本升级覆盖。legacy Topology 的 preset
+引用保持 legacy，只有显式 Topology amendment 才能切换到 v0.4 ID。D.1–D.5
+表中的 Role Preset 列是语义角色标签，解析时必须使用本表对应的 stable ID。
+
 ### E.1 implementer
 
 - purpose：在已批准 mission/repair scope 内实现代码和测试。

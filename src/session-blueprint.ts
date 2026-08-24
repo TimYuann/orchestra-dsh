@@ -64,6 +64,9 @@ export interface GovernedBlueprintMarker {
   reasoningEffort?: string;
   cwd: string;
   title?: string;
+  compositionTools?: string[];
+  orchestraTools?: string[];
+  optionalCapabilities?: string[];
   createdAt: number;
 }
 
@@ -132,6 +135,9 @@ export interface GovernedBlueprintInput {
   model?: string;
   reasoningEffort?: string;
   runtime?: { provider?: string; model?: string; reasoningEffort?: string };
+  compositionTools?: string[];
+  orchestraTools?: string[];
+  optionalCapabilities?: string[];
   requiredTools?: string[];
   signal?: AbortSignal;
 }
@@ -154,6 +160,9 @@ export interface GovernedBlueprintReceipt {
   provider: string;
   model: string;
   reasoningEffort?: string;
+  compositionTools: LightweightToolReadiness;
+  orchestraTools: LightweightToolReadiness;
+  optionalCapabilities: string[];
   tools: LightweightToolReadiness;
 }
 
@@ -179,6 +188,10 @@ export type BlueprintErrorCode =
   | "model_unavailable"
   | "required_tools_unproven"
   | "required_tools_missing"
+  | "composition_tools_unproven"
+  | "composition_tools_missing"
+  | "orchestra_tools_unproven"
+  | "orchestra_tools_missing"
   | "composition_mismatch"
   | "session_unavailable";
 
@@ -265,29 +278,114 @@ function requiredTools(input: { requiredTools?: string[] }): string[] {
   return [...new Set(names)];
 }
 
-/**
- * Non-publishing capability gate for Governed provisioning. DSH rc.6 exposes
- * actual tool schemas only from a composed scope; a preset file/id alone is
- * not a static capability proof. Keep commit-time validation as the second
- * defense, but fail closed before team reservation when required tools cannot
- * be proven without publishing an Agent.
- */
-export function preflightGovernedRequiredTools(input: { requiredTools?: string[]; presetId?: string; presetFile?: BlueprintPresetFile }): void {
-  const required = requiredTools(input);
-  if (required.length === 0) return;
-  const source = input.presetFile?.path ?? input.presetId ?? "explicit preset";
-  throw new SessionBlueprintError(
-    "required_tools_unproven",
-    `required governed tools cannot be proven before Agent publication for ${source}; reservation was not attempted`,
-    { required, source },
-  );
+function capabilityTools(input: { requiredTools?: string[]; compositionTools?: string[]; orchestraTools?: string[] }): {
+  legacy: string[];
+  composition: string[];
+  orchestra: string[];
+  all: string[];
+} {
+  const legacy = requiredTools(input);
+  const compositionInput = input.compositionTools ?? [];
+  const orchestraInput = input.orchestraTools ?? [];
+  for (const [label, values] of [["compositionTools", compositionInput], ["orchestraTools", orchestraInput] as const]) {
+    if (!Array.isArray(values) || values.some((name) => typeof name !== "string" || name === "")) {
+      throw new SessionBlueprintError("invalid_input", label + " must be an array of non-empty strings");
+    }
+  }
+  const composition = [...new Set([...legacy, ...compositionInput])];
+  const orchestra = [...new Set(orchestraInput)];
+  return { legacy, composition, orchestra, all: [...new Set([...composition, ...orchestra])] };
 }
+
+function toolReadiness(names: readonly string[], required: readonly string[]): LightweightToolReadiness {
+  const selected = [...new Set(names)].filter((name) => required.includes(name)).sort();
+  return { names: selected, count: selected.length };
+}
+
+/**
+ * Non-publishing capability gate for Governed provisioning.
+ *
+ * The legacy requiredTools field remains a compatibility alias for
+ * compositionTools. New role plans carry the two capability planes explicitly:
+ * catalog composition proof for DSH rows and host-scope proof for Orchestra tools.
+ */
+export function preflightGovernedRequiredTools(input: {
+  requiredTools?: string[];
+  compositionTools?: string[];
+  orchestraTools?: string[];
+  presetId?: string;
+  presetFile?: BlueprintPresetFile;
+  rolePresetSpec?: { compositionTools: string[]; orchestraTools: string[] };
+  hostToolNames?: string[];
+}): void {
+  const capabilities = capabilityTools(input);
+  const source = input.presetFile?.path ?? input.presetId ?? "explicit preset";
+  if (capabilities.legacy.length > 0 && input.compositionTools === undefined && input.orchestraTools === undefined) {
+    throw new SessionBlueprintError(
+      "required_tools_unproven",
+      "required governed tools cannot be proven before Agent publication for " + source + "; reservation was not attempted",
+      { required: capabilities.legacy, source, plane: "legacy-required-tools" },
+    );
+  }
+  if (capabilities.composition.length > 0) {
+    const declared = input.rolePresetSpec?.compositionTools;
+    if (declared === undefined) {
+      throw new SessionBlueprintError(
+        "composition_tools_unproven",
+        "compositionTools cannot be proven before Agent publication for " + source + "; a catalog spec or static composition proof is required",
+        { required: capabilities.composition, source, plane: "composition" },
+      );
+    }
+    const missing = capabilities.composition.filter((name) => !declared.includes(name));
+    if (missing.length > 0) {
+      throw new SessionBlueprintError(
+        "composition_tools_missing",
+        "catalog composition does not declare required compositionTools: " + missing.join(", "),
+        { missing, declared, source, plane: "composition" },
+      );
+    }
+  }
+  if (capabilities.orchestra.length > 0) {
+    const hostNames = input.hostToolNames ?? [];
+    if (hostNames.length === 0) {
+      throw new SessionBlueprintError(
+        "orchestra_tools_unproven",
+        "orchestraTools cannot be proven in the host/plugin scope before Agent publication for " + source,
+        { required: capabilities.orchestra, source, plane: "orchestra" },
+      );
+    }
+    const missing = capabilities.orchestra.filter((name) => !hostNames.includes(name));
+    if (missing.length > 0) {
+      throw new SessionBlueprintError(
+        "orchestra_tools_missing",
+        "required Orchestra host tools are not visible before reservation: " + missing.join(", "),
+        { missing, visible: hostNames, source, plane: "orchestra" },
+      );
+    }
+  }
+}
+
 
 function visibleToolNames(agentCtx: Context): string[] {
   const tools = agentCtx.get("tools");
   if (tools === undefined) return [];
   const schemas = tools.schemas(scopeOf(agentCtx)) as ToolSchema[];
   return [...new Set(schemas.map((schema) => schema.name))].sort();
+}
+
+export function hostToolNamesForPreflight(ctx: Context): string[] {
+  try {
+    return visibleToolNames(ctx);
+  } catch {
+    const tools = ctx.get("tools");
+    if (tools === undefined) return [];
+    try {
+      const schemas = tools.schemas() as ToolSchema[];
+      return [...new Set(schemas.map((schema) => schema.name))].sort();
+    } catch {
+      return [];
+    }
+  }
 }
 
 export async function prepareLightweightBlueprint(ctx: Context, input: LightweightBlueprintInput): Promise<PreparedLightweightBlueprint> {
@@ -539,9 +637,11 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
     throw new SessionBlueprintError("invalid_input", `governed effective sandbox "${String(sandbox)}" is invalid`);
   }
   const model = governedModel(ctx, input);
-  const required = requiredTools(input);
+  const capabilities = capabilityTools(input);
   const predictedEffectivePermission = sandbox === permissionSpec.sandbox ? permissionPreset : "custom";
   const readiness: LightweightToolReadiness = { names: [], count: 0 };
+  const compositionReadiness: LightweightToolReadiness = { names: [], count: 0 };
+  const orchestraReadiness: LightweightToolReadiness = { names: [], count: 0 };
   const receipt: GovernedBlueprintReceipt = {
     mode: "governed",
     sessionId: input.sessionId,
@@ -560,6 +660,9 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
     provider: model.provider,
     model: model.model,
     ...(model.reasoningEffort === undefined ? {} : { reasoningEffort: model.reasoningEffort }),
+    compositionTools: compositionReadiness,
+    orchestraTools: orchestraReadiness,
+    optionalCapabilities: input.optionalCapabilities ?? [],
     tools: readiness,
   };
   const agentOptions: AgentOptions = { provider: model.provider, model: model.model };
@@ -616,6 +719,9 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
       ...(model.reasoningEffort === undefined ? {} : { reasoningEffort: model.reasoningEffort }),
       cwd: input.cwd,
       ...(input.title === undefined ? {} : { title: input.title }),
+      ...(capabilities.composition.length === 0 ? {} : { compositionTools: capabilities.composition }),
+      ...(capabilities.orchestra.length === 0 ? {} : { orchestraTools: capabilities.orchestra }),
+      ...(input.optionalCapabilities === undefined ? {} : { optionalCapabilities: [...input.optionalCapabilities] }),
       createdAt: Date.now(),
     };
     session.append(GOVERNED_BLUEPRINT_EVENT, marker);
@@ -628,10 +734,25 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
         const actualSandbox = effectiveSandboxMode(session.events);
         if (actualSandbox !== sandbox) throw new SessionBlueprintError("permission_mismatch", `published governed sandbox "${String(actualSandbox)}" does not match blueprint "${sandbox}"`);
         const names = visibleToolNames(agentCtx);
-        const missing = required.filter((name) => !names.includes(name));
-        if (missing.length > 0) throw new SessionBlueprintError("required_tools_missing", `required governed tools are not visible in the composed scope: ${missing.join(", ")}`, { missing, visible: names, roleId: input.roleId });
+        const legacyOnly = capabilities.legacy.length > 0 && input.compositionTools === undefined && input.orchestraTools === undefined;
+        const missingLegacy = capabilities.legacy.filter((name) => !names.includes(name));
+        if (legacyOnly && missingLegacy.length > 0) {
+          throw new SessionBlueprintError("required_tools_missing", "required governed tools are not visible in the composed scope: " + missingLegacy.join(", "), { missing: missingLegacy, visible: names, roleId: input.roleId });
+        }
+        const missingComposition = (legacyOnly ? [] : capabilities.composition).filter((name) => !names.includes(name));
+        if (missingComposition.length > 0) {
+          throw new SessionBlueprintError("composition_tools_missing", "required composition tools are not visible in the composed scope: " + missingComposition.join(", "), { missing: missingComposition, visible: names, roleId: input.roleId, plane: "composition" });
+        }
+        const missingOrchestra = capabilities.orchestra.filter((name) => !names.includes(name));
+        if (missingOrchestra.length > 0) {
+          throw new SessionBlueprintError("orchestra_tools_missing", "required Orchestra host tools are not visible in the composed scope: " + missingOrchestra.join(", "), { missing: missingOrchestra, visible: names, roleId: input.roleId, plane: "orchestra" });
+        }
         readiness.names = names;
         readiness.count = names.length;
+        compositionReadiness.names = toolReadiness(names, capabilities.composition).names;
+        compositionReadiness.count = compositionReadiness.names.length;
+        orchestraReadiness.names = toolReadiness(names, capabilities.orchestra).names;
+        orchestraReadiness.count = orchestraReadiness.names.length;
       },
     };
   };
@@ -706,6 +827,9 @@ export function readGovernedBlueprint(events: readonly SessionEvent[]): Governed
       if (marker.presetSource === "file" && (!nonEmptyString(marker.presetPath) || (marker.presetTrust !== "system" && marker.presetTrust !== "user"))) return undefined;
       if (marker.presetPath !== undefined && typeof marker.presetPath !== "string") return undefined;
       if (marker.presetTrust !== undefined && marker.presetTrust !== "system" && marker.presetTrust !== "user") return undefined;
+      if (marker.compositionTools !== undefined && (!Array.isArray(marker.compositionTools) || marker.compositionTools.some((name) => typeof name !== "string" || name === ""))) return undefined;
+      if (marker.orchestraTools !== undefined && (!Array.isArray(marker.orchestraTools) || marker.orchestraTools.some((name) => typeof name !== "string" || name === ""))) return undefined;
+      if (marker.optionalCapabilities !== undefined && (!Array.isArray(marker.optionalCapabilities) || marker.optionalCapabilities.some((name) => typeof name !== "string" || name === ""))) return undefined;
       if ("createdBySessionId" in marker || "topology" in marker || "roles" in marker) return undefined;
       return marker as GovernedBlueprintMarker;
     } catch {

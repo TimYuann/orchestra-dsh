@@ -47,6 +47,9 @@ export interface TeamRoleBlueprintFacts {
   reasoningEffort?: string;
   cwd?: string;
   title?: string;
+  compositionTools?: { names: string[]; count: number };
+  orchestraTools?: { names: string[]; count: number };
+  optionalCapabilities?: string[];
   tools: { names: string[]; count: number };
 }
 

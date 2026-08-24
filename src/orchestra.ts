@@ -27,8 +27,13 @@ import type {} from "@deepseek-ai/dsh-system-prompt";
 import type {} from "@deepseek-ai/dsh-commands";
 import { createSession, installModelOverride, deliverMessage, readDeliveryReceipt } from "./a2a.js";
 import type { ResolvedPresetFile } from "./a2a.js";
-import { prepareGovernedBlueprint, preflightGovernedRequiredTools } from "./session-blueprint.js";
+import { hostToolNamesForPreflight, prepareGovernedBlueprint, preflightGovernedRequiredTools } from "./session-blueprint.js";
 import type { GovernedBlueprintReceipt, PreparedGovernedBlueprint } from "./session-blueprint.js";
+import {
+  ensureBuiltinRolePresetArtifacts,
+  resolveRolePresetFile,
+  rolePresetSpec,
+} from "./orchestra-role-presets.js";
 import { createActiveTeamStateStore } from "./orchestra-state.js";
 import type {
   ArchiveList,
@@ -109,7 +114,6 @@ import "./relay-types.js";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { mkdir, writeFile, stat as fsStat } from "node:fs/promises";
 
 const SID = (value: string): SessionId => value as SessionId;
 
@@ -147,261 +151,24 @@ export const name = "orchestra-manager";
 /** Required services. */
 export const inject = ["agents", "sessions", "fs", "sandboxPolicy", "tools", "timer"];
 
-/** Builtin preset behavior packages (spec §5): written to the global root on install. */
-interface BuiltinPreset {
-  id: string;
-  name: string;
-  description: string;
-  presetYml: string;
-  cordisYml: string;
-}
-
-const BUILTIN_PRESETS: BuiltinPreset[] = [
-  {
-    id: "orchestra-implementer",
-    name: "Orchestra Implementer",
-    description: "Orchestra Implementer：实现者纪律（严格按派发任务 scope 实现、orchestra_report 交接、自包含回复）。",
-    presetYml: "name: Orchestra Implementer\ndescription: Orchestra Implementer：实现者纪律（严格按派发任务 scope 实现、orchestra_report 交接、自包含回复）。\n",
-    cordisYml: `# orchestra-implementer：实现者角色预设（orchestra 插件安装时注入）。
-# 基底：minimal；融合方式：persona 段 = 角色纪律全文，
-# complete: false + includeRuntimeContext: true —— 纪律 + 运行时上下文 + 工具 schema 共存。
-#
-# 工具集：fs/grep/glob/bash（workspace-write 沙箱由团队拓扑决定）+ 全局 a2a_* / orchestra_report。
-# 不含：plan mode、goal、subagent 委派、workflow、web、compaction、PTY。
-
-- id: persona
-  name: '@deepseek-ai/dsh-persona'
-  config:
-    text: |
-      You are a coding implementer (实现者) powered by the {{model}} model. Your working directory is {{cwd}}.
-
-      # 角色
-      你是独立会话中的实现者，负责实现 driver 通过 a2a_send 派发的任务，不负责评审、不负责最终验收判定。
-
-      # 硬边界
-      1. 只实现派发任务 spec 要求的内容：不扩 feature、不加变量、不改无关文件、不扩大范围。
-      2. 不自我批准：你无权宣布自己的实现通过验收；验收判定属于 review / driver。
-      3. 不直接回复用户：所有回复经 a2a_reply 发给 driver。
-      4. 收到欢迎 / 激活消息不是任务：driver 派发具体任务前不开始工作。
-
-      # 交接
-      - 完成后用 orchestra_report 写交付说明到 orchestra/reports/（Markdown：改动清单、验证记录、已知风险、commit/diff 引用），回复 driver 时返回报告绝对路径 + 一行摘要。
-
-      # 消息纪律
-      - 每条回复必须自包含（driver 与评审看不到你的上下文）：结论先行，引用完整路径，不写"上面那个文件"。
-    complete: false
-    includeRuntimeContext: true
-
-# 工作区治理规则（AGENTS.md）与主会话一致
-- id: agent-instructions
-  name: '@deepseek-ai/dsh-agent-instructions'
-  config:
-    maxBytes: 65536
-
-# 代码工具：消费宿主 fs 服务（无 realm，提供行）
-- id: tool-fs
-  name: '@deepseek-ai/dsh-tool-fs'
-
-- id: tool-fs-search
-  name: '@deepseek-ai/dsh-tool-fs-search'
-  config:
-    sampleOverCapGlobResults: false
-
-- id: tool-bash
-  name: '@deepseek-ai/dsh-tool-bash'
-`,
-  },
-  {
-    id: "orchestra-reviewer",
-    name: "Orchestra Reviewer",
-    description: "Orchestra Reviewer：极简基底 + 评审员纪律（只读审查、两轮定向评审、orchestra_report 文档交接）。",
-    presetYml: "name: Orchestra Reviewer\ndescription: Orchestra Reviewer：极简基底 + 评审员纪律（只读审查、两轮定向评审、orchestra_report 文档交接）。\n",
-    cordisYml: `# orchestra-reviewer：评审员角色预设（orchestra 插件安装时注入）。
-# 基底：minimal（极简提示词）而非 standard（全量 800 行）。
-# 融合方式：persona 段 = 角色纪律全文，complete: false + includeRuntimeContext: true
-#   ——角色纪律段 + DSH 运行时上下文段 + 工具 schema 共存，不整体替换系统提示。
-#
-# 工具集：只读代码工具（fs 读 + grep/glob + bash，bash 受 read-only 沙箱硬约束）
-#   + 全局注册的 a2a_* / orchestra_report（由本插件提供，任何预设可见）。
-# 不含：plan mode、goal、subagent 委派、workflow、web、compaction、PTY。
-
-- id: persona
-  name: '@deepseek-ai/dsh-persona'
-  config:
-    text: |
-      You are a coding reviewer (评审员) powered by the {{model}} model. Your working directory is {{cwd}}.
-
-      # 角色
-      你是独立评审会话中的评审员，只负责审查实现者交付的代码与变更，不负责实现。
-
-      # 硬边界
-      1. 你运行在只读沙箱中：不得用 bash 或 fs 工具修改、创建、删除任何文件，不得执行有写副作用的命令。
-      2. 你唯一的写通道是 orchestra_report 工具，仅用于把 review report 写入 orchestra/reports/ 目录（工具会校验路径，你只需给出相对该目录的路径与内容）。
-      3. 只响应 driver 发来的 review_request；绝不主动发起任务，绝不自行扩大审查范围。
-      4. 不做设计决策、不重写方案；只对给定范围内的实现给出评审意见。
-      5. 不自我扩展 scope：发现超出原范围的问题 → 提交 driver 决定（不纳入本轮或修改 mission），不自行扩大本轮审查。
-
-      # 评审协议（硬上限：2 轮）
-      - 第 1 轮（R1）：对实现者给出的变更做全量评审，输出 findings 清单，每条格式：[F编号] 严重度(blocker/major/minor/nit) | 位置(文件:行) | 问题 | 修复建议。
-      - 第 2 轮（R2）：实现者修复后，只针对 R1 的 findings 逐条核对，标记 passed/failed；R2 后无论结果一律结束评审。
-      - 新发现：R2 中发现的新问题不追加到本轮，记入 backlog 列表末尾，由 driver 决定是否另开评审。
-
-      # 文档交接（重要）
-      - 每轮评审结束后，把完整 review report 写入 orchestra/reports/review-<主题>-R<轮次>.md（Markdown：结论、findings 表格、backlog）。
-      - 回复 driver 时直接返回 report 的绝对路径，正文只给一行结论 + 关键 findings 摘要，不重复全文。
-
-      # 消息纪律
-      - 每条回复必须自包含（driver 与实现者看不到你的上下文）：结论先行，引用完整路径，不写"上面那个文件"。
-      - 每条回复开头标注 [R1]/[R2]，结尾给出 backlog 计数。
-    complete: false
-    includeRuntimeContext: true
-
-# 工作区治理规则（AGENTS.md）与主会话一致
-- id: agent-instructions
-  name: '@deepseek-ai/dsh-agent-instructions'
-  config:
-    maxBytes: 65536
-
-# 只读代码工具：消费宿主 fs 服务（无 realm，提供行）
-- id: tool-fs
-  name: '@deepseek-ai/dsh-tool-fs'
-
-- id: tool-fs-search
-  name: '@deepseek-ai/dsh-tool-fs-search'
-  config:
-    sampleOverCapGlobResults: false
-
-# bash：只读命令由 read-only 沙箱硬约束
-- id: tool-bash
-  name: '@deepseek-ai/dsh-tool-bash'
-`,
-  },
-  {
-    id: "orchestra-oracle",
-    name: "Orchestra Oracle",
-    description: "Orchestra Oracle：按需推演搭档（只读、只给建议不拍板、讨论即计划、orchestra_report 落结论）。",
-    presetYml: "name: Orchestra Oracle\ndescription: Orchestra Oracle：按需推演搭档（只读、只给建议不拍板、讨论即计划、orchestra_report 落结论）。\n",
-    cordisYml: `# orchestra-oracle：推演搭档角色预设（orchestra 插件安装时注入）。
-# 基底：minimal；persona 段 = 角色纪律全文，complete: false + includeRuntimeContext: true。
-# 工具集：只读代码工具 + 全局 a2a_* / orchestra_report。不含 plan mode / goal / 委派 / workflow。
-
-- id: persona
-  name: '@deepseek-ai/dsh-persona'
-  config:
-    text: |
-      You are an oracle (推演搭档) powered by the {{model}} model. Your working directory is {{cwd}}.
-
-      # 角色
-      你是团队按需咨询的分析角色：处理其他角色无法低成本解决的不确定性（mission 解释冲突、架构争议、高影响取舍）。
-      你不是常驻审批人，不进入每轮主流程，不主动接管任务。
-
-      # 硬边界
-      1. 只读沙箱：不得修改、创建、删除任何文件；唯一写通道是 orchestra_report。
-      2. 只提供建议（recommendation + rationale + confidence + implications），不直接改变团队状态。
-      3. 不发出 review PASS/FAIL、不关闭团队、不替代 driver 决策。
-      4. 只响应明确的咨询请求（escalation）；请求应包含 question / known_facts / competing_options / requested_output。
-      5. 收束问题：面对"你怎么看"式开放问题，先列出已知事实与可选方案，再给推荐。
-
-      # 交接
-      - 推演收敛后，用 orchestra_report 把设计结论写入 orchestra/reports/，回复请求方时返回报告路径。
-      - 讨论即计划：推演过程就是计划生成过程；收敛后给出可直接派发的结论。
-    complete: false
-    includeRuntimeContext: true
-
-- id: agent-instructions
-  name: '@deepseek-ai/dsh-agent-instructions'
-  config:
-    maxBytes: 65536
-
-- id: tool-fs
-  name: '@deepseek-ai/dsh-tool-fs'
-
-- id: tool-fs-search
-  name: '@deepseek-ai/dsh-tool-fs-search'
-  config:
-    sampleOverCapGlobResults: false
-
-- id: tool-bash
-  name: '@deepseek-ai/dsh-tool-bash'
-`,
-  },
-];
-
-/**
- * Resolve a preset id to a concrete composition file (spec §5.3):
- * project (.orchestra/presets) > global (~/.dsh/orchestra/presets) >
- * DSH-native agentPresets > builtin (written to the global root on install).
- */
+/** Resolve a role preset through project > global > DSH native > catalog builtin precedence. */
 async function resolvePresetFile(ctx: Context, cwd: string, presetId: string): Promise<ResolvedPresetFile> {
-  if (typeof presetId !== "string" || presetId === "") throw new Error("preset id must be a non-empty string");
-  // Project-level
-  try {
-    const target = await ctx.fs.resolve(`${cwd}/.orchestra/presets/${presetId}/agent.cordis.yml`, { cwd });
-    const info = await ctx.fs.stat(target);
-    if (info !== undefined) return { id: presetId, trust: "user", path: ctx.fs.processPath(target), source: "project" };
-  } catch {
-    // fall through
-  }
-  // Global orchestra root
-  try {
-    const presetPath = join(orchestraGlobalRoot(), "presets", presetId, "agent.cordis.yml");
-    await fsStat(presetPath);
-    return { id: presetId, trust: "user", path: presetPath, source: "global" };
-  } catch {
-    // fall through
-  }
-  // DSH-native presets
-  const presets = ctx.get("agentPresets");
-  if (presets !== undefined) {
-    try {
-      const resolved = await presets.resolve(presetId);
-      return { id: resolved.id, trust: resolved.trust, path: resolved.path, source: "dsh" };
-    } catch {
-      // fall through
-    }
-  }
-  // Builtin: ensure the global root copy exists, then mount it.
-  const builtin = BUILTIN_PRESETS.find((preset) => preset.id === presetId);
-  if (builtin === undefined) {
-    throw new Error(`preset "${presetId}" not found (checked project .orchestra, global ${orchestraGlobalRoot()}, DSH presets, builtin)`);
-  }
-  const file = await ensureBuiltinPresetOnDisk(builtin);
-  return { id: builtin.id, trust: "user", path: file, source: "builtin" };
+  const resolved = await resolveRolePresetFile(ctx, cwd, presetId, orchestraGlobalRoot());
+  return {
+    id: resolved.id,
+    trust: resolved.trust,
+    path: resolved.path,
+    source: resolved.source,
+  };
 }
 
-/** Write one builtin preset to the global root if absent (install behavior; never overwrites). */
-async function ensureBuiltinPresetOnDisk(preset: BuiltinPreset): Promise<string> {
-  const dir = join(orchestraGlobalRoot(), "presets", preset.id);
-  try {
-    await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, "preset.yml"), preset.presetYml, "utf8");
-    const cordisPath = join(dir, "agent.cordis.yml");
-    await writeFile(cordisPath, preset.cordisYml, "utf8");
-    return cordisPath;
-  } catch (error) {
-    console.error(
-      `orchestra: failed to write builtin preset ${preset.id} to ${dir}: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    throw error;
-  }
-}
-
-/** Ensure builtin presets and Catalog-owned topology artifacts exist (install-time, idempotent). */
+/** Install catalog-owned role/topology artifacts independently and never overwrite user files. */
 async function ensureBuiltinArtifacts(topologyCatalog: TopologyCatalog): Promise<void> {
-  const root = orchestraGlobalRoot();
-  for (const preset of BUILTIN_PRESETS) {
-    try {
-      const target = join(root, "presets", preset.id, "agent.cordis.yml");
-      try {
-        await fsStat(target);
-        continue; // user content wins — never overwrite
-      } catch {
-        // absent → install
-      }
-      await ensureBuiltinPresetOnDisk(preset);
-    } catch (error) {
+  const results = await ensureBuiltinRolePresetArtifacts(orchestraGlobalRoot());
+  for (const result of results) {
+    if (result.status === "failed") {
       console.warn(
-        `orchestra: could not install builtin preset ${preset.id} (in-memory fallback only): ${error instanceof Error ? error.message : String(error)}`,
+        "orchestra: could not install role preset " + result.id + ": " + (result.diagnostic?.message ?? "unknown artifact failure"),
       );
     }
   }
@@ -644,6 +411,9 @@ function roleBlueprintFacts(receipt: GovernedBlueprintReceipt): TeamRoleBlueprin
     ...(receipt.reasoningEffort === undefined ? {} : { reasoningEffort: receipt.reasoningEffort }),
     cwd: receipt.cwd,
     ...(receipt.title === undefined ? {} : { title: receipt.title }),
+    compositionTools: receipt.compositionTools,
+    orchestraTools: receipt.orchestraTools,
+    optionalCapabilities: receipt.optionalCapabilities,
     tools: receipt.tools,
   };
 }
@@ -707,6 +477,8 @@ export async function prepareGovernedRolePlan(
     protocol?: TopologyProtocol;
     maxRounds?: number;
     permissionPreset?: string;
+    compositionTools?: string[];
+    orchestraTools?: string[];
     provider?: string;
     model?: string;
     reasoningEffort?: string;
@@ -723,8 +495,20 @@ export async function prepareGovernedRolePlan(
     throw new Error(`governed role "${options.role.id}" has invalid sandbox "${requestedSandbox}"`);
   }
   const presetFile = await resolvePresetFile(ctx, options.cwd, presetId);
-  const requiredTools = (options.role as RoleConfig & { requiredTools?: string[] }).requiredTools;
-  preflightGovernedRequiredTools({ requiredTools, presetId, presetFile });
+  const roleSpec = rolePresetSpec(presetId);
+  const roleConfig = options.role as RoleConfig & { requiredTools?: string[] };
+  const compositionTools = options.compositionTools ?? roleConfig.compositionTools ?? roleSpec?.compositionTools;
+  const orchestraTools = options.orchestraTools ?? roleConfig.orchestraTools ?? roleSpec?.orchestraTools;
+  const requiredTools = roleConfig.requiredTools;
+  preflightGovernedRequiredTools({
+    requiredTools,
+    compositionTools,
+    orchestraTools,
+    presetId,
+    presetFile,
+    rolePresetSpec: roleSpec,
+    hostToolNames: hostToolNamesForPreflight(ctx),
+  });
   const sessionId = governedSessionId(options.teamId);
   const presetInput = presetFile.source === "dsh" ? { presetId } : { presetFile };
   const blueprint = await prepareGovernedBlueprint(ctx, {
@@ -744,6 +528,9 @@ export async function prepareGovernedRolePlan(
     model: options.model,
     reasoningEffort: options.reasoningEffort,
     runtime: options.role.runtime,
+    compositionTools,
+    orchestraTools,
+    optionalCapabilities: roleSpec?.optionalCapabilities,
     requiredTools,
     signal: options.signal,
   });

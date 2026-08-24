@@ -19,6 +19,8 @@ export interface RoleConfig {
   id: string;
   name: string;
   preset?: string | null;
+  compositionTools?: string[];
+  orchestraTools?: string[];
   sandbox?: string;
   runtime?: { provider?: string; model?: string; reasoningEffort?: string };
   maxRounds?: number;
@@ -384,6 +386,17 @@ export function validateTopology(config: unknown): string[] {
       problems.push(`shape: role "${role.id}" sandbox must be a string`);
     } else if (role.sandbox !== undefined && role.sandbox !== "workspace-write" && role.sandbox !== "read-only") {
       problems.push(`role "${role.id}" sandbox "${role.sandbox}" is invalid (workspace-write | read-only)`);
+    }
+    for (const field of ["compositionTools", "orchestraTools"] as const) {
+      if (role[field] !== undefined && !stringArray(role[field])) {
+        problems.push("shape: role \"" + role.id + "\" " + field + " must be an array of strings");
+      }
+    }
+    if (stringArray(role.compositionTools) && role.compositionTools.some((tool) => tool.startsWith("orchestra_") || tool.startsWith("a2a_"))) {
+      problems.push("role \"" + role.id + "\" compositionTools cannot contain host transport/orchestra tools");
+    }
+    if (stringArray(role.orchestraTools) && role.orchestraTools.some((tool) => !tool.startsWith("orchestra_"))) {
+      problems.push("role \"" + role.id + "\" orchestraTools must use Orchestra host tool names");
     }
     if (role.runtime !== undefined) {
       if (!isRecord(role.runtime)) {
