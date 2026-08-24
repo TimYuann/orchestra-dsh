@@ -84,19 +84,25 @@ import type {
 import {
   appendHandoffPending,
   appendHandoffResult,
+  applyGateFallback,
+  graphClosure,
+  graphGates,
   graphHandoffs,
   graphLoops,
   graphSummary,
   GraphRuntimeError,
   initializeGraphRuntime,
+  openGate,
+  recordClosure,
   readGraphRuntime,
   recordVerdict,
+  resolveGate,
   startAttempt,
   startLoop,
 } from "./orchestra-graph.js";
 import type { GraphRuntimeState } from "./orchestra-graph.js";
 import { createTopologyCatalog } from "./orchestra-topology.js";
-import type { RoleConfig, TopologyCatalog, TopologyList, TopologyProtocol, TopologyResolution, TopologyRoleSummary } from "./orchestra-topology.js";
+import type { RoleConfig, TopologyCatalog, TopologyClosureDefinition, TopologyList, TopologyProtocol, TopologyResolution, TopologyRoleSummary } from "./orchestra-topology.js";
 export { validateTopology } from "./orchestra-topology.js";
 import { mountPreset } from "@deepseek-ai/dsh-agent-presets";
 import "./relay-types.js";
@@ -939,6 +945,43 @@ export async function handleTeamApprovalCommand(
   return { kind: "success", text: `Draft ${draftId}@${revision} was already approved; freeze target=${command.value.approvalRef}` };
 }
 
+export async function handleTeamGateDecisionCommand(
+  ctx: Context,
+  activeTeamState: ActiveTeamStateStore,
+  invocation: { rawInput: string; commandId: string; agent: { id: string; session: any } },
+): Promise<{ kind: "success"; text: string }> {
+  const match = invocation.rawInput.trim().match(/^decide\s+([a-z0-9]+(?:-[a-z0-9]+)*)\s+(\S+)$/);
+  if (match === null) throw new Error("gate decision syntax is /team decide <gateInstanceId> <option>");
+  const cwd = invocation.agent.session.header.cwd;
+  if (cwd === undefined) throw new Error("current session has no working directory");
+  const observed = await activeTeamState.read(cwd);
+  throwIfBlocked("decide a Human Gate", observed);
+  if (observed.kind !== "ready") throw new Error(`cannot decide a Human Gate: no ready Team (${observed.kind})`);
+  const team = observed.team;
+  if (invocation.agent.id !== team.controllerSessionId) throw new Error("cannot decide a Human Gate: permission_denied (current Driver required)");
+  const frozen = currentFrozenCharter(team);
+  const graph = currentGraphRuntime(team);
+  if (graph.stale) throw new Error("cannot decide a Human Gate: stale_charter");
+  const gate = graphGates(graph.runtime).find((entry) => entry.gateInstanceId === match[1]);
+  if (gate === undefined) throw new Error(`cannot decide a Human Gate: gate ${match[1]} is unknown`);
+  const definition = frozen.topology.config.protocol?.gates?.find((entry) => entry.gateId === gate.gateId);
+  if (definition === undefined) throw new Error(`cannot decide a Human Gate: definition ${gate.gateId} is missing from Frozen Charter`);
+  let command;
+  try {
+    command = resolveGate(graph.runtime, team, definition, { gateInstanceId: gate.gateInstanceId, option: match[2], approvingSessionId: invocation.agent.id, commandId: String(invocation.commandId), source: "user-command", now: Date.now() });
+  } catch (error) {
+    throw graphCommandError("decide a Human Gate", error);
+  }
+  if (command.kind === "noop") return { kind: "success", text: `Gate ${gate.gateInstanceId} was already resolved with option ${match[2]}` };
+  await appendDurableCharterEvent(ctx, invocation.agent.session, { type: "orchestra/gate-decision", data: { gateInstanceId: gate.gateInstanceId, option: match[2], commandId: String(invocation.commandId), decidedAt: Date.now(), approvingSessionId: invocation.agent.id, source: "user-command" } });
+  try {
+    await persistGraphTransition(ctx, activeTeamState, observed, command.runtime, { agent: invocation.agent } as any);
+  } catch (error) {
+    throw new Error(`gate decision durable but graph transition is pending: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return { kind: "success", text: `Gate ${gate.gateInstanceId} resolved with user option ${match[2]}` };
+}
+
 interface CharterDraftToolArgs {
   draftId?: string;
   expectedRevision?: number;
@@ -1069,6 +1112,15 @@ function currentFrozenCharter(team: TeamState): FrozenCharterRevision {
   return frozen;
 }
 
+function currentClosureDefinition(team: TeamState): TopologyClosureDefinition {
+  const frozen = currentFrozenCharter(team);
+  const protocol = frozen.topology.config.protocol;
+  if (protocol?.closure !== undefined) return protocol.closure;
+  const completion = protocol?.completion;
+  if (completion === undefined) throw new Error("Frozen Charter has no structured closure definition or legacy completion owner");
+  return { owner: completion.owner, openGatePolicy: "reject", allowedOutcomes: ["completed", "failed", "abandoned"] };
+}
+
 function currentGraphRuntime(team: TeamState): { runtime: GraphRuntimeState; stale: boolean } {
   const frozen = currentFrozenCharter(team);
   if (team.graphRuntime === undefined) throw new Error("legacy_missing: Team has no graph runtime; run orchestra_graph_reconcile first");
@@ -1078,8 +1130,8 @@ function currentGraphRuntime(team: TeamState): { runtime: GraphRuntimeState; sta
   return { runtime: read.runtime, stale: read.kind === "stale" };
 }
 
-async function persistGraphTransition(ctx: Context, activeTeamState: ActiveTeamStateStore, snapshot: ActiveTeamReady, runtime: GraphRuntimeState, exec: ToolExecutionInput): Promise<ActiveTeamReady> {
-  const written = await activeTeamState.replace(snapshot, { ...snapshot.team, graphRuntime: runtime }, { policy: escrowPolicy(ctx, exec), signal: exec.signal });
+async function persistGraphTransition(ctx: Context, activeTeamState: ActiveTeamStateStore, snapshot: ActiveTeamReady, runtime: GraphRuntimeState, exec: ToolExecutionInput, status?: TeamState["status"]): Promise<ActiveTeamReady> {
+  const written = await activeTeamState.replace(snapshot, { ...snapshot.team, ...(status === undefined ? {} : { status }), graphRuntime: runtime }, { policy: escrowPolicy(ctx, exec), signal: exec.signal });
   return readySnapshotAfterWrite(activeTeamState, snapshot.cwd, written, exec.signal);
 }
 
@@ -1096,6 +1148,9 @@ function graphToolOutput(team: TeamState, runtime: GraphRuntimeState, stale = fa
     loops: graphLoops(runtime),
     pending_handoffs: summary.pendingHandoffs,
     cap_exhausted: summary.capExhausted,
+    open_gates: summary.openGates,
+    blocked_scopes: summary.blockedScopes,
+    closure: summary.closure,
   };
 }
 
@@ -1485,6 +1540,9 @@ export function apply(ctx: Context): void {
       loops: { type: "array", items: { type: "json" }, required: true },
       pending_handoffs: { type: "array", items: { type: "json" }, required: true },
       cap_exhausted: { type: "array", items: { type: "string" }, required: true },
+      open_gates: { type: "array", items: { type: "json" }, required: true },
+      blocked_scopes: { type: "array", items: { type: "string" }, required: true },
+      closure: { type: "object", additionalProperties: true, required: true },
     },
   } as const;
 
@@ -2424,6 +2482,85 @@ export function apply(ctx: Context): void {
 
   ctx.tools.register(
     defineTool({
+      name: "orchestra_gate_open",
+      description: "Driver-only open of a Human Gate declared by the current Frozen Charter. Gate scope/options/fallback are copied into append-only Graph facts; arbitrary runtime gates are rejected.",
+      parameters: {
+        gateId: { type: "string", required: true },
+        gateInstanceId: { type: "string", required: true },
+        evidence: { type: "array", items: { type: "json" } },
+      },
+      output: {
+        schema: graphOutputSchema,
+        render: (_args, value) => [{ type: "text", text: `gate open ${value.team_id}: ${value.status}, runtime revision ${value.runtime_revision}` }],
+      },
+      async execute(args: { gateId: string; gateInstanceId: string; evidence?: unknown[] }, exec: ToolExecutionInput) {
+        if (exec.agent === undefined) throw new Error("orchestra_gate_open requires an agent caller");
+        const cwd = exec.agent.session.header.cwd;
+        if (cwd === undefined) throw new Error("current session has no working directory");
+        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("open a Human Gate", observation);
+        if (observation.kind !== "ready") throw new Error(`cannot open a Human Gate: no ready Team (${observation.kind})`);
+        const team = observation.team;
+        const { runtime, stale } = currentGraphRuntime(team);
+        if (stale) throw new Error("cannot open a Human Gate: stale_charter");
+        const frozen = currentFrozenCharter(team);
+        const definition = frozen.topology.config.protocol?.gates?.find((gate) => gate.gateId === args.gateId);
+        if (definition === undefined) throw new Error(`cannot open a Human Gate: gate ${args.gateId} is not declared by Frozen Charter`);
+        let command;
+        try {
+          command = openGate(runtime, team, definition, { gateInstanceId: args.gateInstanceId, actorSessionId: exec.agent.id, now: Date.now(), humanMode: frozen.humanParticipationPolicy.mode, evidence: args.evidence as EvidenceRef[] | undefined });
+        } catch (error) {
+          throw graphCommandError("open a Human Gate", error);
+        }
+        const snapshot = command.kind === "noop" ? observation : await persistGraphTransition(ctx, activeTeamState, observation, command.runtime, exec);
+        return graphToolOutput(snapshot.team, command.runtime, false) as any;
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
+      name: "orchestra_gate_fallback",
+      description: "Driver-only explicit checkpoint fallback for a declared Human Gate. Before expiry it requires an explicit unavailable fact; it may only apply the pre-approved onUnavailable action and never invents a new option.",
+      parameters: {
+        gateInstanceId: { type: "string", required: true },
+        unavailableConfirmed: { type: "boolean", required: true },
+        reason: { type: "string", required: true },
+        evidence: { type: "array", items: { type: "json" } },
+      },
+      output: {
+        schema: graphOutputSchema,
+        render: (_args, value) => [{ type: "text", text: `gate fallback ${value.team_id}: ${value.status}, runtime revision ${value.runtime_revision}` }],
+      },
+      async execute(args: { gateInstanceId: string; unavailableConfirmed: boolean; reason: string; evidence?: unknown[] }, exec: ToolExecutionInput) {
+        if (exec.agent === undefined) throw new Error("orchestra_gate_fallback requires an agent caller");
+        const cwd = exec.agent.session.header.cwd;
+        if (cwd === undefined) throw new Error("current session has no working directory");
+        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("apply a Human Gate fallback", observation);
+        if (observation.kind !== "ready") throw new Error(`cannot apply a Human Gate fallback: no ready Team (${observation.kind})`);
+        const team = observation.team;
+        const { runtime, stale } = currentGraphRuntime(team);
+        if (stale) throw new Error("cannot apply a Human Gate fallback: stale_charter");
+        const frozen = currentFrozenCharter(team);
+        const gate = graphGates(runtime).find((entry) => entry.gateInstanceId === args.gateInstanceId);
+        if (gate === undefined) throw new Error(`cannot apply a Human Gate fallback: gate ${args.gateInstanceId} is unknown`);
+        const definition = frozen.topology.config.protocol?.gates?.find((entry) => entry.gateId === gate.gateId);
+        if (definition === undefined) throw new Error(`cannot apply a Human Gate fallback: definition ${gate.gateId} is missing`);
+        let command;
+        try {
+          command = applyGateFallback(runtime, team, definition, { gateInstanceId: args.gateInstanceId, actorSessionId: exec.agent.id, now: Date.now(), unavailableConfirmed: args.unavailableConfirmed, reason: args.reason, evidence: args.evidence as EvidenceRef[] | undefined });
+        } catch (error) {
+          throw graphCommandError("apply a Human Gate fallback", error);
+        }
+        const snapshot = command.kind === "noop" ? observation : await persistGraphTransition(ctx, activeTeamState, observation, command.runtime, exec);
+        return graphToolOutput(snapshot.team, command.runtime, false) as any;
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
       name: "orchestra_graph",
       description: "Read the current Frozen-Charter-bound execution DAG summary: bounded Loops/attempts, pending typed handoffs, cap exhaustion, runtime revision, and stale status. It never dumps or mutates the event log.",
       parameters: {},
@@ -2727,6 +2864,45 @@ export function apply(ctx: Context): void {
         } catch (error) {
           return { status: "delivery_accepted_state_pending", handoff_id: args.handoffId, team_id: team.teamId, from_role: pendingFact.fromRole, to_role: pendingFact.toRole, resolved_session_id: targetSessionId, runtime_revision: pendingRuntime.runtimeRevision, receipt, reconcile_required: true };
         }
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
+      name: "orchestra_close",
+      description: "Request semantic terminal closure under the Frozen Charter's single closure owner. Machine-checks loops, verdicts, evidence, handoffs, and required Human Gates; terminal closure blocks further Graph mutation and is required before dismissing a Frozen Team.",
+      parameters: {
+        outcome: { type: "string", enum: ["completed", "failed", "abandoned"], required: true },
+        reason: { type: "string" },
+        evidence: { type: "array", items: { type: "json" } },
+      },
+      output: {
+        schema: graphOutputSchema,
+        render: (_args, value) => [{ type: "text", text: `closure ${value.team_id}: ${value.status}, outcome=${value.closure?.outcome ?? "rejected"}` }],
+      },
+      async execute(args: { outcome: "completed" | "failed" | "abandoned"; reason?: string; evidence?: unknown[] }, exec: ToolExecutionInput) {
+        if (exec.agent === undefined) throw new Error("orchestra_close requires an agent caller");
+        const cwd = exec.agent.session.header.cwd;
+        if (cwd === undefined) throw new Error("current session has no working directory");
+        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("close the Team", observation);
+        if (observation.kind !== "ready") throw new Error(`cannot close the Team: no ready Team (${observation.kind})`);
+        const team = observation.team;
+        const { runtime, stale } = currentGraphRuntime(team);
+        if (stale) throw new Error("cannot close the Team: stale_charter");
+        const definition = currentClosureDefinition(team);
+        let command;
+        try {
+          command = recordClosure(runtime, team, definition, { outcome: args.outcome, actorSessionId: exec.agent.id, reason: args.reason, now: Date.now(), evidence: args.evidence as EvidenceRef[] | undefined });
+        } catch (error) {
+          throw graphCommandError("close the Team", error);
+        }
+        if (command.kind === "noop") return graphToolOutput(team, runtime, false) as any;
+        const terminalStatus: TeamState["status"] | undefined = command.accepted ? args.outcome === "completed" ? "completed" : args.outcome === "abandoned" ? "abandoned" : "failed" : undefined;
+        const snapshot = await persistGraphTransition(ctx, activeTeamState, observation, command.runtime, exec, terminalStatus);
+        if (!command.accepted) throw new Error(`closure rejected: ${command.diagnostic ?? "requirements not satisfied"}`);
+        return graphToolOutput(snapshot.team, command.runtime, false) as any;
       },
     }),
   );
@@ -3156,6 +3332,10 @@ export function apply(ctx: Context): void {
         throwIfBlocked("dismiss the team", teamObservation);
         if (teamObservation.kind !== "ready") throw new Error(`cannot dismiss the team: ${teamObservation.diagnostic.message}`);
         const team = teamObservation.team;
+        if (team.document?.charterStatus === "frozen") {
+          const graph = currentGraphRuntime(team);
+          if (graph.stale || graphClosure(graph.runtime).status !== "recorded") throw new Error("cannot dismiss a Frozen Team before terminal closure; run orchestra_close with an allowed outcome first");
+        }
         const dismissedAt = Date.now();
         const archived = await archiveStore.create(cwd, team, {
           dismissedAt,
@@ -3554,6 +3734,7 @@ export function apply(ctx: Context): void {
       handler: (invocation) => {
         const raw = invocation.rawInput.trim();
         if (/^approve(?:\s|$)/.test(raw)) return handleTeamApprovalCommand(ctx, invocation as any);
+        if (/^decide(?:\s|$)/.test(raw)) return handleTeamGateDecisionCommand(ctx, activeTeamState, invocation as any);
         // Single plugin-source notice carrying the marker (+ the goal when
         // provided). It renders as a collapsed context row, NOT as a user
         // bubble — the user's bubble is the command bubble itself ("/team

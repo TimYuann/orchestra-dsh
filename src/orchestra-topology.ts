@@ -31,6 +31,8 @@ export interface TopologyProtocol {
   completion?: { owner: string; rule: string };
   handoffs?: TopologyHandoffContract[];
   loops?: TopologyLoopContract[];
+  gates?: TopologyGateDefinition[];
+  closure?: TopologyClosureDefinition;
 }
 
 export interface TopologyHandoffContract {
@@ -53,6 +55,29 @@ export interface TopologyLoopContract {
   retryRoute: string;
   capExhaustedRoute: string;
   requiredEvidenceKinds: string[];
+}
+
+export interface TopologyGateDefinition {
+  gateId: string;
+  decisionScope: string[];
+  blockingScope: string[];
+  options: string[];
+  required: boolean;
+  onUnavailable: "fallback" | "blocked" | "failed" | "safe_stop";
+  fallbackOption?: string;
+  expiresAt?: number;
+  timeoutPolicy?: "fallback" | "blocked" | "failed" | "safe_stop";
+}
+
+export interface TopologyClosureDefinition {
+  owner: string;
+  requiredLoopOutcomes?: string[];
+  requiredVerdicts?: string[];
+  requiredEvidenceKinds?: string[];
+  requiredHandoffs?: string[];
+  openGatePolicy: "reject" | "allow_failed";
+  allowedOutcomes: ("completed" | "failed" | "abandoned")[];
+  userOverride?: boolean;
 }
 
 export interface TopologyConfig {
@@ -479,6 +504,57 @@ export function validateTopology(config: unknown): string[] {
       }
       if (typeof loop.maxAttempts !== "number" || !Number.isSafeInteger(loop.maxAttempts) || loop.maxAttempts <= 0) problems.push(`protocol.loops[${index}].maxAttempts must be a positive safe integer`);
       if (!stringArray(loop.requiredEvidenceKinds)) problems.push(`shape: protocol.loops[${index}].requiredEvidenceKinds must be a string array`);
+    }
+  }
+  if (protocol.gates !== undefined && !Array.isArray(protocol.gates)) {
+    problems.push("shape: protocol.gates must be an array");
+  } else if (Array.isArray(protocol.gates)) {
+    const gateIds = new Set<string>();
+    for (const [index, rawGate] of protocol.gates.entries()) {
+      if (!isRecord(rawGate)) {
+        problems.push(`shape: protocol.gates[${index}] must be an object`);
+        continue;
+      }
+      const gate = rawGate;
+      if (typeof gate.gateId !== "string" || gate.gateId === "") problems.push(`shape: protocol.gates[${index}].gateId must be non-empty`);
+      if (typeof gate.gateId === "string" && gate.gateId !== "" && gateIds.has(gate.gateId)) problems.push(`protocol gate id "${gate.gateId}" is duplicated`);
+      if (typeof gate.gateId === "string" && gate.gateId !== "") gateIds.add(gate.gateId);
+      for (const field of ["decisionScope", "blockingScope"]) if (!stringArray(gate[field]) || gate[field].length === 0) problems.push(`shape: protocol.gates[${index}].${field} must be a non-empty string array`);
+      if (!stringArray(gate.options) || gate.options.length === 0 || new Set(gate.options).size !== gate.options.length || gate.options.some((option) => option === "")) problems.push(`protocol.gates[${index}].options must be non-empty and unique`);
+      if (typeof gate.required !== "boolean") problems.push(`shape: protocol.gates[${index}].required must be boolean`);
+      if (!["fallback", "blocked", "failed", "safe_stop"].includes(gate.onUnavailable)) problems.push(`protocol.gates[${index}].onUnavailable is invalid`);
+      if (gate.onUnavailable === "fallback" && (typeof gate.fallbackOption !== "string" || !Array.isArray(gate.options) || !gate.options.includes(gate.fallbackOption))) problems.push(`protocol.gates[${index}] fallbackOption must be one of options`);
+      if (gate.expiresAt !== undefined && (typeof gate.expiresAt !== "number" || !Number.isFinite(gate.expiresAt))) problems.push(`protocol.gates[${index}].expiresAt must be finite`);
+      if (gate.timeoutPolicy !== undefined && !["fallback", "blocked", "failed", "safe_stop"].includes(gate.timeoutPolicy)) problems.push(`protocol.gates[${index}].timeoutPolicy is invalid`);
+    }
+  }
+  const declaredLoopIds = new Set(Array.isArray(protocol.loops) ? protocol.loops.filter(isRecord).map((loop) => typeof loop.loopId === "string" ? loop.loopId : "") : []);
+  if (Array.isArray(protocol.gates)) {
+    for (const [index, rawGate] of protocol.gates.entries()) {
+      if (!isRecord(rawGate)) continue;
+      for (const scopeField of ["decisionScope", "blockingScope"]) {
+        if (!stringArray(rawGate[scopeField])) continue;
+        for (const scope of rawGate[scopeField]) {
+          const [kind, ref] = scope.split(":", 2);
+          if (kind === "role" && (ref === undefined || !known(ref))) problems.push(`protocol.gates[${index}].${scopeField} references unknown role "${ref ?? ""}"`);
+          if (kind === "loop" && (ref === undefined || !declaredLoopIds.has(ref))) problems.push(`protocol.gates[${index}].${scopeField} references unknown loop "${ref ?? ""}"`);
+          if (!["global", "role", "loop", "node", "event"].includes(kind)) problems.push(`protocol.gates[${index}].${scopeField} has invalid scope ref "${scope}"`);
+        }
+      }
+    }
+  }
+  if (protocol.closure !== undefined) {
+    if (!isRecord(protocol.closure)) {
+      problems.push("shape: protocol.closure must be an object");
+    } else {
+      const closure = protocol.closure;
+      if (typeof closure.owner !== "string" || closure.owner === "" || !known(closure.owner)) problems.push("protocol.closure.owner references an unknown role/controller");
+      for (const field of ["requiredLoopOutcomes", "requiredVerdicts", "requiredEvidenceKinds", "requiredHandoffs"]) if (closure[field] !== undefined && !stringArray(closure[field])) problems.push(`shape: protocol.closure.${field} must be a string array`);
+      if (stringArray(closure.requiredLoopOutcomes)) for (const outcome of closure.requiredLoopOutcomes) if (!declaredLoopIds.has(outcome.split(":", 1)[0])) problems.push(`protocol.closure.requiredLoopOutcomes references unknown loop "${outcome}"`);
+      if (stringArray(closure.requiredVerdicts)) for (const verdict of closure.requiredVerdicts) if (!["PASS", "FAIL", "BLOCKED"].includes(verdict)) problems.push(`protocol.closure.requiredVerdicts contains invalid verdict "${verdict}"`);
+      if (!["reject", "allow_failed"].includes(closure.openGatePolicy)) problems.push("protocol.closure.openGatePolicy is invalid");
+      if (!Array.isArray(closure.allowedOutcomes) || closure.allowedOutcomes.length === 0 || new Set(closure.allowedOutcomes).size !== closure.allowedOutcomes.length || closure.allowedOutcomes.some((outcome) => !["completed", "failed", "abandoned"].includes(outcome))) problems.push("protocol.closure.allowedOutcomes must contain unique completed/failed/abandoned values");
+      if (closure.userOverride !== undefined && typeof closure.userOverride !== "boolean") problems.push("shape: protocol.closure.userOverride must be boolean");
     }
   }
   return problems;

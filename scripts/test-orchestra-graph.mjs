@@ -5,12 +5,18 @@ import {
   GraphRuntimeError,
   appendHandoffPending,
   appendHandoffResult,
+  applyGateFallback,
+  graphClosure,
+  graphGates,
   graphHandoffs,
   graphLoops,
   graphSummary,
   initializeGraphRuntime,
+  openGate,
+  recordClosure,
   readGraphRuntime,
   recordVerdict,
+  resolveGate,
   startAttempt,
   startLoop,
 } from "../lib/orchestra-graph.js";
@@ -90,4 +96,32 @@ test("Graph runtime rejects stale charter, malformed parents, and keeps handoff 
   assert.throws(() => startLoop(runtime, { ...currentTeam, document: { currentCharterRevision: 2, charterRevisions: [{ charterRevision: 2, digest: "new" }] } }, loopContract(), { actorSessionId: "driver", now: 6 }), (error) => error instanceof GraphRuntimeError && error.code === "stale_charter");
   assert.equal(readGraphRuntime({ ...runtime, events: [{ ...runtime.events[0], parents: ["future"] }] }, currentTeam.teamId, 1, "digest").kind, "blocked");
   assert.equal(graphSummary(runtime).pendingHandoffs.length, 0);
+});
+
+test("Human Gate blocks only its declared scope, supports direct decision/fallback, and Closure is owner-only terminal", () => {
+  const currentTeam = team();
+  let runtime = initializeGraphRuntime(currentTeam.teamId, 1, "digest", 1);
+  const blockedContract = { ...loopContract(1), loopId: "blocked" };
+  const independentContract = { ...loopContract(1), loopId: "independent" };
+  const gate = { gateId: "human-review", decisionScope: ["loop:blocked"], blockingScope: ["loop:blocked"], options: ["approve", "reject"], required: true, onUnavailable: "fallback", fallbackOption: "reject", expiresAt: 10 };
+  runtime = openGate(runtime, currentTeam, gate, { gateInstanceId: "gate-1", actorSessionId: "driver", now: 2, humanMode: "checkpointed", evidence: [{ kind: "message", ref: "question" }] }).runtime;
+  assert.deepEqual(graphGates(runtime)[0].status, "open");
+  assert.throws(() => startLoop(runtime, currentTeam, blockedContract, { actorSessionId: "driver", loopInstanceId: "blocked-1", now: 3, evidence: [{ kind: "report", ref: "start.md" }] }), (error) => error?.code === "handoff_invalid");
+  runtime = startLoop(runtime, currentTeam, independentContract, { actorSessionId: "driver", loopInstanceId: "independent-1", now: 3, evidence: [{ kind: "report", ref: "start.md" }] }).runtime;
+  const resolved = resolveGate(runtime, currentTeam, gate, { gateInstanceId: "gate-1", option: "approve", approvingSessionId: "driver", commandId: "cmd-gate", source: "user-command", now: 4 });
+  runtime = resolved.runtime;
+  assert.equal(graphGates(runtime)[0].status, "resolved");
+  assert.throws(() => resolveGate(runtime, currentTeam, gate, { gateInstanceId: "gate-1", option: "reject", approvingSessionId: "driver", commandId: "cmd-conflict", source: "user-command", now: 5 }), (error) => error?.code === "duplicate_event");
+  const fallbackGate = { ...gate, gateId: "human-fallback", decisionScope: ["loop:independent"], blockingScope: ["loop:independent"], options: ["continue", "stop"], fallbackOption: "stop", expiresAt: 100 };
+  runtime = openGate(runtime, currentTeam, fallbackGate, { gateInstanceId: "gate-2", actorSessionId: "driver", now: 6, humanMode: "checkpointed" }).runtime;
+  assert.throws(() => applyGateFallback(runtime, currentTeam, fallbackGate, { gateInstanceId: "gate-2", actorSessionId: "driver", now: 7, unavailableConfirmed: false, reason: "early", evidence: [] }), (error) => error?.code === "handoff_invalid");
+  runtime = applyGateFallback(runtime, currentTeam, fallbackGate, { gateInstanceId: "gate-2", actorSessionId: "driver", now: 7, unavailableConfirmed: true, reason: "user unavailable", evidence: [{ kind: "message", ref: "unavailable" }] }).runtime;
+  assert.equal(graphGates(runtime).find((gateState) => gateState.gateInstanceId === "gate-2").status, "fallback_applied");
+
+  runtime = startAttempt(runtime, currentTeam, independentContract, { loopInstanceId: "independent-1", actorSessionId: "driver", participantRoleId: "implementer", now: 8, evidence: [{ kind: "report", ref: "candidate.md" }] }).runtime;
+  runtime = recordVerdict(runtime, currentTeam, independentContract, { loopInstanceId: "independent-1", actorSessionId: "reviewer-session", evaluatorRole: "reviewer", verdict: "PASS", now: 9, evidence: [{ kind: "report", ref: "review.md" }] }).runtime;
+  const closure = { owner: "driver", requiredLoopOutcomes: ["independent:passed"], requiredEvidenceKinds: ["report"], openGatePolicy: "reject", allowedOutcomes: ["completed", "failed", "abandoned"] };
+  runtime = recordClosure(runtime, currentTeam, closure, { outcome: "completed", actorSessionId: "driver", now: 10, evidence: [{ kind: "report", ref: "closure.md" }] }).runtime;
+  assert.equal(graphClosure(runtime).status, "recorded");
+  assert.throws(() => startLoop(runtime, currentTeam, independentContract, { actorSessionId: "driver", loopInstanceId: "after-close", now: 11, evidence: [{ kind: "report", ref: "late.md" }] }), (error) => error?.code === "loop_terminal");
 });

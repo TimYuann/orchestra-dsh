@@ -10,7 +10,20 @@
 import { randomUUID } from "node:crypto";
 import type { EvidenceRef } from "./orchestration-document.js";
 import type { TeamRole, TeamState } from "./orchestra-state.js";
-import type { TopologyHandoffContract, TopologyLoopContract } from "./orchestra-topology.js";
+import type { TopologyClosureDefinition, TopologyGateDefinition, TopologyHandoffContract, TopologyLoopContract } from "./orchestra-topology.js";
+
+declare module "@deepseek-ai/dsh-session/types" {
+  interface SessionEventMap {
+    "orchestra/gate-decision": {
+      gateInstanceId: string;
+      option: string;
+      commandId: string;
+      decidedAt: number;
+      approvingSessionId: string;
+      source: "user-command";
+    };
+  }
+}
 
 export const GRAPH_RUNTIME_SCHEMA_VERSION = 1;
 
@@ -23,7 +36,15 @@ export type GraphEventType =
   | "verdict_recorded"
   | "attempt_completed"
   | "cap_exhausted"
-  | "remediation_requested";
+  | "remediation_requested"
+  | "gate_opened"
+  | "gate_resolved"
+  | "gate_fallback_applied"
+  | "gate_blocked"
+  | "gate_expired"
+  | "closure_requested"
+  | "closure_rejected"
+  | "closure_recorded";
 
 export interface GraphEvent {
   eventId: string;
@@ -123,6 +144,9 @@ export interface GraphProjectionSummary {
   currentLoop?: { loopInstanceId: string; loopId: string; attempt?: number; status: LoopSummary["status"] };
   pendingHandoffs: HandoffSummary[];
   capExhausted: string[];
+  openGates: GateSummary[];
+  blockedScopes: string[];
+  closure: ClosureSummary;
   runtimeRevision?: number;
   stale: boolean;
 }
@@ -130,6 +154,30 @@ export interface GraphProjectionSummary {
 export type GraphCommandResult =
   | { kind: "changed"; runtime: GraphRuntimeState; events: GraphEvent[] }
   | { kind: "noop"; runtime: GraphRuntimeState; events: [] };
+
+export interface GateSummary {
+  gateInstanceId: string;
+  gateId: string;
+  status: "open" | "resolved" | "fallback_applied" | "blocked" | "expired";
+  decisionScope: string[];
+  blockingScope: string[];
+  options: string[];
+  required: boolean;
+  onUnavailable: TopologyGateDefinition["onUnavailable"];
+  fallbackOption?: string;
+  selectedOption?: string;
+  reason?: string;
+  openedAt: number;
+  expiresAt?: number;
+}
+
+export interface ClosureSummary {
+  status: "none" | "requested" | "rejected" | "recorded";
+  outcome?: "completed" | "failed" | "abandoned";
+  owner?: string;
+  reason?: string;
+  evidence: EvidenceRef[];
+}
 
 const EVENT_TYPES = new Set<GraphEventType>([
   "loop_started",
@@ -141,6 +189,14 @@ const EVENT_TYPES = new Set<GraphEventType>([
   "attempt_completed",
   "cap_exhausted",
   "remediation_requested",
+  "gate_opened",
+  "gate_resolved",
+  "gate_fallback_applied",
+  "gate_blocked",
+  "gate_expired",
+  "closure_requested",
+  "closure_rejected",
+  "closure_recorded",
 ]);
 
 function record(value: unknown): value is Record<string, any> {
@@ -210,6 +266,8 @@ export function readGraphRuntime(raw: unknown, teamId: string, charterRevision?:
   if (raw.runtimeRevision !== raw.events.length) return diagnostic("revision_conflict", "graph runtimeRevision must equal the append-only event count");
   try {
     deriveGraph(raw as GraphRuntimeState);
+    gatesFromEvents(raw.events as GraphEvent[]);
+    closureFromEvents(raw.events as GraphEvent[]);
   } catch (error) {
     return diagnostic(error instanceof GraphRuntimeError ? error.code : "invalid_event", error instanceof Error ? error.message : String(error));
   }
@@ -324,6 +382,97 @@ function deriveGraph(runtime: GraphRuntimeState): Map<string, LoopSummary> {
   return loopsFromEvents(runtime.events);
 }
 
+function validGateDefinition(value: unknown): value is TopologyGateDefinition {
+  return record(value) && nonEmpty(value.gateId) && Array.isArray(value.decisionScope) && value.decisionScope.length > 0 && value.decisionScope.every(nonEmpty) && Array.isArray(value.blockingScope) && value.blockingScope.length > 0 && value.blockingScope.every(nonEmpty) && Array.isArray(value.options) && value.options.length > 0 && new Set(value.options).size === value.options.length && value.options.every(nonEmpty) && typeof value.required === "boolean" && ["fallback", "blocked", "failed", "safe_stop"].includes(value.onUnavailable) && (value.fallbackOption === undefined || value.options.includes(value.fallbackOption)) && (value.expiresAt === undefined || finite(value.expiresAt));
+}
+
+function gatesFromEvents(events: readonly GraphEvent[]): Map<string, GateSummary> {
+  const gates = new Map<string, GateSummary>();
+  for (const event of events) {
+    if (event.type === "gate_opened") {
+      const definition = event.payload.definition;
+      const instance = event.payload.gateInstanceId;
+      if (!validGateDefinition(definition) || !nonEmpty(instance) || gates.has(instance)) throw new GraphRuntimeError("invalid_event", `gate_opened event ${event.eventId} is malformed or duplicated`);
+      gates.set(instance, { gateInstanceId: instance, gateId: definition.gateId, status: "open", decisionScope: [...definition.decisionScope], blockingScope: [...definition.blockingScope], options: [...definition.options], required: definition.required, onUnavailable: definition.onUnavailable, ...(definition.fallbackOption === undefined ? {} : { fallbackOption: definition.fallbackOption }), openedAt: event.createdAt, ...(definition.expiresAt === undefined ? {} : { expiresAt: definition.expiresAt }) });
+    } else if (["gate_resolved", "gate_fallback_applied", "gate_blocked", "gate_expired"].includes(event.type)) {
+      const instance = event.payload.gateInstanceId;
+      const gate = typeof instance === "string" ? gates.get(instance) : undefined;
+      if (gate === undefined || gate.status !== "open") throw new GraphRuntimeError("invalid_event", `gate transition ${event.eventId} has no open gate`);
+      if (event.type === "gate_resolved" || event.type === "gate_fallback_applied") {
+        if (typeof event.payload.option !== "string" || !gate.options.includes(event.payload.option)) throw new GraphRuntimeError("invalid_event", `gate transition ${event.eventId} has an invalid option`);
+        if (event.type === "gate_resolved" && (event.payload.source !== "user-command" || typeof event.payload.commandId !== "string" || typeof event.payload.approvingSessionId !== "string")) throw new GraphRuntimeError("invalid_event", `gate decision ${event.eventId} lacks direct user-command evidence`);
+        gate.selectedOption = event.payload.option;
+        gate.status = event.type === "gate_resolved" ? "resolved" : "fallback_applied";
+      } else {
+        gate.reason = typeof event.payload.reason === "string" ? event.payload.reason : undefined;
+        gate.status = event.type === "gate_blocked" ? "blocked" : "expired";
+      }
+    }
+  }
+  return gates;
+}
+
+function closureFromEvents(events: readonly GraphEvent[]): ClosureSummary {
+  let result: ClosureSummary = { status: "none", evidence: [] };
+  for (const event of events) {
+    if (event.type === "closure_requested") {
+      if (result.status === "recorded") throw new GraphRuntimeError("invalid_event", "closure requested after terminal closure");
+      result = { status: "requested", owner: typeof event.payload.owner === "string" ? event.payload.owner : undefined, outcome: event.payload.outcome as ClosureSummary["outcome"], reason: typeof event.payload.reason === "string" ? event.payload.reason : undefined, evidence: clone(event.evidence) };
+    } else if (event.type === "closure_rejected") {
+      if (result.status === "recorded") throw new GraphRuntimeError("invalid_event", "closure rejected after terminal closure");
+      result = { ...result, status: "rejected", reason: typeof event.payload.reason === "string" ? event.payload.reason : "closure requirements rejected", evidence: clone(event.evidence) };
+    } else if (event.type === "closure_recorded") {
+      if (result.status === "recorded") throw new GraphRuntimeError("duplicate_event", "closure recorded twice");
+      if (event.payload.outcome !== "completed" && event.payload.outcome !== "failed" && event.payload.outcome !== "abandoned") throw new GraphRuntimeError("invalid_event", "closure outcome is invalid");
+      result = { status: "recorded", owner: typeof event.payload.owner === "string" ? event.payload.owner : undefined, outcome: event.payload.outcome, reason: typeof event.payload.reason === "string" ? event.payload.reason : undefined, evidence: clone(event.evidence) };
+    }
+  }
+  return result;
+}
+
+function openBlockingGates(runtime: GraphRuntimeState, scopes: string[]): GateSummary[] {
+  return [...gatesFromEvents(runtime.events).values()].filter((gate) => gate.status === "open" && gate.required && (gate.blockingScope.includes("global") || gate.blockingScope.some((scope) => scopes.includes(scope))));
+}
+
+function assertScopesOpen(runtime: GraphRuntimeState, scopes: string[]): void {
+  const blocked = openBlockingGates(runtime, scopes);
+  if (blocked.length > 0) throw new GraphRuntimeError("handoff_invalid", `scope is blocked by Human Gate ${blocked[0].gateInstanceId} (${blocked[0].decisionScope.join(", ")})`);
+}
+
+function assertGraphOpen(runtime: GraphRuntimeState): void {
+  const closure = closureFromEvents(runtime.events);
+  if (closure.status === "recorded") throw new GraphRuntimeError("loop_terminal", "Graph is terminal after closure; no new execution mutation is allowed");
+}
+
+function ownerSession(team: TeamState, owner: string): string {
+  if (owner.toLowerCase() === "driver" || owner === team.controllerSessionId) return team.controllerSessionId;
+  return roleFor(team, owner).sessionId;
+}
+
+function closureReadiness(runtime: GraphRuntimeState, definition: TopologyClosureDefinition, outcome: ClosureSummary["outcome"], evidenceRefs: EvidenceRef[]): string | undefined {
+  const loops = graphLoops(runtime);
+  if (graphHandoffs(runtime).some((handoff) => handoff.status === "pending")) return "pending handoff requires reconcile";
+  if (loops.some((loop) => loop.status === "running")) return "active Loop attempt remains";
+  if (definition.openGatePolicy === "reject" && [...gatesFromEvents(runtime.events).values()].some((gate) => gate.status === "open" && gate.required)) return "required Human Gate remains open";
+  if (definition.requiredLoopOutcomes !== undefined) {
+    for (const required of definition.requiredLoopOutcomes) {
+      const [loopId, expected] = required.split(":");
+      if (!loops.some((loop) => loop.loopId === loopId && loop.status === expected)) return `required Loop outcome ${required} is missing`;
+    }
+  }
+  if (definition.requiredVerdicts !== undefined) {
+    const verdicts = new Set(runtime.events.filter((event) => event.type === "verdict_recorded").map((event) => String(event.payload.verdict)));
+    for (const required of definition.requiredVerdicts) if (!verdicts.has(required)) return `required verdict ${required} is missing`;
+  }
+  if (definition.requiredHandoffs !== undefined) {
+    const handoffs = graphHandoffs(runtime);
+    for (const required of definition.requiredHandoffs) if (!handoffs.some((handoff) => handoff.handoffId === required && handoff.status === "accepted")) return `required handoff ${required} is missing`;
+  }
+  if (definition.requiredEvidenceKinds !== undefined) for (const kind of definition.requiredEvidenceKinds) if (!evidenceRefs.some((ref) => ref.kind === kind) && !runtime.events.some((event) => event.evidence.some((ref) => ref.kind === kind))) return `required closure evidence ${kind} is missing`;
+  if ((outcome === "failed" || outcome === "abandoned") && evidenceRefs.length === 0) return `${outcome} closure requires evidence`;
+  return undefined;
+}
+
 export function graphLoops(runtime: GraphRuntimeState): LoopSummary[] {
   return [...deriveGraph(runtime).values()].map(clone);
 }
@@ -335,11 +484,13 @@ function assertEvidenceKinds(evidenceRefs: EvidenceRef[], required: string[], ac
 
 export function startLoop(runtime: GraphRuntimeState, team: TeamState, contract: TopologyLoopContract, input: { actorSessionId: string; loopInstanceId?: string; now: number; evidence?: EvidenceRef[] }): GraphCommandResult {
   currentCharterMatches(runtime, team);
+  assertGraphOpen(runtime);
   if (input.actorSessionId !== team.controllerSessionId) throw new GraphRuntimeError("permission_denied", "only the Team controller may start a Loop");
   if (!loopContractValid(contract)) throw new GraphRuntimeError("invalid_shape", "Loop contract is malformed");
   roleFor(team, contract.evaluatorRole);
   for (const participant of contract.participants) roleFor(team, participant);
   assertEvidenceKinds(input.evidence ?? [], contract.requiredEvidenceKinds, "Loop start");
+  assertScopesOpen(runtime, [contract.loopId, `loop:${contract.loopId}`]);
   const loopInstanceId = input.loopInstanceId ?? `loop-${contract.loopId}-${randomUUID()}`;
   const existing = graphLoops(runtime).find((loop) => loop.loopInstanceId === loopInstanceId);
   if (existing !== undefined) {
@@ -351,11 +502,13 @@ export function startLoop(runtime: GraphRuntimeState, team: TeamState, contract:
 
 export function startAttempt(runtime: GraphRuntimeState, team: TeamState, contract: TopologyLoopContract, input: { loopInstanceId: string; actorSessionId: string; participantRoleId: string; candidate?: Record<string, unknown>; now: number; evidence?: EvidenceRef[] }): GraphCommandResult {
   currentCharterMatches(runtime, team);
+  assertGraphOpen(runtime);
   const role = roleFor(team, input.participantRoleId);
   const loops = deriveGraph(runtime);
   const loop = loops.get(input.loopInstanceId);
   if (loop === undefined) throw new GraphRuntimeError("loop_not_found", `Loop ${input.loopInstanceId} was not found`);
   if (loop.loopId !== contract.loopId) throw new GraphRuntimeError("invalid_shape", "attempt contract does not match Loop");
+  assertScopesOpen(runtime, [contract.loopId, `loop:${contract.loopId}`]);
   if (loop.status !== "running") throw new GraphRuntimeError(loop.status === "cap_exhausted" ? "cap_exhausted" : "loop_terminal", `Loop ${loop.loopInstanceId} is ${loop.status}`);
   if (!contract.participants.some((participant) => participant.toLowerCase() === role.id.toLowerCase())) throw new GraphRuntimeError("role_not_participant", `role ${role.id} is not a Loop participant`);
   if (input.candidate !== undefined && !record(input.candidate)) throw new GraphRuntimeError("invalid_shape", "attempt candidate payload must be an object");
@@ -370,9 +523,11 @@ export function startAttempt(runtime: GraphRuntimeState, team: TeamState, contra
 
 export function recordVerdict(runtime: GraphRuntimeState, team: TeamState, contract: TopologyLoopContract, input: { loopInstanceId: string; actorSessionId: string; evaluatorRole: string; verdict: "PASS" | "FAIL" | "BLOCKED"; findings?: string[]; now: number; evidence?: EvidenceRef[] }): GraphCommandResult {
   currentCharterMatches(runtime, team);
+  assertGraphOpen(runtime);
   const evaluator = roleFor(team, contract.evaluatorRole);
   const loop = deriveGraph(runtime).get(input.loopInstanceId);
   if (loop === undefined) throw new GraphRuntimeError("loop_not_found", `Loop ${input.loopInstanceId} was not found`);
+  assertScopesOpen(runtime, [loop.loopId, `loop:${loop.loopId}`]);
   if (loop.evaluatorRole.toLowerCase() !== input.evaluatorRole.toLowerCase() || contract.evaluatorRole.toLowerCase() !== input.evaluatorRole.toLowerCase()) throw new GraphRuntimeError("evaluator_required", "verdict evaluator does not match the declared evaluator role");
   if (input.actorSessionId !== evaluator.sessionId) throw new GraphRuntimeError("evaluator_required", "only the current evaluator Session may record a verdict");
   const attempt = loop.attempts.at(-1);
@@ -407,6 +562,7 @@ export function validateHandoffPayload(contract: TopologyHandoffContract, fromRo
 
 export function appendHandoffPending(runtime: GraphRuntimeState, team: TeamState, contract: TopologyHandoffContract, input: { handoffId: string; kind: string; fromRole: string; toRole: string; loopInstanceId?: string; attempt?: number; summary: string; payload: Record<string, unknown>; actorSessionId: string; now: number; evidence?: EvidenceRef[] }): GraphCommandResult {
   currentCharterMatches(runtime, team);
+  assertGraphOpen(runtime);
   if (!record(input.payload) || !nonEmpty(input.handoffId) || !nonEmpty(input.summary)) throw new GraphRuntimeError("handoff_invalid", "handoff id, summary, and object payload are required");
   const from = roleFor(team, input.fromRole);
   const to = roleFor(team, input.toRole);
@@ -418,6 +574,7 @@ export function appendHandoffPending(runtime: GraphRuntimeState, team: TeamState
     if (loop.status !== "running") throw new GraphRuntimeError(loop.status === "cap_exhausted" ? "cap_exhausted" : "loop_terminal", `handoff Loop ${input.loopInstanceId} is ${loop.status}`);
     const currentAttempt = loop.attempts.at(-1)?.attempt;
     if (input.attempt !== undefined && input.attempt !== currentAttempt) throw new GraphRuntimeError("attempt_conflict", `handoff attempt ${input.attempt} is not the current attempt ${currentAttempt ?? "none"}`);
+    assertScopesOpen(runtime, [loop.loopId, `loop:${loop.loopId}`, `role:${from.id}`, `role:${to.id}`]);
   }
   const existing = graphHandoffs(runtime).find((handoff) => handoff.handoffId === input.handoffId);
   if (existing !== undefined) {
@@ -469,12 +626,92 @@ export function graphSummary(runtime: GraphRuntimeState, stale = false): GraphPr
   const loops = graphLoops(runtime);
   const current = loops.find((loop) => loop.status === "running") ?? loops.at(-1);
   const pending = graphHandoffs(runtime).filter((handoff) => handoff.status === "pending");
+  const gates = gatesFromEvents(runtime.events);
+  const closure = closureFromEvents(runtime.events);
   return {
     status: stale ? "stale" : current === undefined ? "idle" : current.status === "cap_exhausted" ? "cap_exhausted" : current.status,
     ...(current === undefined ? {} : { currentLoop: { loopInstanceId: current.loopInstanceId, loopId: current.loopId, ...(current.attempts.at(-1) === undefined ? {} : { attempt: current.attempts.at(-1)?.attempt }), status: current.status } }),
     pendingHandoffs: pending,
     capExhausted: loops.filter((loop) => loop.capExhausted).map((loop) => loop.loopInstanceId),
+    openGates: [...gates.values()].filter((gate) => gate.status === "open"),
+    blockedScopes: [...gates.values()].filter((gate) => gate.status === "open" && gate.required).flatMap((gate) => gate.blockingScope),
+    closure,
     runtimeRevision: runtime.runtimeRevision,
     stale,
   };
+}
+
+export function graphGates(runtime: GraphRuntimeState): GateSummary[] {
+  return [...gatesFromEvents(runtime.events).values()].map(clone);
+}
+
+export function graphClosure(runtime: GraphRuntimeState): ClosureSummary {
+  return clone(closureFromEvents(runtime.events));
+}
+
+export function openGate(runtime: GraphRuntimeState, team: TeamState, definition: TopologyGateDefinition, input: { gateInstanceId: string; actorSessionId: string; now: number; humanMode?: "interactive" | "checkpointed" | "autonomous"; evidence?: EvidenceRef[] }): GraphCommandResult {
+  currentCharterMatches(runtime, team);
+  assertGraphOpen(runtime);
+  if (input.actorSessionId !== team.controllerSessionId) throw new GraphRuntimeError("permission_denied", "only the Team controller may open a Human Gate");
+  if (!validGateDefinition(definition) || !nonEmpty(input.gateInstanceId)) throw new GraphRuntimeError("invalid_shape", "Gate definition or instance id is invalid");
+  if (input.humanMode === "autonomous" && definition.required && definition.onUnavailable !== "fallback") throw new GraphRuntimeError("handoff_invalid", "autonomous required Human Gate must have a pre-approved fallback");
+  const existing = gatesFromEvents(runtime.events).get(input.gateInstanceId);
+  if (existing !== undefined) {
+    if (existing.gateId !== definition.gateId || stable(existing.blockingScope) !== stable(definition.blockingScope)) throw new GraphRuntimeError("duplicate_event", `Gate instance ${input.gateInstanceId} conflicts with existing scope`);
+    return { kind: "noop", runtime, events: [] };
+  }
+  return appendOne(runtime, { type: "gate_opened", actorSessionId: input.actorSessionId, nodeId: `gate:${input.gateInstanceId}`, createdAt: input.now, eventId: `gate:${input.gateInstanceId}:opened`, payload: { gateInstanceId: input.gateInstanceId, gateId: definition.gateId, definition }, evidence: input.evidence });
+}
+
+export function resolveGate(runtime: GraphRuntimeState, team: TeamState, definition: TopologyGateDefinition, input: { gateInstanceId: string; option: string; approvingSessionId: string; commandId: string; source: "user-command"; now: number; evidence?: EvidenceRef[] }): GraphCommandResult {
+  currentCharterMatches(runtime, team);
+  assertGraphOpen(runtime);
+  if (input.approvingSessionId !== team.controllerSessionId) throw new GraphRuntimeError("permission_denied", "Human Gate decisions must be issued from the current Driver Session");
+  if (input.source !== "user-command" || !nonEmpty(input.commandId) || !definition.options.includes(input.option)) throw new GraphRuntimeError("handoff_invalid", "Gate decision must use a declared option and user-command source");
+  const gate = gatesFromEvents(runtime.events).get(input.gateInstanceId);
+  if (gate === undefined || gate.gateId !== definition.gateId) throw new GraphRuntimeError("loop_not_found", `Gate ${input.gateInstanceId} is unknown`);
+  if (gate.status === "resolved" || gate.status === "fallback_applied") return gate.selectedOption === input.option ? { kind: "noop", runtime, events: [] } : (() => { throw new GraphRuntimeError("duplicate_event", `Gate ${input.gateInstanceId} already resolved with another option`); })();
+  if (gate.status !== "open") throw new GraphRuntimeError("loop_terminal", `Gate ${input.gateInstanceId} is ${gate.status}`);
+  return appendOne(runtime, { type: "gate_resolved", actorSessionId: input.approvingSessionId, nodeId: `gate:${input.gateInstanceId}`, createdAt: input.now, eventId: `gate:${input.gateInstanceId}:resolved`, payload: { gateInstanceId: input.gateInstanceId, gateId: definition.gateId, option: input.option, commandId: input.commandId, source: input.source, approvingSessionId: input.approvingSessionId }, evidence: input.evidence });
+}
+
+export function applyGateFallback(runtime: GraphRuntimeState, team: TeamState, definition: TopologyGateDefinition, input: { gateInstanceId: string; actorSessionId: string; now: number; unavailableConfirmed: boolean; reason: string; evidence?: EvidenceRef[] }): GraphCommandResult {
+  currentCharterMatches(runtime, team);
+  assertGraphOpen(runtime);
+  if (input.actorSessionId !== team.controllerSessionId) throw new GraphRuntimeError("permission_denied", "only the Team controller may apply a Gate fallback");
+  const gate = gatesFromEvents(runtime.events).get(input.gateInstanceId);
+  if (gate === undefined || gate.gateId !== definition.gateId) throw new GraphRuntimeError("loop_not_found", `Gate ${input.gateInstanceId} is unknown`);
+  if (gate.status !== "open") return { kind: "noop", runtime, events: [] };
+  const expired = gate.expiresAt !== undefined && input.now >= gate.expiresAt;
+  if (!expired && !input.unavailableConfirmed) throw new GraphRuntimeError("handoff_invalid", "Gate fallback is not allowed before expiry without an explicit unavailable fact");
+  const type: GraphEventType = definition.onUnavailable === "fallback" ? "gate_fallback_applied" : expired ? "gate_expired" : "gate_blocked";
+  const payload = { gateInstanceId: input.gateInstanceId, gateId: definition.gateId, reason: input.reason, action: definition.onUnavailable, ...(definition.fallbackOption === undefined ? {} : { option: definition.fallbackOption }) };
+  return appendOne(runtime, { type, actorSessionId: input.actorSessionId, nodeId: `gate:${input.gateInstanceId}`, createdAt: input.now, eventId: `gate:${input.gateInstanceId}:${type}`, payload, evidence: input.evidence });
+}
+
+export type ClosureCommandResult = (GraphCommandResult & { accepted: boolean; diagnostic?: string });
+
+export function recordClosure(runtime: GraphRuntimeState, team: TeamState, definition: TopologyClosureDefinition, input: { outcome: "completed" | "failed" | "abandoned"; actorSessionId: string; reason?: string; now: number; evidence?: EvidenceRef[] }): ClosureCommandResult {
+  currentCharterMatches(runtime, team);
+  const owner = ownerSession(team, definition.owner);
+  const existing = closureFromEvents(runtime.events);
+  if (existing.status === "recorded") {
+    if (existing.outcome === input.outcome) return { kind: "noop", runtime, events: [], accepted: true };
+    throw new GraphRuntimeError("duplicate_event", "Team closure already has a different terminal outcome");
+  }
+  if (input.actorSessionId !== owner) throw new GraphRuntimeError("permission_denied", "only the Frozen Charter closure owner may close the Team");
+  if (!definition.allowedOutcomes.includes(input.outcome)) throw new GraphRuntimeError("invalid_shape", `closure outcome ${input.outcome} is not allowed by the Frozen Charter`);
+  const reason = input.reason ?? "";
+  const evidenceRefs = input.evidence ?? [];
+  const readiness = closureReadiness(runtime, definition, input.outcome, evidenceRefs);
+  const requested = appendOne(runtime, { type: "closure_requested", actorSessionId: input.actorSessionId, nodeId: "closure", createdAt: input.now, payload: { owner: definition.owner, outcome: input.outcome, reason }, evidence: evidenceRefs });
+  if (requested.kind === "noop") return { kind: "noop", runtime, events: [], accepted: false };
+  if (readiness !== undefined || ((input.outcome === "failed" || input.outcome === "abandoned") && reason === "")) {
+    const rejected = appendOne(requested.runtime, { type: "closure_rejected", actorSessionId: input.actorSessionId, nodeId: "closure", createdAt: input.now, payload: { reason: readiness ?? `${input.outcome} closure requires a reason` }, evidence: evidenceRefs });
+    if (rejected.kind === "changed") return { kind: "changed", runtime: rejected.runtime, events: [...requested.events, ...rejected.events], accepted: false, diagnostic: readiness ?? `${input.outcome} closure requires a reason` };
+    return { kind: "changed", runtime: requested.runtime, events: requested.events, accepted: false, diagnostic: readiness };
+  }
+  const recorded = appendOne(requested.runtime, { type: "closure_recorded", actorSessionId: input.actorSessionId, nodeId: "closure", createdAt: input.now, payload: { owner: definition.owner, outcome: input.outcome, reason }, evidence: evidenceRefs });
+  if (recorded.kind === "changed") return { kind: "changed", runtime: recorded.runtime, events: [...requested.events, ...recorded.events], accepted: true };
+  return { kind: "changed", runtime: requested.runtime, events: requested.events, accepted: true };
 }

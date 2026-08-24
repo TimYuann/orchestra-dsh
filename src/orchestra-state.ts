@@ -22,7 +22,7 @@ import type { GraphRuntimeState } from "./orchestra-graph.js";
 import { readGraphRuntime } from "./orchestra-graph.js";
 
 export type TeamRolePhase = "reserved" | "provisioning" | "active" | "failed";
-export type TeamStatus = "provisioning" | "active" | "degraded" | "blocked" | "failed";
+export type TeamStatus = "provisioning" | "active" | "degraded" | "blocked" | "failed" | "completed" | "abandoned";
 
 export interface TeamRoleDiagnostic {
   code: string;
@@ -327,7 +327,7 @@ function classifyRaw(raw: unknown, cwd: string):
       diagnostic: diagnostic("inactive", "active team state contains a dismissed snapshot"),
     };
   }
-  if (record.status !== undefined && !["provisioning", "active", "degraded", "blocked", "failed"].includes(record.status)) {
+  if (record.status !== undefined && !["provisioning", "active", "degraded", "blocked", "failed", "completed", "abandoned"].includes(record.status)) {
     return {
       kind: "blocked",
       warnings,
@@ -443,7 +443,7 @@ export function normalizeTeam(raw: unknown, cwd: string, options: { allowDismiss
     schemaVersion: typeof record.schemaVersion === "number" ? record.schemaVersion : 1,
     teamId,
     status:
-      record.status === "provisioning" || record.status === "degraded" || record.status === "blocked" || record.status === "failed"
+      record.status === "provisioning" || record.status === "degraded" || record.status === "blocked" || record.status === "failed" || record.status === "completed" || record.status === "abandoned"
         ? record.status
         : "active",
     rootCwd: typeof record.rootCwd === "string" && record.rootCwd !== "" ? record.rootCwd : cwd,

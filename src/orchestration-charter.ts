@@ -247,6 +247,7 @@ function validDraft(value: unknown): value is CharterDraft {
   if (value.baseCharterRevision !== undefined && (!safeInteger(value.baseCharterRevision) || value.baseTeamId === undefined)) return false;
   if (value.reason !== undefined && typeof value.reason !== "string") return false;
   if (value.summary !== undefined && typeof value.summary !== "string") return false;
+  if (value.humanParticipationPolicy.mode === "autonomous" && value.topology.config.protocol?.gates?.some((gate: any) => gate.required === true && gate.onUnavailable !== "fallback")) return false;
   return draftDigest(value as CharterDraft) === value.digest;
 }
 
@@ -376,6 +377,7 @@ function assertDraftInput(input: DraftCommandInput): void {
   if (!validMission(input.mission)) throw new CharterError("invalid_shape", "charter mission is incomplete");
   if (!validTopologySnapshot(input.topology)) throw new CharterError("invalid_topology", "charter topology snapshot is invalid");
   if (!validHumanPolicy(input.humanParticipationPolicy)) throw new CharterError("invalid_human_policy", "human participation policy is invalid");
+  if (input.humanParticipationPolicy.mode === "autonomous" && input.topology.config.protocol?.gates?.some((gate: any) => gate.required === true && gate.onUnavailable !== "fallback")) throw new CharterError("invalid_human_policy", "autonomous required Human Gates must have a pre-approved fallback");
   if (!nonEmpty(input.authorSessionId) || !finite(input.now)) throw new CharterError("invalid_shape", "charter author and timestamp are required");
   if (input.baseCharterRevision !== undefined && input.baseTeamId === undefined) throw new CharterError("invalid_shape", "baseCharterRevision requires baseTeamId");
 }

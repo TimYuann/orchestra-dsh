@@ -166,7 +166,7 @@ function decision(value: unknown): value is DriverDecision {
 }
 
 function graphProjection(value: unknown): value is GraphProjectionSummary {
-  return record(value) && ["idle", "running", "passed", "blocked", "cap_exhausted", "stale", "legacy_missing"].includes(value.status) && Array.isArray(value.pendingHandoffs) && Array.isArray(value.capExhausted) && value.capExhausted.every((entry: unknown) => typeof entry === "string") && typeof value.stale === "boolean" && (value.runtimeRevision === undefined || finiteSafe(value.runtimeRevision));
+  return record(value) && ["idle", "running", "passed", "blocked", "cap_exhausted", "stale", "legacy_missing"].includes(value.status) && Array.isArray(value.pendingHandoffs) && Array.isArray(value.openGates) && Array.isArray(value.blockedScopes) && value.blockedScopes.every((entry: unknown) => typeof entry === "string") && Array.isArray(value.capExhausted) && value.capExhausted.every((entry: unknown) => typeof entry === "string") && record(value.closure) && ["none", "requested", "rejected", "recorded"].includes(value.closure.status) && Array.isArray(value.closure.evidence) && typeof value.stale === "boolean" && (value.runtimeRevision === undefined || finiteSafe(value.runtimeRevision));
 }
 
 export function readOrchestrationDocument(raw: unknown, teamId?: string): DocumentRead {
@@ -390,7 +390,7 @@ export function renderOrchestrationMarkdown(document: OrchestrationDocument, sta
     `- Projection at: ${projection.projectionAt}`,
     ...(projection.graph === undefined
       ? ["- Graph runtime: legacy_missing"]
-      : [`- Graph runtime: ${projection.graph.status} (runtime revision ${projection.graph.runtimeRevision ?? "unknown"})`, `- Graph pending handoffs: ${projection.graph.pendingHandoffs.length}`, `- Graph cap exhausted: ${projection.graph.capExhausted.length === 0 ? "none" : projection.graph.capExhausted.join(", ")}`]),
+      : [`- Graph runtime: ${projection.graph.status} (runtime revision ${projection.graph.runtimeRevision ?? "unknown"})`, `- Graph pending handoffs: ${projection.graph.pendingHandoffs.length}`, `- Graph open gates: ${projection.graph.openGates.length === 0 ? "none" : projection.graph.openGates.map((gate) => `${gate.gateInstanceId}[${gate.options.join("/")}; fallback=${gate.fallbackOption ?? gate.onUnavailable}]`).join(", ")}`, `- Graph blocked scopes: ${projection.graph.blockedScopes.length === 0 ? "none" : projection.graph.blockedScopes.join(", ")}`, `- Graph cap exhausted: ${projection.graph.capExhausted.length === 0 ? "none" : projection.graph.capExhausted.join(", ")}`, `- Closure: ${projection.graph.closure.status}${projection.graph.closure.outcome === undefined ? "" : ` (${projection.graph.closure.outcome})`}`]),
     "",
     "### Roles",
     ...projection.roles.map((role) => `- ${markdownLine(role.id)} → ${markdownLine(role.sessionId)} · ${markdownLine(role.phase)} · reports=${role.reportCount} · last=${markdownLine(role.lastReport ?? "none")}`),
