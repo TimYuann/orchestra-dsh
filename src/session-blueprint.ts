@@ -525,7 +525,22 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
   };
 }
 
-function governedModel(ctx: Context, input: GovernedBlueprintInput): { provider: string; model: string; reasoningEffort?: string } {
+export interface GovernedModelInput {
+  provider?: string;
+  model?: string;
+  reasoningEffort?: string;
+  runtime?: { provider?: string; model?: string; reasoningEffort?: string };
+}
+
+/**
+ * Model selection for a Governed role, shared by provisioning and draft-time
+ * pre-parsing so the proposal card shows exactly what create will pin.
+ */
+export function resolveDraftRoleModel(ctx: Context, input: GovernedModelInput): { provider: string; model: string; reasoningEffort?: string } {
+  return governedModel(ctx, input);
+}
+
+function governedModel(ctx: Context, input: GovernedModelInput): { provider: string; model: string; reasoningEffort?: string } {
   const explicit = input.provider !== undefined || input.model !== undefined || input.reasoningEffort !== undefined;
   if (explicit) {
     if (typeof input.provider !== "string" || typeof input.model !== "string" || input.provider === "" || input.model === "") {

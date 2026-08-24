@@ -27,7 +27,7 @@ import type {} from "@deepseek-ai/dsh-system-prompt";
 import type {} from "@deepseek-ai/dsh-commands";
 import { createSession, installModelOverride, deliverMessage, readDeliveryReceipt } from "./a2a.js";
 import type { ResolvedPresetFile } from "./a2a.js";
-import { hostToolNamesForPreflight, prepareGovernedBlueprint, preflightGovernedRequiredTools, SessionBlueprintError } from "./session-blueprint.js";
+import { hostToolNamesForPreflight, prepareGovernedBlueprint, preflightGovernedRequiredTools, resolveDraftRoleModel, SessionBlueprintError } from "./session-blueprint.js";
 import type { GovernedBlueprintReceipt, PreparedGovernedBlueprint } from "./session-blueprint.js";
 import {
   ensureBuiltinRolePresetArtifacts,
@@ -553,6 +553,98 @@ export async function prepareGovernedRolePlan(
     ...(options.maxRounds === undefined ? {} : { maxRounds: options.maxRounds }),
     ...(options.protocol === undefined ? {} : { protocol: options.protocol }),
     blueprint,
+  };
+}
+
+/**
+ * One role's proposal-card facts, resolved through the same preset/permission/
+ * model seams that create-time provisioning uses (see prepareGovernedRolePlan).
+ * This is presentation + pre-parsing only: it never creates a Session, never
+ * persists a blueprint marker, and never changes Frozen Charter semantics.
+ */
+export interface DraftRoleFacts {
+  roleId: string;
+  roleName: string;
+  preset: string;
+  presetSource?: "project" | "global" | "dsh" | "builtin";
+  sandbox: "read-only" | "workspace-write" | "danger-full-access";
+  permissionPreset: string;
+  effectivePermissionPreset: string;
+  provider: string;
+  model: string;
+  reasoningEffort?: string;
+  compositionTools: string[];
+  orchestraTools: string[];
+}
+
+async function draftPermissionFacts(
+  ctx: Context,
+  roleSandbox: string | undefined,
+): Promise<{ permissionPreset: string; effectivePermissionPreset: string; sandbox: DraftRoleFacts["sandbox"]; approval: string }> {
+  const permissions = ctx.get("permissionPresets");
+  if (permissions === undefined) throw new Error("permissionPresets service is unavailable");
+  // Mirrors prepareGovernedBlueprint exactly: the deployment default preset is
+  // the base permission, never the catalog spec's declared default.
+  const permissionPreset = permissions.defaultPreset;
+  if (permissionPreset === undefined) throw new Error("permissionPresets has no default preset for the draft role");
+  let permissionSpec: { sandbox: string; approval: string };
+  try {
+    permissionSpec = permissions.resolve(permissionPreset) as { sandbox: string; approval: string };
+  } catch (error) {
+    throw new Error(`permission preset "${permissionPreset}" could not be resolved: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (typeof permissionSpec.approval !== "string" || permissionSpec.approval === "") throw new Error(`permission preset "${permissionPreset}" has no usable approval policy`);
+  const sandbox = roleSandbox ?? permissionSpec.sandbox;
+  if (sandbox !== "read-only" && sandbox !== "workspace-write" && sandbox !== "danger-full-access") {
+    throw new Error(`draft role effective sandbox "${String(sandbox)}" is invalid`);
+  }
+  return {
+    permissionPreset,
+    effectivePermissionPreset: sandbox === permissionSpec.sandbox ? permissionPreset : "custom",
+    sandbox,
+    approval: permissionSpec.approval,
+  };
+}
+
+/**
+ * Draft-time per-role blueprint pre-parsing: mirrors prepareGovernedRolePlan's
+ * resolution order (resolvePresetFile → rolePresetSpec → tools → sandbox /
+ * permission preset → model), so the proposal card matches what orchestra_create
+ * will provision. Any resolution failure fails the draft instead of being
+ * silently skipped.
+ */
+export async function preparseDraftRoleFacts(ctx: Context, cwd: string, role: RoleConfig): Promise<DraftRoleFacts> {
+  const presetId = role.preset;
+  if (typeof presetId !== "string" || presetId === "") {
+    throw new Error(`draft topology role "${role.id}" requires an explicit complete Agent Preset`);
+  }
+  const presetFile = await resolvePresetFile(ctx, cwd, presetId);
+  const roleSpec = rolePresetSpec(presetId);
+  const compositionTools = role.compositionTools ?? roleSpec?.compositionTools;
+  const orchestraTools = role.orchestraTools ?? roleSpec?.orchestraTools;
+  if (roleSpec === undefined && presetFile.path !== "" && compositionTools === undefined) {
+    throw new SessionBlueprintError(
+      "composition_tools_unproven",
+      "Draft role preset " + presetId + " is not cataloged and has no explicit static compositionTools proof; approval draft was not created",
+      { roleId: role.id, presetId, source: presetFile.source, plane: "composition" },
+    );
+  }
+  const permission = await draftPermissionFacts(ctx, role.sandbox);
+  const model = resolveDraftRoleModel(ctx, { runtime: role.runtime });
+  if (model.provider === "" || model.model === "") throw new Error(`draft role "${role.id}" resolved an empty provider/model selection`);
+  return {
+    roleId: role.id,
+    roleName: role.name ?? role.id,
+    preset: presetId,
+    ...(presetFile.source === undefined ? {} : { presetSource: presetFile.source }),
+    sandbox: permission.sandbox,
+    permissionPreset: permission.permissionPreset,
+    effectivePermissionPreset: permission.effectivePermissionPreset,
+    provider: model.provider,
+    model: model.model,
+    ...(model.reasoningEffort === undefined ? {} : { reasoningEffort: model.reasoningEffort }),
+    compositionTools: compositionTools ?? [],
+    orchestraTools: orchestraTools ?? [],
   };
 }
 
@@ -1725,9 +1817,19 @@ export function apply(ctx: Context): void {
             mission: { type: "object", additionalProperties: true, required: true },
             topology: { type: "object", additionalProperties: true, required: true },
             human_participation: { type: "object", additionalProperties: true, required: true },
+            role_blueprint_preview: { type: "array", items: { type: "json" }, required: true },
           },
         },
-        render: (_args, value) => [{ type: "text", text: `charter draft ${value.draft_id}@${value.revision} (${value.approval_status}) digest=${value.digest}` }],
+        render: (_args, value) => {
+          const lines = [`charter draft ${value.draft_id}@${value.revision} (${value.approval_status}) digest=${value.digest}`];
+          for (const rawRole of value.role_blueprint_preview ?? []) {
+            const role = rawRole as unknown as DraftRoleFacts;
+            lines.push(
+              `role ${role.roleId}: preset=${role.preset}${role.presetSource === undefined ? "" : ` (${role.presetSource})`} sandbox=${role.sandbox} permission=${role.permissionPreset} model=${role.provider}/${role.model}${role.reasoningEffort === undefined ? "" : ` reasoningEffort=${role.reasoningEffort}`} compositionTools=[${(role.compositionTools ?? []).join(", ")}] orchestraTools=[${(role.orchestraTools ?? []).join(", ")}]`,
+            );
+          }
+          return [{ type: "text", text: lines.join("\n") }];
+        },
       },
       async execute(args: CharterDraftToolArgs, exec: ToolExecutionInput) {
         if (exec.agent === undefined) throw new Error("orchestra_draft requires an agent caller");
@@ -1765,6 +1867,15 @@ export function apply(ctx: Context): void {
         } catch (error) {
           throw charterCommandError("resolve the charter topology", error);
         }
+        let roleBlueprintPreview: DraftRoleFacts[];
+        try {
+          roleBlueprintPreview = [];
+          for (const role of topology.config.roles) {
+            roleBlueprintPreview.push(await preparseDraftRoleFacts(ctx, cwd, role));
+          }
+        } catch (error) {
+          throw new Error(`cannot create a charter draft: role blueprint pre-parsing failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
         let command;
         try {
           command = prepareDraftEvent(events, {
@@ -1785,7 +1896,7 @@ export function apply(ctx: Context): void {
         }
         if (command.kind !== "changed") throw new Error("charter draft command unexpectedly produced no event");
         await appendDurableCharterEvent(ctx, exec.agent.session, command.event);
-        return charterDraftOutput([...events, command.event], command.value) as any;
+        return { ...charterDraftOutput([...events, command.event], command.value), role_blueprint_preview: roleBlueprintPreview } as any;
       },
     }),
   );
@@ -3502,7 +3613,7 @@ export function apply(ctx: Context): void {
         "1. Goal: ask the user to state the goal — what \"done\" looks like. One topology run completes one goal; a clear goal defines when to stop.\n" +
         "2. Constraints: ask about limits/constraints (time, quality, boundaries). Merge into the same round when possible.\n" +
         "3. Context: read the project context relevant to the goal (files, docs) to ground your understanding.\n" +
-        "4. Proposal: call orchestra_draft to persist the exact mission/topology/human-policy Draft in your Session events, then report its draftId@revision and digest to the user. A proposal IS a collaboration charter (编排 = 协作宪章): it must answer who does what; who owns each decision; routes and handoffs; escalation; round limits; and closure.\n" +
+        "4. Proposal: call orchestra_draft to persist the exact mission/topology/human-policy Draft in your Session events, then report its draftId@revision and digest to the user. The proposal report MUST include a per-role roster card straight from orchestra_draft's role_blueprint_preview: for every role, its preset id, sandbox, permission preset, model provider/model, reasoningEffort, and compositionTools/orchestraTools, so the user can verify each role's configuration before approving. A proposal IS a collaboration charter (编排 = 协作宪章): it must answer who does what; who owns each decision; routes and handoffs; escalation; round limits; and closure.\n" +
         "5. Approval: proposal text or natural-language \"可以/放行\" is NOT approval. Tell the user to run the exact command /team approve <draftId>@<revision>; only the durable user-command approval event permits orchestra_freeze. Until that command succeeds, do NOT freeze or create/spawn any Governed role session.\n" +
         "6. Freeze and execute: after the approval command, call orchestra_freeze with the exact digest, then orchestra_create with frozenRef; for active Teams use orchestra_draft → user command → orchestra_freeze → orchestra_apply_amendment. Dispatch Governed roles via orchestra_send(teamId+roleId); use raw a2a_send only for explicit free SessionId communication.\n" +
         "Dispatch tightness: dispatch every spawned role's task immediately — in the same round, or the round right after spawning. Never leave a spawned role taskless (a spawn-to-dispatch vacuum makes roles start working on their own).\n" +
