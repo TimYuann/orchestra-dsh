@@ -11,7 +11,7 @@ import {
   resolveFrozenCharter,
   frozenRef,
 } from "../lib/orchestration-charter.js";
-import { handleTeamApprovalCommand } from "../lib/orchestra.js";
+import { charterEventsForSession, handleTeamApprovalCommand } from "../lib/orchestra.js";
 
 const mission = {
   objective: "ship the bounded change",
@@ -128,4 +128,9 @@ test("/team approve is a direct user-command seam with flush and no natural-lang
   const secondDraft = prepareDraftEvent(session.events, draftInput({ draftId: "draft-second", now: 200 })).value;
   session.append(CHARTER_DRAFT_EVENT, { draft: secondDraft });
   await assert.rejects(() => handleTeamApprovalCommand(failedCtx, { ...invocation, rawInput: `approve ${secondDraft.draftId}@1` }), /durable flush acceptance/);
+  assert.equal(charterEventsForSession(session).filter((event) => event.type === CHARTER_APPROVAL_EVENT && event.data.approval.draftId === secondDraft.draftId).length, 0);
+  assert.throws(() => prepareFreezeEvent(charterEventsForSession(session), { draftId: secondDraft.draftId, revision: 1, digest: secondDraft.digest, frozenBySessionId: "driver-session", frozenAt: 202 }), (error) => error?.code === "approval_required");
+  await handleTeamApprovalCommand(ctx, { ...invocation, rawInput: `approve ${secondDraft.draftId}@1`, commandId: "command-retry-after-flush" });
+  const authorized = prepareFreezeEvent(charterEventsForSession(session), { draftId: secondDraft.draftId, revision: 1, digest: secondDraft.digest, frozenBySessionId: "driver-session", frozenAt: 202 });
+  assert.equal(authorized.kind, "changed");
 });

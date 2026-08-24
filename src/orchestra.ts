@@ -803,6 +803,10 @@ export function assertSpawnableTeamDocument(state: ActiveTeamRead): void {
   }
 }
 
+export function rejectDirectGovernedSpawn(): void {
+  throw new Error("approval_required: orchestra_spawn cannot mutate a Governed roster directly; use orchestra_draft → /team approve <draftId>@<revision> → orchestra_freeze → orchestra_apply_amendment");
+}
+
 function documentToolStatus(
   team: TeamState | undefined,
   document: OrchestrationDocument | undefined,
@@ -852,8 +856,25 @@ function documentToolStatus(
   };
 }
 
+const quarantinedCharterEvents = new WeakMap<object, Set<unknown>>();
+
 function charterEventsOf(session: { events?: readonly unknown[] }): readonly unknown[] {
-  return Array.isArray(session.events) ? session.events : [];
+  const events = Array.isArray(session.events) ? session.events : [];
+  const quarantined = quarantinedCharterEvents.get(session as object);
+  return quarantined === undefined ? events : events.filter((event) => !quarantined.has(event));
+}
+
+export function charterEventsForSession(session: { events?: readonly unknown[] }): readonly unknown[] {
+  return charterEventsOf(session);
+}
+
+function quarantineCharterEvent(session: object, event: unknown): void {
+  let quarantined = quarantinedCharterEvents.get(session);
+  if (quarantined === undefined) {
+    quarantined = new Set<unknown>();
+    quarantinedCharterEvents.set(session, quarantined);
+  }
+  quarantined.add(event);
 }
 
 function charterCommandError(action: string, error: unknown): Error {
@@ -862,9 +883,17 @@ function charterCommandError(action: string, error: unknown): Error {
 }
 
 async function appendDurableCharterEvent(ctx: Context, session: any, event: CharterEvent): Promise<void> {
-  session.append(event.type, event.data);
-  const accepted = await ctx.sessions.flush(session as any);
-  if (!accepted) throw new Error(`charter event ${event.type} was appended but did not receive durable flush acceptance`);
+  const beforeLength = Array.isArray(session.events) ? session.events.length : 0;
+  const appended: unknown = session.append(event.type, event.data);
+  const inserted = Array.isArray(session.events) ? session.events[beforeLength] : undefined;
+  try {
+    const accepted = await ctx.sessions.flush(session as any);
+    if (!accepted) throw new Error(`charter event ${event.type} was appended but did not receive durable flush acceptance`);
+  } catch (error) {
+    if (appended !== undefined) quarantineCharterEvent(session, appended);
+    if (inserted !== undefined) quarantineCharterEvent(session, inserted);
+    throw error;
+  }
 }
 
 export async function handleTeamApprovalCommand(
@@ -1466,7 +1495,7 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "orchestra_spawn",
       description:
-        "Dynamically create one role session for the current orchestra instance: spawns the session (optional role preset), injects the role self-awareness protocol (driver identity, reply via a2a_reply to the driver — never directly to the user, self-contained tasks, orchestra_report handoff), optionally applies a read-only sandbox, records the role in orchestra/state/team.json (creating a custom instance when none exists), and returns the session id. To add a role from a topology template, pass templateId plus roleId (its preset/sandbox/welcome are reused; explicit presetId/sandbox override them). The driver should follow up with a self-contained task via a2a_send.",
+        "Governed role spawning is approval-gated in 4B and this direct tool fails closed. Use orchestra_draft → /team approve <draftId>@<revision> → orchestra_freeze → orchestra_create for initial Teams, or orchestra_apply_amendment for an approved charter change; no direct roster mutation is performed here.",
       parameters: {
         roleName: { type: "string", description: "Role name, e.g. \"implementer\" (required unless templateId+roleId are given)." },
         mission: { type: "string", description: "Role duties or current task summary; appended to the injected welcome." },
@@ -1529,6 +1558,7 @@ export function apply(ctx: Context): void {
         if (exec.agent === undefined) throw new Error("orchestra_spawn requires an agent caller");
         const cwd = exec.agent.session.header.cwd;
         if (cwd === undefined) throw new Error("current session has no working directory; cannot create a role");
+        rejectDirectGovernedSpawn();
         let roleName = String(args.roleName ?? "").trim();
         if (roleName === "" && args.templateId !== undefined && args.roleId !== undefined) {
           roleName = args.roleId;
@@ -2851,7 +2881,7 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "orchestra_topologies",
       description:
-        "List available topology templates (spec §4.1): project templates under <cwd>/.orchestra/topologies/*.json, global templates under ~/.dsh/orchestra/topologies/*.json, plus the bundled fallback (duo/trio/oracle/four-role-dev). Each entry shows source, controller, protocol (ownership/routes/completion), and roles. Use this before deciding whether to start from a template (orchestra_create) or orchestrate dynamically (orchestra_spawn).",
+        "List available topology templates (spec §4.1): project templates under <cwd>/.orchestra/topologies/*.json, global templates under ~/.dsh/orchestra/topologies/*.json, plus the bundled fallback (duo/trio/oracle/four-role-dev). Each entry shows source, controller, protocol (ownership/routes/completion), and roles. Use a snapshot in orchestra_draft before approval/freeze; direct orchestra_spawn roster mutation is approval-gated and fails closed in 4B.",
       parameters: {},
       output: {
         schema: {

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createActiveTeamStateStore } from "../lib/orchestra-state.js";
-import { assertSpawnableTeamDocument } from "../lib/orchestra.js";
+import { assertSpawnableTeamDocument, rejectDirectGovernedSpawn } from "../lib/orchestra.js";
 import {
   appendDriverDecision,
   applyFrozenCharterRevision,
@@ -300,4 +300,22 @@ test("Frozen charter initializes the Team document and amendments append immutab
   assert.equal(applied.document.charterRevisions.length, 2);
   assert.equal(applied.document.charterRevisions[0].digest, frozen.value.digest);
   assert.throws(() => applyFrozenCharterRevision(initial, source, amendmentFrozen.value, "reviewer-session", 208), (error) => error?.code === "permission_denied");
+});
+
+test("orchestra_spawn direct gate rejects both new and existing frozen Team paths without state mutation", async () => {
+  const emptyFs = new MemoryFs();
+  const emptyBefore = emptyFs.files.size;
+  assert.throws(() => rejectDirectGovernedSpawn(), /approval_required/);
+  assert.equal(emptyFs.files.size, emptyBefore);
+  const existingFs = new MemoryFs();
+  const source = team();
+  const config = { schemaVersion: 1, id: "duo", controller: { id: "driver", source: "caller" }, roles: [{ id: "reviewer", name: "Reviewer", preset: "orchestra-reviewer", sandbox: "read-only" }], protocol: { ownership: { closure: "driver" }, routes: [], completion: { owner: "driver", rule: "done" } } };
+  const draft = prepareDraftEvent([], { draftId: "draft-spawn-gate", mission: source.mission, topology: { source: "inline", id: "duo", config }, humanParticipationPolicy: { mode: "interactive", onUnavailable: "block" }, authorSessionId: source.controllerSessionId, now: 300 });
+  const approval = prepareApprovalEvent([draft.event], { draftId: draft.value.draftId, revision: 1, commandId: "spawn-gate-command", approvingSessionId: source.controllerSessionId, approvedAt: 301 });
+  const frozen = prepareFreezeEvent([draft.event, approval.event], { draftId: draft.value.draftId, revision: 1, digest: draft.value.digest, frozenBySessionId: source.controllerSessionId, frozenAt: 302 });
+  const frozenLike = initializeFrozenOrchestrationDocument(source, frozen.value, 303);
+  existingFs.seed("orchestra/state/team.json", { ...source, document: frozenLike });
+  const before = existingFs.content("orchestra/state/team.json");
+  assert.throws(() => rejectDirectGovernedSpawn(), /approval_required/);
+  assert.equal(existingFs.content("orchestra/state/team.json"), before);
 });
