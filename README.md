@@ -75,6 +75,8 @@ Directory conventions: **project-level `.orchestra/` wins over global `~/.dsh/or
 
 ## Built-in topologies（内置模板）
 
+**v0.3 legacy templates**（继续可读，不静默替换）:
+
 | Template | Spawned roles | Purpose |
 |---|---|---|
 | `duo` | reviewer (read-only) | Minimal loop: driver + targeted two-round review. |
@@ -82,13 +84,25 @@ Directory conventions: **project-level `.orchestra/` wins over global `~/.dsh/or
 | `oracle` | oracle (read-only) | Deep-discussion partner: dialogue → conclusions as tasks. |
 | `four-role-dev` | implementer + reviewer + oracle (reviewer/oracle read-only) | Implement ⇄ review main loop with an on-demand oracle escalation channel. |
 
-Each template carries a `protocol` block: `ownership` (who owns each decision), `routes` (default message flows), and `completion` (who declares the team complete). The plugin validates that ownership/routes reference real roles and injects the protocol into every role's opening message.
+**v0.4 task topologies**（schemaVersion 1，graph-engineered: typed handoffs + bounded Loop + Human Gate + single Closure owner）:
+
+| Template | Spawned roles | Purpose |
+|---|---|---|
+| `feature-development` | implementer + verifier + reviewer (verifier/reviewer read-only) | Approved mission → bounded, tested, reviewed code delivery. Loop `implementation-review` (max 2 attempts), gate `feature-closure-approval`. |
+| `bug-diagnosis-and-fix` | investigator + implementer + verifier + reviewer (read-only except implementer) | Reproduction + root cause first, then minimal repair with regression evidence. Loop `diagnosis-fix-review`, gate `bug-fix-acceptance`. |
+| `architecture-decision` | researcher + architect + reviewer (all read-only) | Evidence-backed decision brief with a direct user choice. Loop `decision-validation`, gate `architecture-decision-approval` (reviewer PASS ≠ user approval). |
+| `refactor-and-migration` | architect + implementer + verifier + reviewer | Behavior-baseline migration in declared slices with rollback evidence. Loop `migration-validation`, gate `migration-compatibility-approval`. |
+| `audit-and-hardening` | hardening-auditor + investigator + implementer + verifier + reviewer | Bounded security audit → minimal remediation → rescan evidence. Loop `hardening-remediation`, gate `security-risk-acceptance` (missing rescan cannot PASS). |
+
+Each template carries a `protocol` block: `ownership` (who owns each decision), `routes` (default message flows), `completion` (who declares the team complete), plus v0.4 `loops` / `gates` / `handoffs` / `closure` contracts. The plugin validates that ownership/routes reference real roles and injects the protocol into every role's opening message. The seven v0.4 role presets (`orchestra-v04-*-v1`) are complete mountable compositions (persona + tools + agent-instructions), not persona-only text.
 
 **Orchestration is flexible by design**: the driver may pick any number of roles (3 or 10) — it must define routes and ownership, but the cast is up to the task. A role named like a template role inherits that template's sandbox/preset by default; explicitly spawned roles default to `workspace-write` unless you pass `sandbox: "read-only"`.
 
 ## Tools（工具一览）
 
-**Orchestration:** `orchestra_create` (template + mission) · `orchestra_spawn` (add a role, with preset/sandbox/model overrides) · `orchestra_team` (team state + archive list) · `orchestra_dismiss` (archive & free the directory; roles stay alive and get an archive notice) · `orchestra_activate` (restore an archived team; requires `archive_id`, handles replaced sessions and controller takeover) · `orchestra_report` (the only write channel for read-only roles) · `orchestra_topologies` (list project/global/built-in templates).
+**Orchestration:** `orchestra_create` (template + mission) · `orchestra_spawn` (add a role, with preset/sandbox/model overrides) · `orchestra_team` (team state + archive list, with graph projection) · `orchestra_dismiss` (archive & free the directory; roles stay alive and get an archive notice) · `orchestra_activate` (restore an archived team; requires `archive_id`, validates archived document/graph before publishing, handles replaced sessions and controller takeover) · `orchestra_report` (the only write channel for read-only roles) · `orchestra_topologies` (list project/global/built-in templates).
+
+**v0.4 governed charter & graph:** `orchestra_draft` (append-only charter drafts, with per-role blueprint preview rendered as a Markdown table) · `/team approve <draftId>@<revision>` (the only hard approval — natural language is not approval) · `orchestra_freeze` (immutable frozen charter revision) · `orchestra_apply_amendment` (new revision, never in-place roster edits) · `orchestra_document` / `orchestra_reconcile` / `orchestra_decision` (living document, runtime projection, append-only driver decision journal) · `orchestra_charters` · `orchestra_loop_start` / `orchestra_attempt_start` / `orchestra_verdict` / `orchestra_handoff` (typed, CAS-guarded; controller is a valid target) / `orchestra_gate_open` / `orchestra_gate_fallback` / `orchestra_graph` / `orchestra_graph_reconcile` / `orchestra_close` (single closure owner, terminal after closure). Node milestones (handoff/verdict/report/gate/close) auto-notify the driver with one-line notices (best-effort, trigger not state source).
 
 **A2A transport:** `a2a_list` (progressive disclosure: your cwd first, archived folded, `current_cwd_team` annotation) · `a2a_create` · `a2a_send` / `a2a_reply` (delivery receipts: `live_inbox` / `durable_inbox` / `resumed_inbox` — accepted ≠ processed) · `a2a_read`.
 
@@ -115,8 +129,9 @@ The dev instance restarts in seconds and never touches the main instance. Intern
 
 ## Roadmap（路线图）
 
-- **v0.4** — orchestration assetization (save a team's charter as a reusable topology/preset at wrap-up, project- and global-level), preset engineering (curated base prompts, review methodologies as presets), advisory/observer role.
-- GUI steering — buttons to create roles/templates, visual template editing (currently display-only panes).
+- **v0.4.0 ✅（2026-08-25 主线闭环）** — living orchestration document (charter draft → `/team approve` → freeze → amendment), bounded graph runtime (loop/attempt/verdict/gate/closure, typed handoffs, cap exhaustion), transactional provisioning, seven v0.4 role presets, five task topologies, session title three-part scheme, driver node-milestone notices, proposal blueprint table, recovery hardening (archive validation, three-branch activate, controller takeover). Local verification: 18 test files / 142 tests green. Real full-session E2E is **not** run by the dev team — see `UPDATE-v0.4.0.md` for the external validation checklist.
+- **0.4.x** — release-readiness topology; real full-session E2E acceptance.
+- **0.5** — product-or-ui-design / frontend-designer; sidebar live topology graph (SVG, no third-party deps); GUI steering (create/close buttons — currently display-only panes).
 
 ## License
 

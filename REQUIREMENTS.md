@@ -1,6 +1,8 @@
 # orchestra-dsh v0.4.0 · 目标规格
 
-> 本文件是 orchestra-dsh v0.4.0 的唯一目标规格面。它记录已经拍板的产品与架构合同，供后续 Executor 实现、Reviewer 验收；不把尚未实现的能力描述成现状。当前公开 checkout 是 v0.3.0，内部状态、评审报告和 DSH 集成手册不属于本仓库依赖。
+> 本文件是 orchestra-dsh v0.4.0 的唯一目标规格面。它记录已经拍板的产品与架构合同，供后续 Executor 实现、Reviewer 验收；不把尚未实现的能力描述成现状。当前公开 checkout 是 v0.4.0（2026-08-25 主线闭环），内部状态、评审报告和 DSH 集成手册不属于本仓库依赖。
+>
+> **实现状态（2026-08-25 更新）**：Checkpoint 1–5、6B-0（七个 v0.4 Role Preset）、6B-1~6B-5（五个任务型 Topology）、Checkpoint 7（recovery）、Checkpoint 8（简化版：driver 节点提醒 + 提案表格卡片）已完成并通过本地 contract/integration tests（18 文件 / 142 测试全绿）；Checkpoint 9（打包防崩 + `UPDATE-v0.4.0.md`）已完成。**真实 full-session E2E 未由开发团队运行**（见 `UPDATE-v0.4.0.md` §4/§5），由用户在 DSH 另开的创造模式验收 Session 独立执行；本文件正文的合同语义不受实现状态更新影响。
 >
 > 文档中的 **已实现事实** 表示当前 v0.3.0 源码已经提供的行为；**v0.4 目标** 表示本版本必须保真的产品语义；**候选** 和 **开放问题** 不得被当作已冻结实现。API、JSON 字段和物理文件布局只在不违背本文件语义的前提下，于对应实现 Checkpoint 冻结。
 
@@ -221,9 +223,9 @@ Orchestra Human Gate 是产品协作决策层；DSH Permission/Approval 是工�
 
 修改一个 Role Preset 不应隐式重写已经 Freeze 的 Topology；修改 Topology 也不应把历史 role 的运行事实改成新默认。
 
-### 6.2 当前 v0.3 基线事实
+### 6.2 当前 v0.4.0 基线事实
 
-当前公开 v0.3.0 源码内置并暴露 4 个 Topology Template：`duo`、`trio`、`oracle`、`four-role-dev`；内置 3 个 Role Preset：`orchestra-implementer`、`orchestra-reviewer`、`orchestra-oracle`。这些是已实现基线，不等于 v0.4.0 已满足 Graph/Loop/Gate 合同。
+当前公开 v0.4.0 源码内置并暴露 9 个 Topology Template：`duo`、`trio`、`oracle`、`four-role-dev`（legacy 兼容）与 `feature-development`、`bug-diagnosis-and-fix`、`architecture-decision`、`refactor-and-migration`、`audit-and-hardening`（6B 已实现，schemaVersion 1，graph/loop/gate/closure 按 D.1~D.5 冻结）；内置 10 个 Role Preset：7 个 v0.4 versioned（`orchestra-v04-implementer-v1`、`orchestra-v04-reviewer-v1`、`orchestra-v04-investigator-v1`、`orchestra-v04-verifier-v1`、`orchestra-v04-architect-v1`、`orchestra-v04-researcher-v1`、`orchestra-v04-hardening-auditor-v1`）加 3 个 legacy（`orchestra-implementer`、`orchestra-reviewer`、`orchestra-oracle`）。这些是已实现基线；实现状态不自动改变本文件的验收语义。
 
 ### 6.3 v0.4 任务型 Topology 候选与冻结入口
 
@@ -383,6 +385,8 @@ Soft warning 不得被工具 render 的一句摘要吞掉；应进入 Draft/Free
 - 用 GUI、workspace adapter 或 discovery 层替代核心 runtime 的一致性和证据合同。
 
 ## 11. 后续实施 Checkpoint 建议
+
+> **状态（2026-08-25）**：Checkpoint 1–5、6B-0~6B-5、Checkpoint 7、Checkpoint 8（简化版）、Checkpoint 9 均已完成本地实现与验证（18 测试文件 / 142 测试全绿，typecheck/build 全过，tgz 防崩三件套通过）。下文保留为完整合同与验收基线；真实 full-session E2E 未运行，验收场景与入口见 `UPDATE-v0.4.0.md`。
 
 以下顺序用于拆分后续实现工作；每个 Checkpoint 主题单一、必须独立验证和提交，后项不得假定前项“差不多完成”。这是实施建议，不是已完成清单。
 

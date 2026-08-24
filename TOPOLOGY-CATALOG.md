@@ -1,10 +1,11 @@
 # orchestra-dsh v0.4.0 · Task Topology / Role Preset Catalog
 
-> 状态：Checkpoint 6A research/design freeze。本文冻结 v0.4.0 首发任务型
-> Topology 与 Role Pool 的产品合同，尚未表示 JSON、Preset 文件或 runtime
-> 已实现。6B 才能按本文实现，并为每个批次提供本地 contract/integration
-> tests 与外部 full-session E2E scenario；真实 E2E 由用户另开的 DSH
-> “创造模式”验收 Session执行。
+> 状态：**6A freeze + 6B implemented（2026-08-25）**。本文冻结 v0.4.0 首发任务型
+> Topology 与 Role Pool 的产品合同；D.1~D.5 五个 Topology 与 E 节七个 Role Preset
+> 已由 6B 实现（BUILTIN_TOPOLOGIES / orchestra-role-presets，本地 contract/
+> integration tests 18 文件 142 测试全绿）。**真实 full-session E2E 未运行**，
+> 由用户另开的 DSH「创造模式」验收 Session 按 `UPDATE-v0.4.0.md` §4/§5 独立
+> 执行；本文的合同值不受实现状态影响。
 >
 > 研究截止：2026-08-24。DSH 官方仓库事实使用
 > dsh 0.1.1-rc.2 release commit
@@ -47,7 +48,7 @@ route、Loop、Gate、Closure 和 E2E 合同。
 
 ### 0.3 冻结与实现的边界
 
-- “冻结”表示 6B 的输入合同，不表示当前源码已有这些内置模板。
+- 本文 D/E 节是 6B 的输入合同；**6B 已按本文实现**（2026-08-25，提交链 798b221→4403b0f），本地 contract/integration tests 全绿。
 - 本文中的能力合同明确分为 compositionTools 与 orchestraTools；实现必须
   分别做 capability preflight，缺失就 fail loud，不能把 host tool 伪装成
   DSH composition row。
@@ -1238,7 +1239,10 @@ Blueprint/Loader 验证，绝不因版本升级覆盖。legacy Topology 的 pres
 
 ## F. Implementation batches
 
-以下是 6B 的建议顺序，不是本 Checkpoint 的实现状态：
+> 状态（2026-08-25）：6B-0~6B-5 **全部完成**并独立提交（
+> `orchestra-role-presets.ts` / `BUILTIN_TOPOLOGIES` / 各 `test-*.mjs`），
+> 本地 contract/integration tests 全绿；各批次的 E2E 场景与验收入口见
+> `UPDATE-v0.4.0.md` §5，由外部 DSH 验收 Session 执行。下文保留为批次合同。
 
 ### 6B-0 · Role Preset foundation
 
