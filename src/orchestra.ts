@@ -199,6 +199,40 @@ export function roleSessionTitle(options: RoleSessionTitleOptions): string {
   return `${role} · ${mission} · ${slug}`;
 }
 
+/** Milestone kinds the host auto-notifies the driver about (CP8 event 2, A). */
+export type MilestoneNoticeKind = "handoff" | "verdict" | "report" | "gate" | "close";
+
+/**
+ * One-line driver milestone notice text. The notice is a trigger, not a state
+ * source: the driver reports progress from orchestra_team/orchestra_graph, so
+ * the text carries only node-level facts — never payload content or secrets.
+ */
+export function milestoneNotice(teamId: string, kind: MilestoneNoticeKind, detail: string): string {
+  return `orchestra: ${teamId} ${kind} ${detail}`;
+}
+
+/**
+ * Best-effort node-milestone notification to the Team controller (driver).
+ * Skips the controller's own calls (no self-messages). Delivery failure is
+ * caught and warned — it can never fail the tool that triggered the notice.
+ */
+export async function notifyDriverMilestone(
+  _ctx: Context,
+  team: TeamState,
+  actorSessionId: string,
+  kind: MilestoneNoticeKind,
+  detail: string,
+  deliver: typeof deliverMessage = deliverMessage,
+): Promise<void> {
+  if (actorSessionId === team.controllerSessionId) return;
+  const text = milestoneNotice(team.teamId, kind, detail);
+  try {
+    await deliver(_ctx, actorSessionId, team.controllerSessionId, [{ type: "text", text }], { wake: true, idempotencyKey: `milestone-${randomUUID()}` });
+  } catch (error) {
+    console.warn(`orchestra: milestone notice to controller ${team.controllerSessionId} failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 /** Cordis plugin name used by loader diagnostics. */
 export const name = "orchestra-manager";
 
@@ -949,6 +983,7 @@ export async function handleTeamGateDecisionCommand(
   } catch (error) {
     throw new Error(`gate decision durable but graph transition is pending: ${error instanceof Error ? error.message : String(error)}`);
   }
+  await notifyDriverMilestone(ctx, team, invocation.agent.id, "gate", `${gate.gateInstanceId} resolved: ${match[2]}`);
   return { kind: "success", text: `Gate ${gate.gateInstanceId} resolved with user option ${match[2]}` };
 }
 
@@ -2805,6 +2840,10 @@ export function apply(ctx: Context): void {
           throw graphCommandError("apply a Human Gate fallback", error);
         }
         const snapshot = command.kind === "noop" ? observation : await persistGraphTransition(ctx, activeTeamState, observation, command.runtime, exec);
+        if (command.kind === "changed") {
+          const after = graphGates(command.runtime).find((entry) => entry.gateInstanceId === args.gateInstanceId);
+          await notifyDriverMilestone(ctx, team, exec.agent.id, "gate", `${args.gateInstanceId} resolved: ${after?.selectedOption ?? after?.status ?? "noop"}`);
+        }
         return graphToolOutput(snapshot.team, command.runtime, false) as any;
       },
     }),
@@ -2947,6 +2986,12 @@ export function apply(ctx: Context): void {
           throw graphCommandError("record a Loop verdict", error);
         }
         const snapshot = command.kind === "noop" ? observation : await persistGraphTransition(ctx, activeTeamState, observation, command.runtime, exec);
+        if (command.kind === "changed") {
+          const updated = graphLoops(command.runtime).find((entry) => entry.loopInstanceId === args.loopInstanceId);
+          const attempt = updated?.attempts.at(-1)?.attempt;
+          const capped = command.runtime.events.at(-1)?.type === "cap_exhausted";
+          await notifyDriverMilestone(ctx, team, exec.agent.id, "verdict", `${args.verdict}: ${args.loopInstanceId} attempt ${attempt ?? "?"}${capped ? " cap_exhausted" : ""}`);
+        }
         return graphToolOutput(snapshot.team, command.runtime, false) as any;
       },
     }),
@@ -3112,6 +3157,7 @@ export function apply(ctx: Context): void {
         try {
           const accepted = appendHandoffResult(pendingRuntime, pendingSnapshot.team, { handoffId: args.handoffId, actorSessionId: exec.agent.id, accepted: true, receipt, now: Date.now() });
           const acceptedSnapshot = await persistGraphTransition(ctx, activeTeamState, pendingSnapshot, accepted.runtime, exec);
+          await notifyDriverMilestone(ctx, team, exec.agent.id, "handoff", `${args.kind} accepted: ${pendingFact.fromRole} → ${pendingFact.toRole}`);
           return { status: "accepted", handoff_id: args.handoffId, team_id: team.teamId, from_role: pendingFact.fromRole, to_role: pendingFact.toRole, resolved_session_id: targetSessionId, runtime_revision: acceptedSnapshot.team.graphRuntime?.runtimeRevision ?? accepted.runtime.runtimeRevision, receipt };
         } catch (error) {
           return { status: "delivery_accepted_state_pending", handoff_id: args.handoffId, team_id: team.teamId, from_role: pendingFact.fromRole, to_role: pendingFact.toRole, resolved_session_id: targetSessionId, runtime_revision: pendingRuntime.runtimeRevision, receipt, reconcile_required: true };
@@ -3154,6 +3200,7 @@ export function apply(ctx: Context): void {
         const terminalStatus: TeamState["status"] | undefined = command.accepted ? args.outcome === "completed" ? "completed" : args.outcome === "abandoned" ? "abandoned" : "failed" : undefined;
         const snapshot = await persistGraphTransition(ctx, activeTeamState, observation, command.runtime, exec, terminalStatus);
         if (!command.accepted) throw new Error(`closure rejected: ${command.diagnostic ?? "requirements not satisfied"}`);
+        await notifyDriverMilestone(ctx, team, exec.agent.id, "close", args.outcome);
         return graphToolOutput(snapshot.team, command.runtime, false) as any;
       },
     }),
@@ -3586,6 +3633,7 @@ export function apply(ctx: Context): void {
               signal: exec.signal,
             });
           }
+          await notifyDriverMilestone(ctx, team, agentId, "report", `written: ${rel}`);
         }
         return { path: canonical };
       },
