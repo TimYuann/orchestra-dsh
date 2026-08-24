@@ -922,7 +922,7 @@ async function appendDurableCharterEvent(ctx: Context, session: any, event: Char
 
 export async function handleTeamApprovalCommand(
   ctx: Context,
-  invocation: { rawInput: string; commandId: string; agent: { id: string; session: any } },
+  invocation: { rawInput: string; commandId: string; agent: { id: string; session: any; followup?: (message: unknown) => unknown } },
 ): Promise<{ kind: "success"; text: string }> {
   const raw = invocation.rawInput.trim();
   const approvalMatch = raw.match(/^approve\s+([a-z0-9]+(?:-[a-z0-9]+)*)@([1-9]\d*)\s*$/);
@@ -942,17 +942,34 @@ export async function handleTeamApprovalCommand(
   } catch (error) {
     throw charterCommandError("approve the charter draft", error);
   }
+  const digest = command.value.digest;
+  const ref = frozenRef(draftId, revision, command.value.digest);
+  // Wake the driver: the approval event is durable, but the agent's turn ended
+  // when it handed the user the command — without a followup the driver waits
+  // forever for a signal that never comes (4600 实测发现). Single plugin-source
+  // notice, same shape as the /team marker (never split deliveries).
+  const notice = createUserMessage({
+    content: [{ type: "text", text: `(orchestra /team approval notice) Draft ${draftId}@${revision} approved by user command. digest=${digest}; freeze target=${ref}. Continue: orchestra_freeze with the exact digest, then orchestra_create(frozenRef=${ref}).` }] as ContentBlock[],
+    source: {
+      kind: "plugin",
+      plugin: "orchestra",
+      form: "notice",
+      summary: "orchestra /team charter approval",
+    } as MessageSource,
+  });
   if (command.kind === "changed") {
     await appendDurableCharterEvent(ctx, invocation.agent.session, command.event);
-    return { kind: "success", text: `Draft ${draftId}@${revision} approved by user command. digest=${command.value.digest}; freeze target=${frozenRef(draftId, revision, command.value.digest)}` };
+    invocation.agent.followup?.(notice);
+    return { kind: "success", text: `Draft ${draftId}@${revision} approved by user command. digest=${digest}; freeze target=${ref}` };
   }
+  invocation.agent.followup?.(notice);
   return { kind: "success", text: `Draft ${draftId}@${revision} was already approved; freeze target=${command.value.approvalRef}` };
 }
 
 export async function handleTeamGateDecisionCommand(
   ctx: Context,
   activeTeamState: ActiveTeamStateStore,
-  invocation: { rawInput: string; commandId: string; agent: { id: string; session: any } },
+  invocation: { rawInput: string; commandId: string; agent: { id: string; session: any; followup?: (message: unknown) => unknown } },
 ): Promise<{ kind: "success"; text: string }> {
   const match = invocation.rawInput.trim().match(/^decide\s+([a-z0-9]+(?:-[a-z0-9]+)*)\s+(\S+)$/);
   if (match === null) throw new Error("gate decision syntax is /team decide <gateInstanceId> <option>");
@@ -976,7 +993,22 @@ export async function handleTeamGateDecisionCommand(
   } catch (error) {
     throw graphCommandError("decide a Human Gate", error);
   }
-  if (command.kind === "noop") return { kind: "success", text: `Gate ${gate.gateInstanceId} was already resolved with option ${match[2]}` };
+  // Wake the driver after a user gate decision, same shape as the /team marker
+  // (single plugin-source notice — the agent's turn ended when the command was
+  // handed to the user, and notifyDriverMilestone skips the controller's own calls).
+  const gateNotice = createUserMessage({
+    content: [{ type: "text", text: `(orchestra /team gate decision notice) Gate ${gate.gateInstanceId} resolved: ${match[2]}. Continue per the Frozen Charter (reconcile, then proceed along the declared pass route).` }] as ContentBlock[],
+    source: {
+      kind: "plugin",
+      plugin: "orchestra",
+      form: "notice",
+      summary: "orchestra /team gate decision",
+    } as MessageSource,
+  });
+  if (command.kind === "noop") {
+    invocation.agent.followup?.(gateNotice);
+    return { kind: "success", text: `Gate ${gate.gateInstanceId} was already resolved with option ${match[2]}` };
+  }
   await appendDurableCharterEvent(ctx, invocation.agent.session, { type: "orchestra/gate-decision", data: { gateInstanceId: gate.gateInstanceId, option: match[2], commandId: String(invocation.commandId), decidedAt: Date.now(), approvingSessionId: invocation.agent.id, source: "user-command" } });
   try {
     await persistGraphTransition(ctx, activeTeamState, observed, command.runtime, { agent: invocation.agent } as any);
@@ -984,6 +1016,7 @@ export async function handleTeamGateDecisionCommand(
     throw new Error(`gate decision durable but graph transition is pending: ${error instanceof Error ? error.message : String(error)}`);
   }
   await notifyDriverMilestone(ctx, team, invocation.agent.id, "gate", `${gate.gateInstanceId} resolved: ${match[2]}`);
+  invocation.agent.followup?.(gateNotice);
   return { kind: "success", text: `Gate ${gate.gateInstanceId} resolved with user option ${match[2]}` };
 }
 

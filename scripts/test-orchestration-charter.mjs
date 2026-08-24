@@ -114,16 +114,29 @@ test("/team approve is a direct user-command seam with flush and no natural-lang
   session.append(CHARTER_DRAFT_EVENT, { draft });
   const flushes = [];
   const ctx = { sessions: { async flush() { flushes.push("flush"); return true; } } };
-  const invocation = { rawInput: `approve ${draft.draftId}@1`, commandId: "command-approve", agent: { id: "driver-session", session } };
+  const followups = [];
+  const invocation = { rawInput: `approve ${draft.draftId}@1`, commandId: "command-approve", agent: { id: "driver-session", session, followup: (message) => { followups.push(message); } } };
   const result = await handleTeamApprovalCommand(ctx, invocation);
   assert.equal(result.kind, "success");
   assert.equal(flushes.length, 1);
   assert.equal(session.events.filter((event) => event.type === CHARTER_APPROVAL_EVENT).length, 1);
+  // The driver must be woken after approval (4600 实测：命令成功后 agent 死等)
+  assert.equal(followups.length, 1);
+  const notice = followups[0];
+  assert.equal(notice?.source?.kind, "plugin");
+  assert.equal(notice?.source?.form, "notice");
+  assert.match(notice?.content?.[0]?.text ?? "", new RegExp(`Draft ${draft.draftId}@1 approved`));
+  assert.match(notice?.content?.[0]?.text ?? "", /digest=/);
+  assert.match(notice?.content?.[0]?.text ?? "", /freeze target=/);
   const retry = await handleTeamApprovalCommand(ctx, { ...invocation, commandId: "command-retry" });
   assert.equal(retry.kind, "success");
   assert.equal(session.events.filter((event) => event.type === CHARTER_APPROVAL_EVENT).length, 1);
+  // already-approved retry still wakes the driver (it needs the freeze target)
+  assert.equal(followups.length, 2);
   await assert.rejects(() => handleTeamApprovalCommand(ctx, { ...invocation, rawInput: `approve ${draft.draftId}@2` }), /revision_conflict/);
   await assert.rejects(() => handleTeamApprovalCommand(ctx, { ...invocation, rawInput: "可以" }), /approval command syntax/);
+  // syntax errors must not wake the driver
+  assert.equal(followups.length, 2);
   const failedCtx = { sessions: { async flush() { return false; } } };
   const secondDraft = prepareDraftEvent(session.events, draftInput({ draftId: "draft-second", now: 200 })).value;
   session.append(CHARTER_DRAFT_EVENT, { draft: secondDraft });
