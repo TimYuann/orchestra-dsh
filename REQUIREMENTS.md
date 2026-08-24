@@ -225,31 +225,55 @@ Orchestra Human Gate 是产品协作决策层；DSH Permission/Approval 是工�
 
 当前公开 v0.3.0 源码内置并暴露 4 个 Topology Template：`duo`、`trio`、`oracle`、`four-role-dev`；内置 3 个 Role Preset：`orchestra-implementer`、`orchestra-reviewer`、`orchestra-oracle`。这些是已实现基线，不等于 v0.4.0 已满足 Graph/Loop/Gate 合同。
 
-### 6.3 v0.4 任务型 Topology 候选
+### 6.3 v0.4 任务型 Topology 候选与冻结入口
 
-以下是 v0.4.0 的候选内置 Topology，不是已实现清单：
+完整的研究、评分、来源、角色合同、图/Loop/Gate/Closure 和 E2E 设计源是
+根目录 TOPOLOGY-CATALOG.md。本节只保留产品规格面的首发决策，不复制整份
+catalog；catalog 的“冻结”仍不是“已实现”。
+
+### 6.4 6A 冻结的 v0.4.0 首发批次
+
+**冻结但尚未实现**的首发 Topology 有五个：
 
 - `feature-development`；
 - `bug-diagnosis-and-fix`；
 - `refactor-and-migration`；
 - `architecture-decision`；
-- `product-or-ui-design`；
-- `release-readiness`；
 - `audit-and-hardening`。
 
-以下是候选 Role Pool，不代表每个角色都必须进入每个 Topology：
+冻结的首发 Role Pool 为：
 
 - `implementer`；
-- `debugger/investigator`；
-- `verifier`；
 - `reviewer`；
+- `investigator`（覆盖候选名 `debugger/investigator`，不再复制第二份 preset）；
+- `verifier`；
 - `architect`；
 - `researcher`；
-- `frontend-designer`；
-- `release-auditor`；
-- `documenter`。
+- `hardening-auditor`。
 
-每个实际纳入 v0.4 交付的内置 Topology 必须带有 graph/loop/gate/role-preset 定义、至少一个示例任务和真实 E2E 验收。候选名单要到对应实现 Checkpoint 冻结后才能转为已实现事实。
+6A 明确延期、不得在 6B 偷渡实现的候选为：
+
+- `product-or-ui-design`；
+- `release-readiness`；
+- `frontend-designer`、`release-auditor`、`documenter`。
+
+五个首发模板必须分别冻结 graph、typed handoff、bounded Loop、evaluator、
+hard cap、Human Gate、single Closure owner、Permission/Model 边界、完整
+Role Preset composition、示例任务和真实 full-session E2E。首发数量限制为
+五个，是在扩大覆盖面的同时保留可重复维护的实现批次；Agency Agents 的
+大量 standalone persona 不直接转成 Orchestra roster。
+
+### 6.5 实现状态与兼容约束
+
+- 以上 6A 资产是 **v0.4 已拍板目标**，不是当前源码已实现事实。
+- 当前 v0.3 的 `duo`、`trio`、`oracle`、`four-role-dev` 和
+  `orchestra-implementer`、`orchestra-reviewer`、`orchestra-oracle`
+  继续作为兼容输入；新模板不得静默替换旧模板或改写已 Freeze 实例。
+- 6B 只能实现 6.4 的五个 Topology 和七个 Role Preset；每个模板通过真实
+  E2E 后才能在 release/实现清单中标记为 implemented。
+- DSH Agent Preset、Permission Preset、Model Selection、sandbox 和
+  optional provider 是分离事实。缺失 required capability 必须在
+  provisioning 前 fail loud；不能以 persona-only 文件或当前默认值补齐。
 
 ## 7. 自定义 Graph Engineering 规范
 
@@ -382,9 +406,15 @@ Soft warning 不得被工具 render 的一句摘要吞掉；应进入 Draft/Free
 
 ### Checkpoint 6 · 内置任务型 Topology 与 Role Preset
 
-- **依赖**：Checkpoint 2、4、5。
-- **范围**：从候选名单中冻结本次交付的任务型 Topology 和 Role Pool；补齐完整 Agent composition、Permission/Model 边界、graph/loop/gate/role-preset 定义、示例任务。
-- **验收**：每个纳入的内置 Topology 都有真实 E2E；候选但未纳入的能力保持明确未实现；Preset 不再是 persona-only；模板修改不重写已 Freeze 实例。
+- **依赖**：Checkpoint 2、4、5 和 6A 的 TOPOLOGY-CATALOG.md 冻结。
+- **范围**：只实现 6A 冻结的五个任务型 Topology 与七个 Role Preset；补齐
+  完整 Agent composition、Permission/Model/sandbox 边界、capability
+  preflight、graph/loop/gate/role-preset 定义、示例任务和真实 full-session
+  E2E。Agency Agents 的 standalone persona 只能作为角色设计参考，不是
+  直接依赖或批量导入格式。
+- **验收**：每个纳入的内置 Topology 都有真实 E2E；延期候选保持明确未
+  实现；Preset 不再是 persona-only；缺失 optional/required capability
+  fail loud；模板修改不重写已 Freeze 实例。
 
 ### Checkpoint 7 · recovery / activate / dismiss
 
@@ -415,6 +445,7 @@ Soft warning 不得被工具 render 的一句摘要吞掉；应进入 Draft/Free
 5. Permission Preset 的内置目录、approval 适配方式和不同 DSH profile 的能力声明；
 6. interactive/checkpointed/autonomous 的默认提示与超时 UX，只要最终满足 Human Gate scope/fallback 合同；
 7. GUI 所需的 observation/query adapter 具体协议，只要观察面不成为核心 runtime 依赖；
-8. 任务型 Topology 候选中哪些进入 v0.4.0 的实际交付批次，以及每个批次的真实 E2E 任务样例。
+8. 6A 已冻结五个首发 Topology；仍开放的是 6B 的具体实现批次、profile
+   capability 证明和每个批次的真实 E2E 任务样例，不得借此扩大到延期候选。
 
 开放问题不允许削弱本文件已经冻结的硬不变量；如果答案改变产品语义，必须通过新的 Topology/document revision 和明确的 Driver/用户批准记录。
