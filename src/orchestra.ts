@@ -37,6 +37,7 @@ import {
 import { createActiveTeamStateStore } from "./orchestra-state.js";
 import type {
   ArchiveList,
+  ArchiveStore,
 } from "./orchestra-archive.js";
 import type {
   ActiveTeamArchivedMarker,
@@ -1332,6 +1333,272 @@ export async function createGovernedTeam(
       live: ctx.agents.get(SID(role.sessionId)) !== undefined,
       phase: role.phase,
     })),
+  };
+}
+
+export interface ActivateRoleResult {
+  role_id: string;
+  sessionId: string;
+  action: string;
+  replacedSessionId?: string;
+}
+
+export interface ActivateArchivedTeamResult {
+  teamId: string;
+  archiveId: string;
+  status: string;
+  roles: ActivateRoleResult[];
+}
+
+export interface ActivateResumeOptions {
+  resumeSessionId: SessionId;
+  agentOptions?: Record<string, unknown>;
+  setup?: (agentCtx: Context) => Promise<void>;
+  signal?: AbortSignal;
+}
+
+/**
+ * Dependency seams for orchestra_activate so its recovery branches are testable
+ * without a real Agent registry (mirrors GovernedProvisionDependencies).
+ */
+export interface ActivateDependencies {
+  createSession?: typeof createSession;
+  resumeAgent?: (ctx: Context, options: ActivateResumeOptions) => Promise<unknown>;
+  sendRoleWelcome?: (ctx: Context, fromSessionId: string, toSessionId: string, roleName: string, extra?: string, protocol?: Parameters<typeof roleProtocolText>[2]) => Promise<TeamWelcomeReceipt>;
+}
+
+/**
+ * Reactivate a dismissed (archived) team. Per role: live sessions are reused,
+ * persisted sessions are resumed, authoritatively missing sessions are replaced
+ * (sessionHistory + replacement reason + Recovery Packet), and other resume
+ * errors fail that role without replacement (team enters degraded). The caller
+ * becomes the new controller when it differs from the archived one (controller
+ * takeover, recorded in controllerHistory). The archive stays immutable.
+ *
+ * CP7 hardening: the archived document and graph runtime are validated before
+ * an active team is published — a blocked/stale runtime fails activation loudly
+ * instead of pretending the team is active.
+ */
+export async function activateArchivedTeam(
+  ctx: Context,
+  activeTeamState: ActiveTeamStateStore,
+  archiveStore: ArchiveStore,
+  args: { archiveId: string },
+  exec: ToolExecutionInput,
+  dependencies: ActivateDependencies = {},
+): Promise<ActivateArchivedTeamResult> {
+  if (exec.agent === undefined) throw new Error("orchestra_activate requires an agent caller");
+  const cwd = exec.agent.session.header.cwd;
+  if (cwd === undefined) throw new Error("current session has no working directory");
+  const existing = await activeTeamState.read(cwd, { signal: exec.signal });
+  throwIfBlocked("activate a team", existing);
+  if (existing.kind === "ready")
+    throw new Error(`an active team already exists here (${existing.team.teamId}); dismiss it first or activate in another working directory`);
+  const loaded = await archiveStore.read(cwd, args.archiveId, { signal: exec.signal });
+  if (loaded.kind === "blocked") {
+    throw new Error(
+      `archive "${args.archiveId}" is blocked (${loaded.diagnostic.code}): ${loaded.diagnostic.message}; repair or remove the archive before activation`,
+    );
+  }
+  if (loaded.kind === "missing") {
+    const available = (await archiveStore.list(cwd, { signal: exec.signal })).ready.map((a) => a.archiveId);
+    throw new Error(
+      `archive "${args.archiveId}" not found at ${cwd}/orchestra/archive/; available: ${available.length === 0 ? "(none)" : available.join(", ")}`,
+    );
+  }
+  const archived = loaded.snapshot;
+  // Rebuild the active state from the archive snapshot (archive stays immutable).
+  const query = ctx.get("sessionQuery");
+  const newTeam: TeamState = {
+    ...archived,
+    status: "active",
+    activatedFromArchiveId: archived.archiveId,
+    roles: archived.roles.map((role) => ({ ...role, sessionHistory: [...(role.sessionHistory ?? [])] })),
+  };
+  // Controller takeover: the caller of activate becomes the controller when different.
+  if (newTeam.controllerSessionId !== exec.agent.id) {
+    newTeam.controllerHistory = [
+      ...newTeam.controllerHistory,
+      { sessionId: newTeam.controllerSessionId, replacedAt: Date.now(), reason: "controller-takeover" },
+    ];
+    newTeam.controllerSessionId = exec.agent.id;
+  }
+  // Fail loud instead of pretending active: validate the archived document and
+  // graph runtime before publishing the active team.
+  if (newTeam.document !== undefined) {
+    const documentRead = readOrchestrationDocument(newTeam.document, newTeam.teamId);
+    if (documentRead.kind === "blocked") {
+      throw new Error(`cannot activate: archived team document is blocked (${documentRead.diagnostic.code}): ${documentRead.diagnostic.message}`);
+    }
+    if (documentRead.kind === "ready") newTeam.document = documentRead.document;
+  }
+  if (newTeam.graphRuntime !== undefined) {
+    const current = (() => {
+      if (newTeam.document === undefined || newTeam.document.currentCharterRevision === null || newTeam.document.currentCharterRevision === undefined) return undefined;
+      return newTeam.document.charterRevisions.find((revision) => revision.charterRevision === newTeam.document?.currentCharterRevision);
+    })();
+    const graphRead = readGraphRuntime(newTeam.graphRuntime, newTeam.teamId, current?.charterRevision, current?.digest);
+    if (graphRead.kind === "blocked") {
+      throw new Error(`cannot activate: archived graph runtime is blocked (${graphRead.diagnostic.code}): ${graphRead.diagnostic.message}`);
+    }
+    if (graphRead.kind === "stale") {
+      throw new Error("cannot activate: archived graph runtime is bound to an older Frozen Charter; no history was migrated");
+    }
+    if (graphRead.kind === "ready") newTeam.graphRuntime = graphRead.runtime;
+  }
+  const results: ActivateRoleResult[] = [];
+  let degraded = false;
+  const activationNotice = "The team has been reactivated. You remain under your role discipline: stop/continue as instructed — wait for driver dispatch before starting new work.";
+  const createRoleSession = dependencies.createSession ?? createSession;
+  const deliverRoleWelcome = dependencies.sendRoleWelcome ?? sendRoleWelcome;
+  const resumeRoleSession = dependencies.resumeAgent ?? (async (agentCtx: Context, options: ActivateResumeOptions): Promise<void> => {
+    await agentCtx.agents.resume({
+      resumeSessionId: options.resumeSessionId,
+      ...(options.agentOptions === undefined ? {} : { agentOptions: options.agentOptions }),
+      ...(options.setup === undefined ? {} : { setup: options.setup }),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    } as never);
+  });
+  for (const role of newTeam.roles) {
+    const agent = ctx.agents.get(SID(role.sessionId));
+    if (agent !== undefined) {
+      // Step 5a: live → reused
+      await deliverRoleWelcome(ctx, exec.agent.id, role.sessionId, role.name, activationNotice);
+      results.push({ role_id: role.id, sessionId: role.sessionId, action: "reused" });
+      continue;
+    }
+    // Step 5b/5c/5d: probe persistence to distinguish "missing" from "temporarily failing".
+    let snapshot: unknown = undefined;
+    if (query !== undefined) {
+      try {
+        snapshot = await query.readSession(SID(role.sessionId));
+      } catch (error) {
+        const code = (error as any)?.code;
+        if (code === "SESSION_QUERY_SESSION_NOT_FOUND") snapshot = "not-found";
+        else if (code === "SESSION_QUERY_CORRUPT_SESSION") snapshot = "corrupt";
+        else snapshot = "query-error";
+      }
+    } else {
+      snapshot = "no-query";
+    }
+    if (snapshot === "not-found" || snapshot === "no-query") {
+      // Step 5c: authoritatively missing → create a replacement session.
+      try {
+        const presetFile =
+          role.preset === null ? undefined : await resolvePresetFile(ctx, cwd, role.preset);
+        const roleModel = role.model;
+        const created = await createRoleSession(ctx, {
+          cwd,
+          ...(presetFile === undefined ? {} : { presetFile }),
+          ...(roleModel === undefined || roleModel.provider === undefined || roleModel.model === undefined
+            ? {}
+            : { provider: roleModel.provider, model: roleModel.model, reasoningEffort: roleModel.reasoningEffort }),
+          currentSessionId: exec.agent.id,
+          title: roleSessionTitle({ roleId: role.id, missionObjective: newTeam.mission.objective, cwd }),
+          signal: exec.signal,
+        });
+        if (role.sandbox === "read-only") {
+          const session = ctx.sessions.get(SID(created.sessionId));
+          if (session !== undefined) session.append("sandbox/mode", { mode: "read-only" });
+        }
+        const oldSessionId = role.sessionId;
+        role.sessionId = created.sessionId;
+        role.sessionHistory = [
+          ...role.sessionHistory,
+          { sessionId: oldSessionId, replacedAt: Date.now(), reason: "session-not-found" },
+        ];
+        // Recovery Packet (spec §8.4).
+        const recoveryPacket = [
+          `Your previous session (${oldSessionId}) no longer exists, so you were re-created as a replacement.`,
+          `team_id: ${newTeam.teamId}`,
+          `role_id: ${role.id}`,
+          `role_name: ${role.name}`,
+          `mission: ${newTeam.mission.objective}`,
+          `topology_id: ${newTeam.topologyRef.id}`,
+          `current driver session id: ${exec.agent.id}`,
+          `replaced session id: ${oldSessionId}`,
+          `existing report paths: ${newTeam.reports.filter((r) => r.roleId === role.id).map((r) => r.path).join(", ") || "(none)"}`,
+          `known state: ${newTeam.status} (reactivated from archive ${newTeam.activatedFromArchiveId ?? "(none)"})`,
+          `IMPORTANT: your old conversation history was NOT inherited.`,
+          "The team has been reactivated. Wait for driver dispatch before starting new work.",
+        ].join("\n");
+        await deliverRoleWelcome(ctx, exec.agent.id, role.sessionId, role.name, recoveryPacket);
+        results.push({ role_id: role.id, sessionId: created.sessionId, action: "replaced", replacedSessionId: oldSessionId });
+      } catch (error) {
+        degraded = true;
+        results.push({
+          role_id: role.id,
+          sessionId: role.sessionId,
+          action: "failed",
+        });
+        console.error(
+          `orchestra_activate: replacement for role ${role.id} failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      continue;
+    }
+    // Step 5b/5d: snapshot readable → try to resume; other errors → failed.
+    try {
+      const presetFile = role.preset === null ? undefined : await resolvePresetFile(ctx, cwd, role.preset);
+      const roleModel = role.model;
+      let setup: ((agentCtx: Context) => Promise<void>) | undefined;
+      if (presetFile !== undefined) {
+        setup = async (agentCtx) => {
+          await mountPreset(agentCtx, { id: presetFile.id, trust: presetFile.trust, path: presetFile.path });
+          installModelOverride(agentCtx, true, roleModel?.provider, roleModel?.model, roleModel?.reasoningEffort);
+        };
+      } else if (roleModel !== undefined) {
+        setup = (agentCtx) => {
+          installModelOverride(agentCtx, true, roleModel.provider, roleModel.model, roleModel.reasoningEffort);
+          return Promise.resolve();
+        };
+      }
+      const override =
+        role.model !== undefined &&
+        (role.model.provider !== undefined || role.model.model !== undefined || role.model.reasoningEffort !== undefined)
+          ? role.model
+          : undefined;
+      const modelSvc = ctx.get("agentDefaultModel");
+      const selection = modelSvc === undefined ? undefined : modelSvc.currentSelection();
+      const agentOptions =
+        override === undefined
+          ? selection === undefined
+            ? {}
+            : { provider: selection.provider, model: selection.model }
+          : {
+              ...(override.provider === undefined ? {} : { provider: override.provider }),
+              ...(override.model === undefined ? {} : { model: override.model }),
+            };
+      await resumeRoleSession(ctx, {
+        resumeSessionId: SID(role.sessionId),
+        agentOptions,
+        ...(setup === undefined ? {} : { setup }),
+        ...(exec.signal === undefined ? {} : { signal: exec.signal }),
+      });
+      await deliverRoleWelcome(ctx, exec.agent.id, role.sessionId, role.name, activationNotice);
+      results.push({ role_id: role.id, sessionId: role.sessionId, action: "resumed" });
+    } catch (error) {
+      degraded = true;
+      results.push({
+        role_id: role.id,
+        sessionId: role.sessionId,
+        action: "failed",
+      });
+      console.error(
+        `orchestra_activate: resume for role ${role.id} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  if (degraded) newTeam.status = "degraded";
+  await activeTeamState.create(cwd, newTeam, {
+    policy: escrowPolicy(ctx, exec),
+    signal: exec.signal,
+  });
+  return {
+    teamId: newTeam.teamId,
+    archiveId: archived.archiveId,
+    status: newTeam.status,
+    roles: results,
   };
 }
 
@@ -3072,190 +3339,17 @@ export function apply(ctx: Context): void {
         ],
       },
       async execute(args: { archiveId: string }, exec: ToolExecutionInput) {
-        if (exec.agent === undefined) throw new Error("orchestra_activate requires an agent caller");
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory");
-        const existing = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("activate a team", existing);
-        if (existing.kind === "ready")
-          throw new Error(`an active team already exists here (${existing.team.teamId}); dismiss it first or activate in another working directory`);
-        const loaded = await archiveStore.read(cwd, args.archiveId, { signal: exec.signal });
-        if (loaded.kind === "blocked") {
-          throw new Error(
-            `archive "${args.archiveId}" is blocked (${loaded.diagnostic.code}): ${loaded.diagnostic.message}; repair or remove the archive before activation`,
-          );
-        }
-        if (loaded.kind === "missing") {
-          const available = (await archiveStore.list(cwd, { signal: exec.signal })).ready.map((a) => a.archiveId);
-          throw new Error(
-            `archive "${args.archiveId}" not found at ${cwd}/orchestra/archive/; available: ${available.length === 0 ? "(none)" : available.join(", ")}`,
-          );
-        }
-        const archived = loaded.snapshot;
-        // Rebuild the active state from the archive snapshot (archive stays immutable).
-        const query = ctx.get("sessionQuery");
-        const newTeam: TeamState = {
-          ...archived,
-          status: "active",
-          activatedFromArchiveId: archived.archiveId,
-          roles: archived.roles.map((role) => ({ ...role, sessionHistory: [...(role.sessionHistory ?? [])] })),
-        };
-        // Controller takeover: the caller of activate becomes the controller when different.
-        if (newTeam.controllerSessionId !== exec.agent.id) {
-          newTeam.controllerHistory = [
-            ...newTeam.controllerHistory,
-            { sessionId: newTeam.controllerSessionId, replacedAt: Date.now(), reason: "controller-takeover" },
-          ];
-          newTeam.controllerSessionId = exec.agent.id;
-        }
-        const results: {
-          role_id: string;
-          session_id: string;
-          action: string;
-          replaced_session_id?: string;
-        }[] = [];
-        let degraded = false;
-        const activationNotice = "The team has been reactivated. You remain under your role discipline: stop/continue as instructed — wait for driver dispatch before starting new work.";
-        for (const role of newTeam.roles) {
-          const agent = ctx.agents.get(SID(role.sessionId));
-          if (agent !== undefined) {
-            // Step 5a: live → reused
-            await sendRoleWelcome(ctx, exec.agent.id, role.sessionId, role.name, activationNotice);
-            results.push({ role_id: role.id, session_id: role.sessionId, action: "reused" });
-            continue;
-          }
-          // Step 5b/5c/5d: probe persistence to distinguish "missing" from "temporarily failing".
-          let snapshot: unknown = undefined;
-          if (query !== undefined) {
-            try {
-              snapshot = await query.readSession(SID(role.sessionId));
-            } catch (error) {
-              const code = (error as any)?.code;
-              if (code === "SESSION_QUERY_SESSION_NOT_FOUND") snapshot = "not-found";
-              else if (code === "SESSION_QUERY_CORRUPT_SESSION") snapshot = "corrupt";
-              else snapshot = "query-error";
-            }
-          } else {
-            snapshot = "no-query";
-          }
-          if (snapshot === "not-found" || snapshot === "no-query") {
-            // Step 5c: authoritatively missing → create a replacement session.
-            try {
-              const presetFile =
-                role.preset === null ? undefined : await resolvePresetFile(ctx, cwd, role.preset);
-              const roleModel = role.model;
-              const created = await createSession(ctx, {
-                cwd,
-                ...(presetFile === undefined ? {} : { presetFile }),
-                ...(roleModel === undefined || roleModel.provider === undefined || roleModel.model === undefined
-                  ? {}
-                  : { provider: roleModel.provider, model: roleModel.model, reasoningEffort: roleModel.reasoningEffort }),
-                currentSessionId: exec.agent.id,
-                title: roleSessionTitle({ roleId: role.id, missionObjective: newTeam.mission.objective, cwd }),
-                signal: exec.signal,
-              });
-              if (role.sandbox === "read-only") {
-                const session = ctx.sessions.get(SID(created.sessionId));
-                if (session !== undefined) session.append("sandbox/mode", { mode: "read-only" });
-              }
-              const oldSessionId = role.sessionId;
-              role.sessionId = created.sessionId;
-              role.sessionHistory = [
-                ...role.sessionHistory,
-                { sessionId: oldSessionId, replacedAt: Date.now(), reason: "session-not-found" },
-              ];
-              // Recovery Packet (spec §8.4).
-              const recoveryPacket = [
-                `Your previous session (${oldSessionId}) no longer exists, so you were re-created as a replacement.`,
-                `team_id: ${newTeam.teamId}`,
-                `role_id: ${role.id}`,
-                `role_name: ${role.name}`,
-                `mission: ${newTeam.mission.objective}`,
-                `topology_id: ${newTeam.topologyRef.id}`,
-                `current driver session id: ${exec.agent.id}`,
-                `replaced session id: ${oldSessionId}`,
-                `existing report paths: ${newTeam.reports.filter((r) => r.roleId === role.id).map((r) => r.path).join(", ") || "(none)"}`,
-                `known state: ${newTeam.status} (reactivated from archive ${newTeam.activatedFromArchiveId ?? "(none)"})`,
-                `IMPORTANT: your old conversation history was NOT inherited.`,
-                "The team has been reactivated. Wait for driver dispatch before starting new work.",
-              ].join("\n");
-              await sendRoleWelcome(ctx, exec.agent.id, role.sessionId, role.name, recoveryPacket);
-              results.push({ role_id: role.id, session_id: created.sessionId, action: "replaced", replaced_session_id: oldSessionId });
-            } catch (error) {
-              degraded = true;
-              results.push({
-                role_id: role.id,
-                session_id: role.sessionId,
-                action: "failed",
-              });
-              console.error(
-                `orchestra_activate: replacement for role ${role.id} failed: ${error instanceof Error ? error.message : String(error)}`,
-              );
-            }
-            continue;
-          }
-          // Step 5b/5d: snapshot readable → try to resume; other errors → failed.
-          try {
-            const presetFile = role.preset === null ? undefined : await resolvePresetFile(ctx, cwd, role.preset);
-            const roleModel = role.model;
-            let setup: ((agentCtx: Context) => Promise<void>) | undefined;
-            if (presetFile !== undefined) {
-              setup = async (agentCtx) => {
-                await mountPreset(agentCtx, { id: presetFile.id, trust: presetFile.trust, path: presetFile.path });
-                installModelOverride(agentCtx, true, roleModel?.provider, roleModel?.model, roleModel?.reasoningEffort);
-              };
-            } else if (roleModel !== undefined) {
-              setup = (agentCtx) => {
-                installModelOverride(agentCtx, true, roleModel.provider, roleModel.model, roleModel.reasoningEffort);
-                return Promise.resolve();
-              };
-            }
-            const override =
-              role.model !== undefined &&
-              (role.model.provider !== undefined || role.model.model !== undefined || role.model.reasoningEffort !== undefined)
-                ? role.model
-                : undefined;
-            const modelSvc = ctx.get("agentDefaultModel");
-            const selection = modelSvc === undefined ? undefined : modelSvc.currentSelection();
-            const agentOptions =
-              override === undefined
-                ? selection === undefined
-                  ? {}
-                  : { provider: selection.provider, model: selection.model }
-                : {
-                    ...(override.provider === undefined ? {} : { provider: override.provider }),
-                    ...(override.model === undefined ? {} : { model: override.model }),
-                  };
-            await ctx.agents.resume({
-              resumeSessionId: SID(role.sessionId),
-              agentOptions,
-              ...(setup === undefined ? {} : { setup }),
-              ...(exec.signal === undefined ? {} : { signal: exec.signal }),
-            });
-            await sendRoleWelcome(ctx, exec.agent.id, role.sessionId, role.name, activationNotice);
-            results.push({ role_id: role.id, session_id: role.sessionId, action: "resumed" });
-          } catch (error) {
-            degraded = true;
-            results.push({
-              role_id: role.id,
-              session_id: role.sessionId,
-              action: "failed",
-            });
-            console.error(
-              `orchestra_activate: resume for role ${role.id} failed: ${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-        }
-        if (degraded) newTeam.status = "degraded";
-        await activeTeamState.create(cwd, newTeam, {
-          policy: escrowPolicy(ctx, exec),
-          signal: exec.signal,
-        });
+        const result = await activateArchivedTeam(ctx, activeTeamState, archiveStore, args, exec);
         return {
-          team_id: newTeam.teamId,
-          archive_id: archived.archiveId,
-          status: newTeam.status,
-          roles: results,
+          team_id: result.teamId,
+          archive_id: result.archiveId,
+          status: result.status,
+          roles: result.roles.map((role) => ({
+            role_id: role.role_id,
+            session_id: role.sessionId,
+            action: role.action,
+            ...(role.replacedSessionId === undefined ? {} : { replaced_session_id: role.replacedSessionId }),
+          })),
         };
       },
     }),
