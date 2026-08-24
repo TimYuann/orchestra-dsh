@@ -401,6 +401,115 @@ export const BUILTIN_TOPOLOGIES: TopologyConfig[] = [
       },
     },
   },
+  {
+    schemaVersion: 1,
+    id: "bug-diagnosis-and-fix",
+    name: "Bug Diagnosis and Fix",
+    description:
+      "先建立可复现事实和根因，再实施最小修复、回归验证和评审：investigator 调查 → implementer 修复 → verifier 回归 → reviewer 评审；Loop PASS 且用户 Gate approve 后才收束",
+    controller: { id: "driver", source: "caller" },
+    roles: [
+      {
+        id: "investigator",
+        name: "Investigator",
+        preset: "orchestra-v04-investigator-v1",
+        sandbox: "read-only",
+        compositionTools: ["tool-fs", "tool-fs-search", "tool-bash"],
+        orchestraTools: ["orchestra_report", "orchestra_handoff"],
+        welcome:
+          "你作为 investigator（调查者）：先建立可复现事实和根因，再给出 repair scope。\n1) 只读沙箱，不改代码；唯一写通道是 orchestra_report。\n2) 没有 reproduction/rootCause 证据前，不得把修复建议当事实；未知项要显式标 unknown。\n3) diagnosis 必须含 symptom、reproduction、rootCause、repairScope，evidence 引用 report/test/message/file。\n4) 对 driver 的汇报经 a2a_reply；角色间 typed 交接走 orchestra_handoff（diagnosis → implementer）。",
+      },
+      {
+        id: "implementer",
+        name: "Implementer",
+        preset: "orchestra-v04-implementer-v1",
+        sandbox: "workspace-write",
+        compositionTools: ["tool-bash", "tool-fs", "tool-fs-search"],
+        orchestraTools: ["orchestra_report", "orchestra_handoff"],
+        welcome:
+          "你作为 implementer（实现者）：只修已批准 repair scope 内的代码与测试。\n1) 以 investigator 的 rootCause 为准；证据不足时先回 findings，不硬修。\n2) 不扩大修复范围、不顺手重构；只改 scope 内文件。\n3) 完成后用 orchestra_report 写交付说明（summary、changedFiles、knownRisks），evidence 引用 commit/diff/test。\n4) 对 driver 的汇报经 a2a_reply；角色间 typed 交接走 orchestra_handoff（candidate → verifier）。\n5) 收到 findings 时按 repairScope 修复，修复后重新走 verifier；不自报 PASS、不碰 charter/graph。",
+      },
+      {
+        id: "verifier",
+        name: "Verifier",
+        preset: "orchestra-v04-verifier-v1",
+        sandbox: "read-only",
+        compositionTools: ["tool-bash", "tool-fs-search"],
+        orchestraTools: ["orchestra_report", "orchestra_handoff"],
+        welcome:
+          "你作为 verifier（验证者）：运行原失败用例与回归用例，解释 deterministic 结果并整理 evidence。\n1) 只读沙箱，不改代码；唯一写通道是 orchestra_report。\n2) 必须列出 command、exit/result、scope、evidence refs 与未执行项，不能只写「tests pass」。\n3) verification 交接含 regressionSummary、remainingRisks，evidence 引用 test/diff/report。\n4) 对 driver 的汇报经 a2a_reply；角色间 typed 交接走 orchestra_handoff（verification → reviewer）。\n5) 不发 review PASS/FAIL。",
+      },
+      {
+        id: "reviewer",
+        name: "Reviewer",
+        preset: "orchestra-v04-reviewer-v1",
+        sandbox: "read-only",
+        compositionTools: ["tool-fs", "tool-fs-search", "tool-bash"],
+        orchestraTools: ["orchestra_report", "orchestra_verdict", "orchestra_handoff"],
+        welcome:
+          "你作为 reviewer（评审者）：唯一有权记录 PASS/FAIL/BLOCKED 的 evaluator。\n1) 只读沙箱，只审不修，不替 implementer/investigator 修复。\n2) 第一 attempt 若 diagnosis 不足必须返回 findings，不能让猜测的 root cause 进入成功路径。\n3) findings 交接（findings、nextEvidence、repairScope）可回 investigator 或 implementer；verdict 交接走 orchestra_handoff（verdict → driver）。\n4) 用 orchestra_verdict 记录 PASS/FAIL/BLOCKED；对 driver 的汇报经 a2a_reply；不伪造用户 Gate、不改 charter/graph。",
+      },
+    ],
+    protocol: {
+      ownership: {
+        reproduction_evidence: "investigator",
+        repair: "implementer",
+        verification: "verifier",
+        review_verdict: "reviewer",
+        closure: "driver",
+      },
+      routes: [
+        { kind: "symptom", from: "driver", to: ["investigator"] },
+        { kind: "diagnosis", from: "investigator", to: ["implementer"] },
+        { kind: "candidate", from: "implementer", to: ["verifier"] },
+        { kind: "verification", from: "verifier", to: ["reviewer"] },
+        { kind: "findings", from: "reviewer", to: ["investigator", "implementer"] },
+        { kind: "verdict", from: "reviewer", to: ["driver"] },
+      ],
+      completion: { owner: "driver", rule: "diagnosis-fix-review Loop PASS + 用户 Gate approve 后由 driver 收束（completed/failed/abandoned）" },
+      handoffs: [
+        { kind: "diagnosis", from: "investigator", to: ["implementer"], requiredPayloadFields: ["symptom", "reproduction", "rootCause", "repairScope"], requiredEvidenceKinds: ["report", "test", "message", "file"] },
+        { kind: "candidate", from: "implementer", to: ["verifier"], requiredPayloadFields: ["summary", "changedFiles", "knownRisks"], requiredEvidenceKinds: ["commit", "diff", "test"] },
+        { kind: "verification", from: "verifier", to: ["reviewer"], requiredPayloadFields: ["regressionSummary", "remainingRisks"], requiredEvidenceKinds: ["test", "diff", "report"] },
+        { kind: "findings", from: "reviewer", to: ["investigator", "implementer"], requiredPayloadFields: ["findings", "nextEvidence", "repairScope"], requiredEvidenceKinds: ["report", "message"] },
+        { kind: "verdict", from: "reviewer", to: ["driver"], requiredPayloadFields: ["verdict", "unresolvedFindings"], requiredEvidenceKinds: ["report", "commit", "diff", "test"] },
+      ],
+      loops: [
+        {
+          loopId: "diagnosis-fix-review",
+          entry: { role: "investigator", event: "diagnosis_ready" },
+          participants: ["investigator", "implementer", "verifier", "reviewer"],
+          evaluatorRole: "reviewer",
+          candidateKind: "candidate",
+          verdictKind: "PASS|FAIL|BLOCKED",
+          maxAttempts: 2,
+          passRoute: "verification → human gate → closure",
+          retryRoute: "findings → investigator/implementer → verifier",
+          capExhaustedRoute: "cap_exhausted → driver remediation branch",
+          requiredEvidenceKinds: ["report", "commit", "diff", "test", "message"],
+        },
+      ],
+      gates: [
+        {
+          gateId: "bug-fix-acceptance",
+          decisionScope: ["loop:diagnosis-fix-review"],
+          blockingScope: ["closure"],
+          options: ["approve", "request-changes", "stop"],
+          required: true,
+          onUnavailable: "blocked",
+        },
+      ],
+      closure: {
+        owner: "driver",
+        requiredLoopOutcomes: ["diagnosis-fix-review:passed"],
+        requiredVerdicts: ["PASS"],
+        requiredEvidenceKinds: ["report", "commit", "diff", "test"],
+        openGatePolicy: "reject",
+        allowedOutcomes: ["completed", "failed", "abandoned"],
+        userOverride: false,
+      },
+    },
+  },
 ];
 
 const TOPOLOGY_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
