@@ -718,6 +718,127 @@ export const BUILTIN_TOPOLOGIES: TopologyConfig[] = [
       },
     },
   },
+  {
+    schemaVersion: 1,
+    id: "audit-and-hardening",
+    name: "Audit and Hardening",
+    description:
+      "对明确边界做安全/可靠性审计，形成可验证 finding，并在批准后完成最小加固与 rescan：auditor 审计 → investigator 复现 → implementer 加固 → verifier rescan → reviewer 评审；Loop PASS 且用户 Gate approve 后才收束",
+    controller: { id: "driver", source: "caller" },
+    roles: [
+      {
+        id: "hardening-auditor",
+        name: "Hardening Auditor",
+        preset: "orchestra-v04-hardening-auditor-v1",
+        sandbox: "read-only",
+        compositionTools: ["tool-fs", "tool-fs-search", "tool-bash"],
+        orchestraTools: ["orchestra_report", "orchestra_handoff"],
+        welcome:
+          "你作为 hardening-auditor（加固审计者）：对明确边界做安全/可靠性审计，产出可重现 finding。\n1) 只读沙箱，只写 findings/threat model report，不改代码。\n2) 初始 finding 必须含稳定 fingerprint、asset/location、impact、severity、reproduction 或 why-not、fix。\n3) rescan/regression/residual-risk 是 verifier → reviewer 的后置事实，初始 residual risk 只能标 unknown；不能预填未来结果。\n4) 不能把扫描分数当证明、不回显 secret、不把客户/用户数据写入 report。\n5) 对 driver 的汇报经 a2a_reply；角色间 typed 交接走 orchestra_handoff（finding → investigator）。",
+      },
+      {
+        id: "investigator",
+        name: "Investigator",
+        preset: "orchestra-v04-investigator-v1",
+        sandbox: "read-only",
+        compositionTools: ["tool-fs", "tool-fs-search", "tool-bash"],
+        orchestraTools: ["orchestra_report", "orchestra_handoff"],
+        welcome:
+          "你作为 investigator（调查者）：为 finding 建立 reproduction/impact evidence，产出 remediation-brief。\n1) 只读沙箱，只写 reproduction/impact evidence，不改代码。\n2) remediation-brief 必须含 reproduction、rootCause、repairScope、risk；不能把猜测写成 root cause。\n3) 对 driver 的汇报经 a2a_reply；角色间 typed 交接走 orchestra_handoff（remediation-brief → implementer）。",
+      },
+      {
+        id: "implementer",
+        name: "Implementer",
+        preset: "orchestra-v04-implementer-v1",
+        sandbox: "workspace-write",
+        compositionTools: ["tool-bash", "tool-fs", "tool-fs-search"],
+        orchestraTools: ["orchestra_report", "orchestra_handoff"],
+        welcome:
+          "你作为 implementer（实现者）：只改批准的 hardening scope。\n1) 不扩大加固范围、不顺手重构；以 remediation-brief 的 repairScope 为准。\n2) hardening-candidate 含 changedFiles、controlAdded、knownRisks，evidence 引用 commit/diff/test。\n3) 对 driver 的汇报经 a2a_reply；角色间 typed 交接走 orchestra_handoff（hardening-candidate → verifier）。\n4) 收到 findings 时按 scope 修复；不自报 PASS、不碰 charter/graph。",
+      },
+      {
+        id: "verifier",
+        name: "Verifier",
+        preset: "orchestra-v04-verifier-v1",
+        sandbox: "read-only",
+        compositionTools: ["tool-bash", "tool-fs-search"],
+        orchestraTools: ["orchestra_report", "orchestra_handoff"],
+        welcome:
+          "你作为 verifier（验证者）：运行 exploit/regression rescan，整理可重读证据。\n1) 只读沙箱，只写 rescan/regression evidence，不改代码。\n2) rescan-evidence 必须含 originalFinding、rescan、regression、residualRisk；evidence 引用 test/diff/report。\n3) 不能把一次命令退出 0 解释成全局成功；必须列 command/exit/scope/未执行项。\n4) 对 driver 的汇报经 a2a_reply；角色间 typed 交接走 orchestra_handoff（rescan-evidence → reviewer）。\n5) 不发 review PASS/FAIL。",
+      },
+      {
+        id: "reviewer",
+        name: "Reviewer",
+        preset: "orchestra-v04-reviewer-v1",
+        sandbox: "read-only",
+        compositionTools: ["tool-fs", "tool-fs-search", "tool-bash"],
+        orchestraTools: ["orchestra_report", "orchestra_verdict", "orchestra_handoff"],
+        welcome:
+          "你作为 reviewer（评审者）：唯一有权记录 PASS/FAIL/BLOCKED 的 security evaluator。\n1) 只读沙箱，只审不修；缺少 rescan 只能 BLOCKED，不得被低严重度标签掩盖。\n2) 修复后仍可复现或 rescan 缺失时不得 PASS；verdict 含 openFindings、residualRisk。\n3) findings 回环按 scope 路由 investigator/implementer；verdict 交接走 orchestra_handoff（verdict → driver）。\n4) 风险接受必须是 direct user decision，不是 reviewer/auditor 自授；不伪造用户 Gate、不改 charter/graph。\n5) 对 driver 的汇报经 a2a_reply。",
+      },
+    ],
+    protocol: {
+      ownership: {
+        finding_model: "hardening-auditor",
+        impact_reproduction: "investigator",
+        remediation_code: "implementer",
+        rescan_checks: "verifier",
+        security_verdict: "reviewer",
+        closure: "driver",
+      },
+      routes: [
+        { kind: "audit-scope", from: "driver", to: ["hardening-auditor"] },
+        { kind: "finding", from: "hardening-auditor", to: ["investigator"] },
+        { kind: "remediation-brief", from: "investigator", to: ["implementer"] },
+        { kind: "hardening-candidate", from: "implementer", to: ["verifier"] },
+        { kind: "rescan-evidence", from: "verifier", to: ["reviewer"] },
+        { kind: "findings", from: "reviewer", to: ["investigator", "implementer"] },
+        { kind: "verdict", from: "reviewer", to: ["driver"] },
+      ],
+      completion: { owner: "driver", rule: "hardening-remediation Loop PASS + 用户 Gate approve 后由 driver 收束（completed/failed/abandoned）" },
+      handoffs: [
+        { kind: "finding", from: "hardening-auditor", to: ["investigator"], requiredPayloadFields: ["fingerprint", "asset", "location", "impact", "severity", "fix", "reproductionOrWhyNot"], requiredEvidenceKinds: ["report", "file", "message"] },
+        { kind: "remediation-brief", from: "investigator", to: ["implementer"], requiredPayloadFields: ["reproduction", "rootCause", "repairScope", "risk"], requiredEvidenceKinds: ["report", "test", "file"] },
+        { kind: "hardening-candidate", from: "implementer", to: ["verifier"], requiredPayloadFields: ["changedFiles", "controlAdded", "knownRisks"], requiredEvidenceKinds: ["commit", "diff", "test"] },
+        { kind: "rescan-evidence", from: "verifier", to: ["reviewer"], requiredPayloadFields: ["originalFinding", "rescan", "regression", "residualRisk"], requiredEvidenceKinds: ["test", "diff", "report"] },
+        { kind: "verdict", from: "reviewer", to: ["driver"], requiredPayloadFields: ["verdict", "openFindings", "residualRisk"], requiredEvidenceKinds: ["report", "commit", "diff", "test"] },
+      ],
+      loops: [
+        {
+          loopId: "hardening-remediation",
+          entry: { role: "investigator", event: "remediation_ready" },
+          participants: ["investigator", "implementer", "verifier", "reviewer"],
+          evaluatorRole: "reviewer",
+          candidateKind: "hardening-candidate",
+          verdictKind: "PASS|FAIL|BLOCKED",
+          maxAttempts: 2,
+          passRoute: "security-risk Gate → closure",
+          retryRoute: "findings → investigator/implementer → verifier",
+          capExhaustedRoute: "cap_exhausted → driver requests user risk decision or abandon",
+          requiredEvidenceKinds: ["report", "commit", "diff", "test"],
+        },
+      ],
+      gates: [
+        {
+          gateId: "security-risk-acceptance",
+          decisionScope: ["loop:hardening-remediation"],
+          blockingScope: ["closure"],
+          options: ["approve", "remediate", "stop"],
+          required: true,
+          onUnavailable: "blocked",
+        },
+      ],
+      closure: {
+        owner: "driver",
+        requiredLoopOutcomes: ["hardening-remediation:passed"],
+        requiredVerdicts: ["PASS"],
+        requiredEvidenceKinds: ["report", "commit", "diff", "test"],
+        openGatePolicy: "reject",
+        allowedOutcomes: ["completed", "failed", "abandoned"],
+        userOverride: false,
+      },
+    },
+  },
 ];
 
 const TOPOLOGY_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
