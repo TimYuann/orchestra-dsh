@@ -781,12 +781,12 @@ migration slice 必须能回答旧行为如何验证、何时允许切换、失�
 | --- | --- | --- | --- | --- | --- | --- |
 | driver | controller session | caller-selected；无隐式升级 | deployment default pinned | caller Agent Preset；不由 topology 追加 | orchestration、report、handoff | migration contract、graph/journal |
 | architect | architect | read-only / workspace-write + ask base | deployment default pinned；可显式 override | tool-fs、tool-fs-search | orchestra_report、orchestra_handoff | 只写 migration plan/compat report |
-
-Migration planning is local-only by default. External web research is an
-explicit variant and cannot be silently inferred from the architect role.
 | implementer | implementer | workspace-write / workspace-write + ask | deployment default pinned | tool-bash、tool-fs、tool-fs-search | orchestra_report、orchestra_handoff | 当前 slice 的源码/测试；不得改 baseline evidence |
 | verifier | verifier | read-only / workspace-write + ask base | deployment default pinned | tool-bash、tool-fs-search | orchestra_report、orchestra_handoff | 只写 compatibility/rollback evidence |
 | reviewer | reviewer | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-bash | orchestra_report、orchestra_verdict、orchestra_handoff | 只写 review report；唯一 evaluator |
+
+Migration planning is local-only by default. External web research is an
+explicit variant and cannot be silently inferred from the architect role.
 
 **Graph / routes / ownership**
 

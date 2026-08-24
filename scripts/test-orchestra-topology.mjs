@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
@@ -314,4 +315,23 @@ test("topology tool actions fail loudly for blocked resolution", async () => {
   }, ["trio"]);
   assert.match(error.message, /blocked/);
   assert.match(error.message, /broken project topology/);
+});
+
+test("catalog D.4 role table keeps all role rows contiguous", () => {
+  const source = readFileSync("TOPOLOGY-CATALOG.md", "utf8");
+  const start = source.indexOf("### D.4 refactor-and-migration");
+  const end = source.indexOf("**Graph / routes / ownership**", start);
+  assert.ok(start >= 0 && end > start);
+  const lines = source.slice(start, end).split("\n");
+  const first = lines.findIndex((line) => line.startsWith("| roleId |"));
+  assert.ok(first >= 0);
+  const rows = lines
+    .map((line, index) => ({ line, index }))
+    .filter(({ line }) => line.startsWith("| ") && !line.startsWith("| ---"));
+  assert.deepEqual(rows.slice(0, 5).map(({ line }) => line.split("|")[1].trim()), ["roleId", "driver", "architect", "implementer", "verifier"]);
+  assert.equal(rows[5]?.line.split("|")[1].trim(), "reviewer");
+  const roleRows = rows.slice(1, 6);
+  for (let index = 1; index < roleRows.length; index += 1) {
+    assert.equal(roleRows[index].index, roleRows[index - 1].index + 1);
+  }
 });
