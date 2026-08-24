@@ -9,12 +9,14 @@
 
 import type { FsInfo, FsTarget, FsWriteIntent, FsWriteOutcome } from "@deepseek-ai/dsh-fs";
 import type { SandboxExecutionPolicy } from "@deepseek-ai/dsh-sandbox";
+import { validateFrozenCharterRevision, validateFrozenCharterRevisions } from "./orchestration-charter.js";
+import type { FrozenCharterRevision } from "./orchestration-charter.js";
 import type { TeamState } from "./orchestra-state.js";
 
 export const ORCHESTRATION_DOCUMENT_SCHEMA_VERSION = 1;
 export const ORCHESTRATION_MARKDOWN_RELATIVE_PATH = "orchestra/orchestration.md";
 
-export type CharterStatus = "draft_required" | "legacy_missing";
+export type CharterStatus = "draft_required" | "frozen" | "legacy_missing";
 export type EvidenceKind = "report" | "commit" | "diff" | "test" | "screenshot" | "message" | "file" | "url";
 
 export interface EvidenceRef {
@@ -73,9 +75,9 @@ export interface OrchestrationDocument {
   teamId: string;
   semanticWriterSessionId: string;
   charterStatus: CharterStatus;
-  currentCharterRevision: null;
+  currentCharterRevision: number | null;
   /** Frozen Charter revisions are intentionally empty until Checkpoint 4B. */
-  charterRevisions: unknown[];
+  charterRevisions: FrozenCharterRevision[];
   runtimeProjection: RuntimeProjection;
   decisions: DriverDecision[];
   createdAt: number;
@@ -84,7 +86,7 @@ export interface OrchestrationDocument {
   markdown: MarkdownProjectionMetadata;
 }
 
-export type DocumentDiagnosticCode = "invalid_shape" | "invalid_evidence" | "permission_denied" | "revision_conflict" | "stale_projection" | "projection_failed";
+export type DocumentDiagnosticCode = "invalid_shape" | "invalid_evidence" | "permission_denied" | "revision_conflict" | "stale_base" | "stale_projection" | "projection_failed";
 
 export class OrchestrationDocumentError extends Error {
   readonly code: DocumentDiagnosticCode;
@@ -165,8 +167,14 @@ export function readOrchestrationDocument(raw: unknown, teamId?: string): Docume
   if (raw.schemaVersion !== ORCHESTRATION_DOCUMENT_SCHEMA_VERSION || !finiteSafe(raw.documentRevision) || !nonEmpty(raw.teamId) || (teamId !== undefined && raw.teamId !== teamId) || !nonEmpty(raw.semanticWriterSessionId)) {
     return { kind: "blocked", diagnostic: { code: "invalid_shape", message: "document identity or schema is invalid" } };
   }
-  if (raw.charterStatus !== "draft_required" && raw.charterStatus !== "legacy_missing") return { kind: "blocked", diagnostic: { code: "invalid_shape", message: "document charterStatus is invalid" } };
-  if (raw.currentCharterRevision !== null || !Array.isArray(raw.charterRevisions) || raw.charterRevisions.length !== 0 || !projection(raw.runtimeProjection) || raw.runtimeProjection.teamId !== raw.teamId || !Array.isArray(raw.decisions) || !raw.decisions.every(decision) || !finiteNumber(raw.createdAt) || !finiteNumber(raw.updatedAt) || !finiteNumber(raw.lastReconciledAt)) {
+  if (raw.charterStatus !== "draft_required" && raw.charterStatus !== "frozen" && raw.charterStatus !== "legacy_missing") return { kind: "blocked", diagnostic: { code: "invalid_shape", message: "document charterStatus is invalid" } };
+  const frozenRevisions = validateFrozenCharterRevisions(raw.charterRevisions);
+  const charterShapeValid = frozenRevisions.ok
+    ? raw.charterStatus === "frozen"
+      ? Number.isSafeInteger(raw.currentCharterRevision) && raw.currentCharterRevision > 0 && frozenRevisions.revisions.length > 0 && raw.currentCharterRevision === frozenRevisions.revisions.at(-1)?.charterRevision
+      : raw.currentCharterRevision === null && frozenRevisions.revisions.length === 0
+    : false;
+  if (!charterShapeValid || !projection(raw.runtimeProjection) || raw.runtimeProjection.teamId !== raw.teamId || !Array.isArray(raw.decisions) || !raw.decisions.every(decision) || !finiteNumber(raw.createdAt) || !finiteNumber(raw.updatedAt) || !finiteNumber(raw.lastReconciledAt)) {
     return { kind: "blocked", diagnostic: { code: "invalid_shape", message: "document runtime, journal, revision, or timestamp shape is invalid" } };
   }
   if (!record(raw.markdown) || !nonEmpty(raw.markdown.path) || (raw.markdown.lastRenderedDocumentRevision !== undefined && !finiteSafe(raw.markdown.lastRenderedDocumentRevision)) || (raw.markdown.hash !== undefined && typeof raw.markdown.hash !== "string")) {
@@ -216,6 +224,17 @@ export function initializeOrchestrationDocument(team: TeamState, now: number): O
   };
 }
 
+export function initializeFrozenOrchestrationDocument(team: TeamState, frozen: FrozenCharterRevision, now: number): OrchestrationDocument {
+  if (!validateFrozenCharterRevision(frozen) || frozen.baseTeamId !== undefined) {
+    throw new OrchestrationDocumentError("invalid_shape", "initial Team requires a valid charter revision without an amendment base");
+  }
+  const document = initializeOrchestrationDocument(team, now);
+  document.charterStatus = "frozen";
+  document.currentCharterRevision = frozen.charterRevision;
+  document.charterRevisions = [clone(frozen)];
+  return document;
+}
+
 function assertWriter(document: OrchestrationDocument, team: TeamState, actorSessionId: string): void {
   if (actorSessionId !== team.controllerSessionId || actorSessionId !== document.semanticWriterSessionId) {
     throw new OrchestrationDocumentError("permission_denied", "only the current Team controller and semantic writer may mutate the document");
@@ -235,6 +254,31 @@ export function reconcileOrchestrationDocument(document: OrchestrationDocument, 
   next.runtimeProjection = runtimeProjectionFromTeam(team, now);
   next.lastReconciledAt = now;
   Object.assign(next, revision);
+  return { kind: "changed", document: next };
+}
+
+export function applyFrozenCharterRevision(document: OrchestrationDocument, team: TeamState, frozen: FrozenCharterRevision, actorSessionId: string, now: number): DocumentCommandResult {
+  assertWriter(document, team, actorSessionId);
+  if (!validateFrozenCharterRevision(frozen)) throw new OrchestrationDocumentError("invalid_shape", "frozen charter revision is invalid");
+  if (frozen.baseTeamId !== team.teamId || frozen.baseCharterRevision !== document.currentCharterRevision) {
+    throw new OrchestrationDocumentError("stale_base", "frozen amendment base does not match the current Team charter");
+  }
+  if (document.charterStatus !== "frozen" || document.currentCharterRevision === null) {
+    throw new OrchestrationDocumentError("invalid_shape", "active Team has no frozen charter to amend");
+  }
+  const existing = document.charterRevisions.find((revision) => revision.charterRevision === frozen.charterRevision);
+  if (existing !== undefined) {
+    if (stable(existing) === stable(frozen)) return { kind: "noop", document };
+    throw new OrchestrationDocumentError("revision_conflict", `charter revision ${frozen.charterRevision} already exists with different facts`);
+  }
+  if (frozen.charterRevision !== document.currentCharterRevision + 1) {
+    throw new OrchestrationDocumentError("revision_conflict", `expected next charter revision ${document.currentCharterRevision + 1}, got ${frozen.charterRevision}`);
+  }
+  const next = clone(document);
+  next.charterStatus = "frozen";
+  next.currentCharterRevision = frozen.charterRevision;
+  next.charterRevisions.push(clone(frozen));
+  Object.assign(next, nextRevision(document, now));
   return { kind: "changed", document: next };
 }
 
@@ -277,14 +321,19 @@ export function documentSummary(document: OrchestrationDocument | undefined, tea
   status: CharterStatus;
   revision: number;
   stale: boolean;
+  currentCharterRevision?: number;
+  currentCharterDigest?: string;
+  approvalRef?: string;
   lastDecision?: { decisionId: string; kind: string; summary: string };
 } {
   if (document === undefined) return { status: "legacy_missing", revision: 0, stale: true };
   const last = document.decisions[document.decisions.length - 1];
+  const current = document.currentCharterRevision === null ? undefined : document.charterRevisions.find((revision) => revision.charterRevision === document.currentCharterRevision);
   return {
     status: document.charterStatus,
     revision: document.documentRevision,
     stale: isRuntimeProjectionStale(document, team),
+    ...(current === undefined ? {} : { currentCharterRevision: current.charterRevision, currentCharterDigest: current.digest, approvalRef: current.approval.approvalRef }),
     ...(last === undefined ? {} : { lastDecision: { decisionId: last.decisionId, kind: last.kind, summary: last.summary } }),
   };
 }
@@ -309,7 +358,15 @@ export function renderOrchestrationMarkdown(document: OrchestrationDocument, sta
     `- Team: ${markdownLine(document.teamId)}`,
     `- Semantic writer: ${markdownLine(document.semanticWriterSessionId)}`,
     `- Document revision: ${document.documentRevision}`,
-    `- Charter: ${document.charterStatus} (current revision: none)`,
+    `- Charter: ${document.charterStatus} (current revision: ${document.currentCharterRevision ?? "none"})`,
+    ...(document.currentCharterRevision === null
+      ? []
+      : (() => {
+          const current = document.charterRevisions.find((revision) => revision.charterRevision === document.currentCharterRevision);
+          return current === undefined
+            ? ["- Charter facts: blocked (current revision is missing)"]
+            : [`- Charter digest: ${current.digest}`, `- Approval: ${current.approval.approvalRef}`];
+        })()),
     "",
     "## Runtime Projection",
     `- Status: ${markdownLine(projection.status)}`,
@@ -323,6 +380,11 @@ export function renderOrchestrationMarkdown(document: OrchestrationDocument, sta
     "",
     "### Reports / Evidence",
     ...projection.reports.map((report) => `- ${markdownLine(report.reportId)} (${markdownLine(report.roleId)}): ${renderEvidence({ kind: "file", ref: report.path })}`),
+    "",
+    "### Charter Revision History",
+    ...(document.charterRevisions.length === 0
+      ? ["- No frozen charter revisions recorded."]
+      : document.charterRevisions.map((revision) => `- revision ${revision.charterRevision}: ${revision.digest} · approval=${revision.approval.approvalRef}${revision.reason === undefined ? "" : ` · reason=${markdownLine(revision.reason)}`}`)),
     "",
     "## Driver Decision Journal",
     ...(document.decisions.length === 0 ? ["- No decisions recorded."] : document.decisions.map((item, index) => [

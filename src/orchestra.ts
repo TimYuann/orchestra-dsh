@@ -50,8 +50,10 @@ import { createGovernedRoleAddressResolver } from "./orchestra-address.js";
 import type { GovernedRoleAddressResolver } from "./orchestra-address.js";
 import {
   appendDriverDecision,
+  applyFrozenCharterRevision,
   documentSummary,
   initializeOrchestrationDocument,
+  initializeFrozenOrchestrationDocument,
   inspectMarkdownProjection,
   isRuntimeProjectionStale,
   OrchestrationDocumentError,
@@ -60,6 +62,25 @@ import {
   writeMarkdownProjection,
 } from "./orchestration-document.js";
 import type { DecisionInput, OrchestrationDocument } from "./orchestration-document.js";
+import {
+  CharterError,
+  charterSummary,
+  foldCharterEvents,
+  frozenRef,
+  latestDraft,
+  prepareApprovalEvent,
+  prepareDraftEvent,
+  prepareFreezeEvent,
+  resolveFrozenCharter,
+} from "./orchestration-charter.js";
+import type {
+  CharterDraft,
+  CharterEvent,
+  CharterMission,
+  CharterTopologySnapshot,
+  FrozenCharterRevision,
+  HumanParticipationPolicy,
+} from "./orchestration-charter.js";
 import { createTopologyCatalog } from "./orchestra-topology.js";
 import type { RoleConfig, TopologyCatalog, TopologyList, TopologyProtocol, TopologyResolution, TopologyRoleSummary } from "./orchestra-topology.js";
 export { validateTopology } from "./orchestra-topology.js";
@@ -794,9 +815,9 @@ function documentToolStatus(
       team_id: null,
       document_revision: 0,
       charter_status: "legacy_missing" as const,
-      runtime_stale: true,
-      runtime_projection: null,
-      decisions: [],
+    runtime_stale: true,
+    runtime_projection: null,
+    decisions: [],
       markdown: { path: "", status: "projection_failed" as const, message: "no active Team" },
       ...(diagnostic === undefined ? {} : { diagnostic }),
     };
@@ -807,9 +828,9 @@ function documentToolStatus(
       team_id: team.teamId,
       document_revision: 0,
       charter_status: "legacy_missing" as const,
-      runtime_stale: true,
-      runtime_projection: null,
-      decisions: [],
+    runtime_stale: true,
+    runtime_projection: null,
+    decisions: [],
       markdown: markdown ?? { path: `${team.rootCwd}/orchestra/orchestration.md`, status: "projection_failed" as const, message: "canonical document is absent" },
       ...(diagnostic === undefined ? {} : { diagnostic }),
     };
@@ -821,11 +842,180 @@ function documentToolStatus(
     document_revision: summary.revision,
     charter_status: summary.status,
     runtime_stale: summary.stale,
+    ...(summary.currentCharterRevision === undefined ? {} : { current_charter_revision: summary.currentCharterRevision }),
+    ...(summary.currentCharterDigest === undefined ? {} : { charter_digest: summary.currentCharterDigest }),
+    ...(summary.approvalRef === undefined ? {} : { approval_ref: summary.approvalRef }),
     runtime_projection: document.runtimeProjection,
     decisions: document.decisions,
     markdown: markdown ?? { path: document.markdown.path, status: "projection_failed" as const, message: "projection was not inspected" },
     ...(diagnostic === undefined ? {} : { diagnostic }),
   };
+}
+
+function charterEventsOf(session: { events?: readonly unknown[] }): readonly unknown[] {
+  return Array.isArray(session.events) ? session.events : [];
+}
+
+function charterCommandError(action: string, error: unknown): Error {
+  if (error instanceof CharterError) return new Error(`cannot ${action}: ${error.code}: ${error.message}`);
+  return new Error(`cannot ${action}: ${error instanceof Error ? error.message : String(error)}`);
+}
+
+async function appendDurableCharterEvent(ctx: Context, session: any, event: CharterEvent): Promise<void> {
+  session.append(event.type, event.data);
+  const accepted = await ctx.sessions.flush(session as any);
+  if (!accepted) throw new Error(`charter event ${event.type} was appended but did not receive durable flush acceptance`);
+}
+
+export async function handleTeamApprovalCommand(
+  ctx: Context,
+  invocation: { rawInput: string; commandId: string; agent: { id: string; session: any } },
+): Promise<{ kind: "success"; text: string }> {
+  const raw = invocation.rawInput.trim();
+  const approvalMatch = raw.match(/^approve\s+([a-z0-9]+(?:-[a-z0-9]+)*)@([1-9]\d*)\s*$/);
+  if (approvalMatch === null) throw new Error("approval command syntax is /team approve <draftId>@<revision>; natural-language consent is not hard approval");
+  const draftId = approvalMatch[1];
+  const revision = Number(approvalMatch[2]);
+  const events = charterEventsOf(invocation.agent.session);
+  let command;
+  try {
+    command = prepareApprovalEvent(events, {
+      draftId,
+      revision,
+      commandId: String(invocation.commandId),
+      approvingSessionId: invocation.agent.id,
+      approvedAt: Date.now(),
+    });
+  } catch (error) {
+    throw charterCommandError("approve the charter draft", error);
+  }
+  if (command.kind === "changed") {
+    await appendDurableCharterEvent(ctx, invocation.agent.session, command.event);
+    return { kind: "success", text: `Draft ${draftId}@${revision} approved by user command. digest=${command.value.digest}; freeze target=${frozenRef(draftId, revision, command.value.digest)}` };
+  }
+  return { kind: "success", text: `Draft ${draftId}@${revision} was already approved; freeze target=${command.value.approvalRef}` };
+}
+
+interface CharterDraftToolArgs {
+  draftId?: string;
+  expectedRevision?: number;
+  goal?: string;
+  topology?: string;
+  inlineTopology?: unknown;
+  scope?: string[];
+  constraints?: string[];
+  acceptanceCriteria?: string[];
+  nonGoals?: string[];
+  context?: string;
+  humanParticipationMode?: "interactive" | "checkpointed" | "autonomous";
+  onUnavailable?: "block" | "safe_stop" | "continue_without_gate";
+  humanPolicySummary?: string;
+  requiredHumanGate?: boolean;
+  reason?: string;
+  summary?: string;
+}
+
+function missionForDraft(args: CharterDraftToolArgs, current?: CharterDraft): CharterMission {
+  return {
+    objective: String(args.goal ?? current?.mission.objective ?? "").trim(),
+    scope: args.scope ?? current?.mission.scope ?? [],
+    constraints: args.constraints ?? current?.mission.constraints ?? [],
+    acceptanceCriteria: args.acceptanceCriteria ?? current?.mission.acceptanceCriteria ?? [],
+    nonGoals: args.nonGoals ?? current?.mission.nonGoals ?? [],
+    context: args.context ?? current?.mission.context ?? "",
+  };
+}
+
+function humanPolicyForDraft(args: CharterDraftToolArgs, current?: CharterDraft): HumanParticipationPolicy {
+  return {
+    mode: args.humanParticipationMode ?? current?.humanParticipationPolicy.mode ?? "interactive",
+    onUnavailable: args.onUnavailable ?? current?.humanParticipationPolicy.onUnavailable ?? "block",
+    ...(args.humanPolicySummary === undefined && current?.humanParticipationPolicy.summary === undefined
+      ? {}
+      : { summary: args.humanPolicySummary ?? current?.humanParticipationPolicy.summary }),
+    ...(args.requiredHumanGate === undefined && current?.humanParticipationPolicy.requiredHumanGate === undefined
+      ? {}
+      : { requiredHumanGate: args.requiredHumanGate ?? current?.humanParticipationPolicy.requiredHumanGate }),
+  };
+}
+
+async function topologySnapshotForDraft(
+  ctx: Context,
+  topologyCatalog: TopologyCatalog,
+  cwd: string,
+  args: CharterDraftToolArgs,
+  current: CharterDraft | undefined,
+  signal?: AbortSignal,
+): Promise<CharterTopologySnapshot> {
+  if (args.inlineTopology !== undefined) {
+    const inline = args.inlineTopology as any;
+    return { source: "inline", id: typeof inline?.id === "string" ? inline.id : "", config: inline };
+  }
+  if (args.topology !== undefined) {
+    const resolved = await topologyCatalog.resolve(cwd, args.topology, { signal });
+    if (resolved.kind !== "ready") {
+      const available = (await topologyCatalog.list(cwd, { signal })).ready.map((entry) => entry.config.id);
+      throw topologyResolutionError("create the charter draft", resolved, available);
+    }
+    return {
+      source: "catalog",
+      id: resolved.config.id,
+      catalogSource: resolved.source,
+      config: resolved.config,
+    };
+  }
+  if (current !== undefined) return current.topology;
+  const resolved = await topologyCatalog.resolve(cwd, "duo", { signal });
+  if (resolved.kind !== "ready") {
+    const available = (await topologyCatalog.list(cwd, { signal })).ready.map((entry) => entry.config.id);
+    throw topologyResolutionError("create the charter draft", resolved, available);
+  }
+  return { source: "catalog", id: resolved.config.id, catalogSource: resolved.source, config: resolved.config };
+}
+
+function charterDraftOutput(events: readonly unknown[], draft: CharterDraft) {
+  const summary = charterSummary(events, draft.draftId);
+  return {
+    draft_id: draft.draftId,
+    revision: draft.revision,
+    digest: draft.digest,
+    approval_status: summary.frozen === undefined ? (summary.approval === undefined ? "pending" : "approved") : "frozen",
+    ...(summary.frozen === undefined ? {} : { frozen_ref: summary.frozen.frozenRef }),
+    ...(draft.baseTeamId === undefined ? {} : { base_team_id: draft.baseTeamId }),
+    ...(draft.baseCharterRevision === undefined ? {} : { base_charter_revision: draft.baseCharterRevision }),
+    mission: draft.mission,
+    topology: { id: draft.topology.id, source: draft.topology.source, ...(draft.topology.catalogSource === undefined ? {} : { catalog_source: draft.topology.catalogSource }) },
+    human_participation: draft.humanParticipationPolicy,
+  };
+}
+
+function frozenCharterOutput(frozen: FrozenCharterRevision) {
+  return {
+    frozen_ref: frozen.frozenRef,
+    charter_revision: frozen.charterRevision,
+    draft_id: frozen.draftId,
+    draft_revision: frozen.draftRevision,
+    digest: frozen.digest,
+    approval_ref: frozen.approval.approvalRef,
+    mission: frozen.mission,
+    topology: { id: frozen.topology.id, source: frozen.topology.source, ...(frozen.topology.catalogSource === undefined ? {} : { catalog_source: frozen.topology.catalogSource }) },
+    human_participation: frozen.humanParticipationPolicy,
+    frozen_by_session_id: frozen.frozenBySessionId,
+    frozen_at: frozen.frozenAt,
+    ...(frozen.reason === undefined ? {} : { reason: frozen.reason }),
+    ...(frozen.impact === undefined ? {} : { impact: frozen.impact }),
+  };
+}
+
+function charterListOutput(events: readonly unknown[], draftId?: string) {
+  const folded = foldCharterEvents(events);
+  if (folded.kind === "blocked") {
+    return { status: "blocked", drafts: [], approvals: [], freezes: [], diagnostic: folded.diagnostic };
+  }
+  const drafts = draftId === undefined ? folded.drafts : folded.drafts.filter((draft) => draft.draftId === draftId);
+  const approvals = draftId === undefined ? folded.approvals : folded.approvals.filter((approval) => approval.draftId === draftId);
+  const freezes = draftId === undefined ? folded.freezes : folded.freezes.filter((freeze) => freeze.draftId === draftId);
+  return { status: "ready", drafts, approvals, freezes };
 }
 
 interface GovernedProvisionResult {
@@ -946,7 +1136,8 @@ export async function provisionGovernedPlans(
 }
 
 export interface OrchestraCreateArgs {
-  goal: string;
+  frozenRef?: string;
+  goal?: string;
   topology?: string;
   scope?: string[];
   constraints?: string[];
@@ -978,14 +1169,23 @@ export async function createGovernedTeam(
       `a team already exists here (team=${existing.team.teamId}, topology=${existing.team.topologyRef.id}); run orchestra_dismiss to close it, or use another working directory`,
     );
   }
-  const objective = String(args.goal ?? "").trim();
-  if (objective === "") throw new Error("goal must not be empty");
-  const topologyResolution = await topologyCatalog.resolve(cwd, args.topology ?? "duo", { signal: exec.signal });
-  if (topologyResolution.kind !== "ready") {
-    const available = (await topologyCatalog.list(cwd, { signal: exec.signal })).ready.map((entry) => entry.config.id);
-    throw topologyResolutionError("create a team", topologyResolution, available);
+  if (args.frozenRef === undefined || args.frozenRef === "") {
+    throw new Error("approval_required: orchestra_create now requires frozenRef from orchestra_freeze; use orchestra_draft → /team approve <draftId>@<revision> → orchestra_freeze");
   }
-  const topology = topologyResolution;
+  let frozen: FrozenCharterRevision;
+  try {
+    frozen = resolveFrozenCharter(charterEventsOf(exec.agent.session), args.frozenRef);
+  } catch (error) {
+    throw charterCommandError("create a team", error);
+  }
+  if (frozen.baseTeamId !== undefined || frozen.sourceSessionId !== exec.agent.id || frozen.frozenBySessionId !== exec.agent.id) {
+    throw new Error("cannot create a Team from an amendment or a charter frozen by another Session");
+  }
+  const topology = {
+    config: frozen.topology.config,
+    source: frozen.topology.catalogSource ?? ("bundled" as const),
+  };
+  void topologyCatalog;
   const teamId = `team-${randomUUID().slice(0, 8)}`;
   const plans: GovernedRolePlan[] = [];
   for (const role of topology.config.roles) {
@@ -1020,19 +1220,14 @@ export async function createGovernedTeam(
     controllerHistory: [],
     topologyRef: { id: topology.config.id, source: topology.source },
     mission: {
-      objective,
-      scope: args.scope ?? [],
-      constraints: args.constraints ?? [],
-      acceptanceCriteria: args.acceptanceCriteria ?? [],
-      nonGoals: args.nonGoals ?? [],
-      context: args.context ?? "",
+      ...frozen.mission,
     },
     createdAt: Date.now(),
     activatedFromArchiveId: null,
     roles: plans.map(reservedRole),
     reports: [],
   };
-  team.document = initializeOrchestrationDocument(team, team.createdAt);
+  team.document = initializeFrozenOrchestrationDocument(team, frozen, team.createdAt);
   const reservation = await activeTeamState.create(cwd, team, {
     policy: escrowPolicy(ctx, exec),
     signal: exec.signal,
@@ -1046,6 +1241,8 @@ export async function createGovernedTeam(
     state_path: reservation.statePath,
     created_at: provisioned.team.createdAt,
     mission: provisioned.team.mission,
+    charter_revision: frozen.charterRevision,
+    frozen_ref: frozen.frozenRef,
     roles: provisioned.team.roles.map((role) => ({
       id: role.id,
       sessionId: role.sessionId,
@@ -1193,10 +1390,11 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "orchestra_create",
       description:
-        "Create the orchestra team: for each role in the topology, spawn its session with the role preset, apply the role sandbox, record the mapping in orchestra/state/team.json (v1.1 with mission + topologyRef + controller), and send each role its welcome message. Run once per working directory; repeat calls fail while a team exists. Use orchestra_team to inspect the team afterwards.",
+        "Create a Governed orchestra team only from an exact immutable frozenRef produced by orchestra_freeze after /team approve <draftId>@<revision>. goal/topology alone are not approval and return approval_required. The frozen mission/topology snapshot is used for transactional role provisioning and copied into team.json.document charterRevisions.",
       parameters: {
-        goal: { type: "string", required: true, description: "The team's mission objective — what \"done\" looks like. Stored as mission.objective." },
-        topology: { type: "string", description: "Topology id. Defaults to \"duo\"." },
+        frozenRef: { type: "string", required: true, description: "Exact frozen charter ref: draftId@revision#digest from orchestra_freeze." },
+        goal: { type: "string", description: "Deprecated compatibility input; ignored without frozenRef and never substitutes approval." },
+        topology: { type: "string", description: "Deprecated compatibility input; frozen topology snapshot is authoritative." },
         scope: { type: "array", items: { type: "string" }, description: "Optional mission scope boundaries." },
         constraints: { type: "array", items: { type: "string" }, description: "Optional mission constraints." },
         acceptanceCriteria: { type: "array", items: { type: "string" }, description: "Optional acceptance criteria." },
@@ -1215,6 +1413,8 @@ export function apply(ctx: Context): void {
             team_id: { type: "string", required: true },
             topology: { type: "string", required: true },
             status: { type: "string", required: true },
+            charter_revision: { type: "number", required: true },
+            frozen_ref: { type: "string", required: true },
             state_path: { type: "string", required: true },
             created_at: { type: "number", required: true },
             mission: {
@@ -1526,6 +1726,318 @@ export function apply(ctx: Context): void {
 
   ctx.tools.register(
     defineTool({
+      name: "orchestra_draft",
+      description:
+        "Driver-only Charter Draft command. Creates revision 1 or appends a new revision using expectedRevision. The Draft is stored in the current Driver Session's append-only events; it is not a Team or approval. For an active Team, only the current controller/semantic writer may create an amendment Draft.",
+      parameters: {
+        draftId: { type: "string", description: "Existing draft id to revise; omit to create a new draft." },
+        expectedRevision: { type: "number", description: "Required when revising an existing draft; stale values fail loud." },
+        goal: { type: "string", description: "Mission objective; required for a new draft." },
+        topology: { type: "string", description: "Catalog topology id to snapshot; omitted on update reuses the latest snapshot." },
+        inlineTopology: { type: "json", description: "Inline custom topology config; validated by the same Topology Catalog validator." },
+        scope: { type: "array", items: { type: "string" } },
+        constraints: { type: "array", items: { type: "string" } },
+        acceptanceCriteria: { type: "array", items: { type: "string" } },
+        nonGoals: { type: "array", items: { type: "string" } },
+        context: { type: "string" },
+        humanParticipationMode: { type: "string", enum: ["interactive", "checkpointed", "autonomous"] },
+        onUnavailable: { type: "string", enum: ["block", "safe_stop", "continue_without_gate"] },
+        humanPolicySummary: { type: "string" },
+        requiredHumanGate: { type: "boolean" },
+        reason: { type: "string" },
+        summary: { type: "string" },
+      },
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            draft_id: { type: "string", required: true },
+            revision: { type: "number", required: true },
+            digest: { type: "string", required: true },
+            approval_status: { type: "string", required: true },
+            frozen_ref: { type: "string" },
+            base_team_id: { type: "string" },
+            base_charter_revision: { type: "number" },
+            mission: { type: "object", additionalProperties: true, required: true },
+            topology: { type: "object", additionalProperties: true, required: true },
+            human_participation: { type: "object", additionalProperties: true, required: true },
+          },
+        },
+        render: (_args, value) => [{ type: "text", text: `charter draft ${value.draft_id}@${value.revision} (${value.approval_status}) digest=${value.digest}` }],
+      },
+      async execute(args: CharterDraftToolArgs, exec: ToolExecutionInput) {
+        if (exec.agent === undefined) throw new Error("orchestra_draft requires an agent caller");
+        const cwd = exec.agent.session.header.cwd;
+        if (cwd === undefined) throw new Error("current session has no working directory");
+        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("create a charter draft", observation);
+        const events = charterEventsOf(exec.agent.session);
+        let current: CharterDraft | undefined;
+        if (args.draftId !== undefined) {
+          try {
+            current = latestDraft(events, args.draftId);
+          } catch (error) {
+            throw charterCommandError("read the charter draft", error);
+          }
+          if (current === undefined) throw new Error(`cannot create a charter draft: draft ${args.draftId} was not found`);
+          if (current.authorSessionId !== exec.agent.id) throw new Error("cannot revise the charter draft: permission_denied (author Session required)");
+        }
+        let baseTeamId: string | undefined;
+        let baseCharterRevision: number | undefined;
+        if (observation.kind === "ready") {
+          const team = observation.team;
+          const document = documentReadForTeam(team);
+          if (document === undefined) throw new Error("cannot create an amendment Draft: legacy_missing (run orchestra_reconcile first)");
+          if (exec.agent.id !== team.controllerSessionId || exec.agent.id !== document.semanticWriterSessionId) {
+            throw new Error("cannot create a charter amendment: permission_denied (current controller/semantic writer required)");
+          }
+          if (document.currentCharterRevision === null) throw new Error("cannot create an amendment Draft: the Team has no frozen charter revision");
+          baseTeamId = team.teamId;
+          baseCharterRevision = document.currentCharterRevision;
+        }
+        let topology;
+        try {
+          topology = await topologySnapshotForDraft(ctx, topologyCatalog, cwd, args, current, exec.signal);
+        } catch (error) {
+          throw charterCommandError("resolve the charter topology", error);
+        }
+        let command;
+        try {
+          command = prepareDraftEvent(events, {
+            draftId: args.draftId,
+            expectedRevision: args.expectedRevision,
+            mission: missionForDraft(args, current),
+            topology,
+            humanParticipationPolicy: humanPolicyForDraft(args, current),
+            authorSessionId: current?.authorSessionId ?? exec.agent.id,
+            now: Date.now(),
+            reason: args.reason ?? current?.reason,
+            summary: args.summary ?? current?.summary,
+            baseTeamId: baseTeamId ?? current?.baseTeamId,
+            baseCharterRevision: baseCharterRevision ?? current?.baseCharterRevision,
+          });
+        } catch (error) {
+          throw charterCommandError("create the charter draft", error);
+        }
+        if (command.kind !== "changed") throw new Error("charter draft command unexpectedly produced no event");
+        await appendDurableCharterEvent(ctx, exec.agent.session, command.event);
+        return charterDraftOutput([...events, command.event], command.value) as any;
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
+      name: "orchestra_charters",
+      description: "Read Draft revisions, durable user approvals, and frozen charter facts from the current Driver Session event log. This is read-only and never infers approval from chat text.",
+      parameters: {
+        draftId: { type: "string", description: "Optional exact draft id filter; all revisions remain visible." },
+      },
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            status: { type: "string", required: true },
+            drafts: { type: "array", items: { type: "json" }, required: true },
+            approvals: { type: "array", items: { type: "json" }, required: true },
+            freezes: { type: "array", items: { type: "json" }, required: true },
+            diagnostic: { type: "object", additionalProperties: true },
+          },
+        },
+        render: (_args, value) => [{ type: "text", text: `charter event log ${value.status}: drafts=${value.drafts.length}, approvals=${value.approvals.length}, freezes=${value.freezes.length}` }],
+      },
+      async execute(args: { draftId?: string }, exec: ToolExecutionInput) {
+        if (exec.agent === undefined) throw new Error("orchestra_charters requires an agent caller");
+        return charterListOutput(charterEventsOf(exec.agent.session), args.draftId) as any;
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
+      name: "orchestra_freeze",
+      description:
+        "Freeze an exactly user-approved Charter Draft into an immutable FrozenCharterRevision. The approval must come from /team approve <draftId>@<revision>; model text and natural-language consent are insufficient. Freeze returns the exact frozenRef used by orchestra_create or amendment application.",
+      parameters: {
+        draftId: { type: "string", required: true },
+        revision: { type: "number", required: true },
+        digest: { type: "string", required: true },
+      },
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            frozen_ref: { type: "string", required: true },
+            charter_revision: { type: "number", required: true },
+            draft_id: { type: "string", required: true },
+            draft_revision: { type: "number", required: true },
+            digest: { type: "string", required: true },
+            approval_ref: { type: "string", required: true },
+            mission: { type: "object", additionalProperties: true, required: true },
+            topology: { type: "object", additionalProperties: true, required: true },
+            human_participation: { type: "object", additionalProperties: true, required: true },
+            frozen_by_session_id: { type: "string", required: true },
+            frozen_at: { type: "number", required: true },
+            reason: { type: "string" },
+            impact: { type: "string" },
+          },
+        },
+        render: (_args, value) => [{ type: "text", text: `charter frozen ${value.frozen_ref} (charter revision ${value.charter_revision})` }],
+      },
+      async execute(args: { draftId: string; revision: number; digest: string }, exec: ToolExecutionInput) {
+        if (exec.agent === undefined) throw new Error("orchestra_freeze requires an agent caller");
+        const cwd = exec.agent.session.header.cwd;
+        if (cwd === undefined) throw new Error("current session has no working directory");
+        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("freeze a charter", observation);
+        if (observation.kind === "ready") {
+          const document = documentReadForTeam(observation.team);
+          if (document === undefined) throw new Error("cannot freeze a charter for an active legacy Team: run orchestra_reconcile first");
+          if (exec.agent.id !== observation.team.controllerSessionId || exec.agent.id !== document.semanticWriterSessionId) throw new Error("cannot freeze a charter: permission_denied (current controller/semantic writer required)");
+        }
+        const events = charterEventsOf(exec.agent.session);
+        let current: CharterDraft;
+        try {
+          const summary = charterSummary(events, args.draftId);
+          current = summary.draft;
+        } catch (error) {
+          throw charterCommandError("read the charter draft", error);
+        }
+        if (observation.kind !== "ready" && current.authorSessionId !== exec.agent.id) throw new Error("cannot freeze a charter: permission_denied (draft author Session required)");
+        let command;
+        try {
+          command = prepareFreezeEvent(events, {
+            draftId: args.draftId,
+            revision: args.revision,
+            digest: args.digest,
+            frozenBySessionId: exec.agent.id,
+            frozenAt: Date.now(),
+          });
+        } catch (error) {
+          throw charterCommandError("freeze the charter", error);
+        }
+        if (command.kind === "changed") await appendDurableCharterEvent(ctx, exec.agent.session, command.event);
+        return frozenCharterOutput(command.value) as any;
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
+      name: "orchestra_apply_amendment",
+      description:
+        "Apply an exactly approved and frozen amendment to the current Team document. This appends an immutable charter revision through ActiveTeam CAS and records a Driver decision; it never spawns, dismisses, or rewrites role Session mappings. Topology roster changes return pending_runtime_actions instead of pretending to be applied.",
+      parameters: {
+        frozenRef: { type: "string", required: true, description: "Exact frozen amendment ref from orchestra_freeze." },
+      },
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            status: { type: "string", required: true },
+            team_id: { type: "string", required: true },
+            frozen_ref: { type: "string", required: true },
+            current_charter_revision: { type: "number", required: true },
+            target_charter_revision: { type: "number", required: true },
+            pending_roles: { type: "array", items: { type: "string" }, required: true },
+            markdown_status: { type: "string", required: true },
+            markdown_path: { type: "string", required: true },
+            message: { type: "string" },
+          },
+        },
+        render: (_args, value) => [{ type: "text", text: `charter amendment ${value.status} for ${value.team_id}: revision ${value.current_charter_revision}${value.pending_roles.length === 0 ? "" : `; pending roles=${value.pending_roles.join(", ")}`}` }],
+      },
+      async execute(args: { frozenRef: string }, exec: ToolExecutionInput) {
+        if (exec.agent === undefined) throw new Error("orchestra_apply_amendment requires an agent caller");
+        const cwd = exec.agent.session.header.cwd;
+        if (cwd === undefined) throw new Error("current session has no working directory");
+        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("apply a charter amendment", observation);
+        if (observation.kind !== "ready") throw new Error(`cannot apply a charter amendment: no ready Team state (${observation.kind})`);
+        if (observation.team.status !== "active" && observation.team.status !== "degraded") throw new Error(`cannot apply a charter amendment while Team status is ${observation.team.status}`);
+        const team = observation.team;
+        const document = documentReadForTeam(team);
+        if (document === undefined) throw new Error("cannot apply a charter amendment: legacy_missing (run orchestra_reconcile first)");
+        if (exec.agent.id !== team.controllerSessionId || exec.agent.id !== document.semanticWriterSessionId) throw new Error("cannot apply a charter amendment: permission_denied (current controller/semantic writer required)");
+        let frozen: FrozenCharterRevision;
+        try {
+          frozen = resolveFrozenCharter(charterEventsOf(exec.agent.session), args.frozenRef);
+        } catch (error) {
+          throw charterCommandError("read the frozen amendment", error);
+        }
+        if (frozen.baseTeamId !== team.teamId || frozen.baseCharterRevision !== document.currentCharterRevision) {
+          throw new Error("cannot apply a charter amendment: stale_base (Team id or current charter revision differs)");
+        }
+        const currentRoleIds = new Set(team.roles.map((role) => role.id.toLowerCase()));
+        const frozenRoleIds = new Set(frozen.topology.config.roles.map((role) => role.id.toLowerCase()));
+        const pendingRoles = [...new Set([...team.roles.map((role) => role.id), ...frozen.topology.config.roles.map((role) => role.id)])].filter((roleId) => !currentRoleIds.has(roleId.toLowerCase()) || !frozenRoleIds.has(roleId.toLowerCase()));
+        if (pendingRoles.length > 0) {
+          return {
+            status: "pending_runtime_actions",
+            team_id: team.teamId,
+            frozen_ref: frozen.frozenRef,
+            current_charter_revision: document.currentCharterRevision ?? 0,
+            target_charter_revision: frozen.charterRevision,
+            pending_roles: pendingRoles,
+            markdown_status: "unchanged",
+            markdown_path: document.markdown.path,
+            message: "topology roster differs from the current Team; no Session mapping was changed",
+          };
+        }
+        let applied;
+        try {
+          applied = applyFrozenCharterRevision(document, team, frozen, exec.agent.id, Date.now());
+        } catch (error) {
+          throw documentCommandError("apply the charter amendment", error);
+        }
+        if (applied.kind === "noop") {
+          const markdown = await inspectMarkdownProjection(ctx.fs, cwd, document, isRuntimeProjectionStale(document, team), exec.signal);
+          return {
+            status: "already_applied",
+            team_id: team.teamId,
+            frozen_ref: frozen.frozenRef,
+            current_charter_revision: document.currentCharterRevision ?? 0,
+            target_charter_revision: frozen.charterRevision,
+            pending_roles: [],
+            markdown_status: markdown.status,
+            markdown_path: markdown.path,
+          };
+        }
+        let nextDocument = applied.document;
+        try {
+          nextDocument = appendDriverDecision(nextDocument, team, {
+            decisionId: `charter-amendment:${frozen.frozenRef}`,
+            kind: "charter_amendment",
+            summary: frozen.reason ?? `Applied charter revision ${frozen.charterRevision}`,
+            actorSessionId: exec.agent.id,
+            createdAt: Date.now(),
+            evidence: [{ kind: "message", ref: frozen.approval.approvalRef }],
+            affects: frozen.topology.config.roles.map((role) => role.id),
+          }).document;
+        } catch (error) {
+          throw documentCommandError("record the charter amendment decision", error);
+        }
+        const persisted = await persistDocumentTransition(ctx, activeTeamState, observation, nextDocument, exec);
+        return {
+          status: persisted.markdown.status === "projection_failed" ? "projection_failed" : persisted.markdown.status === "stale" ? "stale" : "applied",
+          team_id: team.teamId,
+          frozen_ref: frozen.frozenRef,
+          current_charter_revision: persisted.document.currentCharterRevision ?? 0,
+          target_charter_revision: frozen.charterRevision,
+          pending_roles: [],
+          markdown_status: persisted.markdown.status,
+          markdown_path: persisted.markdown.path,
+        };
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
       name: "orchestra_document",
       description:
         "Read the canonical Living Orchestration Document for the current Team. The structured document is authoritative; orchestration.md is a derived projection only and is never parsed as state. Legacy Teams report legacy_missing until the Driver explicitly reconciles them.",
@@ -1540,6 +2052,9 @@ export function apply(ctx: Context): void {
             document_revision: { type: "number", required: true },
             charter_status: { type: "string", required: true },
             runtime_stale: { type: "boolean", required: true },
+            current_charter_revision: { type: "number" },
+            charter_digest: { type: "string" },
+            approval_ref: { type: "string" },
             runtime_projection: {
               oneOf: [
                 {
@@ -1643,6 +2158,9 @@ export function apply(ctx: Context): void {
             document_revision: { type: "number", required: true },
             charter_status: { type: "string", required: true },
             runtime_stale: { type: "boolean", required: true },
+            current_charter_revision: { type: "number" },
+            charter_digest: { type: "string" },
+            approval_ref: { type: "string" },
             runtime_projection: { type: "object", additionalProperties: true, required: true },
             decisions: { type: "array", required: true },
             markdown: {
@@ -1727,6 +2245,9 @@ export function apply(ctx: Context): void {
             document_revision: { type: "number", required: true },
             charter_status: { type: "string", required: true },
             runtime_stale: { type: "boolean", required: true },
+            current_charter_revision: { type: "number" },
+            charter_digest: { type: "string" },
+            approval_ref: { type: "string" },
             runtime_projection: { type: "object", additionalProperties: true, required: true },
             decisions: { type: "array", required: true },
             markdown: {
@@ -1834,6 +2355,9 @@ export function apply(ctx: Context): void {
                     document_status: { type: "string" },
                     document_revision: { type: "number" },
                     document_stale: { type: "boolean" },
+                    current_charter_revision: { type: "number" },
+                    charter_digest: { type: "string" },
+                    approval_ref: { type: "string" },
                     last_decision: {
                       type: "object",
                       additionalProperties: false,
@@ -1925,6 +2449,9 @@ export function apply(ctx: Context): void {
             document_status: documentSummaryValue.status,
             document_revision: documentSummaryValue.revision,
             document_stale: documentSummaryValue.stale,
+            ...(documentSummaryValue.currentCharterRevision === undefined ? {} : { current_charter_revision: documentSummaryValue.currentCharterRevision }),
+            ...(documentSummaryValue.currentCharterDigest === undefined ? {} : { charter_digest: documentSummaryValue.currentCharterDigest }),
+            ...(documentSummaryValue.approvalRef === undefined ? {} : { approval_ref: documentSummaryValue.approvalRef }),
             ...(documentSummaryValue.lastDecision === undefined
               ? {}
               : {
@@ -2571,9 +3098,9 @@ export function apply(ctx: Context): void {
         "1. Goal: ask the user to state the goal — what \"done\" looks like. One topology run completes one goal; a clear goal defines when to stop.\n" +
         "2. Constraints: ask about limits/constraints (time, quality, boundaries). Merge into the same round when possible.\n" +
         "3. Context: read the project context relevant to the goal (files, docs) to ground your understanding.\n" +
-        "4. Proposal: report to the user — your understanding of the work, the topology you propose, and why this setup helps. A proposal IS a collaboration charter (编排 = 协作宪章): it must answer all seven questions — who does what; who owns each decision (ownership, one final owner per decision); where work goes when done (routes); what handoffs must carry; where disputes go (escalation); when loops end (round limits); who declares the team complete (closure). You MUST define routes and ownership; the number of roles (3 or 10) is entirely up to what the task needs — use your judgment, never add roles the user did not ask for, and self-check the six completeness tests: reachability, unique power, every output has a consumer, every loop has an exit, disputes have a destination, completion has a single owner.\n" +
-        "5. Approval: wait for the user's explicit go-ahead BEFORE creating any role sessions. A proposal is NOT approval: end your proposal turn with an explicit question/request for approval (e.g. ask whether they 放行). Until the user explicitly approves (e.g. replies \"放行\"), you must NOT create/spawn any role session.\n" +
-        "6. Execute: create roles (orchestra_create for a matching template, orchestra_spawn per role otherwise), then dispatch Governed roles via orchestra_send(teamId+roleId); use raw a2a_send only for explicit free SessionId communication.\n" +
+        "4. Proposal: call orchestra_draft to persist the exact mission/topology/human-policy Draft in your Session events, then report its draftId@revision and digest to the user. A proposal IS a collaboration charter (编排 = 协作宪章): it must answer who does what; who owns each decision; routes and handoffs; escalation; round limits; and closure.\n" +
+        "5. Approval: proposal text or natural-language \"可以/放行\" is NOT approval. Tell the user to run the exact command /team approve <draftId>@<revision>; only the durable user-command approval event permits orchestra_freeze. Until that command succeeds, do NOT freeze or create/spawn any Governed role session.\n" +
+        "6. Freeze and execute: after the approval command, call orchestra_freeze with the exact digest, then orchestra_create with frozenRef; for active Teams use orchestra_draft → user command → orchestra_freeze → orchestra_apply_amendment. Dispatch Governed roles via orchestra_send(teamId+roleId); use raw a2a_send only for explicit free SessionId communication.\n" +
         "Dispatch tightness: dispatch every spawned role's task immediately — in the same round, or the round right after spawning. Never leave a spawned role taskless (a spawn-to-dispatch vacuum makes roles start working on their own).\n" +
         "Parallelism discipline: parallelize everything that CAN run in parallel (dispatch independent tasks together in one round; never serialize independent work) but NEVER parallelize anything that would BLOCK or conflict (dependency-aware: wait for that specific signal — orchestra_team / a2a_read / report path — before dispatching, and declare the dependency explicitly in the task).\n" +
         "No filler messages: creation injects the welcome; injection IS the confirmation. Do NOT send extra confirmation/ack messages after a role is created or a delivery is confirmed — they pile up in the target's inbox (queue buildup). To check session state use orchestra_team (activity, reportCount, lastReport) or a2a_read (history) — never send a message to ask. Dispatch each task once; use interrupt:true only when a message must surface mid-turn.\n" +
@@ -2601,6 +3128,7 @@ export function apply(ctx: Context): void {
       recordInput: true,
       handler: (invocation) => {
         const raw = invocation.rawInput.trim();
+        if (/^approve(?:\s|$)/.test(raw)) return handleTeamApprovalCommand(ctx, invocation as any);
         // Single plugin-source notice carrying the marker (+ the goal when
         // provided). It renders as a collapsed context row, NOT as a user
         // bubble — the user's bubble is the command bubble itself ("/team

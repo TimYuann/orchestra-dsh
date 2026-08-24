@@ -4,7 +4,9 @@ import { createActiveTeamStateStore } from "../lib/orchestra-state.js";
 import { assertSpawnableTeamDocument } from "../lib/orchestra.js";
 import {
   appendDriverDecision,
+  applyFrozenCharterRevision,
   initializeOrchestrationDocument,
+  initializeFrozenOrchestrationDocument,
   inspectMarkdownProjection,
   isRuntimeProjectionStale,
   readOrchestrationDocument,
@@ -12,6 +14,7 @@ import {
   renderOrchestrationMarkdown,
   writeMarkdownProjection,
 } from "../lib/orchestration-document.js";
+import { prepareApprovalEvent, prepareDraftEvent, prepareFreezeEvent } from "../lib/orchestration-charter.js";
 
 const cwd = "/tmp/orchestra-document-interface-test";
 
@@ -249,4 +252,52 @@ test("orchestra_spawn fails closed on a legacy Team until Driver reconcile, with
   const before = fs.content("orchestra/state/team.json");
   assert.throws(() => assertSpawnableTeamDocument(observed), /legacy_missing/);
   assert.equal(fs.content("orchestra/state/team.json"), before);
+});
+
+test("Frozen charter initializes the Team document and amendments append immutable revisions", () => {
+  const source = team();
+  const config = {
+    schemaVersion: 1,
+    id: "duo",
+    controller: { id: "driver", source: "caller" },
+    roles: [{ id: "reviewer", name: "Reviewer", preset: "orchestra-reviewer", sandbox: "read-only" }],
+    protocol: { ownership: { closure: "driver" }, routes: [], completion: { owner: "driver", rule: "done" } },
+  };
+  const baseInput = {
+    draftId: "draft-frozen-document",
+    mission: source.mission,
+    topology: { source: "inline", id: "duo", config },
+    humanParticipationPolicy: { mode: "interactive", onUnavailable: "block" },
+    authorSessionId: source.controllerSessionId,
+    now: 200,
+  };
+  const draft = prepareDraftEvent([], baseInput);
+  const approval = prepareApprovalEvent([draft.event], { draftId: draft.value.draftId, revision: 1, commandId: "cmd-1", approvingSessionId: source.controllerSessionId, approvedAt: 201 });
+  const frozen = prepareFreezeEvent([draft.event, approval.event], { draftId: draft.value.draftId, revision: 1, digest: draft.value.digest, frozenBySessionId: source.controllerSessionId, frozenAt: 202 });
+  const initial = initializeFrozenOrchestrationDocument(source, frozen.value, 203);
+  assert.equal(initial.charterStatus, "frozen");
+  assert.equal(initial.currentCharterRevision, 1);
+  assert.equal(readOrchestrationDocument(initial, source.teamId).kind, "ready");
+  const corrupted = structuredClone(initial);
+  corrupted.charterRevisions[0].mission.objective = "tampered";
+  assert.equal(readOrchestrationDocument(corrupted, source.teamId).kind, "blocked");
+
+  const amendmentDraft = prepareDraftEvent([draft.event, approval.event, frozen.event], {
+    ...baseInput,
+    draftId: "draft-amendment",
+    expectedRevision: undefined,
+    mission: { ...source.mission, constraints: ["amended"] },
+    baseTeamId: source.teamId,
+    baseCharterRevision: 1,
+    now: 204,
+    reason: "record the amended constraint",
+  });
+  const amendmentApproval = prepareApprovalEvent([draft.event, approval.event, frozen.event, amendmentDraft.event], { draftId: amendmentDraft.value.draftId, revision: 1, commandId: "cmd-2", approvingSessionId: source.controllerSessionId, approvedAt: 205 });
+  const amendmentFrozen = prepareFreezeEvent([draft.event, approval.event, frozen.event, amendmentDraft.event, amendmentApproval.event], { draftId: amendmentDraft.value.draftId, revision: 1, digest: amendmentDraft.value.digest, frozenBySessionId: source.controllerSessionId, frozenAt: 206 });
+  const applied = applyFrozenCharterRevision(initial, source, amendmentFrozen.value, source.controllerSessionId, 207);
+  assert.equal(applied.kind, "changed");
+  assert.equal(applied.document.currentCharterRevision, 2);
+  assert.equal(applied.document.charterRevisions.length, 2);
+  assert.equal(applied.document.charterRevisions[0].digest, frozen.value.digest);
+  assert.throws(() => applyFrozenCharterRevision(initial, source, amendmentFrozen.value, "reviewer-session", 208), (error) => error?.code === "permission_denied");
 });

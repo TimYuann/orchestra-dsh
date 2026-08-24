@@ -4,6 +4,7 @@ import { createActiveTeamStateStore, normalizeTeam } from "../lib/orchestra-stat
 import { prepareGovernedBlueprint, readGovernedBlueprint } from "../lib/session-blueprint.js";
 import { assertUniqueGovernedSessionIds, createGovernedTeam, prepareGovernedRolePlan, provisionGovernedPlans } from "../lib/orchestra.js";
 import { preflightGovernedRequiredTools } from "../lib/session-blueprint.js";
+import { prepareApprovalEvent, prepareDraftEvent, prepareFreezeEvent } from "../lib/orchestration-charter.js";
 
 const cwd = "/tmp/orchestra-governed-test";
 
@@ -236,6 +237,43 @@ function topologyCatalog(roles) {
   };
 }
 
+function approvedFrozenRef(runtime, roles, draftId) {
+  const config = {
+    schemaVersion: 1,
+    id: "integration-topology",
+    name: "integration",
+    controller: { id: "driver", source: "caller" },
+    roles,
+    protocol: { ownership: { closure: "driver" }, routes: [], completion: { owner: "driver", rule: "done" } },
+  };
+  const draft = prepareDraftEvent([], {
+    draftId,
+    mission: { objective: "integration", scope: [], constraints: [], acceptanceCriteria: [], nonGoals: [], context: "test" },
+    topology: { source: "inline", id: config.id, config },
+    humanParticipationPolicy: { mode: "interactive", onUnavailable: "block" },
+    authorSessionId: runtime.controller.id,
+    now: 1,
+  });
+  runtime.controller.session.append(draft.event.type, draft.event.data);
+  const approval = prepareApprovalEvent(runtime.controller.session.events, {
+    draftId,
+    revision: 1,
+    commandId: `command-${draftId}`,
+    approvingSessionId: runtime.controller.id,
+    approvedAt: 2,
+  });
+  runtime.controller.session.append(approval.event.type, approval.event.data);
+  const frozen = prepareFreezeEvent(runtime.controller.session.events, {
+    draftId,
+    revision: 1,
+    digest: draft.value.digest,
+    frozenBySessionId: runtime.controller.id,
+    frozenAt: 3,
+  });
+  runtime.controller.session.append(frozen.event.type, frozen.event.data);
+  return frozen.value.frozenRef;
+}
+
 async function prepared(runtime, roleId, overrides = {}) {
   return prepareGovernedBlueprint(runtime.context, {
     sessionId: `orchestra-team-test-${roleId}`,
@@ -393,15 +431,29 @@ test("Governed create preflights required capabilities before reservation and fa
 
 test("actual orchestra_create bounded entrypoint rejects missing required tool before any Team/Session/Agent publication", async () => {
   const runtime = makeRuntime();
-  const catalog = topologyCatalog([{ id: "reviewer", name: "reviewer", preset: "preset-reviewer", sandbox: "read-only", requiredTools: ["missing-tool"] }]);
+  const roles = [{ id: "reviewer", name: "reviewer", preset: "preset-reviewer", sandbox: "read-only", requiredTools: ["missing-tool"] }];
+  const catalog = topologyCatalog(roles);
+  const frozenRef = approvedFrozenRef(runtime, roles, "draft-required-tool");
   await assert.rejects(
-    () => createGovernedTeam(runtime.context, runtime.store, catalog, { goal: "integration", topology: "integration-topology" }, { agent: runtime.controller }, { createSession: runtime.createSessionAdapter }),
+    () => createGovernedTeam(runtime.context, runtime.store, catalog, { frozenRef }, { agent: runtime.controller }, { createSession: runtime.createSessionAdapter }),
     (error) => error?.code === "required_tools_unproven" && /reservation was not attempted/.test(error.message),
   );
   assert.equal(runtime.fs.files.size, 0, "orchestra_create did not write active Team state");
   assert.equal(runtime.sessions.size, 1, "only the caller Session exists");
   assert.equal(runtime.agents.size, 0, "orchestra_create did not publish a role Agent");
   assert.equal(runtime.events.some((entry) => entry.startsWith("state:")), false);
+});
+
+test("orchestra_create rejects goal/topology approval bypass with zero state or Session side effects", async () => {
+  const runtime = makeRuntime();
+  const catalog = topologyCatalog([{ id: "reviewer", name: "reviewer", preset: "preset-reviewer", sandbox: "read-only" }]);
+  await assert.rejects(
+    () => createGovernedTeam(runtime.context, runtime.store, catalog, { goal: "unapproved" }, { agent: runtime.controller }, { createSession: runtime.createSessionAdapter }),
+    /approval_required/,
+  );
+  assert.equal(runtime.fs.files.size, 0);
+  assert.equal(runtime.sessions.size, 1);
+  assert.equal(runtime.agents.size, 0);
 });
 
 test("role ids that normalize alike receive independent reserved SessionIds", async () => {
@@ -423,23 +475,25 @@ test("role ids that normalize alike receive independent reserved SessionIds", as
 
 test("actual orchestra_create preserves durable one-to-one mappings for a/b and a-b through every phase", async () => {
   const runtime = makeRuntime();
-  const catalog = topologyCatalog([
+  const roles = [
     { id: "a/b", name: "a/b", preset: "preset-reviewer", sandbox: "workspace-write" },
     { id: "a-b", name: "a-b", preset: "preset-reviewer", sandbox: "workspace-write" },
-  ]);
-  const result = await createGovernedTeam(runtime.context, runtime.store, catalog, { goal: "mapping", topology: "integration-topology" }, { agent: runtime.controller }, { createSession: runtime.createSessionAdapter });
+  ];
+  const catalog = topologyCatalog(roles);
+  const frozenRef = approvedFrozenRef(runtime, roles, "draft-mapping");
+  const result = await createGovernedTeam(runtime.context, runtime.store, catalog, { frozenRef }, { agent: runtime.controller }, { createSession: runtime.createSessionAdapter });
   const observed = await runtime.store.read(cwd);
   assert.equal(observed.kind, "ready");
   assert.equal(observed.team.status, "active");
-  assert.equal(observed.team.document?.charterStatus, "draft_required");
-  assert.equal(observed.team.document?.documentRevision, 0);
+  assert.equal(observed.team.document?.charterStatus, "frozen");
+  assert.equal(observed.team.document?.currentCharterRevision, 1);
   assert.deepEqual(observed.team.roles.map((role) => role.phase), ["active", "active"]);
   const mapping = new Map(observed.team.roles.map((role) => [role.id, role.sessionId]));
   assert.equal(mapping.size, 2);
   assert.notEqual(mapping.get("a/b"), mapping.get("a-b"));
   assert.deepEqual(result.roles.map((role) => [role.id, role.sessionId]), [...mapping.entries()]);
   const phaseVectors = runtime.fs.stateSnapshots.map((snapshot) => snapshot.roles.map((role) => role.phase));
-  assert.equal(runtime.fs.stateSnapshots[0].document?.charterStatus, "draft_required");
+  assert.equal(runtime.fs.stateSnapshots[0].document?.charterStatus, "frozen");
   assert.equal(phaseVectors[0].every((phase) => phase === "reserved"), true);
   assert.equal(phaseVectors.some((phases) => phases.includes("provisioning")), true);
   assert.equal(phaseVectors.at(-1).every((phase) => phase === "active"), true);
