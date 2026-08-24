@@ -1114,9 +1114,10 @@ list、persona/instructions、所需 tool rows、compaction/skills（如合同
 - optional deps/mount failure：shell/tool surface 不可证明时在 reservation
   前 fail；不以模拟工具名补齐 receipt。
 - reused by（exhaustive）：initial use = feature-development、
-  bug-diagnosis-and-fix、refactor-and-migration、architecture-decision、
-  audit-and-hardening；remediation-only = none；deferred/future =
-  release-readiness。
+  bug-diagnosis-and-fix、refactor-and-migration、audit-and-hardening；
+  remediation-only = none；architecture-decision uses deterministic
+  code/evidence checks plus reviewer and does not provision verifier；
+  deferred/future = release-readiness。
 
 ### E.5 architect
 
