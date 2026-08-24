@@ -48,6 +48,18 @@ import type {
 import { createArchiveStore } from "./orchestra-archive.js";
 import { createGovernedRoleAddressResolver } from "./orchestra-address.js";
 import type { GovernedRoleAddressResolver } from "./orchestra-address.js";
+import {
+  appendDriverDecision,
+  documentSummary,
+  initializeOrchestrationDocument,
+  inspectMarkdownProjection,
+  isRuntimeProjectionStale,
+  OrchestrationDocumentError,
+  readOrchestrationDocument,
+  reconcileOrchestrationDocument,
+  writeMarkdownProjection,
+} from "./orchestration-document.js";
+import type { DecisionInput, OrchestrationDocument } from "./orchestration-document.js";
 import { createTopologyCatalog } from "./orchestra-topology.js";
 import type { RoleConfig, TopologyCatalog, TopologyList, TopologyProtocol, TopologyResolution, TopologyRoleSummary } from "./orchestra-topology.js";
 export { validateTopology } from "./orchestra-topology.js";
@@ -719,6 +731,95 @@ async function readySnapshotAfterWrite(
   throw new Error(`active team write did not return a ready snapshot (${observed.kind})`);
 }
 
+interface DocumentPersistenceResult {
+  snapshot: ActiveTeamReady;
+  document: OrchestrationDocument;
+  markdown: Awaited<ReturnType<typeof writeMarkdownProjection>>;
+}
+
+function documentCommandError(action: string, error: unknown): Error {
+  if (error instanceof OrchestrationDocumentError) {
+    return new Error(`cannot ${action}: ${error.code}: ${error.message}`);
+  }
+  return new Error(`cannot ${action}: ${error instanceof Error ? error.message : String(error)}`);
+}
+
+async function persistDocumentTransition(
+  ctx: Context,
+  activeTeamState: ActiveTeamStateStore,
+  snapshot: ActiveTeamReady,
+  document: OrchestrationDocument,
+  exec: ToolExecutionInput,
+): Promise<DocumentPersistenceResult> {
+  const cwd = snapshot.cwd;
+  const nextTeam: TeamState = { ...snapshot.team, document };
+  const written = await activeTeamState.replace(snapshot, nextTeam, {
+    policy: escrowPolicy(ctx, exec),
+    signal: exec.signal,
+  });
+  const nextSnapshot = await readySnapshotAfterWrite(activeTeamState, cwd, written, exec.signal);
+  const markdown = await writeMarkdownProjection(ctx.fs, cwd, document, {
+    policy: escrowPolicy(ctx, exec),
+    signal: exec.signal,
+    stale: isRuntimeProjectionStale(document, nextSnapshot.team),
+  });
+  return { snapshot: nextSnapshot, document, markdown };
+}
+
+function documentReadForTeam(team: TeamState): OrchestrationDocument | undefined {
+  const result = readOrchestrationDocument(team.document, team.teamId);
+  if (result.kind === "blocked") {
+    throw new Error(`active team document is blocked (${result.diagnostic.code}): ${result.diagnostic.message}`);
+  }
+  return result.kind === "ready" ? result.document : undefined;
+}
+
+function documentToolStatus(
+  team: TeamState | undefined,
+  document: OrchestrationDocument | undefined,
+  markdown: Awaited<ReturnType<typeof inspectMarkdownProjection>> | undefined,
+  diagnostic?: { code: string; message: string },
+) {
+  if (team === undefined) {
+    return {
+      status: diagnostic === undefined ? ("missing" as const) : ("blocked" as const),
+      team_id: null,
+      document_revision: 0,
+      charter_status: "legacy_missing" as const,
+      runtime_stale: true,
+      runtime_projection: null,
+      decisions: [],
+      markdown: { path: "", status: "projection_failed" as const, message: "no active Team" },
+      ...(diagnostic === undefined ? {} : { diagnostic }),
+    };
+  }
+  if (document === undefined) {
+    return {
+      status: "legacy_missing" as const,
+      team_id: team.teamId,
+      document_revision: 0,
+      charter_status: "legacy_missing" as const,
+      runtime_stale: true,
+      runtime_projection: null,
+      decisions: [],
+      markdown: markdown ?? { path: `${team.rootCwd}/orchestra/orchestration.md`, status: "projection_failed" as const, message: "canonical document is absent" },
+      ...(diagnostic === undefined ? {} : { diagnostic }),
+    };
+  }
+  const summary = documentSummary(document, team);
+  return {
+    status: markdown?.status === "projection_failed" ? ("projection_failed" as const) : markdown?.status === "stale" ? ("stale" as const) : ("ready" as const),
+    team_id: team.teamId,
+    document_revision: summary.revision,
+    charter_status: summary.status,
+    runtime_stale: summary.stale,
+    runtime_projection: document.runtimeProjection,
+    decisions: document.decisions,
+    markdown: markdown ?? { path: document.markdown.path, status: "projection_failed" as const, message: "projection was not inspected" },
+    ...(diagnostic === undefined ? {} : { diagnostic }),
+  };
+}
+
 interface GovernedProvisionResult {
   team: TeamState;
   snapshot: ActiveTeamReady;
@@ -923,6 +1024,7 @@ export async function createGovernedTeam(
     roles: plans.map(reservedRole),
     reports: [],
   };
+  team.document = initializeOrchestrationDocument(team, team.createdAt);
   const reservation = await activeTeamState.create(cwd, team, {
     policy: escrowPolicy(ctx, exec),
     signal: exec.signal,
@@ -1342,6 +1444,7 @@ export function apply(ctx: Context): void {
           status: "provisioning",
           roles: [...team.roles, reservedRole(plan)],
         };
+        if (reservedTeam.document === undefined) reservedTeam.document = initializeOrchestrationDocument(reservedTeam, reservedTeam.createdAt);
         const writeOptions = { policy: escrowPolicy(ctx, exec), signal: exec.signal };
         const reservation = teamObservation.kind === "ready"
           ? await activeTeamState.replace(teamObservation, reservedTeam, writeOptions)
@@ -1415,6 +1518,273 @@ export function apply(ctx: Context): void {
 
   ctx.tools.register(
     defineTool({
+      name: "orchestra_document",
+      description:
+        "Read the canonical Living Orchestration Document for the current Team. The structured document is authoritative; orchestration.md is a derived projection only and is never parsed as state. Legacy Teams report legacy_missing until the Driver explicitly reconciles them.",
+      parameters: {},
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            status: { type: "string", required: true },
+            team_id: { oneOf: [{ type: "string" }, { type: "null" }], required: true },
+            document_revision: { type: "number", required: true },
+            charter_status: { type: "string", required: true },
+            runtime_stale: { type: "boolean", required: true },
+            runtime_projection: {
+              oneOf: [
+                {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    teamId: { type: "string", required: true },
+                    status: { type: "string", required: true },
+                    controllerSessionId: { type: "string", required: true },
+                    topologyRef: { type: "object", additionalProperties: true, required: true },
+                    mission: { type: "object", additionalProperties: true, required: true },
+                    roles: { type: "array", required: true },
+                    reports: { type: "array", required: true },
+                    activatedFromArchiveId: { oneOf: [{ type: "string" }, { type: "null" }], required: true },
+                    projectionAt: { type: "number", required: true },
+                  },
+                },
+                { type: "null" },
+              ],
+              required: true,
+            },
+            decisions: {
+              type: "array",
+              required: true,
+              items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  decisionId: { type: "string", required: true },
+                  kind: { type: "string", required: true },
+                  summary: { type: "string", required: true },
+                  rationale: { type: "string" },
+                  actorSessionId: { type: "string", required: true },
+                  createdAt: { type: "number", required: true },
+                  evidence: { type: "array", required: true },
+                  affects: { type: "array" },
+                },
+              },
+            },
+            markdown: {
+              type: "object",
+              additionalProperties: false,
+              required: true,
+              properties: {
+                path: { type: "string", required: true },
+                status: { type: "string", required: true },
+                message: { type: "string" },
+              },
+            },
+            diagnostic: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                code: { type: "string", required: true },
+                message: { type: "string", required: true },
+              },
+            },
+          },
+        },
+        render: (_args, value) => [
+          {
+            type: "text",
+            text: `orchestration document ${value.status}${value.team_id === null ? "" : ` for ${value.team_id}`} (revision ${value.document_revision}, charter ${value.charter_status}, runtime ${value.runtime_stale ? "stale" : "current"}); Markdown ${value.markdown.status}`,
+          },
+        ],
+      },
+      async execute(_args, exec: ToolExecutionInput) {
+        if (exec.agent === undefined) throw new Error("orchestra_document requires an agent caller");
+        const cwd = exec.agent.session.header.cwd;
+        if (cwd === undefined) throw new Error("current session has no working directory");
+        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
+        if (observation.kind === "blocked") {
+          return documentToolStatus(undefined, undefined, undefined, {
+            code: observation.diagnostic.code,
+            message: observation.diagnostic.message,
+          }) as any;
+        }
+        if (observation.kind !== "ready") return documentToolStatus(undefined, undefined, undefined) as any;
+        const team = observation.team;
+        const document = documentReadForTeam(team);
+        if (document === undefined) return documentToolStatus(team, undefined, undefined) as any;
+        const markdown = await inspectMarkdownProjection(ctx.fs, cwd, document, isRuntimeProjectionStale(document, team), exec.signal);
+        return documentToolStatus(team, document, markdown) as any;
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
+      name: "orchestra_reconcile",
+      description:
+        "Driver-only checkpoint command: initialize a legacy Team's missing canonical document or reconcile its Runtime Projection from active Team state, using one ActiveTeamState CAS. Only after canonical CAS succeeds does it refresh the derived Markdown projection.",
+      parameters: {},
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            status: { type: "string", required: true },
+            team_id: { type: "string", required: true },
+            document_revision: { type: "number", required: true },
+            charter_status: { type: "string", required: true },
+            runtime_stale: { type: "boolean", required: true },
+            runtime_projection: { type: "object", additionalProperties: true, required: true },
+            decisions: { type: "array", required: true },
+            markdown: {
+              type: "object",
+              additionalProperties: false,
+              required: true,
+              properties: {
+                path: { type: "string", required: true },
+                status: { type: "string", required: true },
+                message: { type: "string" },
+              },
+            },
+            diagnostic: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                code: { type: "string", required: true },
+                message: { type: "string", required: true },
+              },
+            },
+          },
+        },
+        render: (_args, value) => [{ type: "text", text: `orchestration document ${value.status} for ${value.team_id} at revision ${value.document_revision}; Markdown ${value.markdown.status}` }],
+      },
+      async execute(_args, exec: ToolExecutionInput) {
+        if (exec.agent === undefined) throw new Error("orchestra_reconcile requires an agent caller");
+        const cwd = exec.agent.session.header.cwd;
+        if (cwd === undefined) throw new Error("current session has no working directory");
+        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("reconcile the orchestration document", observation);
+        if (observation.kind !== "ready") throw new Error(`cannot reconcile the orchestration document: no ready Team state (${observation.kind})`);
+        const team = observation.team;
+        if (exec.agent.id !== team.controllerSessionId) throw new Error("cannot reconcile the orchestration document: permission_denied (Driver/controller required)");
+        let next: OrchestrationDocument;
+        try {
+          const current = documentReadForTeam(team);
+          next = current === undefined
+            ? initializeOrchestrationDocument(team, Date.now())
+            : reconcileOrchestrationDocument(current, team, exec.agent.id, Date.now()).document;
+        } catch (error) {
+          throw documentCommandError("reconcile the orchestration document", error);
+        }
+        const persisted = await persistDocumentTransition(ctx, activeTeamState, observation, next, exec);
+        return documentToolStatus(persisted.snapshot.team, persisted.document, persisted.markdown) as any;
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
+      name: "orchestra_decision",
+      description:
+        "Driver-only append to the canonical Driver Decision Journal. Entries are append-only and idempotent by decisionId; the operation is CAS-guarded and refreshes only the derived Markdown projection after canonical persistence.",
+      parameters: {
+        decisionId: { type: "string", required: true, description: "Stable id for this decision; retrying the same payload is a no-op." },
+        kind: { type: "string", required: true, description: "Decision category, for example scope, route, review, or escalation." },
+        summary: { type: "string", required: true, description: "Short decision summary." },
+        rationale: { type: "string", description: "Optional rationale." },
+        createdAt: { type: "number", description: "Optional finite timestamp; defaults to the current time." },
+        evidence: {
+          type: "array",
+          description: "Evidence references; refs are recorded, not read.",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              kind: { type: "string", required: true },
+              ref: { type: "string", required: true },
+              label: { type: "string" },
+            },
+          },
+        },
+        affects: { type: "array", items: { type: "string" }, description: "Optional affected role/decision summaries." },
+      },
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            status: { type: "string", required: true },
+            team_id: { type: "string", required: true },
+            document_revision: { type: "number", required: true },
+            charter_status: { type: "string", required: true },
+            runtime_stale: { type: "boolean", required: true },
+            runtime_projection: { type: "object", additionalProperties: true, required: true },
+            decisions: { type: "array", required: true },
+            markdown: {
+              type: "object",
+              additionalProperties: false,
+              required: true,
+              properties: {
+                path: { type: "string", required: true },
+                status: { type: "string", required: true },
+                message: { type: "string" },
+              },
+            },
+            diagnostic: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                code: { type: "string", required: true },
+                message: { type: "string", required: true },
+              },
+            },
+          },
+        },
+        render: (_args, value) => [{ type: "text", text: `orchestration decision ${value.status} for ${value.team_id}; document revision ${value.document_revision}; Markdown ${value.markdown.status}` }],
+      },
+      async execute(
+        args: DecisionInput & { createdAt?: number },
+        exec: ToolExecutionInput,
+      ) {
+        if (exec.agent === undefined) throw new Error("orchestra_decision requires an agent caller");
+        const cwd = exec.agent.session.header.cwd;
+        if (cwd === undefined) throw new Error("current session has no working directory");
+        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("append a Driver decision", observation);
+        if (observation.kind !== "ready") throw new Error(`cannot append a Driver decision: no ready Team state (${observation.kind})`);
+        const team = observation.team;
+        if (exec.agent.id !== team.controllerSessionId) throw new Error("cannot append a Driver decision: permission_denied (Driver/controller required)");
+        const current = documentReadForTeam(team);
+        if (current === undefined) throw new Error("cannot append a Driver decision: legacy_missing (run orchestra_reconcile first)");
+        let command;
+        try {
+          const existing = current.decisions.find((entry) => entry.decisionId === args.decisionId);
+          command = appendDriverDecision(current, team, {
+            decisionId: args.decisionId,
+            kind: args.kind,
+            summary: args.summary,
+            ...(args.rationale === undefined ? {} : { rationale: args.rationale }),
+            actorSessionId: exec.agent.id,
+            createdAt: args.createdAt ?? existing?.createdAt ?? Date.now(),
+            evidence: args.evidence,
+            affects: args.affects,
+          });
+        } catch (error) {
+          throw documentCommandError("append a Driver decision", error);
+        }
+        if (command.kind === "noop") {
+          const markdown = await inspectMarkdownProjection(ctx.fs, cwd, current, isRuntimeProjectionStale(current, team), exec.signal);
+          return documentToolStatus(team, current, markdown) as any;
+        }
+        const persisted = await persistDocumentTransition(ctx, activeTeamState, observation, command.document, exec);
+        return documentToolStatus(persisted.snapshot.team, persisted.document, persisted.markdown) as any;
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
       name: "orchestra_team",
       description:
         "Show the orchestra team state plus archive summaries: every role with its session id, live status, report count, last report path, and last activity; the team's mission, controller, and status; plus the current cwd's archive list (dismissed teams, newest first) for orchestra_activate selection. Requires a team created by orchestra_create in this working directory — returns {team: null, archives} when none is active.",
@@ -1451,6 +1821,18 @@ export function apply(ctx: Context): void {
                           path: { type: "string", required: true },
                           createdAt: { type: "number", required: true },
                         },
+                      },
+                    },
+                    document_status: { type: "string" },
+                    document_revision: { type: "number" },
+                    document_stale: { type: "boolean" },
+                    last_decision: {
+                      type: "object",
+                      additionalProperties: false,
+                      properties: {
+                        decision_id: { type: "string", required: true },
+                        kind: { type: "string", required: true },
+                        summary: { type: "string", required: true },
                       },
                     },
                   },
@@ -1519,6 +1901,8 @@ export function apply(ctx: Context): void {
         const archives = archiveListForTeamTool(archiveList);
         if (teamObservation.kind !== "ready") return { team: null, archives };
         const team = teamObservation.team;
+        const document = documentReadForTeam(team);
+        const documentSummaryValue = documentSummary(document, team);
         return {
           team: {
             team_id: team.teamId,
@@ -1530,6 +1914,18 @@ export function apply(ctx: Context): void {
             activated_from_archive_id: team.activatedFromArchiveId,
             roles: await Promise.all(team.roles.map((role) => roleStatus(ctx, role))),
             reports: team.reports,
+            document_status: documentSummaryValue.status,
+            document_revision: documentSummaryValue.revision,
+            document_stale: documentSummaryValue.stale,
+            ...(documentSummaryValue.lastDecision === undefined
+              ? {}
+              : {
+                  last_decision: {
+                    decision_id: documentSummaryValue.lastDecision.decisionId,
+                    kind: documentSummaryValue.lastDecision.kind,
+                    summary: documentSummaryValue.lastDecision.summary,
+                  },
+                }),
           },
           archives,
         };
@@ -2176,7 +2572,7 @@ export function apply(ctx: Context): void {
         "Lightweight mode: for one-off collaboration (check a session, ask a question, read history) use the A2A tools directly (a2a_list/a2a_send/a2a_reply/a2a_read/a2a_status) — no team needed. Governed role dispatch uses orchestra_send so replacement mappings remain current.\n" +
         "Stay in your role: you are the driver, not an implementer or a reviewer. Never fix, polish, or take over any role's work — implementation issues loop back to the implementer (via the implementer-reviewer flow), review findings go to the reviewer. Your job is decisions, dispatch, and coordination, not edits.\n" +
         "Deterministic routing (no mindless relaying): you are NOT an information hub. Messages inside a fixed flow go directly between roles — never through you. Example flow: implementer finishes and hands the result directly to reviewer; reviewer finds issues and sends them directly back to implementer for another round; reviewer's targeted re-check passes and THEN reviewer notifies you to advance. You only receive decision points: advances, blockers, new directions, cross-flow coordination. Do not forward what you do not need to know. Roles may call orchestra_team themselves to check team progress (team transparency).\n" +
-        "All created roles are told to reply to you (their driver) via a2a_reply, never directly to the user; users interact with roles only through you. Track progress with orchestra_team; recover after restart or after dismissal with orchestra_activate (archive_id required — list archives via orchestra_team); close the instance with orchestra_dismiss (archives the team, notifies roles, frees the cwd); list templates with orchestra_topologies.\n" +
+        "All created roles are told to reply to you (their driver) via a2a_reply, never directly to the user; users interact with roles only through you. Track progress with orchestra_team; inspect the canonical Living Orchestration Document with orchestra_document; at a Driver checkpoint use orchestra_reconcile for runtime projection and orchestra_decision for append-only decisions. Roles may read the document but only the Driver may mutate it. Recover after restart or after dismissal with orchestra_activate (archive_id required — list archives via orchestra_team); close the instance with orchestra_dismiss (archives the team, notifies roles, frees the cwd); list templates with orchestra_topologies.\n" +
         "Review flow: to task a reviewer, send via orchestra_send using teamId+roleId a review_request message stating scope, changed locations, and the goal; fix findings one by one; at most two rounds (R2 only re-checks R1 findings); stop after R2 regardless of outcome; new issues go to the backlog for the user to decide. Read handoff reports (paths returned by roles) under orchestra/reports/. All cross-role messages must be self-contained.\n" +
         "Delivery contract: a raw a2a_send/a2a_reply receipt state=accepted means the Transport accepted the message, not that it was claimed or answered; use a2a_status for proven lifecycle facts. orchestra_send adds the resolved teamId/roleId mapping but has the same accepted-only semantics.\n" +
         "Concurrency discipline (avoid information blocking): you are the bottleneck — every role report lands in your context. Minimize fan-in: ask roles to return concise summaries plus report paths, not full dumps; read report files only when needed. Do not over-orchestrate: if one session can do the job, do not spawn roles.",

@@ -431,12 +431,15 @@ test("actual orchestra_create preserves durable one-to-one mappings for a/b and 
   const observed = await runtime.store.read(cwd);
   assert.equal(observed.kind, "ready");
   assert.equal(observed.team.status, "active");
+  assert.equal(observed.team.document?.charterStatus, "draft_required");
+  assert.equal(observed.team.document?.documentRevision, 0);
   assert.deepEqual(observed.team.roles.map((role) => role.phase), ["active", "active"]);
   const mapping = new Map(observed.team.roles.map((role) => [role.id, role.sessionId]));
   assert.equal(mapping.size, 2);
   assert.notEqual(mapping.get("a/b"), mapping.get("a-b"));
   assert.deepEqual(result.roles.map((role) => [role.id, role.sessionId]), [...mapping.entries()]);
   const phaseVectors = runtime.fs.stateSnapshots.map((snapshot) => snapshot.roles.map((role) => role.phase));
+  assert.equal(runtime.fs.stateSnapshots[0].document?.charterStatus, "draft_required");
   assert.equal(phaseVectors[0].every((phase) => phase === "reserved"), true);
   assert.equal(phaseVectors.some((phases) => phases.includes("provisioning")), true);
   assert.equal(phaseVectors.at(-1).every((phase) => phase === "active"), true);

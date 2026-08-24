@@ -16,6 +16,8 @@ import type {
   FsWriteOutcome,
 } from "@deepseek-ai/dsh-fs";
 import type { SandboxExecutionPolicy } from "@deepseek-ai/dsh-sandbox";
+import type { OrchestrationDocument } from "./orchestration-document.js";
+import { readOrchestrationDocument } from "./orchestration-document.js";
 
 export type TeamRolePhase = "reserved" | "provisioning" | "active" | "failed";
 export type TeamStatus = "provisioning" | "active" | "degraded" | "blocked" | "failed";
@@ -90,6 +92,8 @@ export interface TeamState {
   };
   createdAt: number;
   activatedFromArchiveId: string | null;
+  /** Canonical Living Orchestration Document; absent only on legacy state until Driver initialization. */
+  document?: OrchestrationDocument;
   roles: TeamRole[];
   reports: { reportId: string; roleId: string; sessionId: string; path: string; createdAt: number }[];
 }
@@ -254,6 +258,7 @@ function compatibilityOf(record: Record<string, any>): ActiveTeamCompatibility {
   if (Array.isArray(record.roles) && record.roles.some((role: any) => role?.phase === undefined)) {
     migratedFields.push("roles.phase→active");
   }
+  if (record.document === undefined) migratedFields.push("document→legacy_missing");
   return {
     source: legacy ? "v1.0" : "v1.1",
     legacy,
@@ -370,6 +375,15 @@ function classifyRaw(raw: unknown, cwd: string):
       diagnostic: diagnostic("unrecoverable_identity", "active team state has no recoverable roles"),
     };
   }
+  const documentRead = readOrchestrationDocument(record.document, team.teamId);
+  if (documentRead.kind === "blocked") {
+    return {
+      kind: "blocked",
+      warnings,
+      diagnostic: diagnostic("invalid_shape", `active team document is blocked (${documentRead.diagnostic.code}): ${documentRead.diagnostic.message}`),
+    };
+  }
+  if (documentRead.kind === "ready") team.document = documentRead.document;
   return {
     kind: "ready",
     team,
@@ -444,6 +458,7 @@ export function normalizeTeam(raw: unknown, cwd: string, options: { allowDismiss
       typeof record.activatedFromArchiveId === "string" && record.activatedFromArchiveId !== ""
         ? record.activatedFromArchiveId
         : null,
+    ...(asRecord(record.document) ? { document: record.document as OrchestrationDocument } : {}),
     roles,
     reports: Array.isArray(record.reports) ? record.reports : [],
   };
