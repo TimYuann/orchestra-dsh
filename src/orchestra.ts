@@ -146,6 +146,58 @@ export function projectSlugFromCwd(cwd: string | undefined): string {
   return slug === "" ? "unknown" : slug;
 }
 
+/** Segment length caps for role session titles (user-approved three-part scheme). */
+export const ROLE_SESSION_TITLE_ROLE_MAX = 16;
+export const ROLE_SESSION_TITLE_MISSION_MAX = 14;
+export const ROLE_SESSION_TITLE_SLUG_MAX = 16;
+
+function truncateTitleSegment(value: string, max: number): string {
+  const chars = [...value];
+  if (chars.length <= max) return value;
+  return [...chars.slice(0, Math.max(0, max - 1)), "…"].join("");
+}
+
+/**
+ * Deterministic mission abbreviation for a role session title: first non-empty
+ * line of mission.objective, internal whitespace collapsed, capped at
+ * ROLE_SESSION_TITLE_MISSION_MAX chars (code points, so CJK counts per char);
+ * an ellipsis marks truncation. Missing/empty objective falls back to "mission".
+ */
+export function abbreviateMissionObjective(objective: string | undefined): string {
+  if (typeof objective !== "string" || objective.trim() === "") return "mission";
+  const firstLine = objective
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line !== "");
+  if (firstLine === undefined || firstLine === "") return "mission";
+  return truncateTitleSegment(firstLine.replace(/\s+/g, " ").trim(), ROLE_SESSION_TITLE_MISSION_MAX);
+}
+
+export interface RoleSessionTitleOptions {
+  roleId: string;
+  missionObjective?: string;
+  cwd?: string;
+}
+
+/**
+ * Deterministic three-part role session title: `<roleId> · <mission> · <cwd-slug>`.
+ *
+ * - roleId: role.id verbatim (case preserved), capped at ROLE_SESSION_TITLE_ROLE_MAX;
+ * - mission: abbreviateMissionObjective(missionObjective) (≤14 chars, "mission" fallback);
+ * - cwd: projectSlugFromCwd(cwd), capped at ROLE_SESSION_TITLE_SLUG_MAX;
+ *
+ * The title is a derived display value: it never enters the Frozen Charter and
+ * never mutates mission structure. The function is total and deterministic, so
+ * create/spawn/activate all produce the same title for the same (roleId,
+ * mission.objective, cwd) — activate derives from the archived team.mission.
+ */
+export function roleSessionTitle(options: RoleSessionTitleOptions): string {
+  const role = truncateTitleSegment(typeof options.roleId === "string" && options.roleId !== "" ? options.roleId : "role", ROLE_SESSION_TITLE_ROLE_MAX);
+  const mission = abbreviateMissionObjective(options.missionObjective);
+  const slug = truncateTitleSegment(projectSlugFromCwd(options.cwd), ROLE_SESSION_TITLE_SLUG_MAX);
+  return `${role} · ${mission} · ${slug}`;
+}
+
 /** Cordis plugin name used by loader diagnostics. */
 export const name = "orchestra-manager";
 
@@ -1235,7 +1287,7 @@ export async function createGovernedTeam(
         provider: args.provider,
         model: args.model,
         reasoningEffort: args.reasoningEffort,
-        title: `${projectSlugFromCwd(cwd)} · ${role.name} · ${topology.config.id}`,
+        title: roleSessionTitle({ roleId: role.id, missionObjective: frozen.mission.objective, cwd }),
         signal: exec.signal,
       }),
     );
@@ -1699,7 +1751,7 @@ export function apply(ctx: Context): void {
           provider: args.provider,
           model: args.model,
           reasoningEffort: args.reasoningEffort,
-          title: `${projectSlugFromCwd(cwd)} · ${roleName} · ${team.topologyRef.id}`,
+          title: roleSessionTitle({ roleId: roleConfig.id, missionObjective: team.mission.objective, cwd }),
           signal: exec.signal,
         });
         assertUniqueGovernedSessionIds([plan]);
@@ -3099,7 +3151,7 @@ export function apply(ctx: Context): void {
                   ? {}
                   : { provider: roleModel.provider, model: roleModel.model, reasoningEffort: roleModel.reasoningEffort }),
                 currentSessionId: exec.agent.id,
-                title: `${projectSlugFromCwd(cwd)} · ${role.name} · ${newTeam.topologyRef.id}`,
+                title: roleSessionTitle({ roleId: role.id, missionObjective: newTeam.mission.objective, cwd }),
                 signal: exec.signal,
               });
               if (role.sandbox === "read-only") {

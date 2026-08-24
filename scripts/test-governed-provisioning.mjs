@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createActiveTeamStateStore, normalizeTeam } from "../lib/orchestra-state.js";
 import { prepareGovernedBlueprint, readGovernedBlueprint } from "../lib/session-blueprint.js";
-import { assertUniqueGovernedSessionIds, createGovernedTeam, prepareGovernedRolePlan, provisionGovernedPlans } from "../lib/orchestra.js";
+import { assertUniqueGovernedSessionIds, createGovernedTeam, prepareGovernedRolePlan, provisionGovernedPlans, abbreviateMissionObjective, roleSessionTitle } from "../lib/orchestra.js";
 import { preflightGovernedRequiredTools } from "../lib/session-blueprint.js";
 import { prepareApprovalEvent, prepareDraftEvent, prepareFreezeEvent } from "../lib/orchestration-charter.js";
 
@@ -471,6 +471,58 @@ test("role ids that normalize alike receive independent reserved SessionIds", as
   }
   assert.notEqual(plans[0].sessionId, plans[1].sessionId);
   assert.doesNotThrow(() => assertUniqueGovernedSessionIds(plans));
+});
+
+test("roleSessionTitle is deterministic three-part roleId · mission · cwd with capped segments", () => {
+  // three-part structure, roleId first and case-preserved
+  assert.equal(roleSessionTitle({ roleId: "implementer", missionObjective: "修复登录失败的 bug", cwd: "/tmp/my-project" }), "implementer · 修复登录失败的 bug · my-project");
+  assert.equal(roleSessionTitle({ roleId: "Reviewer", missionObjective: "x", cwd: "/tmp/p" }), "Reviewer · x · p");
+  // mission truncation to ≤14 chars with deterministic ellipsis
+  const long = roleSessionTitle({ roleId: "reviewer", missionObjective: "ship the bounded change and verify it", cwd: "/tmp/p" });
+  assert.ok(long.startsWith("reviewer · ship the boun… · p"), long);
+  assert.equal([...long].length, "reviewer".length + 3 + 14 + 3 + 1);
+  // CJK counts per char
+  const cjk = roleSessionTitle({ roleId: "r", missionObjective: "一二三四五六七八九十一二三四五六七八九十", cwd: "/tmp/p" });
+  assert.equal([...cjk].length, 1 + 3 + 14 + 3 + 1);
+  assert.ok(cjk.split(" · ")[1].endsWith("…"));
+  // role segment capped at 16 chars
+  const longRole = roleSessionTitle({ roleId: "a-very-long-role-id-over-sixteen", missionObjective: "m", cwd: "/tmp/p" });
+  assert.equal([...longRole.split(" · ")[0]].length, 16);
+  // whitespace cleaning: first non-empty line, internal whitespace collapsed
+  assert.equal(roleSessionTitle({ roleId: "i", missionObjective: "  fix  the   crash \n and add tests", cwd: "/tmp/p" }), "i · fix the crash · p");
+  // empty objective falls back to "mission"
+  assert.equal(roleSessionTitle({ roleId: "i", missionObjective: undefined, cwd: "/tmp/p" }), "i · mission · p");
+  assert.equal(roleSessionTitle({ roleId: "i", missionObjective: "   \n  ", cwd: "/tmp/p" }), "i · mission · p");
+  assert.equal(abbreviateMissionObjective(""), "mission");
+  // determinism: same inputs -> identical output
+  const again = roleSessionTitle({ roleId: "implementer", missionObjective: "ship the bounded change and verify it", cwd: "/tmp/my-project" });
+  assert.equal(roleSessionTitle({ roleId: "implementer", missionObjective: "ship the bounded change and verify it", cwd: "/tmp/my-project" }), again);
+  // cwd slug capped at 16 chars
+  const longCwd = roleSessionTitle({ roleId: "r", missionObjective: "m", cwd: "/tmp/this-is-a-very-long-project-directory-name" });
+  assert.equal([...longCwd.split(" · ")[2]].length, 16);
+});
+
+test("create session titles follow the three-part roleId · mission · cwd scheme", async () => {
+  const runtime = makeRuntime();
+  const roles = [
+    { id: "investigator", name: "Investigator", preset: "preset-reviewer", sandbox: "read-only" },
+    { id: "implementer", name: "Implementer", preset: "preset-reviewer", sandbox: "workspace-write" },
+  ];
+  const catalog = topologyCatalog(roles);
+  const frozenRef = approvedFrozenRef(runtime, roles, "draft-title");
+  await createGovernedTeam(runtime.context, runtime.store, catalog, { frozenRef }, { agent: runtime.controller }, { createSession: runtime.createSessionAdapter });
+  const observed = await runtime.store.read(cwd);
+  assert.equal(observed.kind, "ready");
+  for (const role of observed.team.roles) {
+    const title = role.blueprint?.title;
+    assert.equal(typeof title, "string");
+    const parts = title.split(" · ");
+    assert.equal(parts.length, 3);
+    assert.equal(parts[0], role.id, "first segment is roleId");
+    assert.equal(parts[1], "integration", "mission abbreviation from the frozen objective");
+    assert.ok([...parts[2]].length <= 16);
+    assert.equal(title, roleSessionTitle({ roleId: role.id, missionObjective: "integration", cwd }));
+  }
 });
 
 test("actual orchestra_create preserves durable one-to-one mappings for a/b and a-b through every phase", async () => {
