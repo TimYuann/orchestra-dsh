@@ -11,6 +11,8 @@ import type { FsInfo, FsTarget, FsWriteIntent, FsWriteOutcome } from "@deepseek-
 import type { SandboxExecutionPolicy } from "@deepseek-ai/dsh-sandbox";
 import { validateFrozenCharterRevision, validateFrozenCharterRevisions } from "./orchestration-charter.js";
 import type { FrozenCharterRevision } from "./orchestration-charter.js";
+import { graphSummary } from "./orchestra-graph.js";
+import type { GraphProjectionSummary } from "./orchestra-graph.js";
 import type { TeamState } from "./orchestra-state.js";
 
 export const ORCHESTRATION_DOCUMENT_SCHEMA_VERSION = 1;
@@ -50,6 +52,7 @@ export interface RuntimeProjection {
   reports: TeamState["reports"];
   activatedFromArchiveId: string | null;
   projectionAt: number;
+  graph?: GraphProjectionSummary;
 }
 
 export interface DriverDecision {
@@ -151,7 +154,8 @@ function projection(value: unknown): value is RuntimeProjection {
   if (!record(value.mission) || !Array.isArray(value.roles) || !Array.isArray(value.reports) || !finiteNumber(value.projectionAt)) return false;
   if (typeof value.mission.objective !== "string" || !stringArray(value.mission.scope) || !stringArray(value.mission.constraints) || !stringArray(value.mission.acceptanceCriteria) || !stringArray(value.mission.nonGoals) || typeof value.mission.context !== "string") return false;
   if (!value.roles.every((role: unknown) => record(role) && nonEmpty(role.id) && nonEmpty(role.sessionId) && ["reserved", "provisioning", "active", "failed"].includes(role.phase) && finiteNumber(role.reportCount) && (role.lastReport === null || typeof role.lastReport === "string"))) return false;
-  return value.reports.every((report: unknown) => record(report) && nonEmpty(report.reportId) && nonEmpty(report.roleId) && nonEmpty(report.sessionId) && nonEmpty(report.path) && finiteNumber(report.createdAt));
+  if (!value.reports.every((report: unknown) => record(report) && nonEmpty(report.reportId) && nonEmpty(report.roleId) && nonEmpty(report.sessionId) && nonEmpty(report.path) && finiteNumber(report.createdAt))) return false;
+  return value.graph === undefined || graphProjection(value.graph);
 }
 
 function decision(value: unknown): value is DriverDecision {
@@ -159,6 +163,10 @@ function decision(value: unknown): value is DriverDecision {
   if (!value.evidence.every(evidence)) return false;
   if (value.rationale !== undefined && typeof value.rationale !== "string") return false;
   return value.affects === undefined || stringArray(value.affects);
+}
+
+function graphProjection(value: unknown): value is GraphProjectionSummary {
+  return record(value) && ["idle", "running", "passed", "blocked", "cap_exhausted", "stale", "legacy_missing"].includes(value.status) && Array.isArray(value.pendingHandoffs) && Array.isArray(value.capExhausted) && value.capExhausted.every((entry: unknown) => typeof entry === "string") && typeof value.stale === "boolean" && (value.runtimeRevision === undefined || finiteSafe(value.runtimeRevision));
 }
 
 export function readOrchestrationDocument(raw: unknown, teamId?: string): DocumentRead {
@@ -184,6 +192,10 @@ export function readOrchestrationDocument(raw: unknown, teamId?: string): Docume
 }
 
 export function runtimeProjectionFromTeam(team: TeamState, projectionAt: number): RuntimeProjection {
+  const currentCharter = team.document?.currentCharterRevision === null || team.document?.currentCharterRevision === undefined
+    ? undefined
+    : team.document.charterRevisions.find((revision) => revision.charterRevision === team.document?.currentCharterRevision);
+  const graphStale = team.graphRuntime !== undefined && (currentCharter === undefined || team.graphRuntime.charterRevision !== currentCharter.charterRevision || team.graphRuntime.charterDigest !== currentCharter.digest);
   return {
     teamId: team.teamId,
     status: team.status,
@@ -194,6 +206,7 @@ export function runtimeProjectionFromTeam(team: TeamState, projectionAt: number)
     reports: clone(team.reports),
     activatedFromArchiveId: team.activatedFromArchiveId,
     projectionAt,
+    ...(team.graphRuntime === undefined ? {} : { graph: graphSummary(team.graphRuntime, graphStale) }),
   };
 }
 
@@ -232,6 +245,7 @@ export function initializeFrozenOrchestrationDocument(team: TeamState, frozen: F
   document.charterStatus = "frozen";
   document.currentCharterRevision = frozen.charterRevision;
   document.charterRevisions = [clone(frozen)];
+  document.runtimeProjection = runtimeProjectionFromTeam({ ...team, document }, now);
   return document;
 }
 
@@ -374,6 +388,9 @@ export function renderOrchestrationMarkdown(document: OrchestrationDocument, sta
     `- Topology: ${markdownLine(projection.topologyRef.id)} (${markdownLine(projection.topologyRef.source)})`,
     `- Mission: ${markdownLine(projection.mission.objective)}`,
     `- Projection at: ${projection.projectionAt}`,
+    ...(projection.graph === undefined
+      ? ["- Graph runtime: legacy_missing"]
+      : [`- Graph runtime: ${projection.graph.status} (runtime revision ${projection.graph.runtimeRevision ?? "unknown"})`, `- Graph pending handoffs: ${projection.graph.pendingHandoffs.length}`, `- Graph cap exhausted: ${projection.graph.capExhausted.length === 0 ? "none" : projection.graph.capExhausted.join(", ")}`]),
     "",
     "### Roles",
     ...projection.roles.map((role) => `- ${markdownLine(role.id)} → ${markdownLine(role.sessionId)} · ${markdownLine(role.phase)} · reports=${role.reportCount} · last=${markdownLine(role.lastReport ?? "none")}`),

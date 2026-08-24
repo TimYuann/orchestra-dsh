@@ -31,8 +31,8 @@ import type {} from "@deepseek-ai/cordis-plugin-timer";
 import { randomUUID } from "node:crypto";
 import { prepareLightweightBlueprint } from "./session-blueprint.js";
 import type { GovernedBlueprintReceipt, PreparedGovernedBlueprint, LightweightBlueprintReceipt } from "./session-blueprint.js";
-import { deliverMessage, queryMessageStatus } from "./a2a-transport.js";
-export { deliverMessage, queryMessageStatus } from "./a2a-transport.js";
+import { deliverMessage, queryMessageStatus, readDeliveryReceipt } from "./a2a-transport.js";
+export { deliverMessage, queryMessageStatus, readDeliveryReceipt } from "./a2a-transport.js";
 export type { DeliverResult, MessageLifecycleState, MessageStatusResult } from "./a2a-transport.js";
 import "./relay-types.js";
 

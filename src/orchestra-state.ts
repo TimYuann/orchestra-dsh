@@ -18,6 +18,8 @@ import type {
 import type { SandboxExecutionPolicy } from "@deepseek-ai/dsh-sandbox";
 import type { OrchestrationDocument } from "./orchestration-document.js";
 import { readOrchestrationDocument } from "./orchestration-document.js";
+import type { GraphRuntimeState } from "./orchestra-graph.js";
+import { readGraphRuntime } from "./orchestra-graph.js";
 
 export type TeamRolePhase = "reserved" | "provisioning" | "active" | "failed";
 export type TeamStatus = "provisioning" | "active" | "degraded" | "blocked" | "failed";
@@ -94,6 +96,8 @@ export interface TeamState {
   activatedFromArchiveId: string | null;
   /** Canonical Living Orchestration Document; absent only on legacy state until Driver initialization. */
   document?: OrchestrationDocument;
+  /** Append-only execution DAG; absent only on legacy/draft state until Graph initialization. */
+  graphRuntime?: GraphRuntimeState;
   roles: TeamRole[];
   reports: { reportId: string; roleId: string; sessionId: string; path: string; createdAt: number }[];
 }
@@ -259,6 +263,7 @@ function compatibilityOf(record: Record<string, any>): ActiveTeamCompatibility {
     migratedFields.push("roles.phase→active");
   }
   if (record.document === undefined) migratedFields.push("document→legacy_missing");
+  if (record.graphRuntime === undefined) migratedFields.push("graphRuntime→legacy_missing");
   return {
     source: legacy ? "v1.0" : "v1.1",
     legacy,
@@ -384,6 +389,17 @@ function classifyRaw(raw: unknown, cwd: string):
     };
   }
   if (documentRead.kind === "ready") team.document = documentRead.document;
+  const currentCharter = team.document?.currentCharterRevision === null || team.document?.currentCharterRevision === undefined
+    ? undefined
+    : team.document.charterRevisions.find((revision) => revision.charterRevision === team.document?.currentCharterRevision);
+  const graphRead = readGraphRuntime(record.graphRuntime, team.teamId, currentCharter?.charterRevision, currentCharter?.digest);
+  if (graphRead.kind === "blocked") {
+    return { kind: "blocked", warnings, diagnostic: diagnostic("invalid_shape", `active team graph runtime is blocked (${graphRead.diagnostic.code}): ${graphRead.diagnostic.message}`) };
+  }
+  if (graphRead.kind === "ready" || graphRead.kind === "stale") {
+    team.graphRuntime = graphRead.runtime;
+    if (graphRead.kind === "stale") warnings.push(...graphRead.warnings);
+  }
   return {
     kind: "ready",
     team,
@@ -459,6 +475,7 @@ export function normalizeTeam(raw: unknown, cwd: string, options: { allowDismiss
         ? record.activatedFromArchiveId
         : null,
     ...(asRecord(record.document) ? { document: record.document as OrchestrationDocument } : {}),
+    ...(asRecord(record.graphRuntime) ? { graphRuntime: record.graphRuntime as GraphRuntimeState } : {}),
     roles,
     reports: Array.isArray(record.reports) ? record.reports : [],
   };

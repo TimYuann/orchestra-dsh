@@ -317,6 +317,13 @@ export async function deliverMessage(
   }
 }
 
+/** Read an existing idempotent receipt without enqueueing or resending anything. */
+export async function readDeliveryReceipt(ctx: Context, targetSessionId: string, idempotencyKey: string): Promise<DeliverResult | undefined> {
+  const key = keyOf({ idempotencyKey });
+  if (key === undefined) return undefined;
+  return existingReceipt(ctx, targetSessionId, key);
+}
+
 function idOf(value: unknown): string | undefined {
   return typeof value === "object" && value !== null && typeof (value as { id?: unknown }).id === "string" ? (value as { id: string }).id : undefined;
 }

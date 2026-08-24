@@ -25,7 +25,7 @@ import type {} from "@deepseek-ai/dsh-sandbox-policy";
 import type {} from "@deepseek-ai/dsh-permission-presets";
 import type {} from "@deepseek-ai/dsh-system-prompt";
 import type {} from "@deepseek-ai/dsh-commands";
-import { createSession, installModelOverride, deliverMessage } from "./a2a.js";
+import { createSession, installModelOverride, deliverMessage, readDeliveryReceipt } from "./a2a.js";
 import type { ResolvedPresetFile } from "./a2a.js";
 import { prepareGovernedBlueprint, preflightGovernedRequiredTools } from "./session-blueprint.js";
 import type { GovernedBlueprintReceipt, PreparedGovernedBlueprint } from "./session-blueprint.js";
@@ -61,7 +61,7 @@ import {
   reconcileOrchestrationDocument,
   writeMarkdownProjection,
 } from "./orchestration-document.js";
-import type { DecisionInput, OrchestrationDocument } from "./orchestration-document.js";
+import type { DecisionInput, EvidenceRef, OrchestrationDocument } from "./orchestration-document.js";
 import {
   CharterError,
   charterSummary,
@@ -81,6 +81,20 @@ import type {
   FrozenCharterRevision,
   HumanParticipationPolicy,
 } from "./orchestration-charter.js";
+import {
+  appendHandoffPending,
+  appendHandoffResult,
+  graphHandoffs,
+  graphLoops,
+  graphSummary,
+  GraphRuntimeError,
+  initializeGraphRuntime,
+  readGraphRuntime,
+  recordVerdict,
+  startAttempt,
+  startLoop,
+} from "./orchestra-graph.js";
+import type { GraphRuntimeState } from "./orchestra-graph.js";
 import { createTopologyCatalog } from "./orchestra-topology.js";
 import type { RoleConfig, TopologyCatalog, TopologyList, TopologyProtocol, TopologyResolution, TopologyRoleSummary } from "./orchestra-topology.js";
 export { validateTopology } from "./orchestra-topology.js";
@@ -1047,6 +1061,49 @@ function charterListOutput(events: readonly unknown[], draftId?: string) {
   return { status: "ready", drafts, approvals, freezes };
 }
 
+function currentFrozenCharter(team: TeamState): FrozenCharterRevision {
+  const document = documentReadForTeam(team);
+  if (document === undefined || document.currentCharterRevision === null) throw new Error("Team has no frozen charter revision");
+  const frozen = document.charterRevisions.find((revision) => revision.charterRevision === document.currentCharterRevision);
+  if (frozen === undefined) throw new Error("Team current charter revision is missing");
+  return frozen;
+}
+
+function currentGraphRuntime(team: TeamState): { runtime: GraphRuntimeState; stale: boolean } {
+  const frozen = currentFrozenCharter(team);
+  if (team.graphRuntime === undefined) throw new Error("legacy_missing: Team has no graph runtime; run orchestra_graph_reconcile first");
+  const read = readGraphRuntime(team.graphRuntime, team.teamId, frozen.charterRevision, frozen.digest);
+  if (read.kind === "blocked") throw new Error(`graph runtime is blocked (${read.diagnostic.code}): ${read.diagnostic.message}`);
+  if (read.kind === "legacy_missing") throw new Error("legacy_missing: Team has no graph runtime; run orchestra_graph_reconcile first");
+  return { runtime: read.runtime, stale: read.kind === "stale" };
+}
+
+async function persistGraphTransition(ctx: Context, activeTeamState: ActiveTeamStateStore, snapshot: ActiveTeamReady, runtime: GraphRuntimeState, exec: ToolExecutionInput): Promise<ActiveTeamReady> {
+  const written = await activeTeamState.replace(snapshot, { ...snapshot.team, graphRuntime: runtime }, { policy: escrowPolicy(ctx, exec), signal: exec.signal });
+  return readySnapshotAfterWrite(activeTeamState, snapshot.cwd, written, exec.signal);
+}
+
+function graphToolOutput(team: TeamState, runtime: GraphRuntimeState, stale = false) {
+  const summary = graphSummary(runtime, stale);
+  return {
+    status: summary.status,
+    team_id: team.teamId,
+    charter_revision: runtime.charterRevision,
+    charter_digest: runtime.charterDigest,
+    runtime_revision: runtime.runtimeRevision,
+    stale: summary.stale,
+    current_loop: summary.currentLoop,
+    loops: graphLoops(runtime),
+    pending_handoffs: summary.pendingHandoffs,
+    cap_exhausted: summary.capExhausted,
+  };
+}
+
+function graphCommandError(action: string, error: unknown): Error {
+  if (error instanceof GraphRuntimeError) return new Error(`cannot ${action}: ${error.code}: ${error.message}`);
+  return new Error(`cannot ${action}: ${error instanceof Error ? error.message : String(error)}`);
+}
+
 interface GovernedProvisionResult {
   team: TeamState;
   snapshot: ActiveTeamReady;
@@ -1256,6 +1313,7 @@ export async function createGovernedTeam(
     roles: plans.map(reservedRole),
     reports: [],
   };
+  team.graphRuntime = initializeGraphRuntime(teamId, frozen.charterRevision, frozen.digest, team.createdAt);
   team.document = initializeFrozenOrchestrationDocument(team, frozen, team.createdAt);
   const reservation = await activeTeamState.create(cwd, team, {
     policy: escrowPolicy(ctx, exec),
@@ -1374,6 +1432,10 @@ function textOf(message: { content?: unknown } | undefined | null): string {
   return parts.join("\n");
 }
 
+function jsonRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 const SECTION_NAME = "tool:orchestra";
 const SECTION_ORDER = 119;
 
@@ -1406,6 +1468,23 @@ export function apply(ctx: Context): void {
       },
       lastActivityAt: { type: "number" },
       lastActivity: { type: "string" },
+    },
+  } as const;
+
+  const graphOutputSchema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      status: { type: "string", required: true },
+      team_id: { type: "string", required: true },
+      charter_revision: { type: "number", required: true },
+      charter_digest: { type: "string", required: true },
+      runtime_revision: { type: "number", required: true },
+      stale: { type: "boolean", required: true },
+      current_loop: { type: "object", additionalProperties: true },
+      loops: { type: "array", items: { type: "json" }, required: true },
+      pending_handoffs: { type: "array", items: { type: "json" }, required: true },
+      cap_exhausted: { type: "array", items: { type: "string" }, required: true },
     },
   } as const;
 
@@ -2100,6 +2179,7 @@ export function apply(ctx: Context): void {
                     reports: { type: "array", required: true },
                     activatedFromArchiveId: { oneOf: [{ type: "string" }, { type: "null" }], required: true },
                     projectionAt: { type: "number", required: true },
+                    graph: { type: "object", additionalProperties: true },
                   },
                 },
                 { type: "null" },
@@ -2344,6 +2424,315 @@ export function apply(ctx: Context): void {
 
   ctx.tools.register(
     defineTool({
+      name: "orchestra_graph",
+      description: "Read the current Frozen-Charter-bound execution DAG summary: bounded Loops/attempts, pending typed handoffs, cap exhaustion, runtime revision, and stale status. It never dumps or mutates the event log.",
+      parameters: {},
+      output: {
+        schema: graphOutputSchema,
+        render: (_args, value) => [{ type: "text", text: `graph ${value.team_id}: ${value.status}, runtime revision ${value.runtime_revision}, pending handoffs=${value.pending_handoffs.length}, cap exhausted=${value.cap_exhausted.length}` }],
+      },
+      async execute(_args, exec: ToolExecutionInput) {
+        if (exec.agent === undefined) throw new Error("orchestra_graph requires an agent caller");
+        const cwd = exec.agent.session.header.cwd;
+        if (cwd === undefined) throw new Error("current session has no working directory");
+        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("read the graph runtime", observation);
+        if (observation.kind !== "ready") throw new Error(`cannot read the graph runtime: ${observation.kind}`);
+        const { runtime, stale } = currentGraphRuntime(observation.team);
+        return graphToolOutput(observation.team, runtime, stale) as any;
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
+      name: "orchestra_loop_start",
+      description: "Driver-only start of a Loop declared by the current Frozen Charter. The loop contract, evaluator, participants, exits, hard cap, and required evidence are resolved from the frozen snapshot.",
+      parameters: {
+        loopId: { type: "string", required: true },
+        loopInstanceId: { type: "string" },
+        evidence: { type: "array", items: { type: "json" } },
+      },
+      output: {
+        schema: graphOutputSchema,
+        render: (_args, value) => [{ type: "text", text: `loop start ${value.team_id}: ${value.status}, runtime revision ${value.runtime_revision}` }],
+      },
+      async execute(args: { loopId: string; loopInstanceId?: string; evidence?: unknown[] }, exec: ToolExecutionInput) {
+        if (exec.agent === undefined) throw new Error("orchestra_loop_start requires an agent caller");
+        const cwd = exec.agent.session.header.cwd;
+        if (cwd === undefined) throw new Error("current session has no working directory");
+        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("start a Loop", observation);
+        if (observation.kind !== "ready") throw new Error(`cannot start a Loop: no ready Team (${observation.kind})`);
+        const team = observation.team;
+        const { runtime, stale } = currentGraphRuntime(team);
+        if (stale) throw new Error("cannot start a Loop: stale_charter (reconcile or create a new runtime branch after amendment)");
+        const frozen = currentFrozenCharter(team);
+        const contract = frozen.topology.config.protocol?.loops?.find((loop) => loop.loopId === args.loopId);
+        if (contract === undefined) throw new Error(`cannot start a Loop: loop ${args.loopId} is not declared by Frozen Charter ${frozen.frozenRef}`);
+        let command;
+        try {
+          command = startLoop(runtime, team, contract, { actorSessionId: exec.agent.id, loopInstanceId: args.loopInstanceId, now: Date.now(), evidence: args.evidence as EvidenceRef[] | undefined });
+        } catch (error) {
+          throw graphCommandError("start a Loop", error);
+        }
+        const snapshot = command.kind === "noop" ? observation : await persistGraphTransition(ctx, activeTeamState, observation, command.runtime, exec);
+        return graphToolOutput(snapshot.team, command.runtime, false) as any;
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
+      name: "orchestra_attempt_start",
+      description: "Start the next continuous attempt of a declared bounded Loop. Attempt number is derived from immutable graph history; a participant or Driver may start it, but cap/passed/blocked Loops cannot retry.",
+      parameters: {
+        loopInstanceId: { type: "string", required: true },
+        participantRoleId: { type: "string", required: true },
+        candidate: { type: "json" },
+        evidence: { type: "array", items: { type: "json" } },
+      },
+      output: {
+        schema: graphOutputSchema,
+        render: (_args, value) => [{ type: "text", text: `attempt start ${value.team_id}: ${value.status}, runtime revision ${value.runtime_revision}` }],
+      },
+      async execute(args: { loopInstanceId: string; participantRoleId: string; candidate?: unknown; evidence?: unknown[] }, exec: ToolExecutionInput) {
+        if (exec.agent === undefined) throw new Error("orchestra_attempt_start requires an agent caller");
+        const cwd = exec.agent.session.header.cwd;
+        if (cwd === undefined) throw new Error("current session has no working directory");
+        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("start a Loop attempt", observation);
+        if (observation.kind !== "ready") throw new Error(`cannot start a Loop attempt: no ready Team (${observation.kind})`);
+        const team = observation.team;
+        const { runtime, stale } = currentGraphRuntime(team);
+        if (stale) throw new Error("cannot start a Loop attempt: stale_charter");
+        const loop = graphLoops(runtime).find((entry) => entry.loopInstanceId === args.loopInstanceId);
+        if (loop === undefined) throw new Error(`cannot start a Loop attempt: Loop ${args.loopInstanceId} was not found`);
+        const frozen = currentFrozenCharter(team);
+        const contract = frozen.topology.config.protocol?.loops?.find((entry) => entry.loopId === loop.loopId);
+        if (contract === undefined) throw new Error(`cannot start a Loop attempt: contract ${loop.loopId} is missing from the current Frozen Charter`);
+        let command;
+        try {
+          command = startAttempt(runtime, team, contract, { loopInstanceId: args.loopInstanceId, actorSessionId: exec.agent.id, participantRoleId: args.participantRoleId, candidate: args.candidate as Record<string, unknown> | undefined, now: Date.now(), evidence: args.evidence as EvidenceRef[] | undefined });
+        } catch (error) {
+          throw graphCommandError("start a Loop attempt", error);
+        }
+        const snapshot = command.kind === "noop" ? observation : await persistGraphTransition(ctx, activeTeamState, observation, command.runtime, exec);
+        return graphToolOutput(snapshot.team, command.runtime, false) as any;
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
+      name: "orchestra_verdict",
+      description: "Record PASS/FAIL/BLOCKED only from the declared evaluator's current active Session. PASS closes the Loop; FAIL below cap permits a later attempt; FAIL at cap emits cap_exhausted; BLOCKED does not silently retry.",
+      parameters: {
+        loopInstanceId: { type: "string", required: true },
+        verdict: { type: "string", enum: ["PASS", "FAIL", "BLOCKED"], required: true },
+        findings: { type: "array", items: { type: "string" } },
+        evidence: { type: "array", items: { type: "json" } },
+      },
+      output: {
+        schema: graphOutputSchema,
+        render: (_args, value) => [{ type: "text", text: `verdict ${value.team_id}: ${value.status}, runtime revision ${value.runtime_revision}` }],
+      },
+      async execute(args: { loopInstanceId: string; verdict: "PASS" | "FAIL" | "BLOCKED"; findings?: string[]; evidence?: unknown[] }, exec: ToolExecutionInput) {
+        if (exec.agent === undefined) throw new Error("orchestra_verdict requires an agent caller");
+        const cwd = exec.agent.session.header.cwd;
+        if (cwd === undefined) throw new Error("current session has no working directory");
+        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("record a Loop verdict", observation);
+        if (observation.kind !== "ready") throw new Error(`cannot record a Loop verdict: no ready Team (${observation.kind})`);
+        const team = observation.team;
+        const { runtime, stale } = currentGraphRuntime(team);
+        if (stale) throw new Error("cannot record a Loop verdict: stale_charter");
+        const loop = graphLoops(runtime).find((entry) => entry.loopInstanceId === args.loopInstanceId);
+        if (loop === undefined) throw new Error(`cannot record a Loop verdict: Loop ${args.loopInstanceId} was not found`);
+        const frozen = currentFrozenCharter(team);
+        const contract = frozen.topology.config.protocol?.loops?.find((entry) => entry.loopId === loop.loopId);
+        if (contract === undefined) throw new Error(`cannot record a Loop verdict: contract ${loop.loopId} is missing from the current Frozen Charter`);
+        let command;
+        try {
+          command = recordVerdict(runtime, team, contract, { loopInstanceId: args.loopInstanceId, actorSessionId: exec.agent.id, evaluatorRole: contract.evaluatorRole, verdict: args.verdict, findings: args.findings, now: Date.now(), evidence: args.evidence as EvidenceRef[] | undefined });
+        } catch (error) {
+          throw graphCommandError("record a Loop verdict", error);
+        }
+        const snapshot = command.kind === "noop" ? observation : await persistGraphTransition(ctx, activeTeamState, observation, command.runtime, exec);
+        return graphToolOutput(snapshot.team, command.runtime, false) as any;
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
+      name: "orchestra_graph_reconcile",
+      description: "Driver-only graph checkpoint. Initializes a missing graph runtime for a Frozen Team; an existing runtime bound to an older charter is reported stale and is never silently migrated.",
+      parameters: {},
+      output: {
+        schema: graphOutputSchema,
+        render: (_args, value) => [{ type: "text", text: `graph reconcile ${value.team_id}: ${value.status}, runtime revision ${value.runtime_revision}` }],
+      },
+      async execute(_args, exec: ToolExecutionInput) {
+        if (exec.agent === undefined) throw new Error("orchestra_graph_reconcile requires an agent caller");
+        const cwd = exec.agent.session.header.cwd;
+        if (cwd === undefined) throw new Error("current session has no working directory");
+        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("reconcile the graph runtime", observation);
+        if (observation.kind !== "ready") throw new Error(`cannot reconcile the graph runtime: no ready Team (${observation.kind})`);
+        const team = observation.team;
+        if (exec.agent.id !== team.controllerSessionId) throw new Error("cannot reconcile the graph runtime: permission_denied (Driver/controller required)");
+        const frozen = currentFrozenCharter(team);
+        if (team.graphRuntime === undefined) {
+          const runtime = initializeGraphRuntime(team.teamId, frozen.charterRevision, frozen.digest, Date.now());
+          const snapshot = await persistGraphTransition(ctx, activeTeamState, observation, runtime, exec);
+          return graphToolOutput(snapshot.team, runtime, false) as any;
+        }
+        const read = readGraphRuntime(team.graphRuntime, team.teamId, frozen.charterRevision, frozen.digest);
+        if (read.kind === "blocked") throw new Error(`cannot reconcile the graph runtime: ${read.diagnostic.code}: ${read.diagnostic.message}`);
+        if (read.kind === "stale") throw new Error("cannot reconcile the graph runtime: stale_charter (start a new runtime branch in a later checkpoint)");
+        if (read.kind === "legacy_missing") throw new Error("cannot reconcile the graph runtime: legacy_missing");
+        let runtime = read.runtime;
+        let snapshot = observation;
+        for (const pending of graphHandoffs(runtime).filter((handoff) => handoff.status === "pending")) {
+          if (pending.targetSessionId === undefined) continue;
+          const receipt = await readDeliveryReceipt(ctx, pending.targetSessionId, pending.handoffId);
+          if (receipt === undefined) continue;
+          const accepted = appendHandoffResult(runtime, snapshot.team, { handoffId: pending.handoffId, actorSessionId: exec.agent.id, accepted: true, receipt: receipt as unknown as Record<string, unknown>, now: Date.now() });
+          if (accepted.kind === "noop") continue;
+          try {
+            snapshot = await persistGraphTransition(ctx, activeTeamState, snapshot, accepted.runtime, exec);
+            runtime = accepted.runtime;
+          } catch (error) {
+            throw graphCommandError("reconcile an accepted typed handoff", error);
+          }
+        }
+        return graphToolOutput(snapshot.team, runtime, false) as any;
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
+      name: "orchestra_handoff",
+      description: "Send a route-aware typed milestone through the same A2A Transport while recording a CAS-guarded Graph pending/accepted/failed transaction. Ordinary a2a_send/orchestra_send remain untyped and unaffected. Reusing handoffId never enqueues a duplicate.",
+      parameters: {
+        handoffId: { type: "string", required: true, description: "Stable idempotency key for this typed handoff." },
+        kind: { type: "string", required: true },
+        fromRole: { type: "string", required: true },
+        toRole: { type: "string", required: true },
+        loopInstanceId: { type: "string" },
+        attempt: { type: "number" },
+        summary: { type: "string", required: true },
+        payload: { type: "json" },
+        evidence: { type: "array", items: { type: "json" } },
+        wake: { type: "boolean" },
+        interrupt: { type: "boolean" },
+      },
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            status: { type: "string", required: true },
+            handoff_id: { type: "string", required: true },
+            team_id: { type: "string", required: true },
+            from_role: { type: "string", required: true },
+            to_role: { type: "string", required: true },
+            resolved_session_id: { type: "string", required: true },
+            runtime_revision: { type: "number", required: true },
+            receipt: { type: "json" },
+            error: { type: "string" },
+            reconcile_required: { type: "boolean" },
+          },
+        },
+        render: (_args, value) => [{ type: "text", text: `handoff ${value.handoff_id} ${value.status}: ${value.from_role} → ${value.to_role}${value.reconcile_required ? " (reconcile required)" : ""}` }],
+      },
+      async execute(args: { handoffId: string; kind: string; fromRole: string; toRole: string; loopInstanceId?: string; attempt?: number; summary: string; payload?: unknown; evidence?: unknown[]; wake?: boolean; interrupt?: boolean }, exec: ToolExecutionInput): Promise<any> {
+        if (exec.agent === undefined) throw new Error("orchestra_handoff requires an agent caller");
+        const cwd = exec.agent.session.header.cwd;
+        if (cwd === undefined) throw new Error("current session has no working directory");
+        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("send a typed handoff", observation);
+        if (observation.kind !== "ready") throw new Error(`cannot send a typed handoff: no ready Team (${observation.kind})`);
+        if (observation.team.status !== "active" && observation.team.status !== "degraded") throw new Error(`cannot send a typed handoff while Team status is ${observation.team.status}`);
+        const team = observation.team;
+        const { runtime, stale } = currentGraphRuntime(team);
+        if (stale) throw new Error("cannot send a typed handoff: stale_charter (runtime is bound to an older Frozen Charter)");
+        const frozen = currentFrozenCharter(team);
+        const contract = frozen.topology.config.protocol?.handoffs?.find((entry) => entry.kind === args.kind);
+        if (contract === undefined) throw new Error(`cannot send a typed handoff: route ${args.kind} is not declared by Frozen Charter ${frozen.frozenRef}`);
+        const payload = jsonRecord(args.payload) ? { ...args.payload, summary: args.summary } : { summary: args.summary };
+        let pendingCommand;
+        try {
+          pendingCommand = appendHandoffPending(runtime, team, contract, {
+            handoffId: args.handoffId,
+            kind: args.kind,
+            fromRole: args.fromRole,
+            toRole: args.toRole,
+            loopInstanceId: args.loopInstanceId,
+            attempt: args.attempt,
+            summary: args.summary,
+            payload,
+            actorSessionId: exec.agent.id,
+            now: Date.now(),
+            evidence: args.evidence as EvidenceRef[] | undefined,
+          });
+        } catch (error) {
+          throw graphCommandError("prepare a typed handoff", error);
+        }
+        let pendingSnapshot = observation;
+        let pendingRuntime = runtime;
+        const existing = graphHandoffs(runtime).find((handoff) => handoff.handoffId === args.handoffId);
+        if (pendingCommand.kind === "changed") {
+          pendingRuntime = pendingCommand.runtime;
+          try {
+            pendingSnapshot = await persistGraphTransition(ctx, activeTeamState, observation, pendingRuntime, exec);
+          } catch (error) {
+            throw graphCommandError("reserve a typed handoff", error);
+          }
+        } else if (existing?.status === "accepted" || existing?.status === "failed") {
+          return {
+            status: existing.status,
+            handoff_id: existing.handoffId,
+            team_id: team.teamId,
+            from_role: existing.fromRole,
+            to_role: existing.toRole,
+            resolved_session_id: team.roles.find((role) => role.id.toLowerCase() === existing.toRole.toLowerCase())?.sessionId ?? "",
+            runtime_revision: runtime.runtimeRevision,
+            ...(existing.receipt === undefined ? {} : { receipt: existing.receipt }),
+            ...(existing.error === undefined ? {} : { error: existing.error }),
+          };
+        }
+        const pendingFact = graphHandoffs(pendingRuntime).find((handoff) => handoff.handoffId === args.handoffId);
+        if (pendingFact === undefined) throw new Error("typed handoff pending fact could not be reconstructed");
+        const targetSessionId = team.roles.find((role) => role.id.toLowerCase() === pendingFact.toRole.toLowerCase())?.sessionId;
+        if (targetSessionId === undefined) throw new Error(`typed handoff target role ${pendingFact.toRole} has no current Session mapping`);
+        let receipt: Record<string, unknown>;
+        try {
+          receipt = await deliverMessage(ctx, exec.agent.id, targetSessionId, [{ type: "text", text: JSON.stringify({ type: "orchestra_handoff", handoff_id: args.handoffId, kind: args.kind, summary: args.summary, payload, evidence: args.evidence ?? [] }) }], { wake: args.wake, interrupt: args.interrupt, idempotencyKey: args.handoffId }) as any;
+        } catch (error) {
+          try {
+            const failed = appendHandoffResult(pendingRuntime, pendingSnapshot.team, { handoffId: args.handoffId, actorSessionId: exec.agent.id, accepted: false, error: error instanceof Error ? error.message : String(error), now: Date.now() });
+            const failedSnapshot = await persistGraphTransition(ctx, activeTeamState, pendingSnapshot, failed.runtime, exec);
+            return { status: "failed", handoff_id: args.handoffId, team_id: team.teamId, from_role: pendingFact.fromRole, to_role: pendingFact.toRole, resolved_session_id: targetSessionId, runtime_revision: failedSnapshot.team.graphRuntime?.runtimeRevision ?? failed.runtime.runtimeRevision, error: error instanceof Error ? error.message : String(error) };
+          } catch (stateError) {
+            return { status: "delivery_failed_state_pending", handoff_id: args.handoffId, team_id: team.teamId, from_role: pendingFact.fromRole, to_role: pendingFact.toRole, resolved_session_id: targetSessionId, runtime_revision: pendingRuntime.runtimeRevision, error: error instanceof Error ? error.message : String(error), reconcile_required: true };
+          }
+        }
+        try {
+          const accepted = appendHandoffResult(pendingRuntime, pendingSnapshot.team, { handoffId: args.handoffId, actorSessionId: exec.agent.id, accepted: true, receipt, now: Date.now() });
+          const acceptedSnapshot = await persistGraphTransition(ctx, activeTeamState, pendingSnapshot, accepted.runtime, exec);
+          return { status: "accepted", handoff_id: args.handoffId, team_id: team.teamId, from_role: pendingFact.fromRole, to_role: pendingFact.toRole, resolved_session_id: targetSessionId, runtime_revision: acceptedSnapshot.team.graphRuntime?.runtimeRevision ?? accepted.runtime.runtimeRevision, receipt };
+        } catch (error) {
+          return { status: "delivery_accepted_state_pending", handoff_id: args.handoffId, team_id: team.teamId, from_role: pendingFact.fromRole, to_role: pendingFact.toRole, resolved_session_id: targetSessionId, runtime_revision: pendingRuntime.runtimeRevision, receipt, reconcile_required: true };
+        }
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
       name: "orchestra_team",
       description:
         "Show the orchestra team state plus archive summaries: every role with its session id, live status, report count, last report path, and last activity; the team's mission, controller, and status; plus the current cwd's archive list (dismissed teams, newest first) for orchestra_activate selection. Requires a team created by orchestra_create in this working directory — returns {team: null, archives} when none is active.",
@@ -2388,6 +2777,9 @@ export function apply(ctx: Context): void {
                     current_charter_revision: { type: "number" },
                     charter_digest: { type: "string" },
                     approval_ref: { type: "string" },
+                    graph_status: { type: "string" },
+                    graph_runtime_revision: { type: "number" },
+                    graph_stale: { type: "boolean" },
                     last_decision: {
                       type: "object",
                       additionalProperties: false,
@@ -2465,6 +2857,8 @@ export function apply(ctx: Context): void {
         const team = teamObservation.team;
         const document = documentReadForTeam(team);
         const documentSummaryValue = documentSummary(document, team);
+        const graphStale = document?.currentCharterRevision !== null && document?.currentCharterRevision !== undefined && document.charterRevisions.find((revision) => revision.charterRevision === document.currentCharterRevision)?.digest !== team.graphRuntime?.charterDigest;
+        const graph = team.graphRuntime === undefined ? undefined : graphSummary(team.graphRuntime, graphStale || document?.runtimeProjection.graph?.stale === true);
         return {
           team: {
             team_id: team.teamId,
@@ -2482,6 +2876,7 @@ export function apply(ctx: Context): void {
             ...(documentSummaryValue.currentCharterRevision === undefined ? {} : { current_charter_revision: documentSummaryValue.currentCharterRevision }),
             ...(documentSummaryValue.currentCharterDigest === undefined ? {} : { charter_digest: documentSummaryValue.currentCharterDigest }),
             ...(documentSummaryValue.approvalRef === undefined ? {} : { approval_ref: documentSummaryValue.approvalRef }),
+            ...(graph === undefined ? {} : { graph_status: graph.status, graph_runtime_revision: graph.runtimeRevision, graph_stale: graph.stale }),
             ...(documentSummaryValue.lastDecision === undefined
               ? {}
               : {
@@ -3137,7 +3532,7 @@ export function apply(ctx: Context): void {
         "Lightweight mode: for one-off collaboration (check a session, ask a question, read history) use the A2A tools directly (a2a_list/a2a_send/a2a_reply/a2a_read/a2a_status) — no team needed. Governed role dispatch uses orchestra_send so replacement mappings remain current.\n" +
         "Stay in your role: you are the driver, not an implementer or a reviewer. Never fix, polish, or take over any role's work — implementation issues loop back to the implementer (via the implementer-reviewer flow), review findings go to the reviewer. Your job is decisions, dispatch, and coordination, not edits.\n" +
         "Deterministic routing (no mindless relaying): you are NOT an information hub. Messages inside a fixed flow go directly between roles — never through you. Example flow: implementer finishes and hands the result directly to reviewer; reviewer finds issues and sends them directly back to implementer for another round; reviewer's targeted re-check passes and THEN reviewer notifies you to advance. You only receive decision points: advances, blockers, new directions, cross-flow coordination. Do not forward what you do not need to know. Roles may call orchestra_team themselves to check team progress (team transparency).\n" +
-        "All created roles are told to reply to you (their driver) via a2a_reply, never directly to the user; users interact with roles only through you. Track progress with orchestra_team; inspect the canonical Living Orchestration Document with orchestra_document; at a Driver checkpoint use orchestra_reconcile for runtime projection and orchestra_decision for append-only decisions. Roles may read the document but only the Driver may mutate it. Recover after restart or after dismissal with orchestra_activate (archive_id required — list archives via orchestra_team); close the instance with orchestra_dismiss (archives the team, notifies roles, frees the cwd); list templates with orchestra_topologies.\n" +
+        "All created roles are told to reply to you (their driver) via a2a_reply, never directly to the user; users interact with roles only through you. Track progress with orchestra_team; inspect the canonical Living Orchestration Document with orchestra_document; at a Driver checkpoint use orchestra_reconcile for runtime projection and orchestra_decision for append-only decisions. For Frozen-Charter execution use orchestra_graph/orchestra_loop_start/orchestra_attempt_start/orchestra_verdict and route milestones through orchestra_handoff; a cap_exhausted Loop has no next attempt in this checkpoint. Roles may read the document but only the Driver may mutate it. Recover after restart or after dismissal with orchestra_activate (archive_id required — list archives via orchestra_team); close the instance with orchestra_dismiss (archives the team, notifies roles, frees the cwd); list templates with orchestra_topologies.\n" +
         "Review flow: to task a reviewer, send via orchestra_send using teamId+roleId a review_request message stating scope, changed locations, and the goal; fix findings one by one; at most two rounds (R2 only re-checks R1 findings); stop after R2 regardless of outcome; new issues go to the backlog for the user to decide. Read handoff reports (paths returned by roles) under orchestra/reports/. All cross-role messages must be self-contained.\n" +
         "Delivery contract: a raw a2a_send/a2a_reply receipt state=accepted means the Transport accepted the message, not that it was claimed or answered; use a2a_status for proven lifecycle facts. orchestra_send adds the resolved teamId/roleId mapping but has the same accepted-only semantics.\n" +
         "Concurrency discipline (avoid information blocking): you are the bottleneck — every role report lands in your context. Minimize fan-in: ask roles to return concise summaries plus report paths, not full dumps; read report files only when needed. Do not over-orchestrate: if one session can do the job, do not spawn roles.",

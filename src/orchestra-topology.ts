@@ -29,6 +29,30 @@ export interface TopologyProtocol {
   ownership?: Record<string, string>;
   routes?: { kind: string; from: string | string[]; to: string[] }[];
   completion?: { owner: string; rule: string };
+  handoffs?: TopologyHandoffContract[];
+  loops?: TopologyLoopContract[];
+}
+
+export interface TopologyHandoffContract {
+  kind: string;
+  from: string | string[];
+  to: string[];
+  requiredPayloadFields?: string[];
+  requiredEvidenceKinds?: string[];
+}
+
+export interface TopologyLoopContract {
+  loopId: string;
+  entry: { role: string; event: string };
+  participants: string[];
+  evaluatorRole: string;
+  candidateKind: string;
+  verdictKind: string;
+  maxAttempts: number;
+  passRoute: string;
+  retryRoute: string;
+  capExhaustedRoute: string;
+  requiredEvidenceKinds: string[];
 }
 
 export interface TopologyConfig {
@@ -400,6 +424,61 @@ export function validateTopology(config: unknown): string[] {
     if (typeof protocol.completion.rule !== "string" || protocol.completion.rule === "") problems.push("shape: protocol.completion.rule must be a non-empty string");
     if (typeof protocol.completion.owner === "string" && protocol.completion.owner !== "" && !known(protocol.completion.owner)) {
       problems.push(`protocol.completion.owner references unknown role "${protocol.completion.owner}"`);
+    }
+  }
+  if (protocol.handoffs !== undefined && !Array.isArray(protocol.handoffs)) {
+    problems.push("shape: protocol.handoffs must be an array");
+  } else if (Array.isArray(protocol.handoffs)) {
+    const handoffKinds = new Set<string>();
+    for (const [index, rawHandoff] of protocol.handoffs.entries()) {
+      if (!isRecord(rawHandoff)) {
+        problems.push(`shape: protocol.handoffs[${index}] must be an object`);
+        continue;
+      }
+      const handoff = rawHandoff;
+      if (typeof handoff.kind !== "string" || handoff.kind === "") problems.push(`shape: protocol.handoffs[${index}].kind must be non-empty`);
+      if (typeof handoff.kind === "string" && handoff.kind !== "" && handoffKinds.has(handoff.kind)) problems.push(`protocol.handoffs kind "${handoff.kind}" is duplicated`);
+      if (typeof handoff.kind === "string" && handoff.kind !== "") handoffKinds.add(handoff.kind);
+      const fromValid = typeof handoff.from === "string" || stringArray(handoff.from);
+      if (!fromValid || (Array.isArray(handoff.from) && handoff.from.length === 0)) problems.push(`shape: protocol.handoffs[${index}].from must be a role or non-empty role array`);
+      if (!stringArray(handoff.to) || handoff.to.length === 0) problems.push(`shape: protocol.handoffs[${index}].to must be a non-empty role array`);
+      const froms = fromValid ? (Array.isArray(handoff.from) ? handoff.from : [handoff.from]) : [];
+      for (const from of froms) if (!known(from)) problems.push(`protocol.handoffs[${index}].from references unknown role "${from}"`);
+      if (stringArray(handoff.to)) for (const to of handoff.to) if (!known(to)) problems.push(`protocol.handoffs[${index}].to references unknown role "${to}"`);
+      for (const field of ["requiredPayloadFields", "requiredEvidenceKinds"]) {
+        if (handoff[field] !== undefined && !stringArray(handoff[field])) problems.push(`shape: protocol.handoffs[${index}].${field} must be a string array`);
+      }
+    }
+  }
+  if (protocol.loops !== undefined && !Array.isArray(protocol.loops)) {
+    problems.push("shape: protocol.loops must be an array");
+  } else if (Array.isArray(protocol.loops)) {
+    const loopIds = new Set<string>();
+    for (const [index, rawLoop] of protocol.loops.entries()) {
+      if (!isRecord(rawLoop)) {
+        problems.push(`shape: protocol.loops[${index}] must be an object`);
+        continue;
+      }
+      const loop = rawLoop;
+      if (typeof loop.loopId !== "string" || loop.loopId === "") problems.push(`shape: protocol.loops[${index}].loopId must be non-empty`);
+      if (typeof loop.loopId === "string" && loop.loopId !== "" && loopIds.has(loop.loopId)) problems.push(`protocol loop id "${loop.loopId}" is duplicated`);
+      if (typeof loop.loopId === "string" && loop.loopId !== "") loopIds.add(loop.loopId);
+      if (!isRecord(loop.entry) || typeof loop.entry.role !== "string" || loop.entry.role === "" || typeof loop.entry.event !== "string" || loop.entry.event === "") {
+        problems.push(`shape: protocol.loops[${index}].entry must contain role and event`);
+      } else if (!known(loop.entry.role)) {
+        problems.push(`protocol.loops[${index}].entry.role references unknown role "${loop.entry.role}"`);
+      }
+      if (!stringArray(loop.participants) || loop.participants.length === 0) {
+        problems.push(`protocol.loops[${index}].participants must be a non-empty role array`);
+      } else {
+        for (const participant of loop.participants) if (!known(participant)) problems.push(`protocol.loops[${index}].participants references unknown role "${participant}"`);
+      }
+      if (typeof loop.evaluatorRole !== "string" || loop.evaluatorRole === "" || !known(loop.evaluatorRole)) problems.push(`protocol.loops[${index}].evaluatorRole references an unknown role`);
+      for (const field of ["candidateKind", "verdictKind", "passRoute", "retryRoute", "capExhaustedRoute"]) {
+        if (typeof loop[field] !== "string" || loop[field] === "") problems.push(`shape: protocol.loops[${index}].${field} must be non-empty`);
+      }
+      if (typeof loop.maxAttempts !== "number" || !Number.isSafeInteger(loop.maxAttempts) || loop.maxAttempts <= 0) problems.push(`protocol.loops[${index}].maxAttempts must be a positive safe integer`);
+      if (!stringArray(loop.requiredEvidenceKinds)) problems.push(`shape: protocol.loops[${index}].requiredEvidenceKinds must be a string array`);
     }
   }
   return problems;

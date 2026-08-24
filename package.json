@@ -38,7 +38,7 @@
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && tsdown",
     "dev": "node --import tsx scripts/loader.mjs",
     "dev:harness": "dsh web --patch ./cordis.patch.yml",
-    "test": "npm run build && node --test scripts/test-v0.3.0.mjs scripts/test-orchestra-state.mjs scripts/test-orchestra-archive.mjs scripts/test-orchestra-topology.mjs scripts/test-session-blueprint.mjs scripts/test-governed-provisioning.mjs scripts/test-a2a-transport.mjs scripts/test-orchestration-document.mjs scripts/test-orchestration-charter.mjs",
+    "test": "npm run build && node --test scripts/test-v0.3.0.mjs scripts/test-orchestra-state.mjs scripts/test-orchestra-archive.mjs scripts/test-orchestra-topology.mjs scripts/test-session-blueprint.mjs scripts/test-governed-provisioning.mjs scripts/test-a2a-transport.mjs scripts/test-orchestration-document.mjs scripts/test-orchestration-charter.mjs scripts/test-orchestra-graph.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.client.json",
     "prepare": "npm run build"
   },
