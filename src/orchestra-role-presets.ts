@@ -242,6 +242,7 @@ function renderComposition(options: {
       "  group: true",
       "  isolate:",
       "    compaction: true",
+      "    toolResultPruner: true",
       "  config:",
       "    - id: compaction-basic",
       "      name: '@deepseek-ai/dsh-compaction-basic'",
