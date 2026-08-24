@@ -450,6 +450,37 @@ function ownerSession(team: TeamState, owner: string): string {
   return roleFor(team, owner).sessionId;
 }
 
+/** Controller role id used by every builtin topology (topology.controller.id). */
+export const CONTROLLER_ROLE_ID = "driver" as const;
+
+export interface HandoffTarget {
+  kind: "role" | "controller";
+  id: string;
+  sessionId: string;
+}
+
+/**
+ * Resolve a typed-handoff target: a TeamRole, or the Team controller when the
+ * roleId matches the controller role id (frozen topology.controller.id, i.e.
+ * "driver" for builtin topologies). A verdict/report handoff to the controller
+ * must not go through the TeamRole lookup, because the controller is not a
+ * provisioned role; its session is team.controllerSessionId. The caller passes
+ * the frozen controller id so custom topologies work too; "driver" is the
+ * default that matches all builtin templates and the deep-module convention
+ * (see ownerSession). fromRole stays a plain TeamRole lookup elsewhere, so a
+ * driver-initiated handoff remains rejected.
+ */
+export function resolveHandoffTarget(team: TeamState, roleId: string, controllerRoleId: string = CONTROLLER_ROLE_ID): HandoffTarget {
+  const normalized = roleId.toLowerCase();
+  if (normalized === controllerRoleId.toLowerCase()) {
+    return { kind: "controller", id: controllerRoleId, sessionId: team.controllerSessionId };
+  }
+  const role = team.roles.find((entry) => entry.id.toLowerCase() === normalized);
+  if (role === undefined) throw new GraphRuntimeError("role_not_participant", `handoff target role ${roleId} is not in the current Team`);
+  if (role.phase !== "active") throw new GraphRuntimeError("role_not_participant", `handoff target role ${role.id} is not active`);
+  return { kind: "role", id: role.id, sessionId: role.sessionId };
+}
+
 function closureReadiness(runtime: GraphRuntimeState, definition: TopologyClosureDefinition, outcome: ClosureSummary["outcome"], evidenceRefs: EvidenceRef[]): string | undefined {
   const loops = graphLoops(runtime);
   if (graphHandoffs(runtime).some((handoff) => handoff.status === "pending")) return "pending handoff requires reconcile";
@@ -561,18 +592,21 @@ export function validateHandoffPayload(contract: TopologyHandoffContract, fromRo
   assertEvidenceKinds(evidenceRefs, contract.requiredEvidenceKinds ?? [], "handoff");
 }
 
-export function appendHandoffPending(runtime: GraphRuntimeState, team: TeamState, contract: TopologyHandoffContract, input: { handoffId: string; kind: string; fromRole: string; toRole: string; loopInstanceId?: string; attempt?: number; summary: string; payload: Record<string, unknown>; actorSessionId: string; now: number; evidence?: EvidenceRef[] }): GraphCommandResult {
+export function appendHandoffPending(runtime: GraphRuntimeState, team: TeamState, contract: TopologyHandoffContract, input: { handoffId: string; kind: string; fromRole: string; toRole: string; loopInstanceId?: string; attempt?: number; summary: string; payload: Record<string, unknown>; actorSessionId: string; now: number; evidence?: EvidenceRef[]; controllerRoleId?: string }): GraphCommandResult {
   currentCharterMatches(runtime, team);
   assertGraphOpen(runtime);
   if (!record(input.payload) || !nonEmpty(input.handoffId) || !nonEmpty(input.summary)) throw new GraphRuntimeError("handoff_invalid", "handoff id, summary, and object payload are required");
   const from = roleFor(team, input.fromRole);
-  const to = roleFor(team, input.toRole);
+  const to = resolveHandoffTarget(team, input.toRole, input.controllerRoleId);
   if (input.actorSessionId !== from.sessionId) throw new GraphRuntimeError("permission_denied", "handoff actor does not own the fromRole");
   validateHandoffPayload(contract, from.id, to.id, input.kind, input.payload, input.evidence ?? []);
   if (input.loopInstanceId !== undefined) {
     const loop = graphLoops(runtime).find((entry) => entry.loopInstanceId === input.loopInstanceId);
     if (loop === undefined) throw new GraphRuntimeError("loop_not_found", `handoff references unknown Loop ${input.loopInstanceId}`);
-    if (loop.status !== "running") throw new GraphRuntimeError(loop.status === "cap_exhausted" ? "cap_exhausted" : "loop_terminal", `handoff Loop ${input.loopInstanceId} is ${loop.status}`);
+    if (loop.status === "cap_exhausted") throw new GraphRuntimeError("cap_exhausted", `handoff Loop ${input.loopInstanceId} is ${loop.status}`);
+    // A passed Loop still accepts a handoff bound to its final (passed) attempt —
+    // the frozen verdict handoff (reviewer → driver) is delivered after PASS.
+    if (loop.status !== "running" && loop.status !== "passed") throw new GraphRuntimeError("loop_terminal", `handoff Loop ${input.loopInstanceId} is ${loop.status}`);
     const currentAttempt = loop.attempts.at(-1)?.attempt;
     if (input.attempt !== undefined && input.attempt !== currentAttempt) throw new GraphRuntimeError("attempt_conflict", `handoff attempt ${input.attempt} is not the current attempt ${currentAttempt ?? "none"}`);
     assertScopesOpen(runtime, [loop.loopId, `loop:${loop.loopId}`, `role:${from.id}`, `role:${to.id}`]);

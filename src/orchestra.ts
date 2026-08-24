@@ -102,6 +102,7 @@ import {
   readGraphRuntime,
   recordVerdict,
   resolveGate,
+  resolveHandoffTarget,
   startAttempt,
   startLoop,
 } from "./orchestra-graph.js";
@@ -2704,6 +2705,7 @@ export function apply(ctx: Context): void {
         const { runtime, stale } = currentGraphRuntime(team);
         if (stale) throw new Error("cannot send a typed handoff: stale_charter (runtime is bound to an older Frozen Charter)");
         const frozen = currentFrozenCharter(team);
+        const controllerRoleId = frozen.topology.config.controller?.id ?? "driver";
         const contract = frozen.topology.config.protocol?.handoffs?.find((entry) => entry.kind === args.kind);
         if (contract === undefined) throw new Error(`cannot send a typed handoff: route ${args.kind} is not declared by Frozen Charter ${frozen.frozenRef}`);
         const payload = jsonRecord(args.payload) ? { ...args.payload, summary: args.summary } : { summary: args.summary };
@@ -2721,6 +2723,7 @@ export function apply(ctx: Context): void {
             actorSessionId: exec.agent.id,
             now: Date.now(),
             evidence: args.evidence as EvidenceRef[] | undefined,
+            controllerRoleId,
           });
         } catch (error) {
           throw graphCommandError("prepare a typed handoff", error);
@@ -2742,7 +2745,7 @@ export function apply(ctx: Context): void {
             team_id: team.teamId,
             from_role: existing.fromRole,
             to_role: existing.toRole,
-            resolved_session_id: team.roles.find((role) => role.id.toLowerCase() === existing.toRole.toLowerCase())?.sessionId ?? "",
+            resolved_session_id: resolveHandoffTarget(team, existing.toRole, controllerRoleId).sessionId,
             runtime_revision: runtime.runtimeRevision,
             ...(existing.receipt === undefined ? {} : { receipt: existing.receipt }),
             ...(existing.error === undefined ? {} : { error: existing.error }),
@@ -2750,8 +2753,7 @@ export function apply(ctx: Context): void {
         }
         const pendingFact = graphHandoffs(pendingRuntime).find((handoff) => handoff.handoffId === args.handoffId);
         if (pendingFact === undefined) throw new Error("typed handoff pending fact could not be reconstructed");
-        const targetSessionId = team.roles.find((role) => role.id.toLowerCase() === pendingFact.toRole.toLowerCase())?.sessionId;
-        if (targetSessionId === undefined) throw new Error(`typed handoff target role ${pendingFact.toRole} has no current Session mapping`);
+        const targetSessionId = resolveHandoffTarget(team, pendingFact.toRole, controllerRoleId).sessionId;
         let receipt: Record<string, unknown>;
         try {
           receipt = await deliverMessage(ctx, exec.agent.id, targetSessionId, [{ type: "text", text: JSON.stringify({ type: "orchestra_handoff", handoff_id: args.handoffId, kind: args.kind, summary: args.summary, payload, evidence: args.evidence ?? [] }) }], { wake: args.wake, interrupt: args.interrupt, idempotencyKey: args.handoffId }) as any;

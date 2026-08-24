@@ -217,9 +217,28 @@ test("feature-development happy path: FAIL→repair→PASS, gate blocks closure 
   runtime = recordVerdict(runtime, currentTeam, loopContract, { loopInstanceId: "loop-fd", actorSessionId: "reviewer-session", evaluatorRole: "reviewer", verdict: "PASS", now: now++, evidence: VERDICT_EVIDENCE }).runtime;
   assert.equal(graphLoops(runtime)[0].status, "passed");
 
-  // verdict handoff contract reviewer -> driver is enforced at the contract level
-  // (the driver is the controller, not a TeamRole; durable verdict facts live in the graph)
-  validateHandoffPayload(handoffContract("verdict"), "reviewer", "driver", "verdict", { summary: "R1 passed", verdict: "PASS", unresolvedFindings: [] }, VERDICT_EVIDENCE);
+  // typed handoff verdict: reviewer -> driver (controller target; receipt/evidence re-readable)
+  runtime = appendHandoffPending(runtime, currentTeam, handoffContract("verdict"), {
+    handoffId: "fd-verdict-1",
+    kind: "verdict",
+    fromRole: "reviewer",
+    toRole: "driver",
+    loopInstanceId: "loop-fd",
+    attempt: 2,
+    summary: "R1 passed",
+    payload: { summary: "R1 passed", verdict: "PASS", unresolvedFindings: [] },
+    actorSessionId: "reviewer-session",
+    now: now++,
+    evidence: VERDICT_EVIDENCE,
+  }).runtime;
+  runtime = appendHandoffResult(runtime, currentTeam, { handoffId: "fd-verdict-1", actorSessionId: "driver", accepted: true, receipt: { message_id: "m4", state: "accepted" }, now: now++ }).runtime;
+  const verdictHandoff = graphHandoffs(runtime).find((handoff) => handoff.handoffId === "fd-verdict-1");
+  assert.equal(verdictHandoff.status, "accepted");
+  assert.equal(verdictHandoff.toRole, "driver");
+  assert.equal(verdictHandoff.targetSessionId, "driver"); // team.controllerSessionId
+  assert.equal(verdictHandoff.attempt, 2);
+  assert.deepEqual(verdictHandoff.receipt, { message_id: "m4", state: "accepted" });
+  assert.deepEqual(verdictHandoff.evidence.map((ref) => ref.kind), ["report", "commit", "diff", "test"]);
 
   // closure gate: open but unapproved -> closure is rejected
   runtime = openGate(runtime, currentTeam, gateDefinition, { gateInstanceId: "gate-fd-1", actorSessionId: "driver", now: now++, humanMode: "checkpointed" }).runtime;
@@ -307,6 +326,59 @@ test("fail-loud negative paths: missing evidence, forged verdict, out-of-bounds 
   assert.ok(validateTopology({ ...fdTopology, protocol: { ...fdProtocol, handoffs: [{ ...handoffContract("candidate"), from: "ghost" }] } }).some((problem) => /unknown role/.test(problem)));
   assert.ok(validateTopology({ ...fdTopology, protocol: { ...fdProtocol, loops: [{ ...loopContract, participants: ["implementer", "ghost"] }] } }).some((problem) => /unknown role/.test(problem)));
   assert.ok(validateTopology({ ...fdTopology, protocol: { ...fdProtocol, gates: [{ ...gateDefinition, decisionScope: ["role:ghost"] }] } }).some((problem) => /unknown role/.test(problem)));
+});
+
+test("handoff to the controller resolves to the controller session and rejects a driver fromRole", () => {
+  const currentTeam = team();
+  let runtime = initializeGraphRuntime(currentTeam.teamId, 1, "digest", 1);
+  let now = 2;
+  runtime = startLoop(runtime, currentTeam, loopContract, { actorSessionId: "driver", loopInstanceId: "loop-target", now: now++, evidence: ALL_LOOP_EVIDENCE }).runtime;
+  runtime = startAttempt(runtime, currentTeam, loopContract, { loopInstanceId: "loop-target", actorSessionId: "driver", participantRoleId: "implementer", now: now++, evidence: ALL_LOOP_EVIDENCE }).runtime;
+
+  // case-normalized controller target (toRole "DRIVER" -> stored controller id "driver")
+  const pending = appendHandoffPending(runtime, currentTeam, handoffContract("verdict"), {
+    handoffId: "fd-verdict-target",
+    kind: "verdict",
+    fromRole: "reviewer",
+    toRole: "DRIVER",
+    loopInstanceId: "loop-target",
+    attempt: 1,
+    summary: "verdict",
+    payload: { summary: "verdict", verdict: "PASS", unresolvedFindings: [] },
+    actorSessionId: "reviewer-session",
+    now: now++,
+    evidence: VERDICT_EVIDENCE,
+  });
+  assert.equal(pending.kind, "changed");
+  runtime = pending.runtime;
+  const fact = graphHandoffs(runtime).find((handoff) => handoff.handoffId === "fd-verdict-target");
+  assert.equal(fact.status, "pending");
+  assert.equal(fact.fromRole, "reviewer");
+  assert.equal(fact.toRole, "driver");
+  assert.equal(fact.targetSessionId, "driver"); // team.controllerSessionId
+  assert.equal(fact.attempt, 1);
+
+  // pending -> accepted full path keeps the receipt re-readable
+  runtime = appendHandoffResult(runtime, currentTeam, { handoffId: "fd-verdict-target", actorSessionId: "driver", accepted: true, receipt: { message_id: "v1", state: "accepted" }, now: now++ }).runtime;
+  const accepted = graphHandoffs(runtime).find((handoff) => handoff.handoffId === "fd-verdict-target");
+  assert.equal(accepted.status, "accepted");
+  assert.deepEqual(accepted.receipt, { message_id: "v1", state: "accepted" });
+
+  // controller as fromRole is still rejected: no driver -> role handoff in the contract
+  assert.throws(
+    () => appendHandoffPending(runtime, currentTeam, handoffContract("candidate"), {
+      handoffId: "fd-from-driver",
+      kind: "candidate",
+      fromRole: "driver",
+      toRole: "verifier",
+      summary: "from driver",
+      payload: { summary: "from driver", changedFiles: [], knownRisks: "" },
+      actorSessionId: "driver",
+      now: now++,
+      evidence: CANDIDATE_EVIDENCE,
+    }),
+    (error) => error?.code === "role_not_participant",
+  );
 });
 
 function draftRuntimeContext(options = {}) {

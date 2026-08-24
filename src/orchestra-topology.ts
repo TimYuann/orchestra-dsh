@@ -320,7 +320,7 @@ export const BUILTIN_TOPOLOGIES: TopologyConfig[] = [
         compositionTools: ["tool-bash", "tool-fs", "tool-fs-search"],
         orchestraTools: ["orchestra_report", "orchestra_handoff"],
         welcome:
-          "你作为 implementer（实现者）：把 driver 派发的 feature mission 变成有边界、可测试的代码交付。\n1) 只改 mission scope 内的文件，不顺手重构、不扩大权限与范围。\n2) 完成后用 orchestra_report 写交付说明（summary、changedFiles、knownRisks），evidence 引用 commit/diff/test。\n3) 用 orchestra_handoff 发起 candidate 交接给 verifier。\n4) 收到 findings 时按 repairScope 修复，修复后重新走 verifier。\n5) 所有回复经 a2a_reply 发给 driver；不自报 PASS、不碰 charter/graph。",
+          "你作为 implementer（实现者）：把 driver 派发的 feature mission 变成有边界、可测试的代码交付。\n1) 只改 mission scope 内的文件，不顺手重构、不扩大权限与范围。\n2) 完成后用 orchestra_report 写交付说明（summary、changedFiles、knownRisks），evidence 引用 commit/diff/test。\n3) 对 driver 的汇报经 a2a_reply；角色间 typed 交接走 orchestra_handoff（candidate → verifier）。\n4) 收到 findings 时按 repairScope 修复，修复后重新走 verifier。\n5) 不自报 PASS、不碰 charter/graph。",
       },
       {
         id: "verifier",
@@ -330,7 +330,7 @@ export const BUILTIN_TOPOLOGIES: TopologyConfig[] = [
         compositionTools: ["tool-bash", "tool-fs-search"],
         orchestraTools: ["orchestra_report", "orchestra_handoff"],
         welcome:
-          "你作为 verifier（验证者）：解释 deterministic 检查（test/typecheck/build/diff）结果并整理 evidence。\n1) 只读沙箱，不改代码；唯一写通道是 orchestra_report。\n2) 检查必须列出 command、exit/result、scope、evidence refs 与未执行项，不能只写一句「tests pass」。\n3) 用 orchestra_handoff 把 verification 交接给 reviewer。\n4) 不发 review PASS/FAIL；所有回复经 a2a_reply 发给 driver。",
+          "你作为 verifier（验证者）：解释 deterministic 检查（test/typecheck/build/diff）结果并整理 evidence。\n1) 只读沙箱，不改代码；唯一写通道是 orchestra_report。\n2) 检查必须列出 command、exit/result、scope、evidence refs 与未执行项，不能只写一句「tests pass」。\n3) 对 driver 的汇报经 a2a_reply；角色间 typed 交接走 orchestra_handoff（verification → reviewer）。\n4) 不发 review PASS/FAIL。",
       },
       {
         id: "reviewer",
@@ -340,7 +340,7 @@ export const BUILTIN_TOPOLOGIES: TopologyConfig[] = [
         compositionTools: ["tool-fs", "tool-fs-search", "tool-bash"],
         orchestraTools: ["orchestra_report", "orchestra_verdict", "orchestra_handoff"],
         welcome:
-          "你作为 reviewer（评审者）：唯一有权记录 PASS/FAIL/BLOCKED 的 evaluator。\n1) 只读沙箱，只审不修，不替 implementer 修复。\n2) 按 frozen acceptance 评价 candidate；verdict 必须引用 report/diff/test evidence。\n3) FAIL 时用 orchestra_handoff 发 findings（summary、findings、repairScope）回 implementer。\n4) 用 orchestra_verdict 记录 PASS/FAIL/BLOCKED；不伪造用户 Gate、不改 charter/graph。\n5) 所有回复经 a2a_reply 发给 driver。",
+          "你作为 reviewer（评审者）：唯一有权记录 PASS/FAIL/BLOCKED 的 evaluator。\n1) 只读沙箱，只审不修，不替 implementer 修复。\n2) 按 frozen acceptance 评价 candidate；verdict 必须引用 report/diff/test evidence。\n3) 用 orchestra_handoff 发 findings（summary、findings、repairScope）回 implementer；verdict 交接走 orchestra_handoff（verdict → driver）。\n4) 用 orchestra_verdict 记录 PASS/FAIL/BLOCKED；对 driver 的汇报经 a2a_reply；不伪造用户 Gate、不改 charter/graph。",
       },
     ],
     protocol: {
