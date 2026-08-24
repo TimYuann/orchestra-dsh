@@ -304,6 +304,103 @@ export const BUILTIN_TOPOLOGIES: TopologyConfig[] = [
       completion: { owner: "driver", rule: "Review PASS or explicit user override" },
     },
   },
+  {
+    schemaVersion: 1,
+    id: "feature-development",
+    name: "Feature Development",
+    description:
+      "把已批准的 feature mission 变成有边界、可测试、经评审的代码交付：implementer 实现 → verifier 验证 → reviewer 评审；Loop PASS 且用户 Gate approve 后才收束",
+    controller: { id: "driver", source: "caller" },
+    roles: [
+      {
+        id: "implementer",
+        name: "Implementer",
+        preset: "orchestra-v04-implementer-v1",
+        sandbox: "workspace-write",
+        compositionTools: ["tool-bash", "tool-fs", "tool-fs-search"],
+        orchestraTools: ["orchestra_report", "orchestra_handoff"],
+        welcome:
+          "你作为 implementer（实现者）：把 driver 派发的 feature mission 变成有边界、可测试的代码交付。\n1) 只改 mission scope 内的文件，不顺手重构、不扩大权限与范围。\n2) 完成后用 orchestra_report 写交付说明（summary、changedFiles、knownRisks），evidence 引用 commit/diff/test。\n3) 用 orchestra_handoff 发起 candidate 交接给 verifier。\n4) 收到 findings 时按 repairScope 修复，修复后重新走 verifier。\n5) 所有回复经 a2a_reply 发给 driver；不自报 PASS、不碰 charter/graph。",
+      },
+      {
+        id: "verifier",
+        name: "Verifier",
+        preset: "orchestra-v04-verifier-v1",
+        sandbox: "read-only",
+        compositionTools: ["tool-bash", "tool-fs-search"],
+        orchestraTools: ["orchestra_report", "orchestra_handoff"],
+        welcome:
+          "你作为 verifier（验证者）：解释 deterministic 检查（test/typecheck/build/diff）结果并整理 evidence。\n1) 只读沙箱，不改代码；唯一写通道是 orchestra_report。\n2) 检查必须列出 command、exit/result、scope、evidence refs 与未执行项，不能只写一句「tests pass」。\n3) 用 orchestra_handoff 把 verification 交接给 reviewer。\n4) 不发 review PASS/FAIL；所有回复经 a2a_reply 发给 driver。",
+      },
+      {
+        id: "reviewer",
+        name: "Reviewer",
+        preset: "orchestra-v04-reviewer-v1",
+        sandbox: "read-only",
+        compositionTools: ["tool-fs", "tool-fs-search", "tool-bash"],
+        orchestraTools: ["orchestra_report", "orchestra_verdict", "orchestra_handoff"],
+        welcome:
+          "你作为 reviewer（评审者）：唯一有权记录 PASS/FAIL/BLOCKED 的 evaluator。\n1) 只读沙箱，只审不修，不替 implementer 修复。\n2) 按 frozen acceptance 评价 candidate；verdict 必须引用 report/diff/test evidence。\n3) FAIL 时用 orchestra_handoff 发 findings（summary、findings、repairScope）回 implementer。\n4) 用 orchestra_verdict 记录 PASS/FAIL/BLOCKED；不伪造用户 Gate、不改 charter/graph。\n5) 所有回复经 a2a_reply 发给 driver。",
+      },
+    ],
+    protocol: {
+      ownership: {
+        implementation: "implementer",
+        verification: "verifier",
+        review_verdict: "reviewer",
+        user_decision: "driver",
+        closure: "driver",
+      },
+      routes: [
+        { kind: "mission", from: "driver", to: ["implementer"] },
+        { kind: "candidate", from: "implementer", to: ["verifier"] },
+        { kind: "verification", from: "verifier", to: ["reviewer"] },
+        { kind: "verdict", from: "reviewer", to: ["driver"] },
+        { kind: "findings", from: "reviewer", to: ["implementer"] },
+      ],
+      completion: { owner: "driver", rule: "implementation-review Loop PASS + 用户 Gate approve 后由 driver 收束（completed/failed/abandoned）" },
+      handoffs: [
+        { kind: "candidate", from: "implementer", to: ["verifier"], requiredPayloadFields: ["summary", "changedFiles", "knownRisks"], requiredEvidenceKinds: ["commit", "diff", "test"] },
+        { kind: "verification", from: "verifier", to: ["reviewer"], requiredPayloadFields: ["summary", "checks", "notes"], requiredEvidenceKinds: ["test", "diff", "file"] },
+        { kind: "findings", from: "reviewer", to: ["implementer"], requiredPayloadFields: ["summary", "findings", "repairScope"], requiredEvidenceKinds: ["report", "diff", "message"] },
+        { kind: "verdict", from: "reviewer", to: ["driver"], requiredPayloadFields: ["summary", "verdict", "unresolvedFindings"], requiredEvidenceKinds: ["report", "commit", "diff", "test"] },
+      ],
+      loops: [
+        {
+          loopId: "implementation-review",
+          entry: { role: "implementer", event: "candidate_ready" },
+          participants: ["implementer", "verifier", "reviewer"],
+          evaluatorRole: "reviewer",
+          candidateKind: "candidate",
+          verdictKind: "PASS|FAIL|BLOCKED",
+          maxAttempts: 2,
+          passRoute: "verification → human gate → closure",
+          retryRoute: "reviewer findings → implementer repair → verifier",
+          capExhaustedRoute: "cap_exhausted → driver remediation branch",
+          requiredEvidenceKinds: ["commit", "diff", "test", "report"],
+        },
+      ],
+      gates: [
+        {
+          gateId: "feature-closure-approval",
+          decisionScope: ["loop:implementation-review"],
+          blockingScope: ["closure"],
+          options: ["approve", "request-changes", "stop"],
+          required: true,
+          onUnavailable: "blocked",
+        },
+      ],
+      closure: {
+        owner: "driver",
+        requiredLoopOutcomes: ["implementation-review:passed"],
+        requiredVerdicts: ["PASS"],
+        requiredEvidenceKinds: ["commit", "diff", "test"],
+        openGatePolicy: "reject",
+        allowedOutcomes: ["completed", "failed", "abandoned"],
+        userOverride: false,
+      },
+    },
+  },
 ];
 
 const TOPOLOGY_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -561,7 +658,7 @@ export function validateTopology(config: unknown): string[] {
           const [kind, ref] = scope.split(":", 2);
           if (kind === "role" && (ref === undefined || !known(ref))) problems.push(`protocol.gates[${index}].${scopeField} references unknown role "${ref ?? ""}"`);
           if (kind === "loop" && (ref === undefined || !declaredLoopIds.has(ref))) problems.push(`protocol.gates[${index}].${scopeField} references unknown loop "${ref ?? ""}"`);
-          if (!["global", "role", "loop", "node", "event"].includes(kind)) problems.push(`protocol.gates[${index}].${scopeField} has invalid scope ref "${scope}"`);
+          if (!["global", "role", "loop", "node", "event", "closure"].includes(kind)) problems.push(`protocol.gates[${index}].${scopeField} has invalid scope ref "${scope}"`);
         }
       }
     }
