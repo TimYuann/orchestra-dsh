@@ -46,8 +46,9 @@ route、Loop、Gate、Closure 和 E2E 合同。
 ### 0.3 冻结与实现的边界
 
 - “冻结”表示 6B 的输入合同，不表示当前源码已有这些内置模板。
-- 本文中的 requiredTools 是能力合同；实现必须在当前 profile 做 capability
-  preflight，缺失就 fail loud，不能以 persona 文本冒充完整 composition。
+- 本文中的能力合同明确分为 compositionTools 与 orchestraTools；实现必须
+  分别做 capability preflight，缺失就 fail loud，不能把 host tool 伪装成
+  DSH composition row。
 - deterministic test、lint、build、diff 和 hash 等可由代码执行、Gate 或
   evidence oracle 完成的工作，不单独虚构一个 Agent role。
 - 所有 Governed role 都是完整 DSH Session；Role Preset 不是 subagent
@@ -63,7 +64,7 @@ route、Loop、Gate、Closure 和 E2E 合同。
 | 术语 | 本文含义 | 不应混淆 |
 | --- | --- | --- |
 | Topology Template | 可复用的协作设计：角色、图边、ownership、typed handoff、bounded Loop、Human Gate、Closure 及其默认参与策略。 | 不是一次运行状态，也不是某个 Agent 的 persona。 |
-| Role Preset | Orchestra 对一个职责的可复用合同：职责、decision rights、禁止事项、report/handoff 约束，以及一份完整可挂载的 DSH Agent Preset composition 策略。 | 不是只有 system prompt 的角色名；也不是 DSH Permission Preset。 |
+| Role Preset | Orchestra 对一个职责的可复用合同：职责、decision rights、禁止事项、report/handoff 约束，以及一份完整可挂载的 DSH Agent Preset composition 策略和独立的 Orchestra host capability 需求。 | 不是只有 system prompt 的角色名；也不是 DSH Permission Preset。 |
 | DSH Agent Preset | DSH 的 composition 目录，决定 persona、model-facing tools、skills、compaction、workflow/delegation 和 tool presentation 等 agent-plane 能力。 | 不决定 provider/model 路由，也不等于 Permission Preset。 |
 | Permission Preset | DSH 的 sandbox/approval bundle。它与 Agent Preset、Model Selection 分离；effective sandbox 可以在角色合同中有明确 override。 | 不等于 Orchestra Human Gate。 |
 | Mission | 本次 Governed Orchestra 要完成的目标、范围、约束、验收和 non-goals 的冻结快照。 | 不是一个泛化 workflow 的输入字符串。 |
@@ -129,6 +130,19 @@ v0.3 id 仍属于兼容输入，6B 不得无记录覆盖它们。
    已产生历史的 Agent 会破坏历史与工具一致性。运行中的 Session 应保留
    已加入的 generation，后续新 Session 才读取新 stamp。
 
+本文后续角色表使用两个明确字段：
+
+- compositionTools：必须出现在 DSH Agent Preset 的 agent-plane composition
+  中，例如 tool-bash、tool-fs、tool-fs-search、tool-web；通过 preset
+  discovery、mount/setup 和实际 scope-visible tool schema 验证；
+- orchestraTools：由 Orchestra plugin/host tool catalog 提供，例如
+  orchestra_report、orchestra_handoff、orchestra_verdict；它们不进入
+  agent.cordis.yml，不由 DSH preset mount 验证，而是在 host plugin 注册、
+  caller scope 和 tool schema seam 上单独验证。
+
+两类能力都可以是 Role 的硬 required capability，但不能合并成一个会让
+实现者误加 DSH row 的无类型 capability 数组。
+
 ### B.2.1 本仓库当前 preset scope：已实现事实
 
 当前 checkout 的实际 built-in Role Preset 仍只有
@@ -159,7 +173,7 @@ Markdown persona。6A 冻结的七个 Role Preset 是下一实现目标，不能
 | --- | --- |
 | setup 前 mount 失败可回滚 | Governed role 的 Session Blueprint 必须在 Agent publish 前验证 preset、权限、model、required tools；不能先创建再补 persona。 |
 | composeFrom 继承父代实际 generation | Lightweight 与 delegated child 不能只读当前 default；Governed role 的 preset 事实必须记录并可恢复。 |
-| optional row 可以 disabled，且 host/runtime 可能缺失 | topology requiredTools 必须有 preflight；可选 row 没有证明就不能被写进成功 receipt。 |
+| optional row 可以 disabled，且 host/runtime 可能缺失 | topology 的 compositionTools/orchestraTools 必须分别 preflight；可选 row 没有证明就不能被写进成功 receipt。 |
 | model 与 permission 在 preset 外独立解析 | Role Preset 只能声明默认/策略，runtime 必须固定真实 provider/model/reasoning 与 base/effective permission。 |
 | standing mount 的 scope parent chain 提供工具面 | Role Preset 的“完整 composition”必须是可实际 mount 的 Agent Preset 文件，而不是 persona-only 文本。 |
 
@@ -325,7 +339,7 @@ Orchestra 的适配决策：
 
 ### D.0 共同运行合同
 
-#### 角色、权限和模型
+#### 角色、权限、模型和能力平面
 
 - 每个角色都是 full Session，必须有 teamId + roleId → sessionId durable
   mapping，并先 reservation 后 publish。
@@ -338,8 +352,11 @@ Orchestra 的适配决策：
 - Model Selection 默认采用 deployment default 并在 Blueprint 中 pin；
   topology 可提供 explicit provider/model/reasoningEffort override，但必须
   成对且在 create 前解析。没有隐藏的“architect 自动更强模型”规则。
-- requiredTools 是硬 capability contract。缺失时 no state/no Session/no Agent
-  的 preflight 失败；实际 composition publish 前还要再验一次。
+- compositionTools 与 orchestraTools 都是硬 capability contract。前者在
+  DSH composition mount/visible-scope seam 预检和 publish 前复验；后者在
+  Orchestra host/plugin tool registration/schema seam 预检和 publish 前
+  复验。任一缺失都必须 no state/no Session/no Agent 地 fail loud。Host
+  tools 永远不能被写入 DSH Agent Preset 文件来“补齐”。
 - default participation 见各模板。User approval for Draft/Freeze 是所有
   Governed 实例的前置条件，不被 topology 的 autonomous/interactive 选择
   取代。
@@ -393,12 +410,12 @@ scope 内文件；不允许把“顺手重构”“发布”“扩大权限”�
 
 **Initial roles 与权利**
 
-| roleId | Role Preset | sandbox / permission | model strategy | requiredTools | write boundary |
-| --- | --- | --- | --- | --- | --- |
-| driver | controller session | caller-selected effective sandbox；不由模板偷偷升级 | deployment default pinned，显式 override 优先 | orchestration tools、A2A/typed handoff、report read | team/document/graph/journal；不持有 reviewer verdict 权 |
-| implementer | implementer | workspace-write / workspace-write + ask | deployment default pinned | tool-bash、tool-fs、tool-fs-search、orchestra_report、orchestra_handoff | mission scope 内源码/测试；不得写 canonical charter/graph |
-| verifier | verifier | read-only / workspace-write + ask base | deployment default pinned | tool-bash、tool-fs-search、orchestra_report、orchestra_handoff | 只写 report/evidence channel；不改代码 |
-| reviewer | reviewer | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-bash、orchestra_report、orchestra_verdict、orchestra_handoff | 只写 review report；唯一 review Loop evaluator |
+| roleId | Role Preset | sandbox / permission | model strategy | compositionTools | orchestraTools | write boundary |
+| --- | --- | --- | --- | --- | --- | --- |
+| driver | controller session | caller-selected effective sandbox；不由模板偷偷升级 | deployment default pinned，显式 override 优先 | caller Agent Preset；不由 topology 追加 | orchestration tools、A2A/typed handoff、report read | team/document/graph/journal；不持有 reviewer verdict 权 |
+| implementer | implementer | workspace-write / workspace-write + ask | deployment default pinned | tool-bash、tool-fs、tool-fs-search | orchestra_report、orchestra_handoff | mission scope 内源码/测试；不得写 canonical charter/graph |
+| verifier | verifier | read-only / workspace-write + ask base | deployment default pinned | tool-bash、tool-fs-search | orchestra_report、orchestra_handoff | 只写 report/evidence channel；不改代码 |
+| reviewer | reviewer | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-bash | orchestra_report、orchestra_verdict、orchestra_handoff | 只写 review report；唯一 review Loop evaluator |
 
 **Graph / routes / ownership**
 
@@ -511,13 +528,13 @@ implementer 只能改已批准 repair scope。
 
 **Initial roles 与权利**
 
-| roleId | Role Preset | sandbox / permission | model strategy | requiredTools | write boundary |
-| --- | --- | --- | --- | --- | --- |
-| driver | controller session | caller-selected；无隐式升级 | deployment default pinned | orchestration、report、handoff | mission/graph/journal；不伪造 evaluator |
-| investigator | investigator | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-bash、orchestra_report、orchestra_handoff | 只读调查与 report/evidence |
-| implementer | implementer | workspace-write / workspace-write + ask | deployment default pinned | tool-bash、tool-fs、tool-fs-search、orchestra_report、orchestra_handoff | repair scope 内源码/测试 |
-| verifier | verifier | read-only / workspace-write + ask base | deployment default pinned | tool-bash、tool-fs-search、orchestra_report、orchestra_handoff | 只写验证 report |
-| reviewer | reviewer | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-bash、orchestra_report、orchestra_verdict、orchestra_handoff | 只写 review report；唯一 quality evaluator |
+| roleId | Role Preset | sandbox / permission | model strategy | compositionTools | orchestraTools | write boundary |
+| --- | --- | --- | --- | --- | --- | --- |
+| driver | controller session | caller-selected；无隐式升级 | deployment default pinned | caller Agent Preset；不由 topology 追加 | orchestration、report、handoff | mission/graph/journal；不伪造 evaluator |
+| investigator | investigator | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-bash | orchestra_report、orchestra_handoff | 只读调查与 report/evidence |
+| implementer | implementer | workspace-write / workspace-write + ask | deployment default pinned | tool-bash、tool-fs、tool-fs-search | orchestra_report、orchestra_handoff | repair scope 内源码/测试 |
+| verifier | verifier | read-only / workspace-write + ask base | deployment default pinned | tool-bash、tool-fs-search | orchestra_report、orchestra_handoff | 只写验证 report |
+| reviewer | reviewer | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-bash | orchestra_report、orchestra_verdict、orchestra_handoff | 只写 review report；唯一 quality evaluator |
 
 **Graph / routes / ownership**
 
@@ -632,12 +649,12 @@ required evidence kinds。architect 拥有推荐/决策稿，不拥有用户 app
 
 **Initial roles 与权利**
 
-| roleId | Role Preset | sandbox / permission | model strategy | requiredTools | write boundary |
-| --- | --- | --- | --- | --- | --- |
-| driver | controller session | caller-selected；无隐式升级 | deployment default pinned | orchestration、report、handoff | charter/graph/journal/decision command；不冒充用户 |
-| researcher | researcher | read-only / workspace-write + ask base | deployment default pinned | tool-web、tool-fs-search、tool-fs、orchestra_report、orchestra_handoff | 只写 source/evidence report |
-| architect | architect | read-only / workspace-write + ask base | deployment default pinned；可显式 override | tool-web、tool-fs-search、tool-fs、orchestra_report、orchestra_handoff | 只写 decision brief/report，不改代码 |
-| reviewer | reviewer | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-web、orchestra_report、orchestra_verdict、orchestra_handoff | 只写 review report；评估 decision evidence |
+| roleId | Role Preset | sandbox / permission | model strategy | compositionTools | orchestraTools | write boundary |
+| --- | --- | --- | --- | --- | --- | --- |
+| driver | controller session | caller-selected；无隐式升级 | deployment default pinned | caller Agent Preset；不由 topology 追加 | orchestration、report、handoff、decision command | charter/graph/journal；不冒充用户 |
+| researcher | researcher | read-only / workspace-write + ask base | deployment default pinned | tool-web、tool-fs-search、tool-fs | orchestra_report、orchestra_handoff | 只写 source/evidence report |
+| architect | architect | read-only / workspace-write + ask base | deployment default pinned；可显式 override | tool-web、tool-fs-search、tool-fs | orchestra_report、orchestra_handoff | 只写 decision brief/report，不改代码 |
+| reviewer | reviewer | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-web | orchestra_report、orchestra_verdict、orchestra_handoff | 只写 review report；评估 decision evidence |
 
 **Graph / routes / ownership**
 
@@ -751,13 +768,13 @@ migration slice 必须能回答旧行为如何验证、何时允许切换、失�
 
 **Initial roles 与权利**
 
-| roleId | Role Preset | sandbox / permission | model strategy | requiredTools | write boundary |
-| --- | --- | --- | --- | --- | --- |
-| driver | controller session | caller-selected；无隐式升级 | deployment default pinned | orchestration、report、handoff | migration contract、graph/journal |
-| architect | architect | read-only / workspace-write + ask base | deployment default pinned；可显式 override | tool-fs、tool-fs-search、tool-web、orchestra_report、orchestra_handoff | 只写 migration plan/compat report |
-| implementer | implementer | workspace-write / workspace-write + ask | deployment default pinned | tool-bash、tool-fs、tool-fs-search、orchestra_report、orchestra_handoff | 当前 slice 的源码/测试；不得改 baseline evidence |
-| verifier | verifier | read-only / workspace-write + ask base | deployment default pinned | tool-bash、tool-fs-search、orchestra_report、orchestra_handoff | 只写 compatibility/rollback evidence |
-| reviewer | reviewer | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-bash、orchestra_report、orchestra_verdict、orchestra_handoff | 只写 review report；唯一 evaluator |
+| roleId | Role Preset | sandbox / permission | model strategy | compositionTools | orchestraTools | write boundary |
+| --- | --- | --- | --- | --- | --- | --- |
+| driver | controller session | caller-selected；无隐式升级 | deployment default pinned | caller Agent Preset；不由 topology 追加 | orchestration、report、handoff | migration contract、graph/journal |
+| architect | architect | read-only / workspace-write + ask base | deployment default pinned；可显式 override | tool-fs、tool-fs-search、tool-web | orchestra_report、orchestra_handoff | 只写 migration plan/compat report |
+| implementer | implementer | workspace-write / workspace-write + ask | deployment default pinned | tool-bash、tool-fs、tool-fs-search | orchestra_report、orchestra_handoff | 当前 slice 的源码/测试；不得改 baseline evidence |
+| verifier | verifier | read-only / workspace-write + ask base | deployment default pinned | tool-bash、tool-fs-search | orchestra_report、orchestra_handoff | 只写 compatibility/rollback evidence |
+| reviewer | reviewer | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-bash | orchestra_report、orchestra_verdict、orchestra_handoff | 只写 review report；唯一 evaluator |
 
 **Graph / routes / ownership**
 
@@ -873,14 +890,14 @@ hardening-auditor 的 finding 必须能映射到位置/资产、影响、修复�
 
 **Initial roles 与权利**
 
-| roleId | Role Preset | sandbox / permission | model strategy | requiredTools | write boundary |
-| --- | --- | --- | --- | --- | --- |
-| driver | controller session | caller-selected；无隐式升级 | deployment default pinned | orchestration、report、handoff | audit charter、graph/journal |
-| hardening-auditor | hardening-auditor | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-bash、orchestra_report、orchestra_handoff | 只写 findings/threat model report |
-| investigator | investigator | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-bash、orchestra_report、orchestra_handoff | 只写 reproduction/impact evidence |
-| implementer | implementer | workspace-write / workspace-write + ask | deployment default pinned | tool-bash、tool-fs、tool-fs-search、orchestra_report、orchestra_handoff | 只改批准的 hardening scope |
-| verifier | verifier | read-only / workspace-write + ask base | deployment default pinned | tool-bash、tool-fs-search、orchestra_report、orchestra_handoff | 只写 rescan/regression evidence |
-| reviewer | reviewer | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-bash、orchestra_report、orchestra_verdict、orchestra_handoff | 只写 security review；唯一 evaluator |
+| roleId | Role Preset | sandbox / permission | model strategy | compositionTools | orchestraTools | write boundary |
+| --- | --- | --- | --- | --- | --- | --- |
+| driver | controller session | caller-selected；无隐式升级 | deployment default pinned | caller Agent Preset；不由 topology 追加 | orchestration、report、handoff | audit charter、graph/journal |
+| hardening-auditor | hardening-auditor | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-bash | orchestra_report、orchestra_handoff | 只写 findings/threat model report |
+| investigator | investigator | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-bash | orchestra_report、orchestra_handoff | 只写 reproduction/impact evidence |
+| implementer | implementer | workspace-write / workspace-write + ask | deployment default pinned | tool-bash、tool-fs、tool-fs-search | orchestra_report、orchestra_handoff | 只改批准的 hardening scope |
+| verifier | verifier | read-only / workspace-write + ask base | deployment default pinned | tool-bash、tool-fs-search | orchestra_report、orchestra_handoff | 只写 rescan/regression evidence |
+| reviewer | reviewer | read-only / workspace-write + ask base | deployment default pinned | tool-fs、tool-fs-search、tool-bash | orchestra_report、orchestra_verdict、orchestra_handoff | 只写 security review；唯一 evaluator |
 
 **Graph / routes / ownership**
 
@@ -907,7 +924,7 @@ typed handoffs：
 
 | kind | from → to | required payload | required evidence |
 | --- | --- | --- | --- |
-| finding | hardening-auditor → investigator | asset、location、impact、severity、fix | report、file、message |
+| finding | hardening-auditor → investigator | fingerprint、asset、location、impact、severity、fix、reproductionOrWhyNot | report、file、message |
 | remediation-brief | investigator → implementer | reproduction、rootCause、repairScope、risk | report、test、file |
 | hardening-candidate | implementer → verifier | changedFiles、controlAdded、knownRisks | commit、diff、test |
 | rescan-evidence | verifier → reviewer | originalFinding、rescan、regression、residualRisk | test、diff、report |
@@ -927,9 +944,10 @@ typed handoffs：
 - capExhaustedRoute：cap_exhausted → driver requests user risk decision or abandon；
 - requiredEvidence：report、commit、diff、test。
 
-审计 finding 可以在 Loop 前记录为 immutable evidence；只有 remediation
-candidate 的 rescan 和 regression evidence 才能进入 PASS。缺少 rescan
-只能 BLOCKED，不得被低严重度标签掩盖。
+审计 finding 可以在 Loop 前记录为 immutable evidence；初始 finding 的
+rescan 与 residualRisk 可以是未产生/unknown，绝不能由 auditor 预填未来
+结果。只有 remediation candidate 的 rescan 和 regression evidence 才能
+进入 PASS；缺少 rescan 只能 BLOCKED，不得被低严重度标签掩盖。
 
 **Human Gate / Closure**
 
@@ -962,9 +980,10 @@ browser/security provider 不作为审计模板的默认隐式依赖。
 **E2E 场景与验收**
 
 在 fixture repo 中种入一个可复现的 authorization/secret-handling/tool
-boundary 缺陷。hardening-auditor 记录位置、影响和修复要求，investigator
-建立 reproduction，implementer 做最小 patch，verifier 运行 exploit/
-regression rescan，reviewer 先拒绝缺少 rescan、再在证据齐全后 PASS。用户
+boundary 缺陷。hardening-auditor 先只记录 fingerprint、位置、影响、修复
+要求和 reproduction/why-not，不能填写未来 rescan；investigator 建立
+reproduction，implementer 做最小 patch，verifier 运行 exploit/regression
+rescan，reviewer 先拒绝缺少 rescan、再在证据齐全后 PASS。用户
 通过 Gate 后才 completed。验收：
 
 1. audit 只读角色不能直接改代码或风险状态；
@@ -998,8 +1017,10 @@ list、persona/instructions、所需 tool rows、compaction/skills（如合同
 - model：deployment default pinned，显式完整 selection 优先；
 - 不启用 subagent provider、Codex/Claude Code optional provider 或
   danger-full-access 作为隐式依赖；
-- mount 失败、required row 缺失、host service 缺失和 tool surface 不符
-  都要在 Session publish 前返回稳定 provisioning diagnostic。
+- mount 失败、compositionTools row 缺失或 visible-scope mismatch、以及
+  orchestraTools 的 host service/schema 缺失，都要在 Session publish 前
+  返回稳定 provisioning diagnostic；后者不能通过向 DSH composition 加 row
+  来绕过。
 
 ### E.1 implementer
 
@@ -1010,18 +1031,19 @@ list、persona/instructions、所需 tool rows、compaction/skills（如合同
 - DSH base composition：standard copy；保留 persona、agent-instructions、
   tool-bash、tool-fs、tool-fs-search、skills、plan-mode、compaction、todo；
   默认移除 delegation、goal、tool-web 和 Code Mode presentation，除非
-  topology 的 requiredTools 与 profile preflight 明确需要。code 是可选
+  topology 的 capability fields 与 profile preflight 明确需要。code 是可选
   explicit variant，不是默认。
-- requiredTools：tool-bash、tool-fs、tool-fs-search、orchestra_report、
-  orchestra_handoff。
+- compositionTools：tool-bash、tool-fs、tool-fs-search。
+- orchestraTools：orchestra_report、orchestra_handoff。
 - sandbox/permission/model：workspace-write；workspace-write + ask；
   deployment default pinned。
 - report/handoff：candidate 必须有 summary、changedFiles、commit/diff/
   test refs、knownRisks；findings 只由 reviewer route 回来。
 - optional deps/mount failure：Code Mode、web、optional subagent provider
   缺失时不能静默降级；若不是 required 则不出现在该 composition。
-- reused by：feature-development、bug-diagnosis-and-fix；architecture 只在
-  新 remediation branch 明确请求时加入。
+- reused by（exhaustive）：initial use = feature-development、
+  bug-diagnosis-and-fix、refactor-and-migration、audit-and-hardening；
+  remediation-only = architecture-decision；deferred/future = release-readiness。
 
 ### E.2 reviewer
 
@@ -1034,15 +1056,18 @@ list、persona/instructions、所需 tool rows、compaction/skills（如合同
 - DSH base composition：standard copy；保留 tool-fs、tool-fs-search、只读
   tool-bash、必要 tool-web、skills/compaction，移除 editor、delegation、
   goal 和 Code Mode。
-- requiredTools：tool-fs、tool-fs-search、tool-bash、orchestra_report、
-  orchestra_verdict、orchestra_handoff。
+- compositionTools：tool-fs、tool-fs-search、tool-bash。
+- orchestraTools：orchestra_report、orchestra_verdict、orchestra_handoff。
 - sandbox/permission/model：read-only effective sandbox；workspace-write +
   ask base；deployment default pinned。
 - report/handoff：R1/R2 或 topology 声明的 bounded review；verdict 必须
   引用 report、diff/test 或 decision evidence。
 - optional deps/mount failure：tool-web 只有在 topology required 且 preflight
   成功时启用；其余缺失不能阻止纯本地 code review。
-- reused by：feature-development、bug-diagnosis-and-fix、architecture-decision。
+- reused by（exhaustive）：initial use = feature-development、
+  bug-diagnosis-and-fix、refactor-and-migration、architecture-decision、
+  audit-and-hardening；remediation-only = none；deferred/future =
+  release-readiness。
 
 ### E.3 investigator
 
@@ -1055,16 +1080,18 @@ list、persona/instructions、所需 tool rows、compaction/skills（如合同
 - DSH base composition：standard copy 的 read-only variant；保留
   tool-fs、tool-fs-search、tool-bash、skills、compaction；tool-web 只作为
   explicit optional row。
-- requiredTools：tool-fs、tool-fs-search、tool-bash、orchestra_report、
-  orchestra_handoff。
+- compositionTools：tool-fs、tool-fs-search、tool-bash。
+- orchestraTools：orchestra_report、orchestra_handoff。
 - sandbox/permission/model：read-only；workspace-write + ask base；
   deployment default pinned。
 - report/handoff：diagnosis 必须含 reproduction、rootCause 或明确
   unknown、candidate evidence、repairScope、knownRisks。
 - optional deps/mount failure：web/provider 不存在时仍可做本地调查；若任务
   required web，则 preflight fail，而不是返回“已研究”。
-- reused by：bug-diagnosis-and-fix；architecture 的 researcher/architect
-  不由 investigator 代替。
+- reused by（exhaustive）：initial use = bug-diagnosis-and-fix、
+  audit-and-hardening；remediation-only = feature-development；
+  architecture-decision、refactor-and-migration 由 researcher/architect
+  路径负责，不默认加入 investigator；deferred/future = release-readiness。
 
 ### E.4 verifier
 
@@ -1077,8 +1104,8 @@ list、persona/instructions、所需 tool rows、compaction/skills（如合同
 - DSH base composition：优先使用精简 standard copy（bash、fs-search、
   report/handoff、最少 compaction）；6B 只有在目标 profile 的 public
   minimal persistent-shell seam 有真实 E2E 后，才可切 minimal。
-- requiredTools：tool-bash、tool-fs-search、orchestra_report、
-  orchestra_handoff；deterministic checks 以 runtime command adapter
+- compositionTools：tool-bash、tool-fs-search。
+- orchestraTools：orchestra_report、orchestra_handoff；deterministic checks 以 runtime command adapter
   注册，不把命令当作 Agent 自创工具。
 - sandbox/permission/model：read-only；workspace-write + ask base；
   deployment default pinned。
@@ -1086,8 +1113,10 @@ list、persona/instructions、所需 tool rows、compaction/skills（如合同
   refs、未执行项目；不能只写“tests pass”。
 - optional deps/mount failure：shell/tool surface 不可证明时在 reservation
   前 fail；不以模拟工具名补齐 receipt。
-- reused by：feature-development、bug-diagnosis-and-fix；release/audit
-  延期后可作为它们的基础 role。
+- reused by（exhaustive）：initial use = feature-development、
+  bug-diagnosis-and-fix、refactor-and-migration、architecture-decision、
+  audit-and-hardening；remediation-only = none；deferred/future =
+  release-readiness。
 
 ### E.5 architect
 
@@ -1099,8 +1128,8 @@ list、persona/instructions、所需 tool rows、compaction/skills（如合同
 - DSH base composition：standard copy 的 analysis variant；保留 tool-web、
   tool-fs、tool-fs-search、skills、compaction、report/handoff；移除 bash、
   editor、delegation、goal 和 Code Mode。
-- requiredTools：tool-web、tool-fs、tool-fs-search、orchestra_report、
-  orchestra_handoff。
+- compositionTools：tool-web、tool-fs、tool-fs-search。
+- orchestraTools：orchestra_report、orchestra_handoff。
 - sandbox/permission/model：read-only；workspace-write + ask base；
   deployment default pinned，强模型必须显式 override。
 - report/handoff：decision brief 必须列 decision question、alternatives、
@@ -1108,8 +1137,10 @@ list、persona/instructions、所需 tool rows、compaction/skills（如合同
   evidence refs。
 - optional deps/mount failure：若 web 不可用但 mission 允许 local evidence，
   明确列 no-web limitation；若 required web，则 fail preflight。
-- reused by：architecture-decision；feature/bug 只作为 cap-exhausted
-  remediation specialist。
+- reused by（exhaustive）：initial use = architecture-decision、
+  refactor-and-migration；remediation-only = feature-development、
+  bug-diagnosis-and-fix、audit-and-hardening；deferred/future =
+  release-readiness。
 
 ### E.6 researcher
 
@@ -1122,16 +1153,19 @@ list、persona/instructions、所需 tool rows、compaction/skills（如合同
 - DSH base composition：standard copy 的 research variant；保留 tool-web、
   tool-fs-search、tool-fs、skills、report/handoff；移除 bash、editor、
   delegation、goal 和 Code Mode。
-- requiredTools：tool-web、tool-fs-search、tool-fs、orchestra_report、
-  orchestra_handoff。
+- compositionTools：tool-web、tool-fs-search、tool-fs。
+- orchestraTools：orchestra_report、orchestra_handoff。
 - sandbox/permission/model：read-only；workspace-write + ask base；
   deployment default pinned。
 - report/handoff：research brief 必须保留 source URL、访问/commit 版本、
   fact/inference 标签、unknowns、evidence refs 和下一步问题。
 - optional deps/mount failure：web provider 缺失时只能做 local-only research
   并将缺口标记为 blocked/deferred；不静默声明完成。
-- reused by：architecture-decision；产品/UI、release、audit 的未来模板可
-  按需复用，但本轮不冻结它们。
+- reused by（exhaustive）：initial use = architecture-decision；
+  remediation-only = bug-diagnosis-and-fix、refactor-and-migration；
+  deferred/future = product-or-ui-design、release-readiness、
+  audit-and-hardening。audit-and-hardening 本轮使用 hardening-auditor，
+  不默认加入 researcher。
 
 ### E.7 hardening-auditor
 
@@ -1145,18 +1179,20 @@ list、persona/instructions、所需 tool rows、compaction/skills（如合同
   tool-fs、tool-fs-search、tool-bash、skills、compaction、report/handoff；
   tool-web 仅在 audit mission 显式需要且 preflight 成功时启用；移除
   editor、delegation、goal 和 Code Mode。
-- requiredTools：tool-fs、tool-fs-search、tool-bash、orchestra_report、
-  orchestra_handoff。
+- compositionTools：tool-fs、tool-fs-search、tool-bash。
+- orchestraTools：orchestra_report、orchestra_handoff。
 - sandbox/permission/model：read-only；workspace-write + ask base；
   deployment default pinned。
-- report/handoff：finding 必须有稳定 fingerprint、asset/location、impact、
-  severity、reproduction 或 why-not、fix、rescan 和 residual-risk 字段；
-  只把可重读 evidence 交给 investigator/reviewer。
+- report/handoff：初始 finding 必须有稳定 fingerprint、asset/location、
+  impact、severity、reproduction 或 why-not、fix；rescan、regression 和
+  residual-risk 是 verifier → reviewer 的后置事实，初始 residual risk
+  只能标 unknown。只把可重读 evidence 交给 investigator/reviewer。
 - optional deps/mount failure：SAST/DAST、web、browser、外部 compliance
   provider 都是 optional；required capability 缺失时 blocked/deferred，不
   伪造 covered。
-- reused by：audit-and-hardening；未来可被 release-readiness 作为 security
-  lane 复用，但本轮不实现 release topology。
+- reused by（exhaustive）：initial use = audit-and-hardening；
+  remediation-only = none；deferred/future = release-readiness 的 security
+  lane。
 
 ### E.8 评估但不冻结的 Role Pool
 

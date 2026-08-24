@@ -272,8 +272,11 @@ Role Preset composition、示例任务和真实 full-session E2E。首发数量�
 - 6B 只能实现 6.4 的五个 Topology 和七个 Role Preset；每个模板通过真实
   E2E 后才能在 release/实现清单中标记为 implemented。
 - DSH Agent Preset、Permission Preset、Model Selection、sandbox 和
-  optional provider 是分离事实。缺失 required capability 必须在
-  provisioning 前 fail loud；不能以 persona-only 文件或当前默认值补齐。
+  optional provider 是分离事实。Topology capability contract 必须区分
+  DSH compositionTools 与 Orchestra orchestraTools：前者通过 preset
+  mount/visible scope 验证，后者通过 host/plugin tool registration 验证；
+  缺失 required capability 必须在 provisioning 前 fail loud，不能把
+  orchestra_* 写入 Agent Preset，也不能以 persona-only 文件或当前默认值补齐。
 
 ## 7. 自定义 Graph Engineering 规范
 
@@ -408,9 +411,10 @@ Soft warning 不得被工具 render 的一句摘要吞掉；应进入 Draft/Free
 
 - **依赖**：Checkpoint 2、4、5 和 6A 的 TOPOLOGY-CATALOG.md 冻结。
 - **范围**：只实现 6A 冻结的五个任务型 Topology 与七个 Role Preset；补齐
-  完整 Agent composition、Permission/Model/sandbox 边界、capability
-  preflight、graph/loop/gate/role-preset 定义、示例任务和真实 full-session
-  E2E。Agency Agents 的 standalone persona 只能作为角色设计参考，不是
+  完整 Agent composition、Permission/Model/sandbox 边界、分平面的
+  compositionTools/orchestraTools capability preflight、graph/loop/gate/
+  role-preset 定义、示例任务和真实 full-session E2E。Agency Agents 的
+  standalone persona 只能作为角色设计参考，不是
   直接依赖或批量导入格式。
 - **验收**：每个纳入的内置 Topology 都有真实 E2E；延期候选保持明确未
   实现；Preset 不再是 persona-only；缺失 optional/required capability
