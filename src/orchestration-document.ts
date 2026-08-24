@@ -127,7 +127,14 @@ function clone<T>(value: T): T {
 }
 
 function stable(value: unknown): string {
-  return JSON.stringify(value);
+  function canonical(input: unknown): unknown {
+    if (Array.isArray(input)) return input.map(canonical);
+    if (record(input)) {
+      return Object.fromEntries(Object.keys(input).sort().map((key) => [key, canonical(input[key])]));
+    }
+    return input;
+  }
+  return JSON.stringify(canonical(value)) ?? "undefined";
 }
 
 function evidence(value: unknown): value is EvidenceRef {
@@ -148,7 +155,8 @@ function projection(value: unknown): value is RuntimeProjection {
 function decision(value: unknown): value is DriverDecision {
   if (!record(value) || !nonEmpty(value.decisionId) || !nonEmpty(value.kind) || !nonEmpty(value.summary) || !nonEmpty(value.actorSessionId) || !finiteNumber(value.createdAt) || !Array.isArray(value.evidence)) return false;
   if (!value.evidence.every(evidence)) return false;
-  return value.rationale === undefined || typeof value.rationale === "string";
+  if (value.rationale !== undefined && typeof value.rationale !== "string") return false;
+  return value.affects === undefined || stringArray(value.affects);
 }
 
 export function readOrchestrationDocument(raw: unknown, teamId?: string): DocumentRead {

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createActiveTeamStateStore } from "../lib/orchestra-state.js";
+import { assertSpawnableTeamDocument } from "../lib/orchestra.js";
 import {
   appendDriverDecision,
   initializeOrchestrationDocument,
@@ -111,6 +112,8 @@ test("document initializes as a draft with deterministic runtime projection", ()
   assert.equal(first.runtimeProjection.roles[0].sessionId, "role-session");
   assert.equal(isRuntimeProjectionStale(first, source), false);
   assert.equal(isRuntimeProjectionStale(first, { ...source, roles: [{ ...source.roles[0], reportCount: 2 }] }), true);
+  const reorderedProjection = Object.fromEntries(Object.entries(first.runtimeProjection).reverse());
+  assert.equal(isRuntimeProjectionStale({ ...first, runtimeProjection: reorderedProjection }, source), false);
   const legacyProjection = initializeOrchestrationDocument({ ...source, mission: { ...source.mission, objective: "" } }, 200);
   assert.equal(readOrchestrationDocument(legacyProjection, source.teamId).kind, "ready");
 });
@@ -137,6 +140,7 @@ test("journal append is append-only, idempotent by decisionId, and conflicts on 
   assert.strictEqual(retry.document, appended.document);
   assert.throws(() => appendDriverDecision(appended.document, source, { ...input, summary: "changed" }), /already exists/);
   assert.throws(() => appendDriverDecision(appended.document, source, { ...input, actorSessionId: "reviewer-session" }), (error) => error?.code === "permission_denied");
+  assert.throws(() => appendDriverDecision(document, source, { ...input, affects: 42 }), (error) => error?.code === "invalid_evidence");
 });
 
 test("durable document reads are total and never reset malformed facts", () => {
@@ -148,6 +152,7 @@ test("durable document reads are total and never reset malformed facts", () => {
     { ...valid, documentRevision: -1 },
     { ...valid, runtimeProjection: null },
     { ...valid, decisions: [null] },
+    { ...valid, decisions: [{ decisionId: "d", kind: "test", summary: "bad", actorSessionId: "driver", createdAt: 1, evidence: [], affects: 42 }] },
     { ...valid, decisions: [{ decisionId: "d", kind: "test", summary: "bad", actorSessionId: "driver", createdAt: 1, evidence: [{ kind: "unknown", ref: "x" }] }] },
     { ...valid, markdown: { path: "" } },
   ];
@@ -229,5 +234,19 @@ test("ActiveTeam treats a malformed canonical document as blocked rather than an
   assert.equal(observed.kind, "blocked");
   assert.match(observed.diagnostic.message, /document/);
   await assert.rejects(() => store.create(cwd, source, { policy: {} }), /cannot create active team state/);
+  assert.equal(fs.content("orchestra/state/team.json"), before);
+});
+
+test("orchestra_spawn fails closed on a legacy Team until Driver reconcile, without writing state", async () => {
+  const fs = new MemoryFs();
+  const store = createActiveTeamStateStore(fs);
+  const source = team();
+  const legacy = { ...source };
+  delete legacy.document;
+  fs.seed("orchestra/state/team.json", legacy);
+  const observed = await store.read(cwd);
+  assert.equal(observed.kind, "ready");
+  const before = fs.content("orchestra/state/team.json");
+  assert.throws(() => assertSpawnableTeamDocument(observed), /legacy_missing/);
   assert.equal(fs.content("orchestra/state/team.json"), before);
 });

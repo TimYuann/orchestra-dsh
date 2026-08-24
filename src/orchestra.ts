@@ -774,6 +774,14 @@ function documentReadForTeam(team: TeamState): OrchestrationDocument | undefined
   return result.kind === "ready" ? result.document : undefined;
 }
 
+/** Existing legacy Teams require an explicit Driver reconcile before spawn may CAS them. */
+export function assertSpawnableTeamDocument(state: ActiveTeamRead): void {
+  throwIfBlocked("spawn a role", state);
+  if (state.kind === "ready" && state.team.document === undefined) {
+    throw new Error("cannot spawn a role: legacy_missing (run orchestra_reconcile first; spawning does not initialize a legacy document)");
+  }
+}
+
 function documentToolStatus(
   team: TeamState | undefined,
   document: OrchestrationDocument | undefined,
@@ -1369,7 +1377,7 @@ export function apply(ctx: Context): void {
         const effectivePreset = args.presetId !== undefined && args.presetId !== "" ? args.presetId : templatePreset;
         const effectiveSandbox = args.sandbox ?? templateSandbox;
         const teamObservation = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("spawn a role", teamObservation);
+        assertSpawnableTeamDocument(teamObservation);
         if (teamObservation.kind === "ready" && teamObservation.team.status !== "active" && teamObservation.team.status !== "degraded") {
           throw new Error(`cannot spawn a role while team status is ${teamObservation.team.status}; inspect the failed/provisioning state first`);
         }
@@ -1444,7 +1452,7 @@ export function apply(ctx: Context): void {
           status: "provisioning",
           roles: [...team.roles, reservedRole(plan)],
         };
-        if (reservedTeam.document === undefined) reservedTeam.document = initializeOrchestrationDocument(reservedTeam, reservedTeam.createdAt);
+        if (teamObservation.kind !== "ready" && reservedTeam.document === undefined) reservedTeam.document = initializeOrchestrationDocument(reservedTeam, reservedTeam.createdAt);
         const writeOptions = { policy: escrowPolicy(ctx, exec), signal: exec.signal };
         const reservation = teamObservation.kind === "ready"
           ? await activeTeamState.replace(teamObservation, reservedTeam, writeOptions)
