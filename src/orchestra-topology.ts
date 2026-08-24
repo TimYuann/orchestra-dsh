@@ -609,6 +609,115 @@ export const BUILTIN_TOPOLOGIES: TopologyConfig[] = [
       },
     },
   },
+  {
+    schemaVersion: 1,
+    id: "refactor-and-migration",
+    name: "Refactor and Migration",
+    description:
+      "在行为基线、兼容窗口和可回滚证据下完成结构或版本迁移：architect 规划 → implementer 逐 slice 实现 → verifier 验证 old/new 与 rollback → reviewer 评审；Loop PASS 且用户 Gate approve 后才收束",
+    controller: { id: "driver", source: "caller" },
+    roles: [
+      {
+        id: "architect",
+        name: "Architect",
+        preset: "orchestra-v04-architect-v1",
+        sandbox: "read-only",
+        compositionTools: ["tool-fs", "tool-fs-search"],
+        orchestraTools: ["orchestra_report", "orchestra_handoff"],
+        welcome:
+          "你作为 architect（架构师）：把迁移任务拆成有 baseline、target 和 rollback 事实的 migration plan。\n1) 只读沙箱，只写 migration plan / compat report，不改代码。\n2) migration plan 必须含 baseline、target、slice、compatWindow、rollback；不得用「全量重写再看」替代可验证事实。\n3) 每个 slice 必须能回答：旧行为如何验证、何时允许切换、失败如何回退。\n4) 对 driver 的汇报经 a2a_reply；角色间 typed 交接走 orchestra_handoff（migration-plan → implementer）。",
+      },
+      {
+        id: "implementer",
+        name: "Implementer",
+        preset: "orchestra-v04-implementer-v1",
+        sandbox: "workspace-write",
+        compositionTools: ["tool-bash", "tool-fs", "tool-fs-search"],
+        orchestraTools: ["orchestra_report", "orchestra_handoff"],
+        welcome:
+          "你作为 implementer（实现者）：只实现当前声明 slice 的源码与测试。\n1) 只改当前 slice scope 内文件；不得改 baseline evidence 与既有兼容 fixture。\n2) 一个 candidate 只含一个已声明 slice，不得把多个未声明 slice 藏在一个 candidate 里。\n3) 完成后用 orchestra_report 写交付说明（changedFiles、compatImpact、rollbackStep），evidence 引用 commit/diff/test。\n4) 对 driver 的汇报经 a2a_reply；角色间 typed 交接走 orchestra_handoff（slice-candidate → verifier）。\n5) 收到 findings 时按 scope 修复；不自报 PASS、不碰 charter/graph。",
+      },
+      {
+        id: "verifier",
+        name: "Verifier",
+        preset: "orchestra-v04-verifier-v1",
+        sandbox: "read-only",
+        compositionTools: ["tool-bash", "tool-fs-search"],
+        orchestraTools: ["orchestra_report", "orchestra_handoff"],
+        welcome:
+          "你作为 verifier（验证者）：运行 old/new contract tests 与 rollback smoke，整理 compatibility evidence。\n1) 只读沙箱，不改代码；唯一写通道是 orchestra_report。\n2) compatibility-evidence 必须含 oldPath、newPath、comparison、rollbackResult；evidence 引用 test/diff/report。\n3) 必须列出 command、exit/result、scope、evidence refs 与未执行项，不能只写「tests pass」。\n4) 对 driver 的汇报经 a2a_reply；角色间 typed 交接走 orchestra_handoff（compatibility-evidence → reviewer）。\n5) 不发 review PASS/FAIL。",
+      },
+      {
+        id: "reviewer",
+        name: "Reviewer",
+        preset: "orchestra-v04-reviewer-v1",
+        sandbox: "read-only",
+        compositionTools: ["tool-fs", "tool-fs-search", "tool-bash"],
+        orchestraTools: ["orchestra_report", "orchestra_verdict", "orchestra_handoff"],
+        welcome:
+          "你作为 reviewer（评审者）：唯一有权记录 PASS/FAIL/BLOCKED 的 evaluator。\n1) 只读沙箱，只审不修；旧行为失败、rollback 未验证或兼容窗口未覆盖时只能 FAIL/BLOCKED，不能放行。\n2) 第一轮缺旧路径证据必须返回 findings（findings、requiredCompatCheck、scope）。\n3) findings 交接可回 architect 或 implementer；verdict 交接走 orchestra_handoff（verdict → driver）。\n4) 用 orchestra_verdict 记录 PASS/FAIL/BLOCKED；对 driver 的汇报经 a2a_reply；不伪造用户 Gate、不改 charter/graph。",
+      },
+    ],
+    protocol: {
+      ownership: {
+        migration_contract: "architect",
+        slice_code: "implementer",
+        compat_checks: "verifier",
+        review_verdict: "reviewer",
+        closure: "driver",
+      },
+      routes: [
+        { kind: "migration-question", from: "driver", to: ["architect"] },
+        { kind: "migration-plan", from: "architect", to: ["implementer"] },
+        { kind: "slice-candidate", from: "implementer", to: ["verifier"] },
+        { kind: "compatibility-evidence", from: "verifier", to: ["reviewer"] },
+        { kind: "findings", from: "reviewer", to: ["architect", "implementer"] },
+        { kind: "verdict", from: "reviewer", to: ["driver"] },
+      ],
+      completion: { owner: "driver", rule: "migration-validation Loop PASS + 用户 Gate approve 后由 driver 收束（completed/failed/abandoned）" },
+      handoffs: [
+        { kind: "migration-plan", from: "architect", to: ["implementer"], requiredPayloadFields: ["baseline", "target", "slice", "compatWindow", "rollback"], requiredEvidenceKinds: ["report", "file", "commit"] },
+        { kind: "slice-candidate", from: "implementer", to: ["verifier"], requiredPayloadFields: ["changedFiles", "compatImpact", "rollbackStep"], requiredEvidenceKinds: ["commit", "diff", "test"] },
+        { kind: "compatibility-evidence", from: "verifier", to: ["reviewer"], requiredPayloadFields: ["oldPath", "newPath", "comparison", "rollbackResult"], requiredEvidenceKinds: ["test", "diff", "report"] },
+        { kind: "findings", from: "reviewer", to: ["architect", "implementer"], requiredPayloadFields: ["findings", "requiredCompatCheck", "scope"], requiredEvidenceKinds: ["report", "message"] },
+        { kind: "verdict", from: "reviewer", to: ["driver"], requiredPayloadFields: ["verdict", "remainingRisk", "cutoverRecommendation"], requiredEvidenceKinds: ["report", "commit", "diff", "test"] },
+      ],
+      loops: [
+        {
+          loopId: "migration-validation",
+          entry: { role: "architect", event: "migration_plan_ready" },
+          participants: ["architect", "implementer", "verifier", "reviewer"],
+          evaluatorRole: "reviewer",
+          candidateKind: "slice-candidate",
+          verdictKind: "PASS|FAIL|BLOCKED",
+          maxAttempts: 2,
+          passRoute: "compatibility Gate → closure",
+          retryRoute: "findings → implementer/architect → verifier",
+          capExhaustedRoute: "cap_exhausted → driver replan or abandon",
+          requiredEvidenceKinds: ["commit", "diff", "test", "report", "file"],
+        },
+      ],
+      gates: [
+        {
+          gateId: "migration-compatibility-approval",
+          decisionScope: ["loop:migration-validation"],
+          blockingScope: ["closure"],
+          options: ["approve", "revise", "stop"],
+          required: true,
+          onUnavailable: "blocked",
+        },
+      ],
+      closure: {
+        owner: "driver",
+        requiredLoopOutcomes: ["migration-validation:passed"],
+        requiredVerdicts: ["PASS"],
+        requiredEvidenceKinds: ["commit", "diff", "test", "report"],
+        openGatePolicy: "reject",
+        allowedOutcomes: ["completed", "failed", "abandoned"],
+        userOverride: false,
+      },
+    },
+  },
 ];
 
 const TOPOLOGY_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
