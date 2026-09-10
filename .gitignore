@@ -22,6 +22,14 @@ archive/
 state/
 reports/
 
+# --- 未跟踪用户资产（永不提交、永不删除；规则来源 STATE.md §5 与 reports/E2E-TESTING-HANDBOOK.md §9） ---
+# external report/  = v0.4「协作宪章」设计原委的外部咨询稿（GPT / Gemini）
+# specs/            = orchestra 自身跑出的 mission spec 样例产物，非插件源码
+# test-bug1-*.mjs   = v0.3 期 Bug #1 回归套（v0.4 行为变更后 2 项失败属预期，正式基线以 npm test 为准）
+/external report/
+/specs/
+/scripts/test-bug1-cross-cwd.mjs
+
 # --- 本机 / 临时文件 ---
 .DS_Store
 *.log
