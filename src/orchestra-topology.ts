@@ -67,6 +67,20 @@ export interface TopologyProtocol {
   loops?: TopologyLoopContract[];
   gates?: TopologyGateDefinition[];
   closure?: TopologyClosureDefinition;
+  budgets?: TopologyBudgets;
+}
+
+/**
+ * Run-wide ceilings that apply regardless of which Loop is advancing.
+ *
+ * A Team budget is measured from `TeamState.createdAt`, which is the only
+ * creation fact a resumed or activated Team keeps. Exceeding it stops
+ * ADVANCEMENT but never stops closure: a budget that could block the terminal
+ * outcome would strand the run forever, which is the opposite of its purpose.
+ */
+export interface TopologyBudgets {
+  /** Wall-clock ceiling for the whole Team run. */
+  teamWallClockMs?: number;
 }
 
 export interface TopologyHandoffContract {
@@ -89,6 +103,33 @@ export interface TopologyLoopContract {
   retryRoute: string;
   capExhaustedRoute: string;
   requiredEvidenceKinds: string[];
+  /**
+   * Wall-clock ceiling for one Attempt. Omission is NOT unbounded: the runtime
+   * applies its own default, so every Attempt has a deadline and an unattended
+   * run cannot hang on a node that simply stopped. Declaring a value here
+   * tightens that ceiling; there is deliberately no way to remove it.
+   */
+  attemptTimeoutMs?: number;
+  /**
+   * Wall-clock ceiling for the whole Loop, across every Attempt. Exceeding it
+   * ends the Loop through the SAME `capExhaustedRoute` a verdict or deadline
+   * exhaustion uses, so a budget breach is a bounded outcome the charter
+   * already anticipated rather than a new terminal kind.
+   */
+  wallClockBudgetMs?: number;
+  /**
+   * Hard ceiling on Attempts in this Loop. It may only NARROW `maxAttempts`;
+   * a larger value is rejected by the validator instead of being stored and
+   * silently ignored, because a ceiling that does not bind is worse than none.
+   */
+  maxTotalAttempts?: number;
+  /**
+   * How long an open Attempt may show no progress before the stall projection
+   * reports it as stalled (milestone 2b). Validated here so a topology cannot
+   * ship an unusable value, and declared here rather than added later so the
+   * frozen contract shape does not have to change twice.
+   */
+  stallGraceMs?: number;
 }
 
 export interface TopologyGateDefinition {
@@ -993,6 +1034,48 @@ function stringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string");
 }
 
+/**
+ * Problems in one Loop's bounded-run fields.
+ *
+ * These are validated rather than defaulted wherever a default would make the
+ * declared value meaningless. A ceiling that silently does not bind, or a grace
+ * period that can never elapse, is worse than an absent field: the topology
+ * reads as if it asked for something the runtime is not doing. Each message
+ * therefore says what the value would have failed to do.
+ *
+ * @param loop - the raw loop record being validated.
+ * @param index - its position, for a message that can be located.
+ * @returns one line per unusable field (empty when all are absent or usable).
+ */
+function boundedRunProblems(loop: Record<string, any>, index: number): string[] {
+  const problems: string[] = [];
+  const ms = (field: "attemptTimeoutMs" | "wallClockBudgetMs" | "stallGraceMs"): number | undefined => {
+    const value = loop[field];
+    if (value === undefined) return undefined;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+      problems.push(`protocol.loops[${index}].${field} must be a positive safe integer of milliseconds`);
+      return undefined;
+    }
+    return value;
+  };
+  const attemptTimeoutMs = ms("attemptTimeoutMs");
+  ms("wallClockBudgetMs");
+  const stallGraceMs = ms("stallGraceMs");
+  const maxAttempts = typeof loop.maxAttempts === "number" && Number.isSafeInteger(loop.maxAttempts) ? loop.maxAttempts : undefined;
+  const maxTotalAttempts = loop.maxTotalAttempts;
+  if (maxTotalAttempts !== undefined) {
+    if (typeof maxTotalAttempts !== "number" || !Number.isSafeInteger(maxTotalAttempts) || maxTotalAttempts < 1) {
+      problems.push(`protocol.loops[${index}].maxTotalAttempts must be a positive safe integer`);
+    } else if (maxAttempts !== undefined && maxTotalAttempts > maxAttempts) {
+      problems.push(`protocol.loops[${index}].maxTotalAttempts (${maxTotalAttempts}) exceeds maxAttempts (${maxAttempts}): it may only narrow the Attempt ceiling, so a larger value would be stored and silently ignored`);
+    }
+  }
+  if (stallGraceMs !== undefined && attemptTimeoutMs !== undefined && stallGraceMs > attemptTimeoutMs) {
+    problems.push(`protocol.loops[${index}].stallGraceMs (${stallGraceMs}) exceeds attemptTimeoutMs (${attemptTimeoutMs}): the Attempt would always time out before the grace period could elapse, so the stall projection could never fire`);
+  }
+  return problems;
+}
+
 export function validateTopology(config: unknown): string[] {
   const problems: string[] = [];
   if (!isRecord(config)) return ["shape: topology config must be an object"];
@@ -1194,6 +1277,17 @@ export function validateTopology(config: unknown): string[] {
       }
       if (typeof loop.maxAttempts !== "number" || !Number.isSafeInteger(loop.maxAttempts) || loop.maxAttempts <= 0) problems.push(`protocol.loops[${index}].maxAttempts must be a positive safe integer`);
       if (!stringArray(loop.requiredEvidenceKinds)) problems.push(`shape: protocol.loops[${index}].requiredEvidenceKinds must be a string array`);
+      problems.push(...boundedRunProblems(loop, index));
+    }
+  }
+  if (protocol.budgets !== undefined) {
+    if (!isRecord(protocol.budgets)) {
+      problems.push("shape: protocol.budgets must be an object");
+    } else {
+      const teamWallClockMs = protocol.budgets.teamWallClockMs;
+      if (teamWallClockMs !== undefined && (typeof teamWallClockMs !== "number" || !Number.isSafeInteger(teamWallClockMs) || teamWallClockMs <= 0)) {
+        problems.push("protocol.budgets.teamWallClockMs must be a positive safe integer of milliseconds");
+      }
     }
   }
   if (protocol.gates !== undefined && !Array.isArray(protocol.gates)) {

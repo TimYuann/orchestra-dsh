@@ -27,9 +27,29 @@ declare module "@deepseek-ai/dsh-session/types" {
 
 export const GRAPH_RUNTIME_SCHEMA_VERSION = 1;
 
+/**
+ * Wall-clock ceiling applied to an Attempt whose Loop declares none.
+ *
+ * This is a POLICY, not a magic number. Principle P10 says every Attempt must
+ * have a deadline, and an unattended run must never hang on a node that simply
+ * stopped working — so the deadline has to exist structurally rather than only
+ * when a topology author remembered to ask for one. Thirty minutes is chosen to
+ * be longer than any single honest Attempt in the shipped task topologies while
+ * still bounding a stalled one inside a working session; a topology that knows
+ * better tightens it with `attemptTimeoutMs`, and nothing may loosen it past
+ * this ceiling by omission.
+ *
+ * Because the value is a default rather than a stored fact, an old persisted
+ * runtime whose `attempt_started` events predate it projects the same deadline
+ * it would have had if the field existed then.
+ */
+export const DEFAULT_ATTEMPT_TIMEOUT_MS = 30 * 60 * 1000;
+
 export type GraphEventType =
   | "loop_started"
   | "attempt_started"
+  | "attempt_expired"
+  | "budget_exhausted"
   | "handoff_pending"
   | "handoff_accepted"
   | "handoff_failed"
@@ -91,6 +111,8 @@ export type GraphDiagnosticCode =
   | "evaluator_required"
   | "cap_exhausted"
   | "stale_charter"
+  | "timeout_not_reached"
+  | "budget_exhausted"
   | "handoff_invalid";
 
 export class GraphRuntimeError extends Error {
@@ -107,11 +129,33 @@ export interface LoopAttemptSummary {
   attempt: number;
   roleId: string;
   sessionId: string;
-  status: "started" | "passed" | "failed" | "blocked";
+  /**
+   * `expired` is a terminal Attempt outcome reached by deadline rather than by
+   * a verdict. It exists so an unattended run has a recorded ending instead of
+   * an Attempt that silently never finished.
+   */
+  status: "started" | "passed" | "failed" | "blocked" | "expired";
   candidate?: Record<string, unknown>;
   verdict?: "PASS" | "FAIL" | "BLOCKED";
   findings?: string[];
+  /** When this Attempt opened (the `attempt_started` event time). */
+  startedAt: number;
+  /**
+   * The deadline this Attempt ran under. Derived as `startedAt + timeoutMs`,
+   * where the timeout is the effective one recorded when the Attempt opened; it
+   * is reported even for a settled Attempt so a later reader can audit whether
+   * the outcome arrived in time.
+   */
+  deadlineAt: number;
   evidence: EvidenceRef[];
+}
+
+/** One wall-clock ceiling that was actually exceeded, and when it started counting. */
+export interface BudgetExhaustion {
+  scope: "loop" | "team";
+  loopId?: string;
+  limitMs: number;
+  consumedMs: number;
 }
 
 export interface LoopSummary {
@@ -119,7 +163,19 @@ export interface LoopSummary {
   loopId: string;
   status: "running" | "passed" | "blocked" | "cap_exhausted";
   evaluatorRole: string;
+  /** Declared ceiling from the frozen contract (`maxAttempts` in the start event). */
   maxAttempts: number;
+  /**
+   * The ceiling actually enforced: `min(maxAttempts, maxTotalAttempts)` when the
+   * contract narrows it. A boundedness reader must use THIS, because the
+   * declared value may be higher than the rule the run obeys.
+   */
+  effectiveMaxAttempts: number;
+  startedAt: number;
+  /** Deadline of the current open Attempt, when one is open. */
+  currentDeadlineAt?: number;
+  /** The Loop-level budget that was exceeded, once one has been. */
+  budgetExhausted?: { limitMs: number; consumedMs: number };
   attempts: LoopAttemptSummary[];
   capExhausted: boolean;
   unresolvedFindings: string[];
@@ -144,6 +200,16 @@ export interface GraphProjectionSummary {
   currentLoop?: { loopInstanceId: string; loopId: string; attempt?: number; status: LoopSummary["status"] };
   pendingHandoffs: HandoffSummary[];
   capExhausted: string[];
+  /** Attempts that ended by deadline instead of by verdict. */
+  expiredAttempts: number;
+  /** Every wall-clock ceiling recorded as exceeded, in append order. */
+  budgets: BudgetExhaustion[];
+  /**
+   * Whether the TEAM-level budget is exhausted. Once true, advancement is
+   * refused while closure stays available, so the run can always be brought to
+   * a terminal outcome rather than being stranded by its own budget.
+   */
+  teamBudgetExhausted: boolean;
   openGates: GateSummary[];
   blockedScopes: string[];
   closure: ClosureSummary;
@@ -182,6 +248,8 @@ export interface ClosureSummary {
 const EVENT_TYPES = new Set<GraphEventType>([
   "loop_started",
   "attempt_started",
+  "attempt_expired",
+  "budget_exhausted",
   "handoff_pending",
   "handoff_accepted",
   "handoff_failed",
@@ -282,6 +350,73 @@ function loopContractValid(contract: TopologyLoopContract): boolean {
   return nonEmpty(contract.loopId) && record(contract.entry) && nonEmpty(contract.entry.role) && nonEmpty(contract.entry.event) && Array.isArray(contract.participants) && contract.participants.length > 0 && contract.participants.every(nonEmpty) && nonEmpty(contract.evaluatorRole) && nonEmpty(contract.candidateKind) && nonEmpty(contract.verdictKind) && safePositive(contract.maxAttempts) && nonEmpty(contract.passRoute) && nonEmpty(contract.retryRoute) && nonEmpty(contract.capExhaustedRoute) && Array.isArray(contract.requiredEvidenceKinds) && contract.requiredEvidenceKinds.every(nonEmpty);
 }
 
+/**
+ * The Attempt ceiling a Loop actually enforces.
+ *
+ * `maxTotalAttempts` may only NARROW `maxAttempts`; the topology validator
+ * rejects a value above it rather than letting the field sit there doing
+ * nothing. Every enforcement site must use this instead of the declared cap,
+ * or a narrowed Loop would be allowed to run past the rule it declared.
+ *
+ * @param contract - the frozen Loop contract.
+ * @returns the enforced ceiling, never above `maxAttempts`.
+ */
+export function effectiveMaxAttempts(contract: Pick<TopologyLoopContract, "maxAttempts" | "maxTotalAttempts">): number {
+  const narrowed = contract.maxTotalAttempts;
+  if (narrowed === undefined) return contract.maxAttempts;
+  return Math.min(contract.maxAttempts, narrowed);
+}
+
+/**
+ * The wall-clock ceiling one Attempt runs under.
+ *
+ * A Loop that declares nothing still gets {@link DEFAULT_ATTEMPT_TIMEOUT_MS},
+ * which is what makes "every Attempt has a deadline" a structural property of
+ * the runtime rather than a property of well-written topologies.
+ *
+ * @param contract - the frozen Loop contract.
+ * @returns the effective timeout in milliseconds.
+ */
+export function effectiveAttemptTimeoutMs(contract: Pick<TopologyLoopContract, "attemptTimeoutMs">): number {
+  return contract.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS;
+}
+
+/** The deadline one Attempt runs to, derived from when it opened. */
+export function attemptDeadlineAt(attempt: Pick<LoopAttemptSummary, "startedAt">, contract: Pick<TopologyLoopContract, "attemptTimeoutMs">): number {
+  return attempt.startedAt + effectiveAttemptTimeoutMs(contract);
+}
+
+/**
+ * Whether the TEAM-level wall-clock budget has been recorded as exhausted.
+ *
+ * Read from the durable event, never computed from a clock, so every command
+ * refuses advancement on the same fact an earlier sweep wrote — and so a
+ * restarted process reaches the same verdict.
+ *
+ * @param runtime - the graph runtime to read.
+ * @returns true once a team-scope budget exhaustion is on the log.
+ */
+export function teamBudgetExhausted(runtime: GraphRuntimeState): boolean {
+  return runtime.events.some((event) => event.type === "budget_exhausted" && event.payload.scope === "team");
+}
+
+/**
+ * Refuse one advancement command once the team budget is gone.
+ *
+ * Closure is deliberately NOT routed through here: a budget that could block
+ * closure would strand the run forever with no terminal outcome, which is the
+ * opposite of what a budget is for. An exhausted team may not take another
+ * step, but it can always be closed.
+ *
+ * @param runtime - the graph runtime to check.
+ * @throws {GraphRuntimeError} `budget_exhausted` when the team ceiling is gone.
+ */
+function assertTeamBudgetOpen(runtime: GraphRuntimeState): void {
+  if (teamBudgetExhausted(runtime)) {
+    throw new GraphRuntimeError("budget_exhausted", "the Team wall-clock budget is exhausted; no further advancement is accepted — record closure to end this run");
+  }
+}
+
 function roleFor(team: TeamState, roleId: string): TeamRole {
   const role = team.roles.find((entry) => entry.id.toLowerCase() === roleId.toLowerCase());
   if (role === undefined) throw new GraphRuntimeError("role_not_participant", `role ${roleId} is not in the current Team`);
@@ -338,19 +473,62 @@ function appendOne(runtime: GraphRuntimeState, input: {
 
 function loopsFromEvents(events: readonly GraphEvent[]): Map<string, LoopSummary> {
   const loops = new Map<string, LoopSummary>();
+  // Team-scope budget exhaustion is a run-wide fact, not Loop state; it is
+  // validated here (once, with usable numbers) and read by callers through
+  // teamBudgetExhausted(). Loop-scope facts live on their Loop.
+  let teamBudgetSeen = false;
   for (const event of events) {
     if (event.type === "loop_started") {
       const payload = event.payload;
       if (!nonEmpty(event.loopInstanceId) || typeof payload.loopId !== "string" || !safePositive(payload.maxAttempts) || typeof payload.evaluatorRole !== "string") throw new GraphRuntimeError("invalid_event", `loop_started event ${event.eventId} is incomplete`);
+      // A runtime written before maxTotalAttempts existed has no effective
+      // ceiling, and the declared value is then already the enforced one.
+      const effective = payload.effectiveMaxAttempts === undefined ? payload.maxAttempts : payload.effectiveMaxAttempts;
+      if (!safePositive(effective) || effective > payload.maxAttempts) throw new GraphRuntimeError("invalid_event", `loop_started event ${event.eventId} declares an effective ceiling above its declared cap`);
       if (loops.has(event.loopInstanceId)) throw new GraphRuntimeError("duplicate_event", `loop ${event.loopInstanceId} was started twice`);
-      loops.set(event.loopInstanceId, { loopInstanceId: event.loopInstanceId, loopId: payload.loopId, status: "running", evaluatorRole: payload.evaluatorRole, maxAttempts: payload.maxAttempts, attempts: [], capExhausted: false, unresolvedFindings: [] });
+      loops.set(event.loopInstanceId, { loopInstanceId: event.loopInstanceId, loopId: payload.loopId, status: "running", evaluatorRole: payload.evaluatorRole, maxAttempts: payload.maxAttempts, effectiveMaxAttempts: effective, startedAt: event.createdAt, attempts: [], capExhausted: false, unresolvedFindings: [] });
     } else if (event.type === "attempt_started") {
       const loop = event.loopInstanceId === undefined ? undefined : loops.get(event.loopInstanceId);
       if (loop === undefined) throw new GraphRuntimeError("loop_not_found", `attempt ${event.eventId} references no loop`);
       if (loop.status !== "running") throw new GraphRuntimeError("loop_terminal", `attempt ${event.eventId} follows terminal loop ${loop.loopInstanceId}`);
       const attempt = event.payload.attempt;
       if (!safePositive(attempt) || attempt !== loop.attempts.length + 1 || typeof event.roleId !== "string" || typeof event.payload.sessionId !== "string") throw new GraphRuntimeError("attempt_conflict", `attempt ${event.eventId} is not continuous`);
-      loop.attempts.push({ attempt, roleId: event.roleId, sessionId: event.payload.sessionId, status: "started", candidate: record(event.payload.candidate) ? event.payload.candidate : undefined, evidence: clone(event.evidence) });
+      // The deadline is DERIVED here, never stored as its own event: the
+      // Attempt records the timeout it started under, and every reader computes
+      // startedAt + timeoutMs. A derived deadline cannot drift from the Attempt
+      // it belongs to.
+      const timeoutMs = event.payload.timeoutMs === undefined ? DEFAULT_ATTEMPT_TIMEOUT_MS : event.payload.timeoutMs;
+      if (!safePositive(timeoutMs)) throw new GraphRuntimeError("invalid_event", `attempt ${event.eventId} declares an unusable timeout`);
+      const startedAt = event.createdAt;
+      loop.attempts.push({ attempt, roleId: event.roleId, sessionId: event.payload.sessionId, status: "started", candidate: record(event.payload.candidate) ? event.payload.candidate : undefined, startedAt, deadlineAt: startedAt + timeoutMs, evidence: clone(event.evidence) });
+      loop.currentDeadlineAt = startedAt + timeoutMs;
+    } else if (event.type === "attempt_expired") {
+      const loop = event.loopInstanceId === undefined ? undefined : loops.get(event.loopInstanceId);
+      const attempt = loop?.attempts.at(-1);
+      if (loop === undefined || attempt === undefined || attempt.attempt !== event.payload.attempt || attempt.verdict !== undefined || attempt.status !== "started") throw new GraphRuntimeError("attempt_conflict", `attempt expiry ${event.eventId} does not match one open attempt`);
+      const deadlineAt = event.payload.deadlineAt;
+      const expiredAt = event.payload.expiredAt;
+      if (!finite(deadlineAt) || !finite(expiredAt)) throw new GraphRuntimeError("invalid_event", `attempt expiry ${event.eventId} lacks a finite deadline or expiry time`);
+      // Expiry is the deadline being reached, not an opinion: an expiry that
+      // precedes its own deadline would make every later sweep inconsistent.
+      if (expiredAt < deadlineAt) throw new GraphRuntimeError("attempt_conflict", `attempt expiry ${event.eventId} precedes its deadline`);
+      if (deadlineAt !== attempt.deadlineAt) throw new GraphRuntimeError("attempt_conflict", `attempt expiry ${event.eventId} names a deadline the attempt never had`);
+    } else if (event.type === "budget_exhausted") {
+      const scope = event.payload.scope;
+      if (scope !== "loop" && scope !== "team") throw new GraphRuntimeError("invalid_event", `budget event ${event.eventId} has an unknown scope`);
+      if (!safePositive(event.payload.limitMs) || !finite(event.payload.consumedMs)) throw new GraphRuntimeError("invalid_event", `budget event ${event.eventId} lacks usable limit or consumption`);
+      if (scope === "team") {
+        // One team can exceed its ceiling once; a second record would let a
+        // repeated sweep look like a second, different breach.
+        if (teamBudgetSeen) throw new GraphRuntimeError("duplicate_event", `team budget was already recorded as exhausted before ${event.eventId}`);
+        teamBudgetSeen = true;
+      } else {
+        const loop = event.loopInstanceId === undefined ? undefined : loops.get(event.loopInstanceId);
+        if (loop === undefined) throw new GraphRuntimeError("loop_not_found", `budget event ${event.eventId} references no loop`);
+        if (typeof event.payload.loopId !== "string" || event.payload.loopId !== loop.loopId) throw new GraphRuntimeError("invalid_event", `budget event ${event.eventId} names a different Loop`);
+        if (loop.budgetExhausted !== undefined) throw new GraphRuntimeError("duplicate_event", `Loop ${loop.loopInstanceId} budget was already recorded as exhausted before ${event.eventId}`);
+        loop.budgetExhausted = { limitMs: event.payload.limitMs, consumedMs: event.payload.consumedMs };
+      }
     } else if (event.type === "verdict_recorded") {
       const loop = event.loopInstanceId === undefined ? undefined : loops.get(event.loopInstanceId);
       if (loop === undefined) throw new GraphRuntimeError("loop_not_found", `verdict ${event.eventId} references no loop`);
@@ -363,17 +541,37 @@ function loopsFromEvents(events: readonly GraphEvent[]): Map<string, LoopSummary
     } else if (event.type === "attempt_completed") {
       const loop = event.loopInstanceId === undefined ? undefined : loops.get(event.loopInstanceId);
       const attempt = loop?.attempts.at(-1);
-      if (loop === undefined || attempt === undefined || attempt.attempt !== event.payload.attempt || !["passed", "failed", "blocked"].includes(String(event.payload.status)) || attempt.verdict === undefined) throw new GraphRuntimeError("attempt_conflict", `attempt completion ${event.eventId} is invalid`);
-      attempt.status = event.payload.status as LoopAttemptSummary["status"];
+      const status = String(event.payload.status);
+      if (loop === undefined || attempt === undefined || attempt.attempt !== event.payload.attempt || !["passed", "failed", "blocked", "expired"].includes(status)) throw new GraphRuntimeError("attempt_conflict", `attempt completion ${event.eventId} is invalid`);
+      // Every completion but `expired` is the consequence of a verdict and must
+      // carry one; an expired Attempt has none by definition, and requiring one
+      // would make a deadline ending unrecordable.
+      if (status === "expired" ? attempt.verdict !== undefined : attempt.verdict === undefined) throw new GraphRuntimeError("attempt_conflict", `attempt completion ${event.eventId} disagrees with the attempt's verdict facts`);
+      attempt.status = status as LoopAttemptSummary["status"];
+      // A settled Attempt has no open deadline; leaving one would keep reporting
+      // a pending deadline for work that already ended.
+      loop.currentDeadlineAt = undefined;
       if (attempt.status === "passed") loop.status = "passed";
       if (attempt.status === "blocked") loop.status = "blocked";
     } else if (event.type === "cap_exhausted") {
       const loop = event.loopInstanceId === undefined ? undefined : loops.get(event.loopInstanceId);
-      const attempt = loop?.attempts.at(-1);
-      if (loop === undefined || attempt === undefined || attempt.verdict !== "FAIL" || attempt.attempt !== loop.maxAttempts) throw new GraphRuntimeError("cap_exhausted", `cap event ${event.eventId} does not follow the hard cap`);
+      if (loop === undefined) throw new GraphRuntimeError("loop_not_found", `cap event ${event.eventId} references no loop`);
+      const attempt = loop.attempts.at(-1);
+      if (loop.budgetExhausted !== undefined) {
+        // A budget can be blown before any Attempt was ever started, so this
+        // precedent does not require one — but the Loop must still be running,
+        // because ending an already-ended Loop would rewrite history.
+        if (loop.status !== "running") throw new GraphRuntimeError("cap_exhausted", `cap event ${event.eventId} follows a Loop that already ended`);
+      } else {
+        // The other two precedents are about one specific Attempt: a FAIL
+        // verdict at the ceiling, or an Attempt that ran out of time there.
+        // Anything else is an unexplained cap and is rejected.
+        if (attempt === undefined || attempt.attempt !== loop.effectiveMaxAttempts) throw new GraphRuntimeError("cap_exhausted", `cap event ${event.eventId} does not follow the hard cap`);
+        if (attempt.verdict !== "FAIL" && attempt.status !== "expired") throw new GraphRuntimeError("cap_exhausted", `cap event ${event.eventId} has no exhausted verdict or deadline behind it`);
+      }
       loop.status = "cap_exhausted";
       loop.capExhausted = true;
-      loop.unresolvedFindings = Array.isArray(event.payload.unresolvedFindings) && event.payload.unresolvedFindings.every((finding) => typeof finding === "string") ? event.payload.unresolvedFindings : attempt.findings ?? [];
+      loop.unresolvedFindings = Array.isArray(event.payload.unresolvedFindings) && event.payload.unresolvedFindings.every((finding) => typeof finding === "string") ? event.payload.unresolvedFindings : attempt?.findings ?? [];
     }
   }
   return loops;
@@ -517,6 +715,7 @@ function assertEvidenceKinds(evidenceRefs: EvidenceRef[], required: string[], ac
 export function startLoop(runtime: GraphRuntimeState, team: TeamState, contract: TopologyLoopContract, input: { actorSessionId: string; loopInstanceId?: string; now: number; evidence?: EvidenceRef[] }): GraphCommandResult {
   currentCharterMatches(runtime, team);
   assertGraphOpen(runtime);
+  assertTeamBudgetOpen(runtime);
   if (input.actorSessionId !== team.controllerSessionId) throw new GraphRuntimeError("permission_denied", "only the Team controller may start a Loop");
   if (!loopContractValid(contract)) throw new GraphRuntimeError("invalid_shape", "Loop contract is malformed");
   roleFor(team, contract.evaluatorRole);
@@ -524,17 +723,19 @@ export function startLoop(runtime: GraphRuntimeState, team: TeamState, contract:
   assertEvidenceKinds(input.evidence ?? [], contract.requiredEvidenceKinds, "Loop start");
   assertScopesOpen(runtime, [contract.loopId, `loop:${contract.loopId}`]);
   const loopInstanceId = input.loopInstanceId ?? `loop-${contract.loopId}-${randomUUID()}`;
+  const effective = effectiveMaxAttempts(contract);
   const existing = graphLoops(runtime).find((loop) => loop.loopInstanceId === loopInstanceId);
   if (existing !== undefined) {
-    if (existing.loopId !== contract.loopId || existing.evaluatorRole !== contract.evaluatorRole || existing.maxAttempts !== contract.maxAttempts) throw new GraphRuntimeError("duplicate_event", `Loop ${loopInstanceId} already exists with different contract facts`);
+    if (existing.loopId !== contract.loopId || existing.evaluatorRole !== contract.evaluatorRole || existing.maxAttempts !== contract.maxAttempts || existing.effectiveMaxAttempts !== effective) throw new GraphRuntimeError("duplicate_event", `Loop ${loopInstanceId} already exists with different contract facts`);
     return { kind: "noop", runtime, events: [] };
   }
-  return appendOne(runtime, { type: "loop_started", actorSessionId: input.actorSessionId, loopInstanceId, createdAt: input.now, payload: { loopId: contract.loopId, maxAttempts: contract.maxAttempts, evaluatorRole: contract.evaluatorRole, entry: contract.entry, participants: contract.participants, candidateKind: contract.candidateKind, verdictKind: contract.verdictKind, passRoute: contract.passRoute, retryRoute: contract.retryRoute, capExhaustedRoute: contract.capExhaustedRoute, requiredEvidenceKinds: contract.requiredEvidenceKinds }, evidence: input.evidence });
+  return appendOne(runtime, { type: "loop_started", actorSessionId: input.actorSessionId, loopInstanceId, createdAt: input.now, payload: { loopId: contract.loopId, maxAttempts: contract.maxAttempts, effectiveMaxAttempts: effective, evaluatorRole: contract.evaluatorRole, entry: contract.entry, participants: contract.participants, candidateKind: contract.candidateKind, verdictKind: contract.verdictKind, passRoute: contract.passRoute, retryRoute: contract.retryRoute, capExhaustedRoute: contract.capExhaustedRoute, requiredEvidenceKinds: contract.requiredEvidenceKinds }, evidence: input.evidence });
 }
 
 export function startAttempt(runtime: GraphRuntimeState, team: TeamState, contract: TopologyLoopContract, input: { loopInstanceId: string; actorSessionId: string; participantRoleId: string; candidate?: Record<string, unknown>; now: number; evidence?: EvidenceRef[] }): GraphCommandResult {
   currentCharterMatches(runtime, team);
   assertGraphOpen(runtime);
+  assertTeamBudgetOpen(runtime);
   const role = roleFor(team, input.participantRoleId);
   const loops = deriveGraph(runtime);
   const loop = loops.get(input.loopInstanceId);
@@ -547,15 +748,25 @@ export function startAttempt(runtime: GraphRuntimeState, team: TeamState, contra
   const actorIsDriver = input.actorSessionId === team.controllerSessionId;
   if (!actorIsDriver && input.actorSessionId !== role.sessionId) throw new GraphRuntimeError("permission_denied", "attempt actor must be the Team controller or current participant Session");
   const nextAttempt = loop.attempts.length + 1;
-  if (nextAttempt > loop.maxAttempts) throw new GraphRuntimeError("cap_exhausted", "Loop hard cap is exhausted; start a new remediation Loop in a later checkpoint");
-  if (nextAttempt > 1 && loop.attempts.at(-1)?.verdict !== "FAIL") throw new GraphRuntimeError("attempt_conflict", "next attempt requires the previous attempt to have a FAIL verdict");
+  const cap = effectiveMaxAttempts(contract);
+  if (nextAttempt > cap) throw new GraphRuntimeError("cap_exhausted", "Loop hard cap is exhausted; start a new remediation Loop in a later checkpoint");
+  // A retry needs a REASON to exist: the previous Attempt must have been judged
+  // FAIL, or must have run out of time. An expired Attempt carries no verdict by
+  // definition, so requiring one would make a timed-out Loop unretryable and
+  // strand the run — the exact failure this milestone removes.
+  if (nextAttempt > 1) {
+    const previous = loop.attempts.at(-1);
+    const retryable = previous?.verdict === "FAIL" || previous?.status === "expired";
+    if (!retryable) throw new GraphRuntimeError("attempt_conflict", `next attempt requires the previous attempt to have a FAIL verdict or to have expired (previous status ${String(previous?.status ?? "missing")})`);
+  }
   assertEvidenceKinds(input.evidence ?? [], contract.requiredEvidenceKinds, "attempt");
-  return appendOne(runtime, { type: "attempt_started", actorSessionId: input.actorSessionId, roleId: role.id, loopInstanceId: input.loopInstanceId, createdAt: input.now, payload: { attempt: nextAttempt, sessionId: role.sessionId, candidateKind: contract.candidateKind, ...(input.candidate === undefined ? {} : { candidate: input.candidate }) }, evidence: input.evidence });
+  return appendOne(runtime, { type: "attempt_started", actorSessionId: input.actorSessionId, roleId: role.id, loopInstanceId: input.loopInstanceId, createdAt: input.now, payload: { attempt: nextAttempt, sessionId: role.sessionId, candidateKind: contract.candidateKind, timeoutMs: effectiveAttemptTimeoutMs(contract), ...(input.candidate === undefined ? {} : { candidate: input.candidate }) }, evidence: input.evidence });
 }
 
 export function recordVerdict(runtime: GraphRuntimeState, team: TeamState, contract: TopologyLoopContract, input: { loopInstanceId: string; actorSessionId: string; evaluatorRole: string; verdict: "PASS" | "FAIL" | "BLOCKED"; findings?: string[]; now: number; evidence?: EvidenceRef[] }): GraphCommandResult {
   currentCharterMatches(runtime, team);
   assertGraphOpen(runtime);
+  assertTeamBudgetOpen(runtime);
   const evaluator = roleFor(team, contract.evaluatorRole);
   const loop = deriveGraph(runtime).get(input.loopInstanceId);
   if (loop === undefined) throw new GraphRuntimeError("loop_not_found", `Loop ${input.loopInstanceId} was not found`);
@@ -566,7 +777,7 @@ export function recordVerdict(runtime: GraphRuntimeState, team: TeamState, contr
   if (loop.status !== "running" && attempt?.verdict === input.verdict) return { kind: "noop", runtime, events: [] };
   if (loop.status !== "running") throw new GraphRuntimeError(loop.status === "cap_exhausted" ? "cap_exhausted" : "loop_terminal", `Loop ${loop.loopInstanceId} is ${loop.status}`);
   if (attempt === undefined || attempt.verdict !== undefined) throw new GraphRuntimeError("attempt_conflict", "verdict requires one current started attempt");
-  if (input.verdict === "PASS" && attempt.attempt > loop.maxAttempts) throw new GraphRuntimeError("cap_exhausted", "PASS cannot occur after the hard cap");
+  if (input.verdict === "PASS" && attempt.attempt > effectiveMaxAttempts(contract)) throw new GraphRuntimeError("cap_exhausted", "PASS cannot occur after the hard cap");
   if (input.findings !== undefined && (!Array.isArray(input.findings) || !input.findings.every((finding) => typeof finding === "string"))) throw new GraphRuntimeError("invalid_shape", "verdict findings must be a string array");
   assertEvidenceKinds(input.evidence ?? [], contract.requiredEvidenceKinds, "verdict");
   let next = appendOne(runtime, { type: "verdict_recorded", actorSessionId: input.actorSessionId, roleId: evaluator.id, loopInstanceId: input.loopInstanceId, createdAt: input.now, payload: { attempt: attempt.attempt, verdict: input.verdict, findings: input.findings ?? [] }, evidence: input.evidence });
@@ -574,11 +785,212 @@ export function recordVerdict(runtime: GraphRuntimeState, team: TeamState, contr
   const completed = appendOne(next.runtime, { type: "attempt_completed", actorSessionId: input.actorSessionId, roleId: evaluator.id, loopInstanceId: input.loopInstanceId, createdAt: input.now, payload: { attempt: attempt.attempt, status: input.verdict === "PASS" ? "passed" : input.verdict === "BLOCKED" ? "blocked" : "failed" }, evidence: input.evidence });
   if (completed.kind === "noop") return completed;
   next = { kind: "changed", runtime: completed.runtime, events: [...next.events, ...completed.events] };
-  if (input.verdict === "FAIL" && attempt.attempt >= loop.maxAttempts) {
+  if (input.verdict === "FAIL" && attempt.attempt >= effectiveMaxAttempts(contract)) {
     const capped = appendOne(next.runtime, { type: "cap_exhausted", actorSessionId: input.actorSessionId, roleId: evaluator.id, loopInstanceId: input.loopInstanceId, createdAt: input.now, payload: { loopId: loop.loopId, attempts: attempt.attempt, evaluatorRole: evaluator.id, unresolvedFindings: input.findings ?? [], charterRevision: runtime.charterRevision, charterDigest: runtime.charterDigest, escalation: contract.capExhaustedRoute }, evidence: input.evidence });
     if (capped.kind === "changed") next = { kind: "changed", runtime: capped.runtime, events: [...next.events, ...capped.events] };
   }
   return next;
+}
+
+/**
+ * The cap event every exhausted Loop ends on, whichever way it was exhausted.
+ *
+ * One payload shape for all three precedents (verdict at the ceiling, deadline
+ * at the ceiling, Loop budget exceeded) means downstream readers — and the
+ * frozen `capExhaustedRoute` a driver follows — never have to branch on how a
+ * Loop died, only on the fact that it did.
+ */
+function capExhaustedPayload(runtime: GraphRuntimeState, loop: LoopSummary, attempt: LoopAttemptSummary | undefined, contract: TopologyLoopContract, unresolvedFindings: string[]): Record<string, unknown> {
+  // `attempts` counts Attempts that actually ran. A Loop whose budget was blown
+  // before anything started honestly reports zero rather than borrowing a
+  // number from an Attempt that never existed.
+  return { loopId: loop.loopId, attempts: attempt?.attempt ?? 0, evaluatorRole: loop.evaluatorRole, unresolvedFindings, charterRevision: runtime.charterRevision, charterDigest: runtime.charterDigest, escalation: contract.capExhaustedRoute };
+}
+
+/**
+ * Close one Attempt that reached its deadline, without inventing a verdict.
+ *
+ * A deadline is a fact about time, not an opinion about the work, so an expired
+ * Attempt records `expired` rather than a FAIL nobody judged — and it still
+ * leaves the Loop through the SAME three exits a verdict would (retry, or
+ * `cap_exhausted` at the ceiling). That is what keeps "超时不是异常" true: a
+ * timed-out Loop is a normal bounded outcome, not a new terminal kind.
+ *
+ * Permission is controller OR the Attempt's own participant Session. Requiring
+ * the evaluator would be wrong: the evaluator may be exactly the party that
+ * never woke up, and the deadline is true regardless of who notices it.
+ *
+ * @param runtime - current graph runtime.
+ * @param team - the Team the runtime belongs to.
+ * @param contract - the frozen Loop contract the attempt started under.
+ * @param input - loop instance, actor, observation time, and optional reason.
+ * @returns appended `attempt_expired` (+ `attempt_completed`, + `cap_exhausted`).
+ * @throws {GraphRuntimeError} `timeout_not_reached` when no Attempt is due,
+ *   `loop_not_found`/`loop_terminal` when the Loop cannot be swept,
+ *   `permission_denied` for an unrelated actor.
+ */
+export function expireAttempt(
+  runtime: GraphRuntimeState,
+  team: TeamState,
+  contract: TopologyLoopContract,
+  input: { loopInstanceId: string; actorSessionId: string; now: number; reason?: string; evidence?: EvidenceRef[] },
+): GraphCommandResult {
+  currentCharterMatches(runtime, team);
+  assertGraphOpen(runtime);
+  if (!finite(input.now)) throw new GraphRuntimeError("invalid_shape", "attempt expiry requires a finite time");
+  const loop = deriveGraph(runtime).get(input.loopInstanceId);
+  if (loop === undefined) throw new GraphRuntimeError("loop_not_found", `Loop ${input.loopInstanceId} was not found`);
+  if (loop.status !== "running") throw new GraphRuntimeError(loop.status === "cap_exhausted" ? "cap_exhausted" : "loop_terminal", `Loop ${loop.loopInstanceId} is ${loop.status}`);
+  if (loop.loopId !== contract.loopId) throw new GraphRuntimeError("invalid_shape", "attempt contract does not match Loop");
+  const attempt = loop.attempts.at(-1);
+  if (attempt === undefined || attempt.status !== "started" || attempt.verdict !== undefined) {
+    throw new GraphRuntimeError("timeout_not_reached", `Loop ${loop.loopInstanceId} has no open attempt to expire; every attempt is already settled`);
+  }
+  // The deadline is recomputed from the contract and the Attempt's own start
+  // time. Trusting a caller-supplied deadline would let a participant end a
+  // peer's Attempt early by asserting one.
+  const deadlineAt = attemptDeadlineAt(attempt, contract);
+  if (input.now < deadlineAt) {
+    throw new GraphRuntimeError("timeout_not_reached", `attempt ${attempt.attempt} of Loop ${loop.loopInstanceId} is still inside its deadline (${deadlineAt - input.now}ms remaining)`);
+  }
+  const actor = input.actorSessionId === team.controllerSessionId ? undefined : roleFor(team, attempt.roleId);
+  if (actor !== undefined && actor.sessionId !== input.actorSessionId) {
+    throw new GraphRuntimeError("permission_denied", "attempt expiry actor must be the Team controller or the attempt's own participant Session");
+  }
+  const reason = input.reason ?? "attempt deadline reached";
+  const expired = appendOne(runtime, { type: "attempt_expired", actorSessionId: input.actorSessionId, roleId: attempt.roleId, loopInstanceId: loop.loopInstanceId, createdAt: input.now, eventId: `attempt:${loop.loopInstanceId}:${attempt.attempt}:expired`, payload: { attempt: attempt.attempt, deadlineAt, expiredAt: input.now, reason }, evidence: input.evidence });
+  if (expired.kind === "noop") return expired;
+  const completed = appendOne(expired.runtime, { type: "attempt_completed", actorSessionId: input.actorSessionId, roleId: attempt.roleId, loopInstanceId: loop.loopInstanceId, createdAt: input.now, eventId: `attempt:${loop.loopInstanceId}:${attempt.attempt}:completed`, payload: { attempt: attempt.attempt, status: "expired", reason }, evidence: input.evidence });
+  if (completed.kind === "noop") return completed;
+  let next: GraphCommandResult = { kind: "changed", runtime: completed.runtime, events: [...expired.events, ...completed.events] };
+  if (attempt.attempt >= loop.effectiveMaxAttempts) {
+    const capped = appendOne(next.runtime, { type: "cap_exhausted", actorSessionId: input.actorSessionId, roleId: attempt.roleId, loopInstanceId: loop.loopInstanceId, createdAt: input.now, payload: capExhaustedPayload(runtime, loop, attempt, contract, [reason]), evidence: input.evidence });
+    if (capped.kind === "changed") next = { kind: "changed", runtime: capped.runtime, events: [...next.events, ...capped.events] };
+  }
+  return next;
+}
+
+/**
+ * Record a Loop-level wall-clock budget as exceeded, and end that Loop.
+ *
+ * Exceeding a budget is an outcome the frozen charter already anticipated
+ * (`capExhaustedRoute`), so the Loop ends through that exit rather than on a
+ * fourth one. The budget event is written BEFORE the cap event so a reader can
+ * always see why the cap fired.
+ */
+function exhaustLoopBudget(runtime: GraphRuntimeState, loop: LoopSummary, contract: TopologyLoopContract, actorSessionId: string, now: number): GraphCommandResult {
+  const consumedMs = now - loop.startedAt;
+  const limitMs = contract.wallClockBudgetMs as number;
+  const recorded = appendOne(runtime, {
+    type: "budget_exhausted",
+    actorSessionId,
+    loopInstanceId: loop.loopInstanceId,
+    createdAt: now,
+    payload: { scope: "loop", loopId: loop.loopId, limitMs, consumedMs },
+  });
+  if (recorded.kind === "noop") return recorded;
+  const attempt = loop.attempts.at(-1);
+  const capped = appendOne(recorded.runtime, {
+    type: "cap_exhausted",
+    actorSessionId,
+    loopInstanceId: loop.loopInstanceId,
+    createdAt: now,
+    payload: capExhaustedPayload(runtime, loop, attempt, contract, [`Loop budget ${limitMs}ms exceeded after ${consumedMs}ms`]),
+  });
+  if (capped.kind === "changed") return { kind: "changed", runtime: capped.runtime, events: [...recorded.events, ...capped.events] };
+  return { kind: "changed", runtime: recorded.runtime, events: recorded.events };
+}
+
+/**
+ * The Team-level wall-clock ceiling the current Frozen Charter declares, if any.
+ *
+ * Read from the FROZEN topology, not from whatever is on disk now: the charter a
+ * run was approved under is the only one whose budget that run can be judged
+ * against.
+ */
+function teamBudgetLimitMs(team: TeamState): number | undefined {
+  const document = team.document;
+  const revision = document?.currentCharterRevision;
+  if (document === undefined || revision === null || revision === undefined) return undefined;
+  const frozen = document.charterRevisions.find((entry) => entry.charterRevision === revision);
+  return frozen?.topology.config.protocol?.budgets?.teamWallClockMs;
+}
+
+/**
+ * Record every deadline and budget that has already passed, and nothing else.
+ *
+ * This is the read-path sweep the design chose over a background timer: it adds
+ * no lifecycle that could leak on unload, it is deterministic given the log and
+ * a clock (so it can be replayed offline), and it makes "the driver is the only
+ * advancer" literal — the facts get written when someone looks, and any
+ * remaining unfairness is stated plainly rather than hidden behind a timer.
+ *
+ * It is idempotent by STATE, not by event id: once an Attempt is `expired` or a
+ * budget is recorded, the guard that produced it no longer fires, so a second
+ * sweep in the same instant returns `noop` instead of raising a duplicate.
+ *
+ * Expiry here does NOT consult the Team budget gate: a deadline that has passed
+ * is already true, and refusing to record it would strand an open Attempt
+ * forever and hide the truth from every later reader.
+ *
+ * @param runtime - current graph runtime.
+ * @param team - the Team the runtime belongs to.
+ * @param contracts - the FROZEN Loop contracts of the current charter.
+ * @param now - observation time; the sweep never invents a different one.
+ * @returns one `changed` carrying every appended fact, or `noop`.
+ */
+export function sweepBoundedRun(
+  runtime: GraphRuntimeState,
+  team: TeamState,
+  contracts: readonly TopologyLoopContract[],
+  now: number,
+): GraphCommandResult {
+  if (!finite(now)) throw new GraphRuntimeError("invalid_shape", "sweep requires a finite observation time");
+  currentCharterMatches(runtime, team);
+  // The sweep is performed on the controller's behalf — it runs while a
+  // controller-side command is executing, and only the controller may advance
+  // the graph — so that is the honest actor to attribute an automatic fact to.
+  const actorSessionId = team.controllerSessionId;
+  let current = runtime;
+  let appended: GraphEvent[] = [];
+  const emit = (result: GraphCommandResult): void => {
+    if (result.kind !== "changed") return;
+    current = result.runtime;
+    appended = [...appended, ...result.events];
+  };
+  const contractFor = (loop: LoopSummary): TopologyLoopContract | undefined => contracts.find((entry) => entry.loopId === loop.loopId);
+
+  // 1) Team budget first: it is the outermost ceiling, and recording it before
+  //    the per-Loop work keeps the log readable in the order the limits apply.
+  const teamLimit = teamBudgetLimitMs(team);
+  if (teamLimit !== undefined && !teamBudgetExhausted(current)) {
+    const consumedMs = now - team.createdAt;
+    if (consumedMs >= teamLimit) {
+      emit(appendOne(current, { type: "budget_exhausted", actorSessionId, createdAt: now, payload: { scope: "team", limitMs: teamLimit, consumedMs } }));
+    }
+  }
+
+  // 2) Attempt deadlines.
+  for (const loop of graphLoops(current)) {
+    if (loop.status !== "running") continue;
+    const contract = contractFor(loop);
+    if (contract === undefined) continue;
+    const attempt = loop.attempts.at(-1);
+    if (attempt === undefined || attempt.status !== "started") continue;
+    if (now < attemptDeadlineAt(attempt, contract)) continue;
+    emit(expireAttempt(current, team, contract, { loopInstanceId: loop.loopInstanceId, actorSessionId, now, reason: "attempt deadline reached" }));
+  }
+
+  // 3) Loop budgets. Re-read the loops: step 2 may have ended one.
+  for (const loop of graphLoops(current)) {
+    if (loop.status !== "running" || loop.budgetExhausted !== undefined) continue;
+    const contract = contractFor(loop);
+    if (contract?.wallClockBudgetMs === undefined) continue;
+    if (now - loop.startedAt < contract.wallClockBudgetMs) continue;
+    emit(exhaustLoopBudget(current, loop, contract, actorSessionId, now));
+  }
+
+  return appended.length === 0 ? { kind: "noop", runtime, events: [] } : { kind: "changed", runtime: current, events: appended };
 }
 
 function handoffContractMatches(contract: TopologyHandoffContract, fromRole: string, toRole: string, kind: string): boolean {
@@ -595,6 +1007,7 @@ export function validateHandoffPayload(contract: TopologyHandoffContract, fromRo
 export function appendHandoffPending(runtime: GraphRuntimeState, team: TeamState, contract: TopologyHandoffContract, input: { handoffId: string; kind: string; fromRole: string; toRole: string; loopInstanceId?: string; attempt?: number; summary: string; payload: Record<string, unknown>; actorSessionId: string; now: number; evidence?: EvidenceRef[]; controllerRoleId?: string }): GraphCommandResult {
   currentCharterMatches(runtime, team);
   assertGraphOpen(runtime);
+  assertTeamBudgetOpen(runtime);
   if (!record(input.payload) || !nonEmpty(input.handoffId) || !nonEmpty(input.summary)) throw new GraphRuntimeError("handoff_invalid", "handoff id, summary, and object payload are required");
   const from = roleFor(team, input.fromRole);
   const to = resolveHandoffTarget(team, input.toRole, input.controllerRoleId);
@@ -633,6 +1046,7 @@ export function appendHandoffPending(runtime: GraphRuntimeState, team: TeamState
 
 export function appendHandoffResult(runtime: GraphRuntimeState, team: TeamState, input: { handoffId: string; actorSessionId: string; accepted: boolean; receipt?: Record<string, unknown>; error?: string; now: number }): GraphCommandResult {
   currentCharterMatches(runtime, team);
+  assertTeamBudgetOpen(runtime);
   const existing = graphHandoffs(runtime).find((handoff) => handoff.handoffId === input.handoffId);
   if (existing === undefined) throw new GraphRuntimeError("handoff_invalid", `handoff ${input.handoffId} has no pending intent`);
   const scopes = [`role:${existing.fromRole}`, `role:${existing.toRole}`];
@@ -674,11 +1088,22 @@ export function graphSummary(runtime: GraphRuntimeState, stale = false): GraphPr
   const gates = gatesFromEvents(runtime.events);
   const closure = closureFromEvents(runtime.events);
   const blockedGates = [...gates.values()].filter((gate) => ["open", "blocked", "expired"].includes(gate.status) && gate.required);
+  const budgets: BudgetExhaustion[] = runtime.events
+    .filter((event) => event.type === "budget_exhausted")
+    .map((event) => ({
+      scope: event.payload.scope as BudgetExhaustion["scope"],
+      ...(typeof event.payload.loopId === "string" ? { loopId: event.payload.loopId } : {}),
+      limitMs: Number(event.payload.limitMs),
+      consumedMs: Number(event.payload.consumedMs),
+    }));
   return {
     status: stale ? "stale" : blockedGates.length > 0 ? "blocked" : current === undefined ? "idle" : current.status === "cap_exhausted" ? "cap_exhausted" : current.status,
     ...(current === undefined ? {} : { currentLoop: { loopInstanceId: current.loopInstanceId, loopId: current.loopId, ...(current.attempts.at(-1) === undefined ? {} : { attempt: current.attempts.at(-1)?.attempt }), status: current.status } }),
     pendingHandoffs: pending,
     capExhausted: loops.filter((loop) => loop.capExhausted).map((loop) => loop.loopInstanceId),
+    expiredAttempts: loops.reduce((total, loop) => total + loop.attempts.filter((attempt) => attempt.status === "expired").length, 0),
+    budgets,
+    teamBudgetExhausted: budgets.some((budget) => budget.scope === "team"),
     openGates: [...gates.values()].filter((gate) => ["open", "blocked", "expired"].includes(gate.status)),
     blockedScopes: blockedGates.flatMap((gate) => gate.blockingScope),
     closure,
@@ -698,6 +1123,7 @@ export function graphClosure(runtime: GraphRuntimeState): ClosureSummary {
 export function openGate(runtime: GraphRuntimeState, team: TeamState, definition: TopologyGateDefinition, input: { gateInstanceId: string; actorSessionId: string; now: number; humanMode?: "interactive" | "checkpointed" | "autonomous"; evidence?: EvidenceRef[] }): GraphCommandResult {
   currentCharterMatches(runtime, team);
   assertGraphOpen(runtime);
+  assertTeamBudgetOpen(runtime);
   if (input.actorSessionId !== team.controllerSessionId) throw new GraphRuntimeError("permission_denied", "only the Team controller may open a Human Gate");
   if (!validGateDefinition(definition) || !nonEmpty(input.gateInstanceId)) throw new GraphRuntimeError("invalid_shape", "Gate definition or instance id is invalid");
   if (input.humanMode === "autonomous" && definition.required && (definition.onUnavailable !== "fallback" || (definition.timeoutPolicy !== undefined && definition.timeoutPolicy !== "fallback"))) throw new GraphRuntimeError("handoff_invalid", "autonomous required Human Gate must have a pre-approved fallback");
@@ -712,6 +1138,7 @@ export function openGate(runtime: GraphRuntimeState, team: TeamState, definition
 export function resolveGate(runtime: GraphRuntimeState, team: TeamState, definition: TopologyGateDefinition, input: { gateInstanceId: string; option: string; approvingSessionId: string; commandId: string; source: "user-command"; now: number; evidence?: EvidenceRef[] }): GraphCommandResult {
   currentCharterMatches(runtime, team);
   assertGraphOpen(runtime);
+  assertTeamBudgetOpen(runtime);
   if (input.approvingSessionId !== team.controllerSessionId) throw new GraphRuntimeError("permission_denied", "Human Gate decisions must be issued from the current Driver Session");
   if (input.source !== "user-command" || !nonEmpty(input.commandId) || !definition.options.includes(input.option)) throw new GraphRuntimeError("handoff_invalid", "Gate decision must use a declared option and user-command source");
   const gate = gatesFromEvents(runtime.events).get(input.gateInstanceId);
@@ -724,6 +1151,7 @@ export function resolveGate(runtime: GraphRuntimeState, team: TeamState, definit
 export function applyGateFallback(runtime: GraphRuntimeState, team: TeamState, definition: TopologyGateDefinition, input: { gateInstanceId: string; actorSessionId: string; now: number; unavailableConfirmed: boolean; reason: string; evidence?: EvidenceRef[] }): GraphCommandResult {
   currentCharterMatches(runtime, team);
   assertGraphOpen(runtime);
+  assertTeamBudgetOpen(runtime);
   if (input.actorSessionId !== team.controllerSessionId) throw new GraphRuntimeError("permission_denied", "only the Team controller may apply a Gate fallback");
   const gate = gatesFromEvents(runtime.events).get(input.gateInstanceId);
   if (gate === undefined || gate.gateId !== definition.gateId) throw new GraphRuntimeError("loop_not_found", `Gate ${input.gateInstanceId} is unknown`);

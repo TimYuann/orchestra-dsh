@@ -109,8 +109,9 @@ import {
   resolveHandoffTarget,
   startAttempt,
   startLoop,
+  sweepBoundedRun,
 } from "./orchestra-graph.js";
-import type { GraphRuntimeState } from "./orchestra-graph.js";
+import type { GraphCommandResult, GraphRuntimeState } from "./orchestra-graph.js";
 import { createSubagentNode, sendToSubagentNode } from "./subagent-node.js";
 import type { SubagentNodeSpec } from "./subagent-node.js";
 import { createTopologyCatalog, resolveRoleExecution } from "./orchestra-topology.js";
@@ -1442,6 +1443,61 @@ function currentGraphRuntime(team: TeamState): { runtime: GraphRuntimeState; sta
   return { runtime: read.runtime, stale: read.kind === "stale" };
 }
 
+/**
+ * Record every deadline and budget that has already passed, on the read path.
+ *
+ * The design chose this over a background timer for three reasons: no lifecycle
+ * is introduced that could outlive the plugin, the facts are recomputable from
+ * the log and a clock so they can be audited offline, and the driver stays the
+ * only party that advances the run. Every graph-reading tool calls it, so a
+ * driver that merely looks at the team also learns that an Attempt ran out of
+ * time, instead of waiting for a verdict that will never arrive.
+ *
+ * The caller's pre-sweep read is renamed to `initial`: the returned snapshot is
+ * the one to work from, and it is also the correct CAS base for the caller's own
+ * write. Reusing the pre-sweep snapshot would lose the race against the write
+ * this function just made.
+ *
+ * Nothing is swept when the Team has no graph runtime, no frozen charter, or a
+ * runtime bound to an older charter: those states have their own loud failures,
+ * and quietly expiring attempts inside them would hide the real problem.
+ *
+ * @param ctx - host context, for the escrow policy the write needs.
+ * @param activeTeamState - the Team CAS store.
+ * @param initial - the caller's own pre-sweep read.
+ * @param exec - the calling tool execution, which owns the write policy.
+ * @param now - observation time; defaults to the wall clock.
+ * @returns the snapshot to use from here on, refreshed only if facts were written.
+ */
+async function sweepTeamBoundedRun(
+  ctx: Context,
+  activeTeamState: ActiveTeamStateStore,
+  initial: ActiveTeamReady,
+  exec: ToolExecutionInput,
+  now: number = Date.now(),
+): Promise<ActiveTeamReady> {
+  const team = initial.team;
+  if (team.graphRuntime === undefined) return initial;
+  const document = documentReadForTeam(team);
+  const revision = document?.currentCharterRevision;
+  if (document === undefined || revision === null || revision === undefined) return initial;
+  const frozen = document.charterRevisions.find((entry) => entry.charterRevision === revision);
+  if (frozen === undefined) return initial;
+  const read = readGraphRuntime(team.graphRuntime, team.teamId, frozen.charterRevision, frozen.digest);
+  if (read.kind !== "ready") return initial;
+  // Contracts come from the FROZEN topology: the charter a run was approved
+  // under is the only one whose deadlines and budgets that run obeys.
+  const contracts = frozen.topology.config.protocol?.loops ?? [];
+  let command: GraphCommandResult;
+  try {
+    command = sweepBoundedRun(read.runtime, team, contracts, now);
+  } catch (error) {
+    throw graphCommandError("sweep bounded-run deadlines", error);
+  }
+  if (command.kind === "noop") return initial;
+  return persistGraphTransition(ctx, activeTeamState, initial, command.runtime, exec);
+}
+
 async function persistGraphTransition(ctx: Context, activeTeamState: ActiveTeamStateStore, snapshot: ActiveTeamReady, runtime: GraphRuntimeState, exec: ToolExecutionInput, status?: TeamState["status"]): Promise<ActiveTeamReady> {
   const written = await activeTeamState.replace(snapshot, { ...snapshot.team, ...(status === undefined ? {} : { status }), graphRuntime: runtime }, { policy: escrowPolicy(ctx, exec), signal: exec.signal });
   return readySnapshotAfterWrite(activeTeamState, snapshot.cwd, written, exec.signal);
@@ -1460,6 +1516,9 @@ function graphToolOutput(team: TeamState, runtime: GraphRuntimeState, stale = fa
     loops: graphLoops(runtime),
     pending_handoffs: summary.pendingHandoffs,
     cap_exhausted: summary.capExhausted,
+    expired_attempts: summary.expiredAttempts,
+    budgets: summary.budgets,
+    team_budget_exhausted: summary.teamBudgetExhausted,
     open_gates: summary.openGates,
     blocked_scopes: summary.blockedScopes,
     closure: summary.closure,
@@ -2297,6 +2356,9 @@ export function apply(ctx: Context): void {
       loops: { type: "array", items: { type: "json" }, required: true },
       pending_handoffs: { type: "array", items: { type: "json" }, required: true },
       cap_exhausted: { type: "array", items: { type: "string" }, required: true },
+      expired_attempts: { type: "number", required: true },
+      budgets: { type: "array", items: { type: "json" }, required: true },
+      team_budget_exhausted: { type: "boolean", required: true },
       open_gates: { type: "array", items: { type: "json" }, required: true },
       blocked_scopes: { type: "array", items: { type: "string" }, required: true },
       closure: { type: "object", additionalProperties: true, required: true },
@@ -3269,9 +3331,10 @@ export function apply(ctx: Context): void {
         if (exec.agent === undefined) throw new Error("orchestra_gate_open requires an agent caller");
         const cwd = exec.agent.session.header.cwd;
         if (cwd === undefined) throw new Error("current session has no working directory");
-        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("open a Human Gate", observation);
-        if (observation.kind !== "ready") throw new Error(`cannot open a Human Gate: no ready Team (${observation.kind})`);
+        const initial = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("open a Human Gate", initial);
+        if (initial.kind !== "ready") throw new Error(`cannot open a Human Gate: no ready Team (${initial.kind})`);
+        const observation = await sweepTeamBoundedRun(ctx, activeTeamState, initial, exec);
         const team = observation.team;
         const { runtime, stale } = currentGraphRuntime(team);
         if (stale) throw new Error("cannot open a Human Gate: stale_charter");
@@ -3348,11 +3411,12 @@ export function apply(ctx: Context): void {
         if (exec.agent === undefined) throw new Error("orchestra_graph requires an agent caller");
         const cwd = exec.agent.session.header.cwd;
         if (cwd === undefined) throw new Error("current session has no working directory");
-        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("read the graph runtime", observation);
-        if (observation.kind !== "ready") throw new Error(`cannot read the graph runtime: ${observation.kind}`);
-        const { runtime, stale } = currentGraphRuntime(observation.team);
-        return graphToolOutput(observation.team, runtime, stale) as any;
+        const initial = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("read the graph runtime", initial);
+        if (initial.kind !== "ready") throw new Error(`cannot read the graph runtime: ${initial.kind}`);
+        const observationSwept = await sweepTeamBoundedRun(ctx, activeTeamState, initial, exec);
+        const { runtime, stale } = currentGraphRuntime(observationSwept.team);
+        return graphToolOutput(observationSwept.team, runtime, stale) as any;
       },
     }),
   );
@@ -3374,9 +3438,10 @@ export function apply(ctx: Context): void {
         if (exec.agent === undefined) throw new Error("orchestra_loop_start requires an agent caller");
         const cwd = exec.agent.session.header.cwd;
         if (cwd === undefined) throw new Error("current session has no working directory");
-        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("start a Loop", observation);
-        if (observation.kind !== "ready") throw new Error(`cannot start a Loop: no ready Team (${observation.kind})`);
+        const initial = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("start a Loop", initial);
+        if (initial.kind !== "ready") throw new Error(`cannot start a Loop: no ready Team (${initial.kind})`);
+        const observation = await sweepTeamBoundedRun(ctx, activeTeamState, initial, exec);
         const team = observation.team;
         const { runtime, stale } = currentGraphRuntime(team);
         if (stale) throw new Error("cannot start a Loop: stale_charter (reconcile or create a new runtime branch after amendment)");
@@ -3413,9 +3478,10 @@ export function apply(ctx: Context): void {
         if (exec.agent === undefined) throw new Error("orchestra_attempt_start requires an agent caller");
         const cwd = exec.agent.session.header.cwd;
         if (cwd === undefined) throw new Error("current session has no working directory");
-        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("start a Loop attempt", observation);
-        if (observation.kind !== "ready") throw new Error(`cannot start a Loop attempt: no ready Team (${observation.kind})`);
+        const initial = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("start a Loop attempt", initial);
+        if (initial.kind !== "ready") throw new Error(`cannot start a Loop attempt: no ready Team (${initial.kind})`);
+        const observation = await sweepTeamBoundedRun(ctx, activeTeamState, initial, exec);
         const team = observation.team;
         const { runtime, stale } = currentGraphRuntime(team);
         if (stale) throw new Error("cannot start a Loop attempt: stale_charter");
@@ -3454,9 +3520,10 @@ export function apply(ctx: Context): void {
         if (exec.agent === undefined) throw new Error("orchestra_verdict requires an agent caller");
         const cwd = exec.agent.session.header.cwd;
         if (cwd === undefined) throw new Error("current session has no working directory");
-        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("record a Loop verdict", observation);
-        if (observation.kind !== "ready") throw new Error(`cannot record a Loop verdict: no ready Team (${observation.kind})`);
+        const initial = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("record a Loop verdict", initial);
+        if (initial.kind !== "ready") throw new Error(`cannot record a Loop verdict: no ready Team (${initial.kind})`);
+        const observation = await sweepTeamBoundedRun(ctx, activeTeamState, initial, exec);
         const team = observation.team;
         const { runtime, stale } = currentGraphRuntime(team);
         if (stale) throw new Error("cannot record a Loop verdict: stale_charter");
@@ -3496,9 +3563,10 @@ export function apply(ctx: Context): void {
         if (exec.agent === undefined) throw new Error("orchestra_graph_reconcile requires an agent caller");
         const cwd = exec.agent.session.header.cwd;
         if (cwd === undefined) throw new Error("current session has no working directory");
-        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("reconcile the graph runtime", observation);
-        if (observation.kind !== "ready") throw new Error(`cannot reconcile the graph runtime: no ready Team (${observation.kind})`);
+        const initial = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("reconcile the graph runtime", initial);
+        if (initial.kind !== "ready") throw new Error(`cannot reconcile the graph runtime: no ready Team (${initial.kind})`);
+        const observation = await sweepTeamBoundedRun(ctx, activeTeamState, initial, exec);
         const team = observation.team;
         if (exec.agent.id !== team.controllerSessionId) throw new Error("cannot reconcile the graph runtime: permission_denied (Driver/controller required)");
         const frozen = currentFrozenCharter(team);
@@ -3571,10 +3639,11 @@ export function apply(ctx: Context): void {
         if (exec.agent === undefined) throw new Error("orchestra_handoff requires an agent caller");
         const cwd = exec.agent.session.header.cwd;
         if (cwd === undefined) throw new Error("current session has no working directory");
-        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("send a typed handoff", observation);
-        if (observation.kind !== "ready") throw new Error(`cannot send a typed handoff: no ready Team (${observation.kind})`);
-        if (observation.team.status !== "active" && observation.team.status !== "degraded") throw new Error(`cannot send a typed handoff while Team status is ${observation.team.status}`);
+        const initial = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("send a typed handoff", initial);
+        if (initial.kind !== "ready") throw new Error(`cannot send a typed handoff: no ready Team (${initial.kind})`);
+        const observation = await sweepTeamBoundedRun(ctx, activeTeamState, initial, exec);
+        if (initial.team.status !== "active" && initial.team.status !== "degraded") throw new Error(`cannot send a typed handoff while Team status is ${initial.team.status}`);
         const team = observation.team;
         const { runtime, stale } = currentGraphRuntime(team);
         if (stale) throw new Error("cannot send a typed handoff: stale_charter (runtime is bound to an older Frozen Charter)");
@@ -3767,6 +3836,8 @@ export function apply(ctx: Context): void {
                             },
                             pending_handoffs: { type: "number", required: true },
                             cap_exhausted: { type: "number", required: true },
+                            expired_attempts: { type: "number", required: true },
+                            team_budget_exhausted: { type: "boolean", required: true },
                             open_gates: { type: "number", required: true },
                             closure_status: { type: "string", required: true },
                             closure_outcome: { type: "string" },
@@ -3848,11 +3919,12 @@ export function apply(ctx: Context): void {
         if (exec.agent === undefined) throw new Error("orchestra_team requires an agent caller");
         const cwd = exec.agent.session.header.cwd;
         if (cwd === undefined) throw new Error("current session has no working directory");
-        const teamObservation = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("inspect the team", teamObservation);
+        const initialTeam = await activeTeamState.read(cwd, { signal: exec.signal });
+        throwIfBlocked("inspect the team", initialTeam);
         const archiveList = await archiveStore.list(cwd, { signal: exec.signal });
         const archives = archiveListForTeamTool(archiveList);
-        if (teamObservation.kind !== "ready") return { team: null, archives };
+        if (initialTeam.kind !== "ready") return { team: null, archives };
+        const teamObservation = await sweepTeamBoundedRun(ctx, activeTeamState, initialTeam, exec);
         const team = teamObservation.team;
         const document = documentReadForTeam(team);
         const documentSummaryValue = documentSummary(document, team);
@@ -3894,6 +3966,8 @@ export function apply(ctx: Context): void {
                         }),
                     pending_handoffs: graph.pendingHandoffs.length,
                     cap_exhausted: graph.capExhausted.length,
+                    expired_attempts: graph.expiredAttempts,
+                    team_budget_exhausted: graph.teamBudgetExhausted,
                     open_gates: graph.openGates.length,
                     closure_status: graph.closure.status,
                     ...(graph.closure.outcome === undefined ? {} : { closure_outcome: graph.closure.outcome }),
@@ -4305,6 +4379,11 @@ export function apply(ctx: Context): void {
                         id: status.id,
                         name: status.name,
                         sessionId: status.sessionId,
+                        // The backend decides what a role can do at all (hold its
+                        // own preset, ask for approval, be read-only), so the panel
+                        // shows it ahead of the facts it constrains.
+                        execution: status.execution,
+                        ...(status.parentSessionId === undefined ? {} : { parentSessionId: status.parentSessionId }),
                         ...(record.preset === undefined || record.preset === null ? {} : { preset: record.preset }),
                         ...(record.sandbox === undefined ? {} : { sandbox: record.sandbox }),
                         live: status.live,
