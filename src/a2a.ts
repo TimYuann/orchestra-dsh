@@ -30,6 +30,7 @@ import type {} from "@deepseek-ai/dsh-system-prompt";
 import type {} from "@deepseek-ai/cordis-plugin-timer";
 import { randomUUID } from "node:crypto";
 import { prepareLightweightBlueprint } from "./session-blueprint.js";
+import { createSubagentNode } from "./subagent-node.js";
 import type { GovernedBlueprintReceipt, PreparedGovernedBlueprint, LightweightBlueprintReceipt } from "./session-blueprint.js";
 import { deliverMessage, queryMessageStatus, readDeliveryReceipt } from "./a2a-transport.js";
 export { deliverMessage, queryMessageStatus, readDeliveryReceipt } from "./a2a-transport.js";
@@ -127,6 +128,111 @@ export interface LightweightSessionCreateResult extends SessionCreateResult {
   provider: string;
   model: string;
   tools: { names: string[]; count: number };
+}
+
+/**
+ * Establish a lightweight collaborator on the NATIVE sub-agent backend.
+ *
+ * This is the same delegation the governed node backend performs, exposed on
+ * the lightweight path so a caller can open a cheap collaborator without a
+ * Team: a durable continuable child that joins the caller's live composition.
+ *
+ * Three capabilities of the session backend have no native counterpart, and
+ * each is REFUSED rather than reinterpreted — a caller must never be handed a
+ * guarantee that was not provided:
+ *
+ * - `cwd` — a native child shares its parent's working directory;
+ * - `presetId` / `agentPreset` / `permissionPreset` / `requiredTools` — a child
+ *   cannot mount its own composition or pin its own permission, so a caller
+ *   asking for either wants `execution: "session"`;
+ * - `title` — a native child's durable identity is its creation `label`, and a
+ *   session title event would describe a session that has no independent life.
+ *
+ * `prompt` is required because the native contract has no
+ * established-but-idle state: creation and the first delivery are one call.
+ *
+ * @param ctx - host context carrying the subagent registry.
+ * @param args - the tool arguments; session-only fields must be absent.
+ * @param exec - the calling tool execution, whose Agent becomes the child's parent.
+ * @returns the durable child id plus the route the node actually runs.
+ * @throws when a session-only field is present, `prompt` is missing, or the
+ *   model route is incomplete or the delegation itself fails.
+ */
+export async function createLightweightSubagentNode(
+  ctx: Context,
+  args: {
+    cwd?: string;
+    presetId?: string;
+    agentPreset?: string;
+    permissionPreset?: string;
+    provider?: string;
+    model?: string;
+    reasoningEffort?: string;
+    title?: string;
+    label?: string;
+    prompt?: string;
+    persona?: string;
+    toolFilter?: { allow?: string[]; deny?: string[] };
+    requiredTools?: string[];
+  },
+  exec: ToolExecutionInput,
+) {
+  const caller = exec.agent;
+  if (caller === undefined) throw new Error("a2a_create requires an agent caller");
+  const sessionOnly: [string, unknown][] = [
+    ["cwd", args.cwd],
+    ["presetId", args.presetId],
+    ["agentPreset", args.agentPreset],
+    ["permissionPreset", args.permissionPreset],
+    ["title", args.title],
+    ["requiredTools", args.requiredTools],
+  ];
+  const used = sessionOnly.filter(([, value]) => value !== undefined).map(([name]) => name);
+  if (used.length > 0) {
+    throw new Error(
+      `a2a_create execution "subagent" cannot honor ${used.join(", ")}: a native sub-agent shares its parent's cwd, joins the caller's live Agent Preset (so it mounts no composition of its own), takes its durable identity from label rather than a session title, and has its sandbox and approval policy pinned at the delegation boundary — use execution: "session" when any of those are required`,
+    );
+  }
+  if (typeof args.prompt !== "string" || args.prompt.trim() === "") {
+    throw new Error('a2a_create execution "subagent" requires prompt: the native contract establishes the child and delivers its initial prompt in one call, so there is no established-but-idle child to message afterwards');
+  }
+  if ((args.provider === undefined) !== (args.model === undefined)) throw new Error("a2a_create requires provider and model together");
+  if (args.reasoningEffort !== undefined && (args.provider === undefined || args.model === undefined)) {
+    throw new Error("a2a_create reasoningEffort requires provider and model");
+  }
+  const label = args.label === undefined || args.label === "" ? `a2a-node-${randomUUID().slice(0, 8)}` : args.label;
+  const receipt = await createSubagentNode(
+    ctx,
+    caller,
+    {
+      label,
+      prompt: args.prompt,
+      ...(args.provider === undefined
+        ? {}
+        : {
+            agentOptions: {
+              provider: args.provider,
+              model: args.model as string,
+              ...(args.reasoningEffort === undefined ? {} : { reasoningEffort: args.reasoningEffort }),
+            },
+          }),
+      ...(args.persona === undefined ? {} : { persona: args.persona }),
+      ...(args.toolFilter === undefined ? {} : { toolFilter: args.toolFilter }),
+    },
+    exec.signal,
+  );
+  // Report the route the node actually runs: an unstated override means the
+  // child inherits the caller's, so the caller's values are the honest answer.
+  const provider = args.provider ?? caller.options.provider;
+  const model = args.model ?? caller.options.model;
+  return {
+    sessionId: receipt.childId,
+    execution: "subagent" as const,
+    label,
+    ...(provider === undefined ? {} : { provider }),
+    ...(model === undefined ? {} : { model }),
+    ...(args.reasoningEffort === undefined ? {} : { reasoningEffort: args.reasoningEffort }),
+  };
 }
 
 export function createSession(ctx: Context, options: CreateSessionOptions & { mode: "lightweight" }): Promise<LightweightSessionCreateResult>;
@@ -897,17 +1003,30 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "a2a_create",
       description:
-        "Open a complete lightweight agent Session. Before publication it resolves and installs an Agent Preset composition, pins a Permission Preset and Model Selection, records a lightweight blueprint marker, fixes the title, and verifies required tools. If the caller has a composed preset, the child joins that exact generation; a rosterless caller mounts the deployment default or fails loudly. The new session appears only after setup/commit succeeds.",
+        "Open a lightweight collaborator under the caller. Two backends share this tool, and `execution` selects one. Default \"session\": a complete peer Session that resolves and installs its own Agent Preset composition, pins a Permission Preset and Model Selection, records a lightweight blueprint marker, fixes the title, and verifies required tools; it is addressable by any session through a2a_send. \"subagent\": a durable continuable DSH sub-agent child — cheaper, and it CANNOT hold its own preset (it joins the caller's live composition), CANNOT ask the user for approval (its policy is pinned to never), and CANNOT be addressed by anyone but the exact caller, because native delegation authorizes delivery by the direct-parent edge alone. Choose \"subagent\" when the node needs only a model route and, optionally, a per-child persona or tool filter.",
       parameters: {
-        cwd: { type: "string", description: "Working directory for the new session. Defaults to the calling thread's cwd." },
-        presetId: { type: "string", description: "Legacy-compatible explicit Agent Preset id." },
-        agentPreset: { type: "string", description: "Explicit Agent Preset id; takes precedence over presetId." },
-        permissionPreset: { type: "string", description: "Permission Preset to pin; defaults to permissionPresets.defaultPreset." },
+        execution: { type: "string", enum: ["session", "subagent"], description: "Backend: \"session\" (default, a complete peer Session) or \"subagent\" (a native continuable child of the caller)." },
+        cwd: { type: "string", description: "Working directory for the new session. Defaults to the calling thread's cwd. Session backend only." },
+        presetId: { type: "string", description: "Legacy-compatible explicit Agent Preset id. Session backend only." },
+        agentPreset: { type: "string", description: "Explicit Agent Preset id; takes precedence over presetId. Session backend only." },
+        permissionPreset: { type: "string", description: "Permission Preset to pin; defaults to permissionPresets.defaultPreset. Session backend only." },
         provider: { type: "string", description: "Explicit model provider; must be paired with model." },
         model: { type: "string", description: "Explicit model id; must be paired with provider." },
         reasoningEffort: { type: "string", description: "Optional reasoning effort; requires provider and model." },
-        title: { type: "string", description: "Title pinned before the Session is published." },
-        requiredTools: { type: "array", items: { type: "string" }, description: "Optional tool names that must be visible in the child scope before publication." },
+        title: { type: "string", description: "Title pinned before the Session is published. Session backend only." },
+        label: { type: "string", description: "Durable creation label, shown by list_agents and the GUI lineage. Subagent backend only; defaults to a generated id." },
+        prompt: { type: "string", description: "The node's opening task. REQUIRED by the subagent backend: the native contract establishes the child and delivers its initial prompt in one call, so there is no established-but-idle child to message later." },
+        persona: { type: "string", description: "Per-child persona shadowing the deployment persona for this child alone. Subagent backend only." },
+        toolFilter: {
+          type: "object",
+          additionalProperties: false,
+          description: "Native per-child tool scoping: the named tools vanish from the child's prompt AND refuse to execute. This narrows AVAILABILITY, it is NOT a permission guarantee (the denied tool's underlying capability, e.g. a shell, may still reach the same effect). Subagent backend only.",
+          properties: {
+            allow: { type: "array", items: { type: "string" }, description: "Global tool names the child keeps; everything else is removed." },
+            deny: { type: "array", items: { type: "string" }, description: "Global tool names removed from the child." },
+          },
+        },
+        requiredTools: { type: "array", items: { type: "string" }, description: "Optional tool names that must be visible in the child scope before publication. Session backend only." },
       },
       output: {
         schema: {
@@ -915,18 +1034,19 @@ export function apply(ctx: Context): void {
           additionalProperties: false,
           properties: {
             sessionId: { type: "string", required: true },
+            execution: { type: "string", required: true },
             cwd: { type: "string" },
-            agentPreset: { type: "string", required: true },
-            mode: { type: "string", required: true },
-            permissionPreset: { type: "string", required: true },
-            provider: { type: "string", required: true },
-            model: { type: "string", required: true },
+            agentPreset: { type: "string" },
+            mode: { type: "string" },
+            permissionPreset: { type: "string" },
+            provider: { type: "string" },
+            model: { type: "string" },
             reasoningEffort: { type: "string" },
             title: { type: "string" },
+            label: { type: "string" },
             tools: {
               type: "object",
               additionalProperties: false,
-              required: true,
               properties: {
                 names: { type: "array", items: { type: "string" }, required: true },
                 count: { type: "number", required: true },
@@ -934,15 +1054,28 @@ export function apply(ctx: Context): void {
             },
           },
         },
-        render: (_args, value) => [
-          {
-            type: "text",
-            text: `new lightweight session ${value.sessionId} opened${value.cwd === undefined ? "" : ` in ${value.cwd}`} (${value.agentPreset}, permission=${value.permissionPreset}, model=${value.provider}/${value.model}, tools=${value.tools.count})`,
-          },
-        ],
+        render: (_args, value) => {
+          // An absent route means the node inherits whatever the caller resolves
+          // at its next request, so the card says that instead of inventing one.
+          const route = `${value.provider ?? "inherited"}/${value.model ?? "inherited"}`;
+          return value.execution === "subagent"
+            ? [
+                {
+                  type: "text",
+                  text: `new sub-agent node ${value.sessionId} established${value.label === undefined ? "" : ` as "${value.label}"`} (model=${route}; inherits the caller's composition and permission — approval is pinned to never; only the caller can address it)`,
+                },
+              ]
+            : [
+                {
+                  type: "text",
+                  text: `new lightweight session ${value.sessionId} opened${value.cwd === undefined ? "" : ` in ${value.cwd}`} (${value.agentPreset}, permission=${value.permissionPreset}, model=${route}, tools=${value.tools?.count ?? 0})`,
+                },
+              ];
+        },
       },
-      execute(
+      async execute(
         args: {
+          execution?: string;
           cwd?: string;
           presetId?: string;
           agentPreset?: string;
@@ -951,12 +1084,20 @@ export function apply(ctx: Context): void {
           model?: string;
           reasoningEffort?: string;
           title?: string;
+          label?: string;
+          prompt?: string;
+          persona?: string;
+          toolFilter?: { allow?: string[]; deny?: string[] };
           requiredTools?: string[];
         },
         exec: ToolExecutionInput,
       ) {
         if (exec.agent === undefined) throw new Error("a2a_create requires an agent caller");
-        return createSession(ctx, {
+        if (args.execution !== undefined && args.execution !== "session" && args.execution !== "subagent") {
+          throw new Error(`a2a_create execution "${String(args.execution)}" is invalid (session | subagent)`);
+        }
+        if (args.execution === "subagent") return createLightweightSubagentNode(ctx, args, exec);
+        const created = await createSession(ctx, {
           mode: "lightweight",
           cwd: args.cwd ?? exec.agent.session.header.cwd,
           presetId: args.agentPreset ?? args.presetId,
@@ -971,6 +1112,9 @@ export function apply(ctx: Context): void {
           currentSessionId: exec.agent.id,
           signal: exec.signal,
         });
+        // The backend is a required fact of this result: a caller must be able
+        // to tell which of the two very different collaborators it just opened.
+        return { ...created, execution: "session" as const };
       },
     }),
   );
