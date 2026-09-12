@@ -129,9 +129,14 @@ The dev instance restarts in seconds and never touches the main instance. Intern
 
 ## Roadmap（路线图）
 
+- **v0.4.1 ✅（2026-09-12）** — DSH `0.1.5-rc.2` compatibility. Dependency upgrade from `0.1.0-rc.6` (20 host type errors, all mechanical), plus one runtime regression the typechecker cannot see: DSH 0.1.5 made slot registration declaration-gated, so a client plugin must use `ctx.slots.inject("settings.section", () => ctx.slots.register(...))` — a bare `register()` failed the whole plugin load. 142/142 tests green; verified end-to-end on a real dev instance (settings panel renders the topology catalog; a live session calls `orchestra_topologies` successfully).
 - **v0.4.0 ✅（2026-08-25 主线闭环）** — living orchestration document (charter draft → `/team approve` → freeze → amendment), bounded graph runtime (loop/attempt/verdict/gate/closure, typed handoffs, cap exhaustion), transactional provisioning, seven v0.4 role presets, five task topologies, session title three-part scheme, driver node-milestone notices, proposal blueprint table, recovery hardening (archive validation, three-branch activate, controller takeover). Local verification: 18 test files / 142 tests green. Real full-session E2E is **not** run by the dev team — see `UPDATE-v0.4.0.md` for the external validation checklist.
 - **0.4.x** — release-readiness topology; real full-session E2E acceptance.
 - **0.5** — product-or-ui-design / frontend-designer; sidebar live topology graph (SVG, no third-party deps); GUI steering (create/close buttons — currently display-only panes).
+
+## Coexistence（与官方 Agent Teams 共存）
+
+DSH ships an opt-in experimental Agent Teams group (`@deepseek-ai/dsh-experimental-agent-team` and its siblings). Orchestra **does not use it and does not depend on it** (experimental packages are not installable dependencies outside that group), and it occupies **none** of that group's tool names — `send_message`, `list_agents`, `interrupt_agent`, `spawn_teammate`, `wait_agent`, `team_task_*`. Orchestra's own tools are namespaced `orchestra_*` / `a2a_*`, so both can be mounted together.
 
 ## License
 
