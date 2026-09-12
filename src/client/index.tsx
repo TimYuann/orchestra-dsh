@@ -22,6 +22,8 @@ const POLL_MS = 5000;
 interface RoleSummary {
   id: string;
   name: string;
+  /** Resolved node backend; absent on a deployment that predates the field. */
+  execution?: string;
   preset?: string;
   sandbox?: string;
   maxRounds?: number;
@@ -41,6 +43,7 @@ interface InstanceRole {
   id: string;
   name: string;
   sessionId: string;
+  execution?: string;
   preset?: string;
   sandbox?: string;
   live: boolean;
@@ -117,6 +120,8 @@ function templateProtocolSummary(t: TemplateSummary): string {
 interface FlatTemplateRole {
   id: string;
   name: string;
+  /** Resolved node backend (`session` | `subagent`) when the host reports one. */
+  execution?: string;
   preset?: string;
   sandbox?: string;
   /** Template ids that define this role, in template order. */
@@ -139,6 +144,7 @@ function flattenTemplateRoles(templates: TemplateSummary[]): FlatTemplateRole[] 
         byId.set(r.id, {
           id: r.id,
           name: r.name,
+          ...(r.execution === undefined ? {} : { execution: r.execution }),
           ...(r.preset === undefined ? {} : { preset: r.preset }),
           ...(r.sandbox === undefined ? {} : { sandbox: r.sandbox }),
           sources: [t.id],
@@ -165,7 +171,7 @@ function teamLabel(team: TeamInstance): string {
 }
 
 function instanceRoleLine(r: InstanceRole): string {
-  return `${r.name} (${r.id}) · ${r.status} · R${r.reportCount}${r.preset === undefined ? "" : ` · ${r.preset}`}${r.sandbox === undefined ? "" : ` · ${r.sandbox}`}${r.lastReport === null ? "" : ` · report: ${r.lastReport}`}${r.lastActivity === undefined ? "" : ` · last: ${r.lastActivity.slice(0, 60)}`}`;
+  return `${r.name} (${r.id}) · ${r.execution === undefined ? "" : `${r.execution} · `}${r.status} · R${r.reportCount}${r.preset === undefined ? "" : ` · ${r.preset}`}${r.sandbox === undefined ? "" : ` · ${r.sandbox}`}${r.lastReport === null ? "" : ` · report: ${r.lastReport}`}${r.lastActivity === undefined ? "" : ` · last: ${r.lastActivity.slice(0, 60)}`}`;
 }
 
 /** Settings panel page: two display-only scrollable panes. */
@@ -264,6 +270,7 @@ export function OrchestraPanel(): React.JSX.Element {
                   flattenTemplateRoles(snapshot.templates).map((r) => (
                     <div key={r.id} style={{ marginTop: 4 }}>
                       {r.name} <span style={{ opacity: 0.6 }}>({r.id}
+                        {r.execution === undefined ? "" : ` · ${r.execution}`}
                         {r.preset === undefined ? "" : ` · ${r.preset}`}
                         {r.sandbox === undefined ? "" : ` · ${r.sandbox}`})</span>{" "}
                       <span style={{ opacity: 0.6 }}>— 来源: {r.sources.join(", ")}</span>
