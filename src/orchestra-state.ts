@@ -134,7 +134,37 @@ export interface TeamState {
   graphRuntime?: GraphRuntimeState;
   roles: TeamRole[];
   reports: { reportId: string; roleId: string; sessionId: string; path: string; createdAt: number }[];
+  /**
+   * Driver wake-ups that could NOT be delivered, newest last.
+   *
+   * This lives on the Team rather than on the graph runtime on purpose. The
+   * graph log is the record of DAG nodes and Loops — `readGraphRuntime`
+   * requires every event to name a `nodeId` or a `loopInstanceId` — and a failed
+   * notice is neither, so filing it there would mean inventing a node that does
+   * not exist and every node-enumerating reader would then see a phantom. A
+   * Team-level list keeps the fact exactly as wide as it is true, and it is what
+   * stops "the driver was never woken" from being invisible on an unattended run.
+   *
+   * Bounded by {@link NOTICE_FAILURE_LIMIT}; the oldest entries are dropped.
+   */
+  noticeFailures?: TeamNoticeFailure[];
 }
+
+/** One driver milestone notice that could not be delivered. */
+export interface TeamNoticeFailure {
+  milestone: string;
+  targetSessionId: string;
+  failedAt: number;
+  reason: string;
+}
+
+/**
+ * How many undelivered notices are retained. The list is a breadcrumb for a
+ * stalled run, not an audit log: a run that fails to wake the driver repeatedly
+ * has one problem to fix, and an unbounded list would grow team.json without
+ * bound while adding nothing to the diagnosis.
+ */
+export const NOTICE_FAILURE_LIMIT = 20;
 
 /** Inactive marker written after an immutable archive has been published. */
 export interface ActiveTeamArchivedMarker {
@@ -535,6 +565,21 @@ export function normalizeTeam(raw: unknown, cwd: string, options: { allowDismiss
     ...(asRecord(record.graphRuntime) ? { graphRuntime: record.graphRuntime as GraphRuntimeState } : {}),
     roles,
     reports: Array.isArray(record.reports) ? record.reports : [],
+    // A malformed breadcrumb is DROPPED rather than fatal: this list exists to
+    // explain a stalled run, and refusing to read the Team because one entry is
+    // corrupt would destroy the very evidence a reader came for.
+    noticeFailures: (Array.isArray(record.noticeFailures) ? record.noticeFailures : [])
+      .filter(
+        (entry: any) =>
+          entry !== null &&
+          typeof entry === "object" &&
+          typeof entry.milestone === "string" &&
+          typeof entry.targetSessionId === "string" &&
+          typeof entry.failedAt === "number" &&
+          Number.isFinite(entry.failedAt) &&
+          typeof entry.reason === "string",
+      )
+      .slice(-NOTICE_FAILURE_LIMIT),
   };
 }
 

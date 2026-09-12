@@ -387,6 +387,61 @@ export function attemptDeadlineAt(attempt: Pick<LoopAttemptSummary, "startedAt">
 }
 
 /**
+ * Inactivity grace before an open Attempt whose node is provably not working is
+ * reported as stalled. A POLICY, not a fact: it decides how long a silent node
+ * is tolerated before the condition is worth surfacing, so it is deliberately
+ * overridable per Loop through `stallGraceMs`.
+ */
+export const DEFAULT_STALL_GRACE_MS = 60_000;
+
+/** Whether an open Attempt's node is working, silent, or unobservable. */
+export type NodeStall = "ok" | "stalled" | "unknown";
+
+/**
+ * Whether an open Attempt whose node is provably not working has passed its
+ * inactivity grace.
+ *
+ * The three-valued result is the point. "Cannot tell" is NOT "fine": a reader
+ * that read no activity fact has no evidence the node is alive, and reporting
+ * that as `ok` would let a dead node look healthy forever — the exact failure
+ * unattended operation cannot detect for itself. So an unreadable activity
+ * timestamp yields `unknown`, which a controller must resolve by looking rather
+ * than by waiting.
+ *
+ * This is derived, never recorded: no event and no state field is written,
+ * because the condition follows from facts already on the log (the open
+ * Attempt) plus two observations (is the node working, when was it last seen).
+ * A derived stall can be recomputed after a restart and can never disagree with
+ * the log it was computed from.
+ *
+ * @param input.attempt - the Loop's current open Attempt, if any.
+ * @param input.contract - the frozen Loop contract, for its declared grace.
+ * @param input.working - whether the node is demonstrably working right now.
+ * @param input.lastActivityAt - when the node was last observed to act, or
+ *   `undefined` when that could not be read.
+ * @param input.now - observation time; the caller never lets this drift.
+ * @returns `ok` without an open Attempt or while the node works or is inside
+ *   its grace, `stalled` once a silent node passes the grace, `unknown` when
+ *   the node's last activity could not be observed.
+ */
+export function nodeStall(input: {
+  attempt: LoopAttemptSummary | undefined;
+  contract: TopologyLoopContract | undefined;
+  working: boolean;
+  lastActivityAt: number | undefined;
+  now: number;
+}): NodeStall {
+  // No open Attempt: nothing is running, so nothing can be stalled.
+  if (input.attempt === undefined || input.attempt.status !== "started") return "ok";
+  if (input.working) return "ok";
+  // Unobservable beats silent: an unreadable fact must not be reported as health.
+  if (input.lastActivityAt === undefined) return "unknown";
+  const grace = input.contract?.stallGraceMs ?? DEFAULT_STALL_GRACE_MS;
+  return input.now - input.lastActivityAt >= grace ? "stalled" : "ok";
+}
+
+
+/**
  * Whether the TEAM-level wall-clock budget has been recorded as exhausted.
  *
  * Read from the durable event, never computed from a clock, so every command

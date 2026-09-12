@@ -126,6 +126,75 @@ test("notifyDriverMilestone skips controller self-calls, delivers to the control
   assert.equal(delivered.length, 1); // failed delivery added nothing
 });
 
+test("a notice that cannot be delivered becomes a durable fact, and a double failure is explained not swallowed", async () => {
+  const currentTeam = team();
+  const failing = async () => {
+    throw new Error("transport down");
+  };
+
+  // 1) Delivery fails, recording succeeds: the failure is now on the log, so
+  //    "the driver was never woken" stops being invisible on an unattended run.
+  const recorded = [];
+  await assert.doesNotReject(() =>
+    notifyDriverMilestone({}, currentTeam, "reviewer-session", "verdict", "PASS: loop-1", {
+      deliver: failing,
+      recordFailure: async (fact) => {
+        recorded.push(fact);
+      },
+    }),
+  );
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0].milestone, "verdict");
+  assert.equal(recorded[0].targetSessionId, currentTeam.controllerSessionId);
+  assert.equal(recorded[0].reason, "transport down");
+  assert.ok(recorded[0].failedAt > 0);
+
+  // 2) A successful delivery records nothing: the notice IS the record.
+  const untouched = [];
+  await notifyDriverMilestone({}, currentTeam, "reviewer-session", "verdict", "PASS: loop-1", {
+    deliver: async () => {},
+    recordFailure: async (fact) => {
+      untouched.push(fact);
+    },
+  });
+  assert.equal(untouched.length, 0);
+
+  // 3) Both paths fail. The caller still must not see a rejection (the notice is
+  //    best-effort by contract), but the failure must not vanish either: the
+  //    warning names BOTH reasons so a human can tell a quiet Team from a
+  //    recording path that is itself broken.
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(" "));
+  try {
+    await assert.doesNotReject(() =>
+      notifyDriverMilestone({}, currentTeam, "reviewer-session", "verdict", "PASS: loop-1", {
+        deliver: failing,
+        recordFailure: async () => {
+          throw new Error("state blocked: invalid_json");
+        },
+      }),
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /transport down/);
+  assert.match(warnings[0], /state blocked: invalid_json/);
+  assert.match(warnings[0], /no durable trace/);
+
+  // 4) Without a recorder the legacy behavior is preserved: warn once, never throw.
+  const legacy = [];
+  console.warn = (...args) => legacy.push(args.join(" "));
+  try {
+    await assert.doesNotReject(() => notifyDriverMilestone({}, currentTeam, "reviewer-session", "report", "written: r.md", failing));
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.equal(legacy.length, 1);
+  assert.match(legacy[0], /milestone notice to controller driver-session failed: transport down/);
+});
+
 test("all five task topologies carry the driver-progress reporting discipline in every role welcome", () => {
   const sentence = "每个节点完成（交接/verdict/报告）后，向 driver 汇报一行进展";
   for (const id of ["feature-development", "bug-diagnosis-and-fix", "architecture-decision", "refactor-and-migration", "audit-and-hardening"]) {

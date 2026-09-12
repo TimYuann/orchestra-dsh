@@ -36,7 +36,7 @@ import {
   resolveRolePresetFile,
   rolePresetSpec,
 } from "./orchestra-role-presets.js";
-import { createActiveTeamStateStore } from "./orchestra-state.js";
+import { createActiveTeamStateStore, NOTICE_FAILURE_LIMIT } from "./orchestra-state.js";
 import type {
   ArchiveList,
   ArchiveStore,
@@ -110,12 +110,15 @@ import {
   startAttempt,
   startLoop,
   sweepBoundedRun,
+  nodeStall,
 } from "./orchestra-graph.js";
-import type { GraphCommandResult, GraphRuntimeState } from "./orchestra-graph.js";
+import type { GraphCommandResult, GraphRuntimeState, LoopSummary, NodeStall } from "./orchestra-graph.js";
+import { createTeamChangeBus, withChangeSignal } from "./team-change-bus.js";
+import type { TeamChangeBus } from "./team-change-bus.js";
 import { createSubagentNode, sendToSubagentNode } from "./subagent-node.js";
 import type { SubagentNodeSpec } from "./subagent-node.js";
 import { createTopologyCatalog, resolveRoleExecution } from "./orchestra-topology.js";
-import type { RoleConfig, TopologyCatalog, TopologyClosureDefinition, TopologyList, TopologyProtocol, TopologyResolution, TopologyRoleSummary } from "./orchestra-topology.js";
+import type { RoleConfig, TopologyCatalog, TopologyClosureDefinition, TopologyList, TopologyLoopContract, TopologyProtocol, TopologyResolution, TopologyRoleSummary } from "./orchestra-topology.js";
 export { validateTopology } from "./orchestra-topology.js";
 import { mountPreset } from "@deepseek-ai/dsh-agent-presets";
 import "./relay-types.js";
@@ -124,6 +127,15 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 
 const SID = (value: string): SessionId => value as SessionId;
+
+/**
+ * `orchestra_wait` bounds. A minimum keeps a caller from turning a wait into a
+ * busy poll, and a maximum keeps one call from outliving the turn budget that
+ * has to notice the run is not advancing.
+ */
+const MIN_WAIT_TIMEOUT_MS = 10_000;
+const MAX_WAIT_TIMEOUT_MS = 3_600_000;
+const DEFAULT_WAIT_TIMEOUT_MS = 60_000;
 
 /** DSH home directory (env override wins; default ~/.dsh). */
 function dshHome(): string {
@@ -217,26 +229,122 @@ export function milestoneNotice(teamId: string, kind: MilestoneNoticeKind, detai
   return `orchestra: ${teamId} ${kind} ${detail}`;
 }
 
+/** One milestone notice that could not be delivered, as a durable fact. */
+export interface NoticeFailureFact {
+  milestone: MilestoneNoticeKind;
+  targetSessionId: string;
+  failedAt: number;
+  reason: string;
+}
+
+/** Persists one undelivered notice. Rejecting makes the caller fall back to stderr. */
+export type NoticeFailureRecorder = (fact: NoticeFailureFact) => Promise<void>;
+
+/** Optional channels for {@link notifyDriverMilestone}. */
+export interface MilestoneNoticeOptions {
+  /** Delivery channel; tests replace it. Defaults to the real transport. */
+  deliver?: typeof deliverMessage;
+  /**
+   * Durable recorder for a notice that could not be delivered. Omitted means
+   * the failure is only warned about, which is the legacy behavior.
+   */
+  recordFailure?: NoticeFailureRecorder;
+}
+
 /**
  * Best-effort node-milestone notification to the Team controller (driver).
- * Skips the controller's own calls (no self-messages). Delivery failure is
- * caught and warned — it can never fail the tool that triggered the notice.
+ * Skips the controller's own calls (no self-messages).
+ *
+ * The failure path is a deliberate THREE-step degradation chain, because a
+ * notice is both unreliable and load-bearing at the same time:
+ *
+ * 1. deliver the notice;
+ * 2. if delivery fails, hand the failure to `recordFailure`, which persists it
+ *    as a graph fact so "the driver was never woken" stops being invisible on an
+ *    unattended run;
+ * 3. if THAT fails too (a blocked store, a lost CAS), warn on stderr naming both
+ *    reasons.
+ *
+ * No step ever throws: the notice is best-effort by contract and must never fail
+ * the tool that triggered it. But no step is silent either — the failure is
+ * either durable or explained, and a reader can always tell which.
+ *
+ * @param ctx - host context.
+ * @param team - the Team whose controller is notified.
+ * @param actorSessionId - the session that produced the milestone.
+ * @param kind - the milestone kind.
+ * @param detail - node-level detail, never payload content.
+ * @param options - delivery and failure-recording channels, or just the
+ *   delivery function (the historical signature).
+ * @returns nothing; failures are recorded or warned, never raised.
  */
 export async function notifyDriverMilestone(
-  _ctx: Context,
+  ctx: Context,
   team: TeamState,
   actorSessionId: string,
   kind: MilestoneNoticeKind,
   detail: string,
-  deliver: typeof deliverMessage = deliverMessage,
+  options: typeof deliverMessage | MilestoneNoticeOptions = {},
 ): Promise<void> {
   if (actorSessionId === team.controllerSessionId) return;
+  const resolved: MilestoneNoticeOptions = typeof options === "function" ? { deliver: options } : options;
+  const deliver = resolved.deliver ?? deliverMessage;
   const text = milestoneNotice(team.teamId, kind, detail);
   try {
-    await deliver(_ctx, actorSessionId, team.controllerSessionId, [{ type: "text", text }], { wake: true, idempotencyKey: `milestone-${randomUUID()}` });
+    await deliver(ctx, actorSessionId, team.controllerSessionId, [{ type: "text", text }], { wake: true, idempotencyKey: `milestone-${randomUUID()}` });
   } catch (error) {
-    console.warn(`orchestra: milestone notice to controller ${team.controllerSessionId} failed: ${error instanceof Error ? error.message : String(error)}`);
+    const reason = error instanceof Error ? error.message : String(error);
+    if (resolved.recordFailure !== undefined) {
+      try {
+        await resolved.recordFailure({ milestone: kind, targetSessionId: team.controllerSessionId, failedAt: Date.now(), reason });
+        return;
+      } catch (recordError) {
+        const recordReason = recordError instanceof Error ? recordError.message : String(recordError);
+        console.warn(
+          `orchestra: milestone notice to controller ${team.controllerSessionId} failed (${reason}) AND recording that failure failed (${recordReason}); the driver was not woken and the run carries no durable trace of it`,
+        );
+        return;
+      }
+    }
+    console.warn(`orchestra: milestone notice to controller ${team.controllerSessionId} failed: ${reason}`);
   }
+}
+
+/**
+ * Recorder that persists an undelivered notice on the Team it concerns.
+ *
+ * WHY THE TEAM AND NOT THE GRAPH: the graph log is the record of DAG nodes and
+ * Loops, and `readGraphRuntime` rejects any event that names neither a `nodeId`
+ * nor a `loopInstanceId`. A failed wake-up is neither, so a graph entry would
+ * have to invent a node that does not exist — and every reader that enumerates
+ * nodes would then see a phantom. The Team record keeps the fact exactly as wide
+ * as it is true. The trade-off is real and accepted: the fact is not part of the
+ * bounded DAG, so it cannot be replayed as graph history; it is visible through
+ * `orchestra_team` instead.
+ *
+ * It re-reads the Team instead of reusing a snapshot the caller is holding:
+ * notice failure happens on the error path of an unrelated tool call, where the
+ * caller's snapshot may already be stale, and a CAS write against a stale
+ * snapshot would fail for a reason that has nothing to do with the notice.
+ *
+ * @param ctx - host context.
+ * @param activeTeamState - the Team CAS store.
+ * @param cwd - the Team's working directory.
+ * @param exec - the calling execution; its sandbox policy owns the write.
+ * @returns the recorder {@link notifyDriverMilestone} calls on a failed delivery.
+ */
+export function noticeRecorderFor(
+  ctx: Context,
+  activeTeamState: ActiveTeamStateStore,
+  cwd: string,
+  exec: ToolExecutionInput,
+): NoticeFailureRecorder {
+  return async (fact) => {
+    const observed = await activeTeamState.read(cwd, { signal: exec.signal });
+    if (observed.kind !== "ready") throw new Error(`active Team state is ${observed.kind}, so the failed notice cannot be recorded`);
+    const noticeFailures = [...(observed.team.noticeFailures ?? []), fact].slice(-NOTICE_FAILURE_LIMIT);
+    await activeTeamState.replace(observed, { ...observed.team, noticeFailures }, { policy: escrowPolicy(ctx, exec), signal: exec.signal });
+  };
 }
 
 /** Cordis plugin name used by loader diagnostics. */
@@ -791,6 +899,145 @@ function prepareSubagentRolePlan(
 }
 
 /**
+ * The FROZEN charter revision the Team runs under, with the Loop contracts that
+ * revision fixes.
+ *
+ * Both the bounded-run sweep and the health projection read the same authority:
+ * the charter a run was APPROVED under is the only one whose deadlines,
+ * budgets, and stall grace that run obeys. A later revision's contracts must
+ * never govern an older run's Attempts, or a re-drafted charter would silently
+ * rewrite the rules of work already in flight.
+ *
+ * @param team - the active Team.
+ * @returns the frozen revision, its digest, and its Loop contracts; undefined
+ *   when the Team has no document, no current revision, or no such revision.
+ */
+function frozenCharterOf(team: TeamState): { charterRevision: number; digest: string; contracts: TopologyLoopContract[] } | undefined {
+  const document = documentReadForTeam(team);
+  const revision = document?.currentCharterRevision;
+  if (document === undefined || revision === null || revision === undefined) return undefined;
+  const frozen = document.charterRevisions.find((entry) => entry.charterRevision === revision);
+  if (frozen === undefined) return undefined;
+  return { charterRevision: frozen.charterRevision, digest: frozen.digest, contracts: frozen.topology.config.protocol?.loops ?? [] };
+}
+
+/** Derived health inputs one Team's role rows share: one read serves every role. */
+export interface TeamRoleHealth {
+  loops: LoopSummary[];
+  contracts: TopologyLoopContract[];
+  now: number;
+}
+
+/**
+ * Derived health inputs for one Team's role rows.
+ *
+ * The graph runtime is read through the SAME frozen-charter resolution the
+ * bounded-run sweep uses, so a row's `stall` and `deadlineAt` always describe
+ * the Attempt the sweep would act on. A runtime that no longer matches its
+ * charter is still projected: a stale run is precisely when a reader most needs
+ * to see that nothing is advancing.
+ *
+ * @param team - the active Team.
+ * @returns the shared health inputs, or undefined when the Team has no readable
+ *   graph runtime (in which case rows carry no stall claim at all).
+ */
+function roleHealthFor(team: TeamState): TeamRoleHealth | undefined {
+  if (team.graphRuntime === undefined) return undefined;
+  const frozen = frozenCharterOf(team);
+  const read = readGraphRuntime(team.graphRuntime, team.teamId, frozen?.charterRevision, frozen?.digest);
+  if (read.kind !== "ready" && read.kind !== "stale") return undefined;
+  return { loops: graphLoops(read.runtime), contracts: frozen?.contracts ?? [], now: Date.now() };
+}
+
+/**
+ * The newest OPEN Attempt belonging to one role, with the Loop it runs in.
+ *
+ * Matching on the Attempt's own `roleId` (rather than on a Loop-level
+ * participant list) keeps the link honest for a Loop whose participants change
+ * between Attempts: the row describes the Attempt that is actually open.
+ *
+ * @param loops - every Loop of the runtime.
+ * @param roleId - the role whose open Attempt is wanted.
+ * @returns the newest match, or undefined when the role has no open Attempt.
+ */
+export function openAttemptFor(loops: readonly LoopSummary[], roleId: string): { loopId: string; loopInstanceId: string; attempt: LoopSummary["attempts"][number] } | undefined {
+  let found: { loopId: string; loopInstanceId: string; attempt: LoopSummary["attempts"][number] } | undefined;
+  for (const loop of loops) {
+    const attempt = loop.attempts.at(-1);
+    if (attempt === undefined || attempt.status !== "started") continue;
+    if (attempt.roleId !== roleId) continue;
+    found = { loopId: loop.loopId, loopInstanceId: loop.loopInstanceId, attempt };
+  }
+  return found;
+}
+
+/** One role row's derived stall verdict and open-Attempt timing. */
+export interface RoleAttemptHealth {
+  stall: NodeStall;
+  attempt?: { loopInstanceId: string; loopId: string; attempt: number; startedAt: number; deadlineAt: number; msRemaining: number; expired: boolean };
+}
+
+/**
+ * The derived stall verdict and Attempt timing for one role row.
+ *
+ * Pure by construction: every input is an observation the caller already made,
+ * so the same facts always produce the same row — a projection can be recomputed
+ * after a restart, and a test can drive it without a live Team.
+ *
+ * @param role - the durable role record (only its id is read).
+ * @param health - the Team's shared Attempt/contract inputs.
+ * @param observations - whether the node is working, and when it was last seen.
+ * @returns the stall verdict, plus Attempt timing when the role has one open.
+ */
+export function roleAttemptHealth(
+  role: Pick<TeamRole, "id">,
+  health: TeamRoleHealth,
+  observations: { working: boolean; lastActivityAt: number | undefined },
+): RoleAttemptHealth {
+  const open = openAttemptFor(health.loops, role.id);
+  const contract = open === undefined ? undefined : health.contracts.find((entry) => entry.loopId === open.loopId);
+  const stall = nodeStall({
+    attempt: open?.attempt,
+    contract,
+    working: observations.working,
+    lastActivityAt: observations.lastActivityAt,
+    now: health.now,
+  });
+  if (open === undefined) return { stall };
+  return {
+    stall,
+    attempt: {
+      loopInstanceId: open.loopInstanceId,
+      loopId: open.loopId,
+      attempt: open.attempt.attempt,
+      startedAt: open.attempt.startedAt,
+      deadlineAt: open.attempt.deadlineAt,
+      msRemaining: Math.max(open.attempt.deadlineAt - health.now, 0),
+      expired: health.now >= open.attempt.deadlineAt,
+    },
+  };
+}
+
+/**
+ * Whether a node is demonstrably working right now.
+ *
+ * Two independent facts count, because either alone under-reports: `running`
+ * says a turn is in flight, and a non-empty inbox says accepted work is parked
+ * for the next step. A node with queued work that has not started its turn yet
+ * is not stalled — it is waiting to be scheduled.
+ *
+ * @param agent - the live agent, when the role is loaded.
+ * @returns true when the node is working or has pending work.
+ */
+export function nodeIsWorking(agent: { status?: string; inbox?: { nextTurn?: readonly unknown[]; nextStep?: readonly unknown[] } } | undefined): boolean {
+  if (agent === undefined) return false;
+  if (agent.status === "running") return true;
+  const inbox = agent.inbox;
+  if (inbox === undefined) return false;
+  return (inbox.nextTurn?.length ?? 0) > 0 || (inbox.nextStep?.length ?? 0) > 0;
+}
+
+/**
  * One role's proposal-card facts, resolved through the same preset/permission/
  * model seams that create-time provisioning uses (see prepareGovernedRolePlan).
  * This is presentation + pre-parsing only: it never creates a Session, never
@@ -1290,7 +1537,9 @@ export async function handleTeamGateDecisionCommand(
   } catch (error) {
     throw new Error(`gate decision durable but graph transition is pending: ${error instanceof Error ? error.message : String(error)}`);
   }
-  await notifyDriverMilestone(ctx, team, invocation.agent.id, "gate", `${gate.gateInstanceId} resolved: ${match[2]}`);
+  await notifyDriverMilestone(ctx, team, invocation.agent.id, "gate", `${gate.gateInstanceId} resolved: ${match[2]}`, {
+    recordFailure: noticeRecorderFor(ctx, activeTeamState, invocation.agent.session.header.cwd ?? "", { agent: invocation.agent } as any),
+  });
   invocation.agent.followup?.(gateNotice);
   return { kind: "success", text: `Gate ${gate.gateInstanceId} resolved with user option ${match[2]}` };
 }
@@ -1478,16 +1727,11 @@ async function sweepTeamBoundedRun(
 ): Promise<ActiveTeamReady> {
   const team = initial.team;
   if (team.graphRuntime === undefined) return initial;
-  const document = documentReadForTeam(team);
-  const revision = document?.currentCharterRevision;
-  if (document === undefined || revision === null || revision === undefined) return initial;
-  const frozen = document.charterRevisions.find((entry) => entry.charterRevision === revision);
+  const frozen = frozenCharterOf(team);
   if (frozen === undefined) return initial;
   const read = readGraphRuntime(team.graphRuntime, team.teamId, frozen.charterRevision, frozen.digest);
   if (read.kind !== "ready") return initial;
-  // Contracts come from the FROZEN topology: the charter a run was approved
-  // under is the only one whose deadlines and budgets that run obeys.
-  const contracts = frozen.topology.config.protocol?.loops ?? [];
+  const contracts = frozen.contracts;
   let command: GraphCommandResult;
   try {
     command = sweepBoundedRun(read.runtime, team, contracts, now);
@@ -1503,6 +1747,29 @@ async function persistGraphTransition(ctx: Context, activeTeamState: ActiveTeamS
   return readySnapshotAfterWrite(activeTeamState, snapshot.cwd, written, exec.signal);
 }
 
+/**
+ * Add the wall-clock reading of each Loop's open Attempt to its row.
+ *
+ * `currentDeadlineAt` alone forces every reader to do the subtraction against
+ * its own clock, and a reader that forgets reports a deadline without saying
+ * whether it has already passed. `msRemaining` and `expired` are derived here,
+ * from ONE observation time, so every row in one answer agrees with every other
+ * — and `expired` distinguishes "the deadline passed and the sweep has not run
+ * yet" from "there is no open Attempt", which is the difference a controller
+ * needs to decide whether to sweep or to wait.
+ *
+ * @param loops - the runtime's Loop summaries.
+ * @param now - the single observation time for this answer.
+ * @returns the same rows with timing fields on Loops that have an open Attempt.
+ */
+export function loopsWithAttemptTiming(loops: readonly LoopSummary[], now: number): LoopSummary[] {
+  return loops.map((loop) => {
+    const deadlineAt = loop.currentDeadlineAt;
+    if (deadlineAt === undefined) return loop;
+    return { ...loop, currentDeadlineMsRemaining: Math.max(deadlineAt - now, 0), currentDeadlineExpired: now >= deadlineAt } as LoopSummary;
+  });
+}
+
 function graphToolOutput(team: TeamState, runtime: GraphRuntimeState, stale = false) {
   const summary = graphSummary(runtime, stale);
   return {
@@ -1513,7 +1780,7 @@ function graphToolOutput(team: TeamState, runtime: GraphRuntimeState, stale = fa
     runtime_revision: runtime.runtimeRevision,
     stale: summary.stale,
     current_loop: summary.currentLoop,
-    loops: graphLoops(runtime),
+    loops: loopsWithAttemptTiming(graphLoops(runtime), Date.now()),
     pending_handoffs: summary.pendingHandoffs,
     cap_exhausted: summary.capExhausted,
     expired_attempts: summary.expiredAttempts,
@@ -2230,7 +2497,16 @@ async function sendToGovernedSubagentNode(
   };
 }
 
-async function roleStatus(ctx: Context, role: TeamRole) {
+/**
+ * One role's live status row.
+ *
+ * @param ctx - host context.
+ * @param role - the durable role record.
+ * @param health - derived Attempt/stall inputs, when the caller could supply
+ *   them. Omitting it produces the row without stall information rather than a
+ *   row that guesses: a reader must never see `ok` for a check nobody ran.
+ */
+async function roleStatus(ctx: Context, role: TeamRole, health?: TeamRoleHealth) {
   const agent = ctx.agents.get(SID(role.sessionId));
   const status: {
     id: string;
@@ -2246,6 +2522,8 @@ async function roleStatus(ctx: Context, role: TeamRole) {
     diagnostic?: TeamRoleDiagnostic;
     lastActivityAt?: number;
     lastActivity?: string;
+    stall?: NodeStall;
+    attempt?: { loopInstanceId: string; loopId: string; attempt: number; startedAt: number; deadlineAt: number; msRemaining: number; expired: boolean };
   } = {
     id: role.id,
     name: role.name,
@@ -2261,9 +2539,21 @@ async function roleStatus(ctx: Context, role: TeamRole) {
     lastReport: role.lastReport ?? null,
     ...(role.diagnostic === undefined ? {} : { diagnostic: role.diagnostic }),
   };
+  const annotateHealth = (): void => {
+    if (health === undefined) return;
+    const derived = roleAttemptHealth(role, health, {
+      working: nodeIsWorking(agent as { status?: string; inbox?: { nextTurn?: readonly unknown[]; nextStep?: readonly unknown[] } } | undefined),
+      lastActivityAt: status.lastActivityAt,
+    });
+    status.stall = derived.stall;
+    if (derived.attempt !== undefined) status.attempt = derived.attempt;
+  };
   try {
     const query = ctx.get("sessionQuery");
-    if (query === undefined) return status;
+    if (query === undefined) {
+      annotateHealth();
+      return status;
+    }
     const snapshot = await query.readSession(SID(role.sessionId));
     for (let i = snapshot.events.length - 1; i >= 0; i--) {
       const event = snapshot.events[i];
@@ -2285,6 +2575,7 @@ async function roleStatus(ctx: Context, role: TeamRole) {
   } catch (error) {
     // read-only best effort: absence of activity detail must not fail the team view
   }
+  annotateHealth();
   return status;
 }
 
@@ -2311,7 +2602,14 @@ const SECTION_ORDER = 119;
 export const Config = undefined;
 
 export function apply(ctx: Context): void {
-  const activeTeamState = createActiveTeamStateStore(ctx.fs);
+  // One change bus per plugin instance, owned by this fiber: unloading the
+  // plugin releases every pending waiter instead of leaving a timer behind.
+  const teamChange = createTeamChangeBus();
+  ctx.effect(() => () => teamChange.dispose());
+  // The store is constructed ONCE here, which makes this the single choke point
+  // every committed Team write passes through — a future write path cannot
+  // bypass the signal without bypassing the store itself.
+  const activeTeamState = withChangeSignal(createActiveTeamStateStore(ctx.fs), teamChange);
   const archiveStore = createArchiveStore(ctx.fs);
   const topologyCatalog = createTopologyCatalog(ctx.fs);
   const governedAddress = createGovernedRoleAddressResolver(activeTeamState);
@@ -2339,6 +2637,20 @@ export function apply(ctx: Context): void {
       },
       lastActivityAt: { type: "number" },
       lastActivity: { type: "string" },
+      stall: { type: "string" },
+      attempt: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          loopInstanceId: { type: "string", required: true },
+          loopId: { type: "string", required: true },
+          attempt: { type: "number", required: true },
+          startedAt: { type: "number", required: true },
+          deadlineAt: { type: "number", required: true },
+          msRemaining: { type: "number", required: true },
+          expired: { type: "boolean", required: true },
+        },
+      },
     },
   } as const;
 
@@ -3391,9 +3703,87 @@ export function apply(ctx: Context): void {
         const snapshot = command.kind === "noop" ? observation : await persistGraphTransition(ctx, activeTeamState, observation, command.runtime, exec);
         if (command.kind === "changed") {
           const after = graphGates(command.runtime).find((entry) => entry.gateInstanceId === args.gateInstanceId);
-          await notifyDriverMilestone(ctx, team, exec.agent.id, "gate", `${args.gateInstanceId} resolved: ${after?.selectedOption ?? after?.status ?? "noop"}`);
+          await notifyDriverMilestone(ctx, team, exec.agent.id, "gate", `${args.gateInstanceId} resolved: ${after?.selectedOption ?? after?.status ?? "noop"}`, {
+            recordFailure: noticeRecorderFor(ctx, activeTeamState, cwd, exec),
+          });
         }
         return graphToolOutput(snapshot.team, command.runtime, false) as any;
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
+      name: "orchestra_wait",
+      description:
+        "Sleep until the active Team changes, or until the timeout elapses. Reports ONLY whether something happened — never what it was — so the caller re-reads orchestra_team / orchestra_graph after waking; that split keeps the wake-up from racing the state read it stands for. A change is any committed Team write: graph milestones, a role filing a report through orchestra_report, a gate decision, provisioning progress. The wait is ONE-SHOT: it ends at the first change or the timeout, and the caller decides whether to wait again. Use this INSTEAD of polling in a loop: after dispatching work, sleep here; on waking (or timing out) re-read state, advance whatever can advance, then wait again. A timeout is not a failure — it means nothing was committed, and bounded Attempt deadlines still guarantee the run ends even if every wait times out.",
+      parameters: {
+        teamId: { type: "string", description: "Team to wait on; defaults to the active Team of the calling session's working directory." },
+        timeoutMs: {
+          type: "number",
+          description: `Maximum wait in milliseconds (${MIN_WAIT_TIMEOUT_MS}..${MAX_WAIT_TIMEOUT_MS}); defaults to ${DEFAULT_WAIT_TIMEOUT_MS}. Values outside the range are refused rather than clamped, so a caller can never believe it waited longer than it did.`,
+        },
+      },
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            team_id: { type: "string", required: true },
+            changed: { type: "boolean", required: true },
+            timedOut: { type: "boolean", required: true },
+            observed_at: { type: "number", required: true },
+            waited_ms: { type: "number", required: true },
+            cancelled: { type: "boolean" },
+            reason: { type: "string" },
+          },
+        },
+        render: (_args, value) => [
+          {
+            type: "text",
+            text: value.cancelled === true
+              ? `orchestra_wait ${value.team_id}: cancelled after ${value.waited_ms}ms — re-read state before deciding`
+              : value.changed
+                ? `orchestra_wait ${value.team_id}: a change was committed after ${value.waited_ms}ms — re-read orchestra_team / orchestra_graph`
+                : `orchestra_wait ${value.team_id}: nothing changed within ${value.waited_ms}ms — re-read state, then decide whether to wait again`,
+          },
+        ],
+      },
+      async execute(args: { teamId?: string; timeoutMs?: number }, exec: ToolExecutionInput) {
+        if (exec.agent === undefined) throw new Error("orchestra_wait requires an agent caller");
+        const cwd = exec.agent.session.header.cwd;
+        if (cwd === undefined) throw new Error("current session has no working directory");
+        const timeoutMs = args.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
+        if (!Number.isSafeInteger(timeoutMs) || timeoutMs < MIN_WAIT_TIMEOUT_MS || timeoutMs > MAX_WAIT_TIMEOUT_MS) {
+          throw new Error(`orchestra_wait timeoutMs must be an integer between ${MIN_WAIT_TIMEOUT_MS} and ${MAX_WAIT_TIMEOUT_MS} (received ${String(args.timeoutMs)}); it is never silently clamped`);
+        }
+        const observed = await activeTeamState.read(cwd, { signal: exec.signal });
+        if (observed.kind !== "ready") {
+          throw new Error(`orchestra_wait requires an active Team at ${cwd} (state is ${observed.kind}); waiting with nothing to wait on would just burn the timeout`);
+        }
+        const team = observed.team;
+        if (args.teamId !== undefined && args.teamId !== "" && args.teamId !== team.teamId) {
+          throw new Error(`orchestra_wait teamId "${args.teamId}" does not match the active Team ${team.teamId} at ${cwd}`);
+        }
+        // The baseline is sampled from the SAME read that proved the Team
+        // exists, so a commit that lands between the read and the wait is not
+        // mistaken for the waiter's own starting point.
+        const outcome = await teamChange.wait({
+          timeoutMs,
+          cwd,
+          baselineRevision: team.graphRuntime?.runtimeRevision ?? 0,
+          signal: exec.signal,
+        });
+        return {
+          team_id: team.teamId,
+          changed: outcome.changed,
+          timedOut: outcome.timedOut,
+          observed_at: outcome.observedAt,
+          waited_ms: outcome.waitedMs,
+          ...(outcome.cancelled === true
+            ? { cancelled: true, reason: "the wait was cancelled by the caller's signal before any change was committed" }
+            : {}),
+        };
       },
     }),
   );
@@ -3543,7 +3933,9 @@ export function apply(ctx: Context): void {
           const updated = graphLoops(command.runtime).find((entry) => entry.loopInstanceId === args.loopInstanceId);
           const attempt = updated?.attempts.at(-1)?.attempt;
           const capped = command.runtime.events.at(-1)?.type === "cap_exhausted";
-          await notifyDriverMilestone(ctx, team, exec.agent.id, "verdict", `${args.verdict}: ${args.loopInstanceId} attempt ${attempt ?? "?"}${capped ? " cap_exhausted" : ""}`);
+          await notifyDriverMilestone(ctx, team, exec.agent.id, "verdict", `${args.verdict}: ${args.loopInstanceId} attempt ${attempt ?? "?"}${capped ? " cap_exhausted" : ""}`, {
+            recordFailure: noticeRecorderFor(ctx, activeTeamState, cwd, exec),
+          });
         }
         return graphToolOutput(snapshot.team, command.runtime, false) as any;
       },
@@ -3712,7 +4104,9 @@ export function apply(ctx: Context): void {
         try {
           const accepted = appendHandoffResult(pendingRuntime, pendingSnapshot.team, { handoffId: args.handoffId, actorSessionId: exec.agent.id, accepted: true, receipt, now: Date.now() });
           const acceptedSnapshot = await persistGraphTransition(ctx, activeTeamState, pendingSnapshot, accepted.runtime, exec);
-          await notifyDriverMilestone(ctx, team, exec.agent.id, "handoff", `${args.kind} accepted: ${pendingFact.fromRole} → ${pendingFact.toRole}`);
+          await notifyDriverMilestone(ctx, team, exec.agent.id, "handoff", `${args.kind} accepted: ${pendingFact.fromRole} → ${pendingFact.toRole}`, {
+            recordFailure: noticeRecorderFor(ctx, activeTeamState, cwd, exec),
+          });
           return { status: "accepted", handoff_id: args.handoffId, team_id: team.teamId, from_role: pendingFact.fromRole, to_role: pendingFact.toRole, resolved_session_id: targetSessionId, runtime_revision: acceptedSnapshot.team.graphRuntime?.runtimeRevision ?? accepted.runtime.runtimeRevision, receipt };
         } catch (error) {
           return { status: "delivery_accepted_state_pending", handoff_id: args.handoffId, team_id: team.teamId, from_role: pendingFact.fromRole, to_role: pendingFact.toRole, resolved_session_id: targetSessionId, runtime_revision: pendingRuntime.runtimeRevision, receipt, reconcile_required: true };
@@ -3755,7 +4149,9 @@ export function apply(ctx: Context): void {
         const terminalStatus: TeamState["status"] | undefined = command.accepted ? args.outcome === "completed" ? "completed" : args.outcome === "abandoned" ? "abandoned" : "failed" : undefined;
         const snapshot = await persistGraphTransition(ctx, activeTeamState, observation, command.runtime, exec, terminalStatus);
         if (!command.accepted) throw new Error(`closure rejected: ${command.diagnostic ?? "requirements not satisfied"}`);
-        await notifyDriverMilestone(ctx, team, exec.agent.id, "close", args.outcome);
+        await notifyDriverMilestone(ctx, team, exec.agent.id, "close", args.outcome, {
+          recordFailure: noticeRecorderFor(ctx, activeTeamState, cwd, exec),
+        });
         return graphToolOutput(snapshot.team, command.runtime, false) as any;
       },
     }),
@@ -3798,6 +4194,20 @@ export function apply(ctx: Context): void {
                           sessionId: { type: "string", required: true },
                           path: { type: "string", required: true },
                           createdAt: { type: "number", required: true },
+                        },
+                      },
+                    },
+                    notice_failures: {
+                      type: "array",
+                      required: true,
+                      items: {
+                        type: "object",
+                        additionalProperties: false,
+                        properties: {
+                          milestone: { type: "string", required: true },
+                          targetSessionId: { type: "string", required: true },
+                          failedAt: { type: "number", required: true },
+                          reason: { type: "string", required: true },
                         },
                       },
                     },
@@ -3930,6 +4340,7 @@ export function apply(ctx: Context): void {
         const documentSummaryValue = documentSummary(document, team);
         const graphStale = document?.currentCharterRevision !== null && document?.currentCharterRevision !== undefined && document.charterRevisions.find((revision) => revision.charterRevision === document.currentCharterRevision)?.digest !== team.graphRuntime?.charterDigest;
         const graph = team.graphRuntime === undefined ? undefined : graphSummary(team.graphRuntime, graphStale || document?.runtimeProjection.graph?.stale === true);
+        const roleHealth = roleHealthFor(team);
         return {
           team: {
             team_id: team.teamId,
@@ -3939,8 +4350,9 @@ export function apply(ctx: Context): void {
             controller_session_id: team.controllerSessionId,
             created_at: team.createdAt,
             activated_from_archive_id: team.activatedFromArchiveId,
-            roles: await Promise.all(team.roles.map((role) => roleStatus(ctx, role))),
+            roles: await Promise.all(team.roles.map((role) => roleStatus(ctx, role, roleHealth))),
             reports: team.reports,
+            notice_failures: team.noticeFailures ?? [],
             document_status: documentSummaryValue.status,
             document_revision: documentSummaryValue.revision,
             document_stale: documentSummaryValue.stale,
@@ -4193,7 +4605,9 @@ export function apply(ctx: Context): void {
               signal: exec.signal,
             });
           }
-          await notifyDriverMilestone(ctx, team, agentId, "report", `written: ${rel}`);
+          await notifyDriverMilestone(ctx, team, agentId, "report", `written: ${rel}`, {
+            recordFailure: noticeRecorderFor(ctx, activeTeamState, cwd, exec),
+          });
         }
         return { path: canonical };
       },
@@ -4244,6 +4658,21 @@ export function apply(ctx: Context): void {
                       properties: {
                         id: { type: "string", required: true },
                         name: { type: "string", required: true },
+                        // The backend decides what the role can do at all, and the
+                        // two native knobs only ever appear on a `subagent` role.
+                        // A summary that carries a field its schema does not declare
+                        // makes the WHOLE tool call invalid, so these three are
+                        // declared here the moment roleSummary can emit them.
+                        execution: { type: "string" },
+                        persona: { type: "string" },
+                        toolFilter: {
+                          type: "object",
+                          additionalProperties: false,
+                          properties: {
+                            allow: { type: "array", items: { type: "string" } },
+                            deny: { type: "array", items: { type: "string" } },
+                          },
+                        },
                         preset: { type: "string" },
                         sandbox: { type: "string" },
                         compositionTools: { type: "array", items: { type: "string" } },
@@ -4270,7 +4699,11 @@ export function apply(ctx: Context): void {
                       (t) =>
                         t.status === "blocked"
                           ? `${t.id || t.filename} (${t.source}, blocked: ${t.diagnostic?.code ?? "unknown"})`
-                          : `${t.id} (${t.source})${t.description === undefined ? "" : `: ${t.description}`} [roles: ${t.roles.map((r) => r.id).join(", ")}]`,
+                          // The backend is printed with the role id because it is what
+                          // decides whether that role can hold its own preset or be
+                          // read-only; a driver reading only ids cannot tell a hybrid
+                          // template from a uniform one.
+                          : `${t.id} (${t.source})${t.description === undefined ? "" : `: ${t.description}`} [roles: ${t.roles.map((r) => (r.execution === undefined ? r.id : `${r.id}:${r.execution}`)).join(", ")}]`,
                     )
                     .join("; "),
           },
@@ -4372,9 +4805,10 @@ export function apply(ctx: Context): void {
                 }
                 if (teamObservation.kind === "ready") {
                   const team = teamObservation.team;
+                  const roleHealth = roleHealthFor(team);
                   const roles = await Promise.all(
                     team.roles.map(async (record) => {
-                      const status = await roleStatus(ctx, record);
+                      const status = await roleStatus(ctx, record, roleHealth);
                       return {
                         id: status.id,
                         name: status.name,
