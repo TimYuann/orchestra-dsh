@@ -29,7 +29,8 @@ function topology(overrides = {}) {
     name: "Trio",
     controller: { id: "driver", source: "caller" },
     roles: [{ id: "reviewer", name: "Reviewer", preset: "orchestra-reviewer", sandbox: "read-only" }],
-    protocol: { ownership: { closure: "driver" }, routes: [], completion: { owner: "driver", rule: "done" } },
+    // P9: the declared reviewer must be referenced by a route.
+    protocol: { ownership: { closure: "driver" }, routes: [{ kind: "dispatch", from: "driver", to: ["reviewer"] }], completion: { owner: "driver", rule: "done" } },
     ...overrides,
   };
 }

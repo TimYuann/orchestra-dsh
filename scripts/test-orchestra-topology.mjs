@@ -236,7 +236,13 @@ test("validateTopology refuses the two knobs a native sub-agent cannot honor", (
     name: "hybrid",
     controller: { id: "driver", source: "caller" },
     roles,
-    protocol: { ownership: { closure: "driver" }, routes: [], completion: { owner: "driver", rule: "done" } },
+    protocol: {
+      ownership: { closure: "driver" },
+      // P9: every declared node must be referenced, so the driver
+      // dispatches to each one it declared.
+      routes: [{ kind: "dispatch", from: "driver", to: roles.map((role) => role.id) }],
+      completion: { owner: "driver", rule: "done" },
+    },
   });
 
   assert.deepEqual(validateTopology(withRoles([{ id: "helper", name: "Helper", execution: "subagent" }])), []);
@@ -290,6 +296,71 @@ test("validateTopology refuses the two knobs a native sub-agent cannot honor", (
   assert.match(sessionKnobProblems.join("\n"), /resolves to the "session" backend but declares toolFilter/);
 });
 
+test("P6/P9: an authored topology must reach closure and reference every node", () => {
+  const reviewer = { id: "reviewer", name: "Reviewer", preset: "orchestra-reviewer", sandbox: "read-only" };
+
+  // A complete authored topology: every node is dispatched to and someone owns
+  // the terminal decision.
+  assert.deepEqual(
+    validateTopology(topology("governed", { roles: [reviewer] })),
+    [],
+    "a routed node plus a completion owner is the whole contract",
+  );
+
+  // P9: a declared node nothing references cannot be dispatched to, owns no
+  // decision, and is on no path to closure — the author believes it runs.
+  const orphan = validateTopology(topology("orphan", { roles: [reviewer, { id: "ghost", name: "Ghost" }] }));
+  assert.equal(orphan.length, 1, orphan.join(" | "));
+  assert.match(orphan[0], /"ghost" is referenced by nothing/);
+  assert.match(orphan[0], /P9/);
+
+  // Naming the orphan anywhere counts as referencing it.
+  assert.deepEqual(
+    validateTopology(
+      topology("named-orphan", {
+        roles: [reviewer, { id: "ghost", name: "Ghost" }],
+        protocol: {
+          ownership: { scope: "driver", closure: "driver", haunting: "ghost" },
+          routes: [{ kind: "work", from: "driver", to: ["reviewer"] }],
+          completion: { owner: "driver", rule: "done" },
+        },
+      }),
+    ),
+    [],
+  );
+
+  // P6: with a protocol but no completion authority, nothing can declare the run
+  // finished, so an approved run would have no terminal state.
+  const noAuthority = validateTopology({
+    schemaVersion: 1,
+    id: "no-authority",
+    controller: { id: "driver", source: "caller" },
+    roles: [reviewer],
+    protocol: { ownership: { scope: "driver" }, routes: [{ kind: "work", from: "driver", to: ["reviewer"] }] },
+  });
+  assert.equal(noAuthority.length, 1, noAuthority.join(" | "));
+  assert.match(noAuthority[0], /no completion authority/);
+  assert.match(noAuthority[0], /P6/);
+
+  // The legacy completion owner is an accepted authority, because the runtime
+  // synthesizes a closure from it — a stricter rule would reject topologies that
+  // close perfectly well today.
+  assert.deepEqual(
+    validateTopology({
+      schemaVersion: 1,
+      id: "legacy-completion",
+      controller: { id: "driver", source: "caller" },
+      roles: [reviewer],
+      protocol: {
+        ownership: { scope: "driver" },
+        routes: [{ kind: "work", from: "driver", to: ["reviewer"] }],
+        completion: { owner: "driver", rule: "done" },
+      },
+    }),
+    [],
+  );
+});
+
 test("catalog summary reports the resolved execution backend", async () => {
   await withRoots(async ({ fs, projectRoot, globalRoot }) => {
     await fs.seed(
@@ -301,6 +372,13 @@ test("catalog summary reports the resolved execution backend", async () => {
           { id: "reviewer", name: "Reviewer", preset: "orchestra-reviewer", sandbox: "read-only", execution: "auto" },
           { id: "legacy", name: "Legacy" },
         ],
+        // P9: all three nodes must be referenced, or the catalog blocks the
+        // template before the execution summary under test is ever built.
+        protocol: {
+          ownership: { scope: "driver", closure: "driver" },
+          routes: [{ kind: "work", from: "driver", to: ["helper", "reviewer", "legacy"] }],
+          completion: { owner: "driver", rule: "done" },
+        },
       }),
     );
     const catalog = createTopologyCatalog(fs, { globalRoot });

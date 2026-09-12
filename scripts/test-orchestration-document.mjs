@@ -261,7 +261,8 @@ test("Frozen charter initializes the Team document and amendments append immutab
     id: "duo",
     controller: { id: "driver", source: "caller" },
     roles: [{ id: "reviewer", name: "Reviewer", preset: "orchestra-reviewer", sandbox: "read-only" }],
-    protocol: { ownership: { closure: "driver" }, routes: [], completion: { owner: "driver", rule: "done" } },
+    // P9: the declared reviewer must be referenced by a route.
+    protocol: { ownership: { closure: "driver" }, routes: [{ kind: "dispatch", from: "driver", to: ["reviewer"] }], completion: { owner: "driver", rule: "done" } },
   };
   const baseInput = {
     draftId: "draft-frozen-document",
@@ -309,7 +310,7 @@ test("orchestra_spawn direct gate rejects both new and existing frozen Team path
   assert.equal(emptyFs.files.size, emptyBefore);
   const existingFs = new MemoryFs();
   const source = team();
-  const config = { schemaVersion: 1, id: "duo", controller: { id: "driver", source: "caller" }, roles: [{ id: "reviewer", name: "Reviewer", preset: "orchestra-reviewer", sandbox: "read-only" }], protocol: { ownership: { closure: "driver" }, routes: [], completion: { owner: "driver", rule: "done" } } };
+  const config = { schemaVersion: 1, id: "duo", controller: { id: "driver", source: "caller" }, roles: [{ id: "reviewer", name: "Reviewer", preset: "orchestra-reviewer", sandbox: "read-only" }], protocol: { ownership: { closure: "driver" }, routes: [{ kind: "dispatch", from: "driver", to: ["reviewer"] }], completion: { owner: "driver", rule: "done" } } };
   const draft = prepareDraftEvent([], { draftId: "draft-spawn-gate", mission: source.mission, topology: { source: "inline", id: "duo", config }, humanParticipationPolicy: { mode: "interactive", onUnavailable: "block" }, authorSessionId: source.controllerSessionId, now: 300 });
   const approval = prepareApprovalEvent([draft.event], { draftId: draft.value.draftId, revision: 1, commandId: "spawn-gate-command", approvingSessionId: source.controllerSessionId, approvedAt: 301 });
   const frozen = prepareFreezeEvent([draft.event, approval.event], { draftId: draft.value.draftId, revision: 1, digest: draft.value.digest, frozenBySessionId: source.controllerSessionId, frozenAt: 302 });

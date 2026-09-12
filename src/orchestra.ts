@@ -121,6 +121,7 @@ import { createTopologyCatalog, resolveRoleExecution } from "./orchestra-topolog
 import type { RoleConfig, TopologyCatalog, TopologyClosureDefinition, TopologyList, TopologyLoopContract, TopologyProtocol, TopologyResolution, TopologyRoleSummary } from "./orchestra-topology.js";
 export { validateTopology } from "./orchestra-topology.js";
 import { mountPreset } from "@deepseek-ai/dsh-agent-presets";
+import { registerOrchestrationPrinciples } from "./orchestration-principles.js";
 import "./relay-types.js";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
@@ -4882,6 +4883,10 @@ export function apply(ctx: Context): void {
       registerWebSurface();
     }
   });
+
+  // The method behind /team, registered where a driver meets it: a short
+  // always-on section plus the worked detail as a loadable skill.
+  registerOrchestrationPrinciples(ctx);
 
   const systemPrompt = ctx.get("systemPrompt");
   if (systemPrompt !== undefined) {

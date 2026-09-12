@@ -1186,6 +1186,13 @@ export function validateTopology(config: unknown): string[] {
     problems.push("shape: topology protocol must be an object");
     return problems;
   }
+  // A topology with NO protocol is the v0.3 shape, and the catalog already
+  // classifies it as ready-with-a-warning rather than rejecting it: the shipped
+  // contract is that legacy templates stay readable and are flagged, never
+  // silently replaced. P6 and P9 therefore apply to AUTHORED topologies — those
+  // that declare a protocol — and this early return is the legacy boundary
+  // rather than an oversight. Reading it the other way would break every v0.3
+  // template on disk to enforce a rule they predate.
   if (!isRecord(protocol)) return problems;
   if (protocol.ownership !== undefined && !isRecord(protocol.ownership)) {
     problems.push("shape: protocol.ownership must be an object");
@@ -1341,6 +1348,73 @@ export function validateTopology(config: unknown): string[] {
       if (closure.userOverride !== undefined && typeof closure.userOverride !== "boolean") problems.push("shape: protocol.closure.userOverride must be boolean");
     }
   }
+  // ── Principles P6 and P9, as far as a static topology can prove them ──────
+  //
+  // P9: a declared node that nothing references is a design defect, not a
+  // harmless extra. It cannot be dispatched to, cannot be handed anything, and
+  // no decision belongs to it — the run simply never uses it, and the author
+  // believes it does.
+  const referenced = new Set<string>([controllerId.toLowerCase()]);
+  const noteRef = (ref: unknown): void => {
+    if (typeof ref === "string" && ref !== "") referenced.add(ref.toLowerCase());
+  };
+  const noteRefs = (refs: unknown): void => {
+    if (Array.isArray(refs)) for (const ref of refs) noteRef(ref);
+  };
+  for (const role of Array.isArray(config.roles) ? config.roles : []) {
+    if (!isRecord(role)) continue;
+    // A role that names itself as the controller is referenced by that fact.
+    if (typeof role.id === "string" && role.id.toLowerCase() === controllerId.toLowerCase()) noteRef(role.id);
+  }
+  if (isRecord(protocol.ownership)) for (const owner of Object.values(protocol.ownership)) noteRef(owner);
+  for (const collection of ["routes", "handoffs"] as const) {
+    const entries = protocol[collection];
+    if (!Array.isArray(entries)) continue;
+    for (const entry of entries) {
+      if (!isRecord(entry)) continue;
+      noteRef(entry.from);
+      noteRefs(entry.to);
+    }
+  }
+  if (isRecord(protocol.completion)) noteRef(protocol.completion.owner);
+  if (Array.isArray(protocol.loops)) {
+    for (const loop of protocol.loops) {
+      if (!isRecord(loop)) continue;
+      noteRef(loop.evaluatorRole);
+      noteRefs(loop.participants);
+      if (isRecord(loop.entry)) noteRef(loop.entry.role);
+    }
+  }
+  if (Array.isArray((protocol as { gates?: unknown }).gates)) {
+    for (const gate of (protocol as { gates: unknown[] }).gates) if (isRecord(gate)) noteRefs(gate.decisionScope);
+  }
+  if (isRecord(protocol.closure)) noteRef(protocol.closure.owner);
+  for (const id of roleIds) {
+    if (!referenced.has(id)) {
+      const original = (Array.isArray(config.roles) ? config.roles : []).find(
+        (role) => isRecord(role) && typeof role.id === "string" && role.id.toLowerCase() === id,
+      );
+      problems.push(
+        `role "${isRecord(original) ? String(original.id) : id}" is referenced by nothing: no ownership entry, route, handoff, Loop, completion owner, or closure owner names it, so the run would never use it — give it a decision or a route, or delete it (P9: every declared node must lie on a path to closure)`,
+      );
+    }
+  }
+
+  // P6: the topology must name who declares the run complete. Without one there
+  // is no terminal state to reach, and an approved run could never be declared
+  // finished — precisely the outcome this plugin exists to prevent.
+  //
+  // BOTH mechanisms count, because the runtime honors both: an explicit
+  // `protocol.closure`, or the legacy `protocol.completion.owner` from which
+  // the close path synthesizes a closure. Requiring the structured form alone
+  // would reject topologies that close perfectly well today, which is a stricter
+  // rule than the system it guards rather than a safer one.
+  if (protocol.closure === undefined && (protocol.completion === undefined || !isRecord(protocol.completion) || typeof protocol.completion.owner !== "string" || protocol.completion.owner === "")) {
+    problems.push(
+      "topology declares no completion authority: neither protocol.closure nor a legacy protocol.completion.owner names who may declare the run finished, so an approved run could have no terminal state (P6)",
+    );
+  }
+
   return problems;
 }
 

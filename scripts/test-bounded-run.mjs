@@ -245,15 +245,27 @@ test("sweeping twice in the same instant is a noop and never duplicates a fact",
 });
 
 test("bounded-run contract fields are validated rather than silently ignored", () => {
-  const base = { schemaVersion: 1, id: "bounded", roles: [{ id: "implementer", name: "Implementer" }, { id: "reviewer", name: "Reviewer" }] };
-  const withLoop = (loop) => ({ ...base, protocol: { loops: [loopContract(loop)] } });
+  // A complete topology, not just roles plus a Loop: P9 requires every declared
+  // node to be referenced and P6 requires a completion authority, so a fixture
+  // that declared roles and nothing else would fail those before reaching the
+  // bounded-run rules under test.
+  const base = {
+    schemaVersion: 1,
+    id: "bounded",
+    roles: [{ id: "implementer", name: "Implementer" }, { id: "reviewer", name: "Reviewer" }],
+    protocol: {
+      ownership: { implementation: "implementer", review_verdict: "reviewer" },
+      completion: { owner: "reviewer", rule: "done" },
+    },
+  };
+  const withLoop = (loop) => ({ ...base, protocol: { ...base.protocol, loops: [loopContract(loop)] } });
   assert.deepEqual(validateTopology(withLoop({ maxAttempts: 5, attemptTimeoutMs: 1_000, wallClockBudgetMs: 60_000, maxTotalAttempts: 3, stallGraceMs: 500 })), []);
   assert.ok(validateTopology(withLoop({ attemptTimeoutMs: 0 })).some((problem) => /attemptTimeoutMs must be a positive safe integer/.test(problem)));
   assert.ok(validateTopology(withLoop({ wallClockBudgetMs: 1.5 })).some((problem) => /wallClockBudgetMs must be a positive safe integer/.test(problem)));
   assert.ok(validateTopology(withLoop({ maxTotalAttempts: 4 })).some((problem) => /may only narrow the Attempt ceiling/.test(problem)));
   assert.ok(validateTopology(withLoop({ attemptTimeoutMs: 100, stallGraceMs: 900 })).some((problem) => /stall projection could never fire/.test(problem)));
-  assert.ok(validateTopology({ ...base, protocol: { budgets: { teamWallClockMs: -1 } } }).some((problem) => /teamWallClockMs must be a positive safe integer/.test(problem)));
-  assert.deepEqual(validateTopology({ ...base, protocol: { budgets: { teamWallClockMs: 60_000 } } }), []);
+  assert.ok(validateTopology({ ...base, protocol: { ...base.protocol, budgets: { teamWallClockMs: -1 } } }).some((problem) => /teamWallClockMs must be a positive safe integer/.test(problem)));
+  assert.deepEqual(validateTopology({ ...base, protocol: { ...base.protocol, budgets: { teamWallClockMs: 60_000 } } }), []);
   assert.equal(effectiveMaxAttempts({ maxAttempts: 5, maxTotalAttempts: 2 }), 2);
   assert.equal(effectiveMaxAttempts({ maxAttempts: 5 }), 5);
 });

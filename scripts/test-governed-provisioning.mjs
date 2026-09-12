@@ -232,7 +232,13 @@ function topologyCatalog(roles) {
     name: "integration",
     controller: { id: "driver", source: "caller" },
     roles,
-    protocol: { ownership: { closure: "driver" }, routes: [], completion: { owner: "driver", rule: "done" } },
+    protocol: {
+      ownership: { closure: "driver" },
+      // P9: every declared node must be referenced, so the driver
+      // dispatches to each one it declared.
+      routes: [{ kind: "dispatch", from: "driver", to: roles.map((role) => role.id) }],
+      completion: { owner: "driver", rule: "done" },
+    },
   };
   return {
     async resolve() {
@@ -251,7 +257,13 @@ function approvedFrozenRef(runtime, roles, draftId) {
     name: "integration",
     controller: { id: "driver", source: "caller" },
     roles,
-    protocol: { ownership: { closure: "driver" }, routes: [], completion: { owner: "driver", rule: "done" } },
+    protocol: {
+      ownership: { closure: "driver" },
+      // P9: every declared node must be referenced, so the driver
+      // dispatches to each one it declared.
+      routes: [{ kind: "dispatch", from: "driver", to: roles.map((role) => role.id) }],
+      completion: { owner: "driver", rule: "done" },
+    },
   };
   const draft = prepareDraftEvent([], {
     draftId,

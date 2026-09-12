@@ -47,12 +47,16 @@ function loopContract(maxAttempts = 1) {
 }
 
 test("Topology protocol validates bounded loops and typed handoffs total", () => {
-  const config = { schemaVersion: 1, id: "graph-topology", roles: [{ id: "implementer", name: "Implementer" }, { id: "reviewer", name: "Reviewer" }], protocol: { loops: [loopContract()], handoffs: [{ kind: "candidate", from: "implementer", to: ["reviewer"], requiredPayloadFields: ["summary"], requiredEvidenceKinds: ["report"] }] } };
+  const config = { schemaVersion: 1, id: "graph-topology", roles: [{ id: "implementer", name: "Implementer" }, { id: "reviewer", name: "Reviewer" }], protocol: { loops: [loopContract()], handoffs: [{ kind: "candidate", from: "implementer", to: ["reviewer"], requiredPayloadFields: ["summary"], requiredEvidenceKinds: ["report"] }], completion: { owner: "driver", rule: "done" } } };
   assert.deepEqual(validateTopology(config), []);
   assert.ok(validateTopology({ ...config, protocol: { loops: [{ ...loopContract(), maxAttempts: 0 }] } }).some((problem) => /maxAttempts/.test(problem)));
   assert.ok(validateTopology({ ...config, protocol: { loops: [{ ...loopContract(), evaluatorRole: "missing" }] } }).some((problem) => /evaluatorRole/.test(problem)));
   assert.ok(validateTopology({ ...config, protocol: { handoffs: [{ kind: "bad", from: "missing", to: ["reviewer"] }] } }).some((problem) => /unknown role/.test(problem)));
   assert.ok(validateTopology({ ...config, protocol: { loops: [{ ...loopContract(), entry: null }] } }).some((problem) => /entry/.test(problem)));
+  // A topology with no protocol is the v0.3 shape and stays valid: the catalog
+  // flags it with a warning instead of rejecting it, because the shipped
+  // contract is that legacy templates remain readable and are never silently
+  // replaced. P6 and P9 therefore start at the first declared protocol.
   assert.deepEqual(validateTopology({ schemaVersion: 1, id: "legacy", roles: [{ id: "reviewer", name: "Reviewer" }] }), []);
 });
 
