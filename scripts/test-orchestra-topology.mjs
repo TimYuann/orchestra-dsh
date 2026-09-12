@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
-import { createTopologyCatalog } from "../lib/orchestra-topology.js";
+import { createTopologyCatalog, resolveRoleExecution, validateTopology } from "../lib/orchestra-topology.js";
 import { topologyListForTool, topologyResolutionError } from "../lib/orchestra.js";
 
 class FsTestError extends Error {
@@ -215,6 +215,101 @@ test("catalog classifies unsafe ids, filename mismatch, legacy, unsupported, and
     result = await catalog.resolve(projectRoot, "trio");
     assert.equal(result.kind, "blocked");
     assert.equal(result.diagnostic.code, "invalid_topology");
+  });
+});
+
+test("resolveRoleExecution keeps the absent default on session and derives auto from the preset", () => {
+  assert.equal(resolveRoleExecution({}), "session", "the nine built-in topologies must keep their current behavior");
+  assert.equal(resolveRoleExecution({ preset: "orchestra-reviewer" }), "session");
+  assert.equal(resolveRoleExecution({ preset: null }), "session", "an explicit null preset is still an absent request");
+  assert.equal(resolveRoleExecution({ execution: "session", preset: "orchestra-reviewer" }), "session");
+  assert.equal(resolveRoleExecution({ execution: "subagent" }), "subagent", "an explicit request wins over the derived default");
+  assert.equal(resolveRoleExecution({ execution: "auto", preset: "orchestra-reviewer" }), "session", "only a session can mount its own composition");
+  assert.equal(resolveRoleExecution({ execution: "auto", preset: "" }), "subagent");
+  assert.equal(resolveRoleExecution({ execution: "auto" }), "subagent");
+});
+
+test("validateTopology refuses the two knobs a native sub-agent cannot honor", () => {
+  const withRoles = (roles) => ({
+    schemaVersion: 1,
+    id: "hybrid",
+    name: "hybrid",
+    controller: { id: "driver", source: "caller" },
+    roles,
+    protocol: { ownership: { closure: "driver" }, routes: [], completion: { owner: "driver", rule: "done" } },
+  });
+
+  assert.deepEqual(validateTopology(withRoles([{ id: "helper", name: "Helper", execution: "subagent" }])), []);
+
+  const presetProblems = validateTopology(withRoles([{ id: "helper", name: "Helper", execution: "subagent", preset: "orchestra-reviewer" }]));
+  assert.equal(presetProblems.length, 1);
+  assert.match(presetProblems[0], /joins its parent's live Agent Preset/);
+  assert.match(presetProblems[0], /use execution: "session"/);
+
+  const sandboxProblems = validateTopology(withRoles([{ id: "helper", name: "Helper", execution: "subagent", sandbox: "read-only" }]));
+  assert.equal(sandboxProblems.length, 1);
+  assert.match(sandboxProblems[0], /frozen from its parent's explicit override/);
+  assert.match(sandboxProblems[0], /approval policy is pinned to "never"/);
+
+  assert.deepEqual(
+    validateTopology(withRoles([{ id: "helper", name: "Helper", execution: "auto" }])),
+    [],
+    "auto without a preset is a legal subagent role",
+  );
+  assert.deepEqual(
+    validateTopology(withRoles([{ id: "helper", name: "Helper", execution: "auto", preset: "orchestra-reviewer", sandbox: "read-only" }])),
+    [],
+    "auto with a preset resolves to session, where both knobs are legal",
+  );
+  assert.match(
+    validateTopology(withRoles([{ id: "helper", name: "Helper", execution: "native" }]))[0],
+    /is invalid \(auto \| session \| subagent\)/,
+  );
+
+  // The two native per-child knobs belong to the delegated backend only, and
+  // each direction fails loud instead of letting a declared field be ignored.
+  assert.deepEqual(
+    validateTopology(withRoles([{ id: "scout", name: "Scout", execution: "subagent", persona: "你是侦察节点。", toolFilter: { deny: ["write", "edit"] } }])),
+    [],
+    "both native knobs are legal on a subagent role",
+  );
+  assert.equal(validateTopology(withRoles([{ id: "scout", name: "Scout", execution: "subagent", persona: "   " }])).length, 1);
+  assert.match(
+    validateTopology(withRoles([{ id: "scout", name: "Scout", execution: "subagent", toolFilter: { deny: [] } }]))[0],
+    /toolFilter\.deny must be a non-empty array/,
+  );
+  assert.match(
+    validateTopology(withRoles([{ id: "scout", name: "Scout", execution: "subagent", toolFilter: {} }]))[0],
+    /declares neither allow nor deny/,
+  );
+  const sessionKnobProblems = validateTopology(
+    withRoles([{ id: "reviewer", name: "Reviewer", preset: "orchestra-reviewer", persona: "x", toolFilter: { deny: ["write"] } }]),
+  );
+  assert.equal(sessionKnobProblems.length, 2);
+  assert.match(sessionKnobProblems.join("\n"), /resolves to the "session" backend but declares persona/);
+  assert.match(sessionKnobProblems.join("\n"), /resolves to the "session" backend but declares toolFilter/);
+});
+
+test("catalog summary reports the resolved execution backend", async () => {
+  await withRoots(async ({ fs, projectRoot, globalRoot }) => {
+    await fs.seed(
+      projectRoot,
+      ".orchestra/topologies/hybrid.json",
+      topology("hybrid", {
+        roles: [
+          { id: "helper", name: "Helper", execution: "auto" },
+          { id: "reviewer", name: "Reviewer", preset: "orchestra-reviewer", sandbox: "read-only", execution: "auto" },
+          { id: "legacy", name: "Legacy" },
+        ],
+      }),
+    );
+    const catalog = createTopologyCatalog(fs, { globalRoot });
+    const result = await catalog.resolve(projectRoot, "hybrid");
+    assert.equal(result.kind, "ready");
+    const executionOf = (roleId) => result.roles.find((role) => role.id === roleId).execution;
+    assert.equal(executionOf("helper"), "subagent");
+    assert.equal(executionOf("reviewer"), "session");
+    assert.equal(executionOf("legacy"), undefined, "an absent request is not silently rewritten in the summary");
   });
 });
 

@@ -1,11 +1,22 @@
 /** Governed teamId+roleId address resolution. No title/name/cwd scanning. */
 
-import type { ActiveTeamStateStore, TeamRole, TeamStatus } from "./orchestra-state.js";
+import type { ActiveTeamStateStore, TeamRole, TeamRoleExecution, TeamStatus } from "./orchestra-state.js";
 
 export interface GovernedRoleAddress {
   team_id: string;
   role_id: string;
   resolved_session_id: string;
+  /**
+   * Backend carrying this role. Delivery branches on it: a `session` role is
+   * reached through general Session routing, a `subagent` role only through the
+   * native direct-parent edge.
+   */
+  execution: TeamRoleExecution;
+  /**
+   * The controller Session a `subagent` role is a direct child of. Absent for
+   * `session` roles. Delivery must be attempted by this exact Agent.
+   */
+  parent_session_id?: string;
   team_status: "active" | "degraded";
   role_phase: "active";
   preset: string | null;
@@ -51,6 +62,8 @@ export function createGovernedRoleAddressResolver(activeTeamState: ActiveTeamSta
         team_id: observed.team.teamId,
         role_id: role.id,
         resolved_session_id: role.sessionId,
+        execution: role.execution,
+        ...(role.parentSessionId === undefined ? {} : { parent_session_id: role.parentSessionId }),
         team_status: observed.team.status,
         role_phase: "active",
         preset: role.preset,

@@ -17,7 +17,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolExecutionInput } from "@deepseek-ai/dsh-tools";
 // `JsonValue` moved out of `@deepseek-ai/dsh-tools` in DSH 0.1.5-rc.2.
 import type { JsonValue } from "@deepseek-ai/dsh-util-values";
-import type { AgentHandle } from "@deepseek-ai/dsh-agent";
+import type { AgentHandle, Agent } from "@deepseek-ai/dsh-agent";
 import type {} from "@deepseek-ai/dsh-session";
 import type { SessionId } from "@deepseek-ai/dsh-session";
 import type {} from "@deepseek-ai/dsh-fs";
@@ -50,12 +50,13 @@ import type {
   TeamState,
   TeamRoleBlueprintFacts,
   TeamRoleDiagnostic,
+  TeamRoleExecution,
   TeamRolePhase,
   TeamWelcomeReceipt,
 } from "./orchestra-state.js";
 import { createArchiveStore } from "./orchestra-archive.js";
 import { createGovernedRoleAddressResolver } from "./orchestra-address.js";
-import type { GovernedRoleAddressResolver } from "./orchestra-address.js";
+import type { GovernedRoleAddress, GovernedRoleAddressResolver } from "./orchestra-address.js";
 import {
   appendDriverDecision,
   applyFrozenCharterRevision,
@@ -110,7 +111,9 @@ import {
   startLoop,
 } from "./orchestra-graph.js";
 import type { GraphRuntimeState } from "./orchestra-graph.js";
-import { createTopologyCatalog } from "./orchestra-topology.js";
+import { createSubagentNode, sendToSubagentNode } from "./subagent-node.js";
+import type { SubagentNodeSpec } from "./subagent-node.js";
+import { createTopologyCatalog, resolveRoleExecution } from "./orchestra-topology.js";
 import type { RoleConfig, TopologyCatalog, TopologyClosureDefinition, TopologyList, TopologyProtocol, TopologyResolution, TopologyRoleSummary } from "./orchestra-topology.js";
 export { validateTopology } from "./orchestra-topology.js";
 import { mountPreset } from "@deepseek-ai/dsh-agent-presets";
@@ -435,6 +438,23 @@ function roleProtocolText(
   return lines.join("\n");
 }
 
+/**
+ * 角色开场消息正文：协议段 + 可选自定义欢迎说明。
+ *
+ * Session 后端把它交给 `sendRoleWelcome` 投递，subagent 后端把它作为原生子节点的
+ * 初始 prompt —— 两条路径必须生成完全相同的正文，否则协议段会只在其中一种后端生效。
+ */
+function roleWelcomeText(
+  fromSessionId: string,
+  roleName: string,
+  extra?: string,
+  protocol: Parameters<typeof roleProtocolText>[2] = {},
+): string {
+  const parts = [roleProtocolText(fromSessionId, roleName, protocol)];
+  if (typeof extra === "string" && extra !== "") parts.push(extra);
+  return parts.join("\n\n");
+}
+
 /** 向角色会话发送开场消息：协议段 + 可选自定义欢迎说明，并等待 durable admission。 */
 async function sendRoleWelcome(
   ctx: Context,
@@ -446,10 +466,8 @@ async function sendRoleWelcome(
 ): Promise<TeamWelcomeReceipt> {
   const agent = ctx.agents.get(SID(toSessionId));
   if (agent === undefined) throw new Error(`role session ${toSessionId} is not live; cannot deliver`);
-  const parts = [roleProtocolText(fromSessionId, roleName, protocol)];
-  if (typeof extra === "string" && extra !== "") parts.push(extra);
   const message = createUserMessage({
-    content: [{ type: "text", text: parts.join("\n\n") }] as ContentBlock[],
+    content: [{ type: "text", text: roleWelcomeText(fromSessionId, roleName, extra, protocol) }] as ContentBlock[],
     source: { kind: "a2a", form: "relay", senderSessionId: fromSessionId },
   });
   agent.followup(message);
@@ -462,13 +480,41 @@ export interface GovernedRolePlan {
   roleId: string;
   roleName: string;
   sessionId: string;
-  presetId: string;
-  sandbox: "read-only" | "workspace-write" | "danger-full-access";
+  /** Resolved backend; selects both the provisioning and the delivery path. */
+  execution: TeamRoleExecution;
+  /**
+   * Controller Session id, present only for `subagent` roles. The child's
+   * direct-parent edge is what authorizes later delivery, so it is durable.
+   */
+  parentSessionId?: string;
+  /** Agent Preset to mount; absent for `subagent` roles, which join the parent's. */
+  presetId?: string;
+  /** Declared sandbox; absent for `subagent` roles, whose mode is frozen at delegation. */
+  sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  /** Native per-child model route, present only for `subagent` roles. */
+  agentOptions?: SubagentNodeSpec["agentOptions"];
+  /** Native per-child tool scoping, present only for `subagent` roles. */
+  toolFilter?: SubagentNodeSpec["toolFilter"];
+  /** Native per-child persona, present only for `subagent` roles. */
+  persona?: string;
   welcome?: string;
   maxRounds?: number;
   protocol?: TopologyProtocol;
-  blueprint: PreparedGovernedBlueprint;
+  /** Complete Blueprint for a `session` role. A `subagent` role has none: the native
+   *  contract mounts no composition of its own, so fabricating a receipt would
+   *  claim facts the child never had. */
+  blueprint?: PreparedGovernedBlueprint;
 }
+
+/**
+ * Recorded sandbox for a role whose mode this plugin does not choose.
+ *
+ * A native sub-agent's sandbox is frozen from its parent's explicit override at
+ * the delegation boundary, so a `subagent` role has no declared mode to store.
+ * `"inherited"` is a durable, honest marker — never a value to switch on — and
+ * the Actor's own confined calls remain governed by the child's real mode.
+ */
+const INHERITED_SANDBOX = "inherited";
 
 function governedSessionId(teamId: string): string {
   // Role ids are durable domain keys, not filesystem-safe session ids. Keep
@@ -510,20 +556,27 @@ function roleBlueprintFacts(receipt: GovernedBlueprintReceipt): TeamRoleBlueprin
 }
 
 function reservedRole(plan: GovernedRolePlan): TeamRole {
+  // A subagent role carries no Blueprint receipt: its composition, permission
+  // preset, and sandbox all belong to the controller Session it joins. Only the
+  // native per-child options it actually declared are recorded.
+  const receipt = plan.blueprint?.receipt;
+  const model = receipt === undefined ? plan.agentOptions : {
+    provider: receipt.provider,
+    model: receipt.model,
+    ...(receipt.reasoningEffort === undefined ? {} : { reasoningEffort: receipt.reasoningEffort }),
+  };
   return {
     id: plan.roleId,
     name: plan.roleName,
     sessionId: plan.sessionId,
     phase: "reserved",
+    execution: plan.execution,
+    ...(plan.execution === "subagent" && plan.parentSessionId !== undefined ? { parentSessionId: plan.parentSessionId } : {}),
     sessionHistory: [],
-    preset: plan.presetId,
-    sandbox: plan.sandbox,
-    model: {
-      provider: plan.blueprint.receipt.provider,
-      model: plan.blueprint.receipt.model,
-      ...(plan.blueprint.receipt.reasoningEffort === undefined ? {} : { reasoningEffort: plan.blueprint.receipt.reasoningEffort }),
-    },
-    blueprint: roleBlueprintFacts(plan.blueprint.receipt),
+    preset: plan.presetId ?? null,
+    sandbox: plan.sandbox ?? INHERITED_SANDBOX,
+    ...(model === undefined ? {} : { model }),
+    ...(receipt === undefined ? {} : { blueprint: roleBlueprintFacts(receipt) }),
     reportCount: 0,
     lastReport: null,
   };
@@ -553,6 +606,16 @@ async function disposeCreatedHandles(handles: AgentHandle[]): Promise<void> {
   }
 }
 
+/** 写入开场消息的协议段（ownership / routes / completion / maxRounds）。 */
+function welcomeProtocol(plan: GovernedRolePlan): Parameters<typeof roleProtocolText>[2] {
+  return {
+    ownership: plan.protocol?.ownership,
+    routes: plan.protocol?.routes,
+    completion: plan.protocol?.completion,
+    maxRounds: plan.maxRounds,
+  };
+}
+
 export async function prepareGovernedRolePlan(
   ctx: Context,
   options: {
@@ -574,9 +637,18 @@ export async function prepareGovernedRolePlan(
     model?: string;
     reasoningEffort?: string;
     title?: string;
+    /** Native per-child tool scoping; only meaningful for a `subagent` role. */
+    toolFilter?: { allow?: string[]; deny?: string[] };
+    /** Native per-child persona; only meaningful for a `subagent` role. */
+    persona?: string;
     signal?: AbortSignal;
   },
 ): Promise<GovernedRolePlan> {
+  const sessionId = governedSessionId(options.teamId);
+  const execution = resolveRoleExecution(options.role);
+  if (execution === "subagent") {
+    return prepareSubagentRolePlan(options, sessionId);
+  }
   const presetId = options.presetId ?? options.role.preset;
   if (typeof presetId !== "string" || presetId === "") {
     throw new Error(`governed role "${options.role.id}" requires an explicit complete Agent Preset`);
@@ -608,7 +680,6 @@ export async function prepareGovernedRolePlan(
     staticCompositionTools: presetFile.compositionRowIds,
     hostToolNames: hostToolNamesForPreflight(ctx),
   });
-  const sessionId = governedSessionId(options.teamId);
   const presetInput = presetFile.source === "dsh" ? { presetId } : { presetFile };
   const blueprint = await prepareGovernedBlueprint(ctx, {
     sessionId,
@@ -637,12 +708,84 @@ export async function prepareGovernedRolePlan(
     roleId: options.role.id,
     roleName: options.role.name,
     sessionId,
+    execution: "session",
     presetId: blueprint.receipt.agentPreset,
     sandbox: blueprint.receipt.sandbox,
     ...(options.welcome === undefined ? {} : { welcome: options.welcome }),
     ...(options.maxRounds === undefined ? {} : { maxRounds: options.maxRounds }),
     ...(options.protocol === undefined ? {} : { protocol: options.protocol }),
     blueprint,
+  };
+}
+
+/**
+ * Plan one `subagent` role: a durable native child of the controller Session.
+ *
+ * This branch deliberately runs NONE of the Session machinery — no preset
+ * resolution, no permission preset, no Blueprint, no composition preflight —
+ * because none of it applies: the child joins its parent's live composition and
+ * its sandbox and approval policy are fixed at the delegation boundary. What it
+ * does instead is validate the native limits loudly, so a caller that asks for
+ * something the child cannot have is told why rather than silently ignored.
+ *
+ * @param options - the same call shape `prepareGovernedRolePlan` accepts.
+ * @param sessionId - the pre-reserved identity, which becomes the child id so
+ *   team.json can record provisioning before materialization.
+ * @returns a Blueprint-free plan carrying only the native per-child knobs.
+ * @throws when the request names a preset or sandbox, when the model route is
+ *   incomplete, or when a native knob has an unusable shape.
+ */
+function prepareSubagentRolePlan(
+  options: Parameters<typeof prepareGovernedRolePlan>[1],
+  sessionId: string,
+): GovernedRolePlan {
+  const roleId = options.role.id;
+  const requestedPreset = options.presetId ?? options.role.preset;
+  if (typeof requestedPreset === "string" && requestedPreset !== "") {
+    throw new Error(
+      `governed role "${roleId}" resolves to the "subagent" backend but requests preset "${requestedPreset}": a native sub-agent joins its parent's live Agent Preset and cannot mount its own composition, so the preset would never take effect — use execution: "session" for a role that needs its own preset`,
+    );
+  }
+  const requestedSandbox = options.sandbox ?? options.role.sandbox;
+  if (requestedSandbox !== undefined) {
+    throw new Error(
+      `governed role "${roleId}" resolves to the "subagent" backend but requests sandbox "${requestedSandbox}": a native sub-agent's sandbox mode is frozen from its parent's explicit override at the delegation boundary and its approval policy is pinned to "never", so the sandbox would never take effect — use execution: "session" for a read-only or otherwise restricted role`,
+    );
+  }
+  const { provider, model, reasoningEffort } = options;
+  if ((provider === undefined) !== (model === undefined)) {
+    throw new Error(`governed role "${roleId}" subagent model route must provide provider and model together`);
+  }
+  if (reasoningEffort !== undefined && (provider === undefined || model === undefined)) {
+    throw new Error(`governed role "${roleId}" subagent model reasoningEffort requires provider and model`);
+  }
+  // The topology role is the durable declaration; a caller-supplied override
+  // (orchestra_spawn) wins for one provisioning only, exactly like presetId.
+  const toolFilter = options.toolFilter ?? options.role.toolFilter;
+  if (toolFilter !== undefined) {
+    for (const field of ["allow", "deny"] as const) {
+      const value = toolFilter[field];
+      if (value !== undefined && (!Array.isArray(value) || value.some((name) => typeof name !== "string" || name === ""))) {
+        throw new Error(`governed role "${roleId}" subagent toolFilter.${field} must be an array of non-empty tool names`);
+      }
+    }
+  }
+  const persona = options.persona ?? options.role.persona;
+  if (persona !== undefined && (typeof persona !== "string" || persona === "")) {
+    throw new Error(`governed role "${roleId}" subagent persona must be a non-empty string`);
+  }
+  return {
+    roleId,
+    roleName: options.role.name,
+    sessionId,
+    execution: "subagent",
+    parentSessionId: options.controllerSessionId,
+    ...(provider === undefined ? {} : { agentOptions: { provider, model: model as string, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) } }),
+    ...(toolFilter === undefined ? {} : { toolFilter }),
+    ...(persona === undefined ? {} : { persona }),
+    ...(options.welcome === undefined ? {} : { welcome: options.welcome }),
+    ...(options.maxRounds === undefined ? {} : { maxRounds: options.maxRounds }),
+    ...(options.protocol === undefined ? {} : { protocol: options.protocol }),
   };
 }
 
@@ -655,14 +798,31 @@ export async function prepareGovernedRolePlan(
 export interface DraftRoleFacts {
   roleId: string;
   roleName: string;
-  preset: string;
+  /**
+   * Resolved backend of this role — the one fact a user must see to judge a
+   * proposal, since it decides whether the role can hold its own composition,
+   * ask for approval, or be read-only at all.
+   */
+  execution: TeamRoleExecution;
+  /** Session rows only: the composed Agent Preset. Absent for a subagent row. */
+  preset?: string;
   presetSource?: "project" | "global" | "dsh" | "builtin";
-  sandbox: "read-only" | "workspace-write" | "danger-full-access";
-  permissionPreset: string;
-  effectivePermissionPreset: string;
+  /**
+   * `inherited` marks a subagent row: a delegated child's sandbox mode is frozen
+   * from the driver's explicit override at the delegation boundary, so no
+   * per-role mode exists to report.
+   */
+  sandbox: "read-only" | "workspace-write" | "danger-full-access" | "inherited";
+  /** Session rows only. A subagent row has no permission preset: its approval policy is pinned to `never`. */
+  permissionPreset?: string;
+  effectivePermissionPreset?: string;
   provider: string;
   model: string;
   reasoningEffort?: string;
+  /** Native per-child persona; only a subagent row can carry one. */
+  persona?: string;
+  /** Native per-child tool scoping; only a subagent row can carry one. */
+  toolFilter?: { allow?: string[]; deny?: string[] };
   compositionTools: string[];
   orchestraTools: string[];
 }
@@ -704,6 +864,12 @@ async function draftPermissionFacts(
  * silently skipped.
  */
 export async function preparseDraftRoleFacts(ctx: Context, cwd: string, role: RoleConfig): Promise<DraftRoleFacts> {
+  // The two backends have disjoint fact sets, so the draft must branch exactly
+  // where provisioning branches. Without this, a hybrid topology whose
+  // `subagent` role correctly declares no preset would fail the session path's
+  // "requires an explicit complete Agent Preset" check and no proposal could
+  // ever be drafted for it.
+  if (resolveRoleExecution(role) === "subagent") return preparseSubagentDraftRoleFacts(ctx, role);
   const presetId = role.preset;
   if (typeof presetId !== "string" || presetId === "") {
     throw new Error(`draft topology role "${role.id}" requires an explicit complete Agent Preset`);
@@ -725,6 +891,7 @@ export async function preparseDraftRoleFacts(ctx: Context, cwd: string, role: Ro
   return {
     roleId: role.id,
     roleName: role.name ?? role.id,
+    execution: "session",
     preset: presetId,
     ...(presetFile.source === undefined ? {} : { presetSource: presetFile.source }),
     sandbox: permission.sandbox,
@@ -738,6 +905,62 @@ export async function preparseDraftRoleFacts(ctx: Context, cwd: string, role: Ro
   };
 }
 
+/**
+ * Draft-time facts for a `subagent` role.
+ *
+ * The session path's whole pre-parse — preset file, composition proof,
+ * permission preset — has no counterpart here, because the native contract
+ * provides none of it: a delegated child joins its parent's LIVE composition
+ * and has its approval policy pinned at the delegation boundary. What a
+ * proposal can honestly promise is therefore only the model route and the two
+ * native per-child knobs, and the row says exactly that rather than borrowing
+ * columns that would not hold.
+ *
+ * A preset or sandbox reaching this path is refused instead of rendered: the
+ * topology validator already rejects both, and a draft that displayed them
+ * would make the proposal card disagree with what provisioning can do.
+ *
+ * @param ctx - context carrying the model-selection service.
+ * @param role - a role that resolved to the `subagent` backend.
+ * @returns the facts a user needs to judge this node, with nothing invented.
+ * @throws when the role carries a session-only field or resolves no model.
+ */
+function preparseSubagentDraftRoleFacts(ctx: Context, role: RoleConfig): DraftRoleFacts {
+  if (typeof role.preset === "string" && role.preset !== "") {
+    throw new Error(
+      `draft topology role "${role.id}" resolves to the "subagent" backend but declares preset "${role.preset}": a native sub-agent joins its parent's live Agent Preset and cannot mount its own composition — use execution: "session" for a role that needs its own preset`,
+    );
+  }
+  if (role.sandbox !== undefined) {
+    throw new Error(
+      `draft topology role "${role.id}" resolves to the "subagent" backend but declares sandbox "${String(role.sandbox)}": a native sub-agent's sandbox mode is frozen from its parent's explicit override at the delegation boundary — use execution: "session" for a read-only or otherwise restricted role`,
+    );
+  }
+  const model = resolveDraftRoleModel(ctx, { runtime: role.runtime });
+  if (model.provider === "" || model.model === "") throw new Error(`draft topology role "${role.id}" resolved an empty provider/model selection`);
+  const toolFilter = role.toolFilter;
+  return {
+    roleId: role.id,
+    roleName: role.name ?? role.id,
+    execution: "subagent",
+    sandbox: "inherited",
+    provider: model.provider,
+    model: model.model,
+    ...(model.reasoningEffort === undefined ? {} : { reasoningEffort: model.reasoningEffort }),
+    ...(role.persona === undefined ? {} : { persona: role.persona }),
+    ...(toolFilter === undefined
+      ? {}
+      : {
+          toolFilter: {
+            ...(toolFilter.allow === undefined ? {} : { allow: [...toolFilter.allow] }),
+            ...(toolFilter.deny === undefined ? {} : { deny: [...toolFilter.deny] }),
+          },
+        }),
+    compositionTools: [],
+    orchestraTools: [],
+  };
+}
+
 /** Markdown table cells; missing/empty values render as "-" for a stable grid. */
 function tableCell(value: string | undefined): string {
   return value === undefined || value === "" ? "-" : value;
@@ -747,23 +970,60 @@ function tableCell(value: string | undefined): string {
  * Render the per-role blueprint preview as a Markdown table (rendered as a
  * table card by the GUI). Header + separator + one row per role; an empty
  * preview yields just the header and separator.
+ *
+ * The `backend` column comes first because it is what a user has to judge
+ * before approving: it decides whether the role can hold its own composition,
+ * ask for approval, or be read-only at all. A `subagent` row then reads `-` in
+ * the columns the native contract cannot fill, and its two native knobs are
+ * summarized on one line under the table rather than in two more columns that
+ * would be empty for every session role.
  */
 export function renderDraftBlueprintTable(preview: readonly DraftRoleFacts[]): string {
-  const header = "| 角色 | preset | sandbox | permission | model | reasoningEffort | compositionTools | orchestraTools |";
-  const separator = "| --- | --- | --- | --- | --- | --- | --- | --- |";
+  const header = "| 角色 | backend | preset | sandbox | permission | model | reasoningEffort | compositionTools | orchestraTools |";
+  const separator = "| --- | --- | --- | --- | --- | --- | --- | --- | --- |";
   const rows = preview.map((role) =>
     `| ${[
       tableCell(role.roleId),
+      tableCell(role.execution),
       tableCell(role.preset),
       tableCell(role.sandbox),
       tableCell(role.effectivePermissionPreset),
       `${tableCell(role.provider)}/${tableCell(role.model)}`,
       tableCell(role.reasoningEffort),
-      (role.compositionTools ?? []).join(", "),
-      (role.orchestraTools ?? []).join(", "),
+      // `tableCell` is what keeps the grid rectangular: a subagent row has no
+      // tool lists at all, and an empty cell would collapse the columns.
+      tableCell(role.compositionTools.join(", ")),
+      tableCell(role.orchestraTools.join(", ")),
     ].join(" | ")} |`,
   );
-  return [header, separator, ...rows].join("\n");
+  return [header, separator, ...rows, ...subagentKnobNotes(preview)].join("\n");
+}
+
+/**
+ * One summary line per `subagent` role, listing the native knobs it carries.
+ *
+ * These rows have no preset and no permission to show, so without this line a
+ * user approving a hybrid proposal could not tell one sub-agent node from
+ * another. Rendering them as an explicit note (instead of two more table
+ * columns that every session role would leave empty) keeps the grid readable.
+ *
+ * @param preview - the same rows the table renders.
+ * @returns zero or more Markdown lines to append below the table.
+ */
+function subagentKnobNotes(preview: readonly DraftRoleFacts[]): string[] {
+  const notes = preview
+    .filter((role) => role.execution === "subagent")
+    .map((role) => {
+      const knobs: string[] = [];
+      if (role.persona !== undefined) knobs.push(`persona ${role.persona.length} 字符`);
+      const filter = role.toolFilter;
+      if (filter !== undefined) {
+        if (filter.allow !== undefined) knobs.push(`toolFilter allow=[${filter.allow.join(", ")}]`);
+        if (filter.deny !== undefined) knobs.push(`toolFilter deny=[${filter.deny.join(", ")}]`);
+      }
+      return `- \`${role.roleId}\`（subagent）：继承 driver 的 composition 与权限（审批钉死 never）；原生可调项 ${knobs.length === 0 ? "无（仅模型路由）" : knobs.join("；")}`;
+    });
+  return notes.length === 0 ? [] : ["", ...notes];
 }
 
 async function readySnapshotAfterWrite(
@@ -1220,6 +1480,30 @@ interface GovernedProvisionResult {
 export interface GovernedProvisionDependencies {
   createSession?: typeof createSession;
   sendRoleWelcome?: (ctx: Context, fromSessionId: string, toSessionId: string, roleName: string, extra?: string, protocol?: Parameters<typeof roleProtocolText>[2]) => Promise<TeamWelcomeReceipt>;
+  /** Subagent-backend creation seam; tests replace it to run the branch without a native registry. */
+  createSubagentNode?: typeof createSubagentNode;
+  /**
+   * Subagent-backend release seam used by the rollback path. Releasing a child
+   * drops its live activation while its Session log stays durable, which is the
+   * native analogue of disposing a created Session handle.
+   */
+  releaseSubagentNode?: (ctx: Context, parent: Agent, childId: string) => Promise<void>;
+}
+
+/**
+ * Release one native child that a failed provisioning transaction had already
+ * materialized. Best-effort for the same reason `disposeCreatedHandles` is: the
+ * durable failed state is the source of truth, and a secondary cleanup error
+ * must not replace the original failure.
+ */
+async function releaseSubagentNodeDefault(ctx: Context, parent: Agent, childId: string): Promise<void> {
+  const subagents = ctx.get("subagents");
+  if (subagents === undefined) return;
+  try {
+    await subagents.drainContinuableChildren(parent, [SID(childId)]);
+  } catch {
+    // See disposeCreatedHandles: the recorded failure outranks a cleanup error.
+  }
 }
 
 /** Reserve-first role provisioning transaction shared by create and spawn. */
@@ -1239,8 +1523,12 @@ export async function provisionGovernedPlans(
   let snapshotUsable = true;
   let failedRoleId: string | undefined;
   const handles: AgentHandle[] = [];
+  /** Native children this transaction materialized, released if a later step fails. */
+  const subagentChildren: { parent: Agent; childId: string }[] = [];
   const createRoleSession = dependencies.createSession ?? createSession;
   const deliverRoleWelcome = dependencies.sendRoleWelcome ?? sendRoleWelcome;
+  const createRoleSubagent = dependencies.createSubagentNode ?? createSubagentNode;
+  const releaseRoleSubagent = dependencies.releaseSubagentNode ?? releaseSubagentNodeDefault;
   const writeOptions = { policy: escrowPolicy(ctx, exec), signal: exec.signal };
   try {
     for (const plan of plans) {
@@ -1255,6 +1543,56 @@ export async function provisionGovernedPlans(
       }
       snapshot = await readySnapshotAfterWrite(activeTeamState, cwd, written, exec.signal);
       team = snapshot.team;
+
+      if (plan.execution === "subagent") {
+        const controller = exec.agent;
+        if (controller === undefined) {
+          throw new Error(
+            `governed role "${plan.roleId}" runs on the "subagent" backend and requires a live controller agent: a native child's direct-parent edge is what authorizes every later delivery, so an agentless caller cannot create one`,
+          );
+        }
+        if (plan.parentSessionId !== undefined && plan.parentSessionId !== controller.id) {
+          throw new Error(
+            `governed role "${plan.roleId}" was reserved under controller ${plan.parentSessionId} but is being provisioned by ${controller.id}: a native child can only be created by the parent that will address it`,
+          );
+        }
+        const receipt = await createRoleSubagent(
+          ctx,
+          controller,
+          {
+            label: plan.roleName,
+            // The opening prompt IS the welcome: `startContinuable` establishes
+            // the child and delivers this prompt in one durable step, so a
+            // separate follow-up would only duplicate the protocol text.
+            prompt: roleWelcomeText(controller.id, plan.roleName, plan.welcome, welcomeProtocol(plan)),
+            childId: plan.sessionId,
+            ...(plan.agentOptions === undefined ? {} : { agentOptions: plan.agentOptions }),
+            ...(plan.toolFilter === undefined ? {} : { toolFilter: plan.toolFilter }),
+            ...(plan.persona === undefined ? {} : { persona: plan.persona }),
+          },
+          exec.signal,
+        );
+        if (receipt.childId !== plan.sessionId) {
+          throw new Error(
+            `governed role "${plan.roleId}" reserved child id ${plan.sessionId} but provider "${receipt.provider}" materialized ${receipt.childId}: the reserved identity is what team.json records, so a mismatch cannot be reconciled`,
+          );
+        }
+        subagentChildren.push({ parent: controller, childId: receipt.childId });
+        const activeSubagentTeam = updateTeamRole(team, plan.roleId, {
+          phase: "active",
+          diagnostic: undefined,
+          welcome: { messageId: receipt.messageId, sessionId: receipt.childId, acceptedAt: Date.now() },
+        });
+        try {
+          written = await activeTeamState.replace(snapshot, activeSubagentTeam, writeOptions);
+        } catch (error) {
+          snapshotUsable = false;
+          throw error;
+        }
+        snapshot = await readySnapshotAfterWrite(activeTeamState, cwd, written, exec.signal);
+        team = snapshot.team;
+        continue;
+      }
 
       const created = await createRoleSession(ctx, {
         mode: "governed",
@@ -1272,18 +1610,17 @@ export async function provisionGovernedPlans(
         created.sessionId,
         plan.roleName,
         plan.welcome,
-        {
-          ownership: plan.protocol?.ownership,
-          routes: plan.protocol?.routes,
-          completion: plan.protocol?.completion,
-          maxRounds: plan.maxRounds,
-        },
+        welcomeProtocol(plan),
       );
+      const blueprint = plan.blueprint;
+      if (blueprint === undefined) {
+        throw new Error(`governed role "${plan.roleId}" runs on the "session" backend without a Blueprint receipt: Session provisioning cannot proceed`);
+      }
       const activeRoleTeam = updateTeamRole(team, plan.roleId, {
         phase: "active",
         diagnostic: undefined,
         welcome,
-        blueprint: roleBlueprintFacts(plan.blueprint.receipt),
+        blueprint: roleBlueprintFacts(blueprint.receipt),
       });
       try {
         written = await activeTeamState.replace(snapshot, activeRoleTeam, writeOptions);
@@ -1308,6 +1645,12 @@ export async function provisionGovernedPlans(
     return { team: snapshot.team, snapshot, handles };
   } catch (error) {
     await disposeCreatedHandles(handles);
+    // A native child owns no AgentHandle — the continuation manager holds it —
+    // so the transactional release is the selected Activation, not a dispose.
+    // The child's Session log stays durable; only the live orphan goes away.
+    for (const child of subagentChildren.reverse()) {
+      await releaseRoleSubagent(ctx, child.parent, child.childId);
+    }
     if (!snapshotUsable) {
       throw new Error(`governed provisioning stopped after stale state CAS: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1594,6 +1937,16 @@ export async function activateArchivedTeam(
     if (snapshot === "not-found" || snapshot === "no-query") {
       // Step 5c: authoritatively missing → create a replacement session.
       try {
+        if (role.execution === "subagent") {
+          // Re-creating the missing child as a Session would silently change the
+          // role's backend and drop its direct-parent address: the replacement
+          // would no longer be deliverable through the native edge team.json
+          // records. Re-establishing a native child is not implemented, so this
+          // role fails loudly and the team degrades for a human to re-provision.
+          throw new Error(
+            `role ${role.id} runs on the "subagent" backend and its child session ${role.sessionId} is missing; replacing it with a Session would silently change the role's backend, and re-establishing a native child is not implemented — re-provision this role instead`,
+          );
+        }
         const presetFile =
           role.preset === null ? undefined : await resolvePresetFile(ctx, cwd, role.preset);
         const roleModel = role.model;
@@ -1733,11 +2086,89 @@ export async function sendGovernedRole(
   if (cwd === undefined) throw new Error("current session has no working directory");
   const address = await addressResolver.resolve(cwd, args.teamId, args.roleId, { signal: exec.signal });
   if (address.resolved_session_id === exec.agent.id) throw new Error("orchestra_send cannot target the caller's own Governed role");
-  const receipt = await deliverMessage(ctx, exec.agent.id, address.resolved_session_id, [
+  const blocks: ContentBlock[] = [
     { type: "text", text: `Governed dispatch from ${exec.agent.id} to ${address.team_id}/${address.role_id}:` },
     { type: "text", text: args.message },
-  ], { wake: args.wake, interrupt: args.interrupt === true, idempotencyKey: args.idempotencyKey });
+  ];
+  if (address.execution === "subagent") {
+    return sendToGovernedSubagentNode(ctx, address, args, exec, blocks);
+  }
+  const receipt = await deliverMessage(ctx, exec.agent.id, address.resolved_session_id, blocks, { wake: args.wake, interrupt: args.interrupt === true, idempotencyKey: args.idempotencyKey });
   return { team_id: address.team_id, role_id: address.role_id, resolved_session_id: address.resolved_session_id, receipt };
+}
+
+/**
+ * Deliver one dispatch to a `subagent` role.
+ *
+ * The native seam authorizes delivery by the direct-parent edge alone: only the
+ * exact Agent that created the child can steer it, and there is no host path
+ * that impersonates that Agent. So a caller that is not the recorded parent is
+ * refused here with the reason, rather than handed a routing error later.
+ *
+ * Three raw-transport guarantees have no native counterpart, and each one is
+ * refused instead of silently dropped — a caller must never believe it received
+ * a guarantee that was never provided:
+ *
+ * - `wake: false` (park the message for a later turn without waking the target)
+ *   — native delivery always steers: a running child admits at its next step
+ *   boundary and an idle one starts a turn;
+ * - `interrupt: true` — cancelling a child's current turn is a separate native
+ *   operation this path does not perform;
+ * - `idempotencyKey` — native delivery mints its own message id and has no
+ *   caller-supplied dedup key.
+ *
+ * @param ctx - host context carrying the subagent registry.
+ * @param address - the resolved role address; `parent_session_id` must equal the caller.
+ * @param args - the original dispatch arguments.
+ * @param exec - the calling tool execution (its Agent is the only legal sender).
+ * @param blocks - already-composed dispatch content.
+ * @returns the durable mapping plus an accepted-only receipt.
+ */
+async function sendToGovernedSubagentNode(
+  ctx: Context,
+  address: GovernedRoleAddress,
+  args: OrchestraSendArgs,
+  exec: ToolExecutionInput,
+  blocks: ContentBlock[],
+) {
+  const sender = exec.agent;
+  if (sender === undefined) throw new Error("orchestra_send requires an agent caller");
+  if (address.parent_session_id !== sender.id) {
+    throw new Error(
+      `governed role ${address.team_id}/${address.role_id} is a native sub-agent node whose direct parent is ${address.parent_session_id ?? "not recorded in team state"}; only that exact parent may deliver, but the caller is ${sender.id} — native delivery is authorized by the direct-parent edge and cannot be delegated or impersonated`,
+    );
+  }
+  if (args.wake === false) {
+    throw new Error(
+      `orchestra_send cannot honor wake=false for sub-agent role ${address.role_id}: native delivery always steers (a running child admits at its next step boundary, an idle one starts a turn), so parking a message without waking is not expressible`,
+    );
+  }
+  if (args.interrupt === true) {
+    throw new Error(
+      `orchestra_send cannot honor interrupt=true for sub-agent role ${address.role_id}: the native delivery path does not cancel the target's current turn`,
+    );
+  }
+  if (args.idempotencyKey !== undefined) {
+    throw new Error(
+      `orchestra_send cannot honor idempotencyKey for sub-agent role ${address.role_id}: native delivery mints its own message identity and offers no caller-supplied dedup key`,
+    );
+  }
+  const delivered = await sendToSubagentNode(ctx, sender, address.resolved_session_id, blocks, { signal: exec.signal });
+  return {
+    team_id: address.team_id,
+    role_id: address.role_id,
+    resolved_session_id: address.resolved_session_id,
+    receipt: {
+      message_id: delivered.messageId,
+      target_session_id: address.resolved_session_id,
+      accepted_at_ms: Date.now(),
+      // Not one of the raw transport's three modes: this is the native steer
+      // path, reported as itself so a reader cannot mistake it for an inbox
+      // splice or a cold-resume delivery.
+      delivery_mode: "native_steer",
+      state: "accepted" as const,
+    },
+  };
 }
 
 async function roleStatus(ctx: Context, role: TeamRole) {
@@ -1749,6 +2180,8 @@ async function roleStatus(ctx: Context, role: TeamRole) {
     live: boolean;
     status: string;
     phase: TeamRolePhase;
+    execution: TeamRoleExecution;
+    parentSessionId?: string;
     reportCount: number;
     lastReport: string | null;
     diagnostic?: TeamRoleDiagnostic;
@@ -1761,6 +2194,10 @@ async function roleStatus(ctx: Context, role: TeamRole) {
     live: agent !== undefined,
     status: agent === undefined ? "cold" : agent.status,
     phase: role.phase,
+    execution: role.execution,
+    // A subagent role's durable address is its direct-parent edge, so the
+    // controller it hangs off is part of every status read.
+    ...(role.parentSessionId === undefined ? {} : { parentSessionId: role.parentSessionId }),
     reportCount: role.reportCount ?? 0,
     lastReport: role.lastReport ?? null,
     ...(role.diagnostic === undefined ? {} : { diagnostic: role.diagnostic }),
@@ -1829,6 +2266,8 @@ export function apply(ctx: Context): void {
       live: { type: "boolean", required: true },
       status: { type: "string", required: true },
       phase: { type: "string", required: true },
+      execution: { type: "string", required: true },
+      parentSessionId: { type: "string" },
       reportCount: { type: "number", required: true },
       lastReport: { oneOf: [{ type: "string" }, { type: "null" }], required: true },
       diagnostic: {

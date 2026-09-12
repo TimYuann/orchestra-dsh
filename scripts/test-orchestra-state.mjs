@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { ActiveTeamStateError, createActiveTeamStateStore } from "../lib/orchestra-state.js";
+import { ActiveTeamStateError, createActiveTeamStateStore, normalizeTeam } from "../lib/orchestra-state.js";
 
 const cwd = "/tmp/orchestra-state-interface-test";
 
@@ -354,4 +354,35 @@ test("blocked state cannot be mistaken for an available create target", async ()
     (error) => error instanceof ActiveTeamStateError && error.code === "write_failed" && /invalid JSON/.test(error.message),
   );
   assert.equal(fs.content(), "not-json");
+});
+
+test("role execution backend defaults to session on legacy state and carries the native parent", () => {
+  const legacy = normalizeTeam(team(), cwd);
+  assert.equal(legacy.roles[0].execution, "session", "a team.json written before the field existed was provisioned as Sessions");
+  assert.equal(legacy.roles[0].parentSessionId, undefined, "a session role has no direct-parent address");
+
+  const nativeRole = { ...team().roles[0], execution: "subagent", parentSessionId: "session-driver" };
+  const native = normalizeTeam(team({ roles: [nativeRole] }), cwd);
+  assert.equal(native.roles[0].execution, "subagent");
+  assert.equal(native.roles[0].parentSessionId, "session-driver", "the durable address survives normalization");
+
+  const orphan = normalizeTeam(team({ roles: [{ ...nativeRole, parentSessionId: "" }] }), cwd);
+  assert.equal(orphan.roles[0].parentSessionId, undefined, "an empty parent address is absence, not an address");
+});
+
+test("an unclassifiable execution backend blocks the team instead of degrading to session", async () => {
+  const fs = new MemoryFs();
+  const store = createActiveTeamStateStore(fs);
+  fs.seed(team({ roles: [{ ...team().roles[0], execution: "native" }] }));
+  const blocked = await store.read(cwd);
+  assert.equal(blocked.kind, "blocked");
+  assert.equal(blocked.diagnostic.code, "invalid_shape");
+  assert.match(blocked.diagnostic.message, /invalid execution backend "native"/);
+
+  assert.equal(
+    normalizeTeam(team({ roles: [{ ...team().roles[0], execution: "native" }] }), cwd),
+    undefined,
+    "a direct normalize call reports the same corruption rather than coercing it to session",
+  );
+  assert.equal(normalizeTeam(team({ roles: [{ ...team().roles[0], execution: null }] }), cwd).roles[0].execution, "session", "null is an unwritten field, not a corrupt one");
 });

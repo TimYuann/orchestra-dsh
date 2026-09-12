@@ -473,3 +473,52 @@ test("draft per-role blueprint pre-parsing mirrors create-time resolution facts 
   const brokenCtx = draftRuntimeContext({ brokenPreset: "broken-preset" });
   await assert.rejects(preparseDraftRoleFacts(brokenCtx, "/tmp/fd", { id: "x", name: "X", preset: "broken-preset" }), /could not be resolved|unavailable/i);
 });
+
+test("draft pre-parsing branches on the backend, so a hybrid topology can be proposed", async () => {
+  const ctx = draftRuntimeContext();
+
+  // A subagent role has no preset by construction, so it must NOT be routed
+  // through the session pre-parse's "requires an explicit complete Agent
+  // Preset" failure — that would make every hybrid proposal undraftable while
+  // create-time provisioning accepted the very same role.
+  const scout = await preparseDraftRoleFacts(ctx, "/tmp/fd", {
+    id: "scout",
+    name: "Scout",
+    execution: "subagent",
+    runtime: { provider: "p", model: "m", reasoningEffort: "max" },
+    persona: "你是侦察节点。",
+    toolFilter: { deny: ["write", "edit"] },
+  });
+  assert.equal(scout.execution, "subagent");
+  assert.equal(scout.preset, undefined);
+  assert.equal(scout.permissionPreset, undefined);
+  assert.equal(scout.sandbox, "inherited");
+  assert.equal(scout.provider, "p");
+  assert.equal(scout.model, "m");
+  assert.equal(scout.reasoningEffort, "max");
+  assert.equal(scout.persona, "你是侦察节点。");
+  assert.deepEqual(scout.toolFilter, { deny: ["write", "edit"] });
+  assert.deepEqual(scout.compositionTools, []);
+  assert.deepEqual(scout.orchestraTools, []);
+
+  // `auto` derives the backend from the preset criterion on the draft path too.
+  const autoSubagent = await preparseDraftRoleFacts(ctx, "/tmp/fd", { id: "auto-node", name: "Auto", execution: "auto" });
+  assert.equal(autoSubagent.execution, "subagent");
+  const autoSession = await preparseDraftRoleFacts(ctx, "/tmp/fd", { id: "auto-session", name: "Auto", execution: "auto", preset: "orchestra-v04-reviewer-v1" });
+  assert.equal(autoSession.execution, "session");
+
+  // The session pre-parse still reports its own backend on the drafted facts.
+  const reviewer = await preparseDraftRoleFacts(ctx, "/tmp/fd", { id: "reviewer", name: "Reviewer", preset: "orchestra-v04-reviewer-v1", sandbox: "read-only" });
+  assert.equal(reviewer.execution, "session");
+
+  // A session-only field on a subagent role is refused here as well, so the
+  // proposal card can never advertise a fact provisioning would not honor.
+  await assert.rejects(
+    preparseDraftRoleFacts(ctx, "/tmp/fd", { id: "x", name: "X", execution: "subagent", preset: "orchestra-v04-reviewer-v1" }),
+    /subagent" backend but declares preset/,
+  );
+  await assert.rejects(
+    preparseDraftRoleFacts(ctx, "/tmp/fd", { id: "x", name: "X", execution: "subagent", sandbox: "read-only" }),
+    /subagent" backend but declares sandbox/,
+  );
+});

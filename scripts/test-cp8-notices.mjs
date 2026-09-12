@@ -38,6 +38,7 @@ test("renderDraftBlueprintTable emits a Markdown table with one row per role and
     {
       roleId: "implementer",
       roleName: "Implementer",
+      execution: "session",
       preset: "orchestra-v04-implementer-v1",
       presetSource: "bundled",
       sandbox: "workspace-write",
@@ -52,6 +53,7 @@ test("renderDraftBlueprintTable emits a Markdown table with one row per role and
     {
       roleId: "reviewer",
       roleName: "Reviewer",
+      execution: "session",
       preset: "orchestra-v04-reviewer-v1",
       sandbox: "read-only",
       permissionPreset: "workspace",
@@ -61,14 +63,36 @@ test("renderDraftBlueprintTable emits a Markdown table with one row per role and
       compositionTools: ["tool-fs", "tool-fs-search"],
       orchestraTools: ["orchestra_report", "orchestra_verdict"],
     },
+    {
+      // A subagent row carries no preset and no permission, and reports the
+      // inherited sandbox honestly rather than borrowing a mode it cannot have.
+      roleId: "scout",
+      roleName: "Scout",
+      execution: "subagent",
+      sandbox: "inherited",
+      provider: "p",
+      model: "m",
+      persona: "你是侦察节点。",
+      toolFilter: { deny: ["write", "edit"] },
+      compositionTools: [],
+      orchestraTools: [],
+    },
   ];
   const table = renderDraftBlueprintTable(preview);
   const lines = table.split("\n");
-  assert.equal(lines[0], "| 角色 | preset | sandbox | permission | model | reasoningEffort | compositionTools | orchestraTools |");
-  assert.equal(lines[1], "| --- | --- | --- | --- | --- | --- | --- | --- |");
-  assert.equal(lines.length, 4); // header + separator + 2 roles
-  assert.ok(lines[2].includes("| implementer | orchestra-v04-implementer-v1 | workspace-write | workspace | p/m | medium | tool-bash, tool-fs | orchestra_report, orchestra_handoff |"));
-  assert.ok(lines[3].includes("| reviewer | orchestra-v04-reviewer-v1 | read-only | custom | p/m | - | tool-fs, tool-fs-search | orchestra_report, orchestra_verdict |"));
+  assert.equal(lines[0], "| 角色 | backend | preset | sandbox | permission | model | reasoningEffort | compositionTools | orchestraTools |");
+  assert.equal(lines[1], "| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+  // header + separator + 3 roles + blank + the subagent knob note
+  // header + separator + 3 roles + a blank spacer + the subagent knob note
+  assert.equal(lines.length, 7);
+  assert.ok(lines[2].includes("| implementer | session | orchestra-v04-implementer-v1 | workspace-write | workspace | p/m | medium | tool-bash, tool-fs | orchestra_report, orchestra_handoff |"));
+  assert.ok(lines[3].includes("| reviewer | session | orchestra-v04-reviewer-v1 | read-only | custom | p/m | - | tool-fs, tool-fs-search | orchestra_report, orchestra_verdict |"));
+  assert.ok(lines[4].includes("| scout | subagent | - | inherited | - | p/m | - | - | - |"));
+  assert.equal(lines[5], "");
+  const note = lines[6];
+  assert.ok(note.startsWith("- `scout`（subagent）"), note);
+  assert.ok(note.includes("toolFilter deny=[write, edit]"), note);
+  assert.ok(note.includes("persona 7 字符"), note);
   // empty preview falls back to header + separator only
   const empty = renderDraftBlueprintTable([]);
   assert.equal(empty.split("\n").length, 2);

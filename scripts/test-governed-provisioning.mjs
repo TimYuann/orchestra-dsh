@@ -642,3 +642,142 @@ test("stale state CAS stops provisioning without reread-overwrite", async () => 
   assert.equal(runtime.agents.size, 0);
   assert.equal(replaceCount, 2);
 });
+
+/** The native-backend role request used by the hybrid tests below. */
+function subagentRolePlanOptions(runtime, overrides = {}) {
+  return {
+    cwd,
+    teamId: "team-test",
+    controllerSessionId: "driver",
+    topologyId: "hybrid",
+    topologySource: "bundled",
+    role: { id: "helper", name: "helper", execution: "subagent" },
+    welcome: "brief",
+    maxRounds: 3,
+    provider: "route-provider",
+    model: "route-model",
+    reasoningEffort: "high",
+    toolFilter: { deny: ["write"] },
+    persona: "You are the helper.",
+    ...overrides,
+  };
+}
+
+/** A reserved team.json whose roles are already classified as native nodes. */
+function reservedSubagentTeam(plans) {
+  const list = Array.isArray(plans) ? plans : [plans];
+  return planTeam(
+    "team-test",
+    list.map((plan) => ({
+      id: plan.roleId,
+      name: plan.roleName,
+      sessionId: plan.sessionId,
+      phase: "reserved",
+      execution: "subagent",
+      parentSessionId: "driver",
+      sessionHistory: [],
+      preset: null,
+      sandbox: "inherited",
+      reportCount: 0,
+      lastReport: null,
+    })),
+  );
+}
+
+test("a subagent role is planned without Blueprint machinery and refuses session-only knobs", async () => {
+  const runtime = makeRuntime();
+  const plan = await prepareGovernedRolePlan(runtime.context, subagentRolePlanOptions(runtime));
+
+  assert.equal(plan.execution, "subagent");
+  assert.equal(plan.parentSessionId, "driver", "the controller is the durable direct-parent address");
+  assert.equal(plan.blueprint, undefined, "no Blueprint receipt is fabricated for a native child");
+  assert.equal(plan.presetId, undefined);
+  assert.equal(plan.sandbox, undefined);
+  assert.deepEqual(plan.agentOptions, { provider: "route-provider", model: "route-model", reasoningEffort: "high" });
+  assert.deepEqual(plan.toolFilter, { deny: ["write"] });
+  assert.equal(plan.persona, "You are the helper.");
+  assert.equal(plan.maxRounds, 3);
+  assert.equal(plan.welcome, "brief");
+  assert.match(plan.sessionId, /^orchestra-team-test-/, "the reserved identity becomes the native child id");
+  assert.equal(runtime.events.some((event) => event.startsWith("mount:")), false, "planning a native node mounts no preset");
+
+  await assert.rejects(
+    () => prepareGovernedRolePlan(runtime.context, subagentRolePlanOptions(runtime, { role: { id: "helper", name: "helper", execution: "subagent", preset: "orchestra-reviewer" } })),
+    /cannot mount its own composition/,
+  );
+  await assert.rejects(
+    () => prepareGovernedRolePlan(runtime.context, subagentRolePlanOptions(runtime, { role: { id: "helper", name: "helper", execution: "subagent", sandbox: "read-only" } })),
+    /frozen from its parent's explicit override/,
+  );
+  await assert.rejects(
+    () => prepareGovernedRolePlan(runtime.context, subagentRolePlanOptions(runtime, { model: undefined })),
+    /provider and model together/,
+  );
+});
+
+test("a subagent role is provisioned as a native child and never as a Session", async () => {
+  const runtime = makeRuntime();
+  const plan = await prepareGovernedRolePlan(runtime.context, subagentRolePlanOptions(runtime));
+  const reservation = await runtime.store.create(cwd, reservedSubagentTeam(plan), { policy: {} });
+  const spawned = [];
+  const result = await provisionGovernedPlans(runtime.context, runtime.store, { agent: runtime.controller, signal: new AbortController().signal }, cwd, reservation.snapshot, [plan], "active", "failed", {
+    createSubagentNode: async (_ctx, parent, spec, signal) => {
+      spawned.push({ parent, spec, signal });
+      return { childId: spec.childId, messageId: "msg-native", provider: spec.provider ?? "spawn" };
+    },
+  });
+
+  assert.equal(result.team.status, "active");
+  assert.equal(result.team.roles[0].phase, "active");
+  assert.equal(result.team.roles[0].execution, "subagent");
+  assert.equal(result.team.roles[0].welcome.messageId, "msg-native");
+  assert.equal(result.team.roles[0].welcome.sessionId, plan.sessionId);
+  assert.equal(runtime.events.some((event) => event.startsWith("create:")), false, "the native branch never creates a Session");
+  assert.equal(runtime.agents.size, 0, "no Session agent is registered for a native node");
+  assert.deepEqual(result.handles, [], "a native child owns no AgentHandle");
+  assert.equal(spawned.length, 1);
+  assert.equal(spawned[0].parent, runtime.controller, "the live controller is the delegation parent");
+  assert.equal(spawned[0].spec.childId, plan.sessionId, "the reserved id is handed to the native provider");
+  assert.ok(spawned[0].signal instanceof AbortSignal);
+  assert.match(spawned[0].spec.prompt, /helper/, "the opening prompt carries the role protocol");
+  assert.match(spawned[0].spec.prompt, /brief/, "and the declared welcome");
+  assert.deepEqual(spawned[0].spec.toolFilter, { deny: ["write"] });
+  assert.equal(spawned[0].spec.persona, "You are the helper.");
+
+  const agents = makeRuntime();
+  const agentlessPlan = await prepareGovernedRolePlan(agents.context, subagentRolePlanOptions(agents));
+  const agentlessReservation = await agents.store.create(cwd, reservedSubagentTeam(agentlessPlan), { policy: {} });
+  await assert.rejects(
+    () => provisionGovernedPlans(agents.context, agents.store, {}, cwd, agentlessReservation.snapshot, [agentlessPlan], "active", "failed"),
+    /requires a live controller agent/,
+    "an agentless caller cannot create a native child",
+  );
+});
+
+test("a failed native provisioning releases the child it already materialized", async () => {
+  const runtime = makeRuntime();
+  const first = await prepareGovernedRolePlan(runtime.context, subagentRolePlanOptions(runtime, { role: { id: "helper", name: "helper", execution: "subagent" } }));
+  const second = await prepareGovernedRolePlan(runtime.context, subagentRolePlanOptions(runtime, { role: { id: "helper-2", name: "helper-2", execution: "subagent" } }));
+  const reservation = await runtime.store.create(cwd, reservedSubagentTeam([first, second]), { policy: {} });
+  const released = [];
+  await assert.rejects(
+    () =>
+      provisionGovernedPlans(runtime.context, runtime.store, { agent: runtime.controller, signal: new AbortController().signal }, cwd, reservation.snapshot, [first, second], "active", "failed", {
+        createSubagentNode: async (_ctx, _parent, spec) => {
+          if (spec.label === "helper-2") throw new Error("provider refused");
+          return { childId: spec.childId, messageId: "msg-native", provider: "spawn" };
+        },
+        releaseSubagentNode: async (_ctx, parent, childId) => {
+          released.push({ parent: parent.id, childId });
+        },
+      }),
+    /provider refused/,
+  );
+
+  assert.deepEqual(released, [{ parent: "driver", childId: first.sessionId }], "the materialized child is released so no orphan activation stays live");
+  const state = await runtime.store.read(cwd);
+  assert.equal(state.kind, "ready");
+  assert.equal(state.team.status, "failed");
+  assert.equal(state.team.roles.find((role) => role.id === "helper").phase, "active", "the role whose child was created keeps its activated record");
+  assert.equal(state.team.roles.find((role) => role.id === "helper-2").phase, "failed");
+});

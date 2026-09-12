@@ -23,7 +23,7 @@ function session(id, cwd = "/caller") {
   };
 }
 
-function runtime() {
+function runtime(options = {}) {
   const sessions = new Map();
   const agents = new Map();
   const coldSnapshots = new Map();
@@ -84,6 +84,7 @@ function runtime() {
       if (name === "sessionQuery") return query;
       if (name === "agentPresets") return presets;
       if (name === "agentDefaultModel") return { currentSelection: () => ({ provider: "p", model: "m" }) };
+      if (name === "subagents") return options.subagents;
       return undefined;
     },
   };
@@ -268,10 +269,31 @@ function teamState(status = "active", rolePhase = "active", roleSession = "role-
       mission: { objective: "test", scope: [], constraints: [], acceptanceCriteria: [], nonGoals: [], context: "" },
       createdAt: 1,
       activatedFromArchiveId: null,
-      roles: [{ id: "reviewer", name: "Reviewer", sessionId: roleSession, phase: rolePhase, sessionHistory: [], preset: "preset", sandbox: "workspace-write", reportCount: 0, lastReport: null }],
+      roles: [{ id: "reviewer", name: "Reviewer", sessionId: roleSession, phase: rolePhase, execution: "session", sessionHistory: [], preset: "preset", sandbox: "workspace-write", reportCount: 0, lastReport: null }],
       reports: [],
     },
   };
+}
+
+/** The same team, with its single role carried by a native sub-agent node. */
+function nativeTeamState(parentSessionId = "driver") {
+  const state = teamState();
+  state.team.roles = [
+    {
+      id: "reviewer",
+      name: "Reviewer",
+      sessionId: "child-native",
+      phase: "active",
+      execution: "subagent",
+      parentSessionId,
+      sessionHistory: [],
+      preset: null,
+      sandbox: "inherited",
+      reportCount: 0,
+      lastReport: null,
+    },
+  ];
+  return state;
 }
 
 test("Governed address resolves exact team/role current mapping and tracks replacement", async () => {
@@ -319,4 +341,58 @@ test("durable idempotency replay in a fresh context returns the original receipt
   const replay = await deliverMessage(freshContext, "sender", target.id, [{ type: "text", text: "retry" }], { idempotencyKey: "fresh-key", replyTo: "original" });
   assert.deepEqual(replay, first);
   assert.equal(target.events.filter((event) => event.type === "agent/inbox/spliced").length, 1);
+});
+
+test("orchestra_send reaches a native node only through its recorded direct parent", async () => {
+  const sent = [];
+  const env = runtime({
+    subagents: {
+      async sendMessage(sender, targetId, content, options) {
+        sent.push({ sender, targetId, content, options });
+        return "native-message";
+      },
+    },
+  });
+  const caller = session("driver", "/caller");
+  env.sessions.set(caller.id, caller);
+  env.agents.set(caller.id, { id: caller.id, session: caller, status: "idle" });
+  const resolver = createGovernedRoleAddressResolver({ async read() { return nativeTeamState(); } });
+  const exec = { agent: env.agents.get(caller.id), signal: new AbortController().signal };
+
+  const result = await sendGovernedRole(env.context, resolver, { teamId: "team-address", roleId: "reviewer", message: "dispatch" }, exec);
+  assert.equal(result.resolved_session_id, "child-native");
+  assert.deepEqual(result.receipt, {
+    message_id: "native-message",
+    target_session_id: "child-native",
+    accepted_at_ms: result.receipt.accepted_at_ms,
+    delivery_mode: "native_steer",
+    state: "accepted",
+  });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].sender, exec.agent, "the caller's own Agent is the only authorized sender");
+  assert.equal(sent[0].targetId, "child-native");
+  assert.equal(sent[0].content[1].text, "dispatch");
+  assert.ok(sent[0].options.signal instanceof AbortSignal);
+
+  // A caller that is not the recorded parent is refused rather than misrouted.
+  const stranger = session("other-driver", "/caller");
+  env.sessions.set(stranger.id, stranger);
+  env.agents.set(stranger.id, { id: stranger.id, session: stranger, status: "idle" });
+  await assert.rejects(
+    () => sendGovernedRole(env.context, resolver, { teamId: "team-address", roleId: "reviewer", message: "x" }, { agent: env.agents.get(stranger.id), signal: new AbortController().signal }),
+    /only that exact parent may deliver/,
+  );
+
+  // The three raw-transport guarantees have no native counterpart.
+  for (const [args, pattern] of [
+    [{ wake: false }, /cannot honor wake=false/],
+    [{ interrupt: true }, /cannot honor interrupt=true/],
+    [{ idempotencyKey: "k" }, /cannot honor idempotencyKey/],
+  ]) {
+    await assert.rejects(
+      () => sendGovernedRole(env.context, resolver, { teamId: "team-address", roleId: "reviewer", message: "x", ...args }, exec),
+      pattern,
+    );
+  }
+  assert.equal(sent.length, 1, "no refused call reached the native seam");
 });

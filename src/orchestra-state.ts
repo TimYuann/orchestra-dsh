@@ -24,6 +24,25 @@ import { readGraphRuntime } from "./orchestra-graph.js";
 export type TeamRolePhase = "reserved" | "provisioning" | "active" | "failed";
 export type TeamStatus = "provisioning" | "active" | "degraded" | "blocked" | "failed" | "completed" | "abandoned";
 
+/**
+ * Which backend carries one role.
+ *
+ * `session` is the original backend: a first-class, user-visible Session created
+ * through `ctx.agents.create()`, with its own Agent Preset, permission preset,
+ * sandbox, and model route.
+ *
+ * `subagent` is the native-DSH backend: a durable continuable child of the
+ * controller Session created through `ctx.subagents.startContinuable()`. It is
+ * cheaper and integrated (roster, inbox, cold resume handled by the harness),
+ * but the native contract makes three things structurally impossible, and the
+ * topology validator rejects them instead of degrading silently: a child cannot
+ * choose its own Agent Preset (it joins its parent's live composition), its
+ * approval policy is pinned to `never` at the delegation boundary, and its
+ * sandbox mode is frozen from the parent's explicit override at that same
+ * boundary.
+ */
+export type TeamRoleExecution = "session" | "subagent";
+
 export interface TeamRoleDiagnostic {
   code: string;
   message: string;
@@ -65,6 +84,18 @@ export interface TeamRole {
   name: string;
   sessionId: string;
   phase: TeamRolePhase;
+  /**
+   * Backend that carries this role. Required on every record written from now
+   * on; legacy team.json without it normalizes to `"session"`, which is exactly
+   * how those teams were provisioned.
+   */
+  execution: TeamRoleExecution;
+  /**
+   * The controller Session id a `subagent` role is a direct child of. Present
+   * only for `subagent` roles: native delivery is authorized by the direct
+   * parent edge, so the address must be durable to survive a restart.
+   */
+  parentSessionId?: string;
   diagnostic?: TeamRoleDiagnostic;
   blueprint?: TeamRoleBlueprintFacts;
   welcome?: TeamWelcomeReceipt;
@@ -359,6 +390,17 @@ function classifyRaw(raw: unknown, cwd: string):
         diagnostic: diagnostic("invalid_shape", `active team role at index ${index} has invalid provisioning phase`),
       };
     }
+    if (role.execution !== undefined && role.execution !== "session" && role.execution !== "subagent") {
+      // A role whose backend cannot be classified is not a role this runtime can
+      // address, deliver to, or activate: an unknown value is data damage, and
+      // coercing it to "session" would silently re-point delivery at a Session
+      // that was never created for that role.
+      return {
+        kind: "blocked",
+        warnings,
+        diagnostic: diagnostic("invalid_shape", `active team role at index ${index} has invalid execution backend "${String(role.execution)}" (session | subagent)`),
+      };
+    }
   }
 
   const team = normalizeTeam(raw, cwd);
@@ -419,6 +461,14 @@ export function normalizeTeam(raw: unknown, cwd: string, options: { allowDismiss
   if (record.archived === true) return undefined;
   if (record.status === "dismissed" && options.allowDismissed !== true) return undefined;
   if (!Array.isArray(record.roles)) return undefined;
+  // Backend classification decides how every later address lookup reaches the
+  // role (Session routing vs the direct-parent subagent edge), so a value
+  // outside the enum is corruption, never something to coerce. `undefined`
+  // there is different: a legacy team.json predates the field and was, by
+  // construction, provisioned as Sessions.
+  if (record.roles.some((role: any) => role?.execution !== undefined && role?.execution !== null && role?.execution !== "session" && role?.execution !== "subagent")) {
+    return undefined;
+  }
   const createdAt = typeof record.createdAt === "number" ? record.createdAt : Date.now();
   const teamId = typeof record.teamId === "string" && record.teamId !== "" ? record.teamId : `team-${createdAt}`;
   const roles: TeamRole[] = record.roles
@@ -428,6 +478,10 @@ export function normalizeTeam(raw: unknown, cwd: string, options: { allowDismiss
       name: typeof role.name === "string" ? role.name : String(role.id ?? "role"),
       sessionId: role.sessionId,
       phase: role.phase === "reserved" || role.phase === "provisioning" || role.phase === "failed" ? role.phase : "active",
+      execution: role.execution === "subagent" ? ("subagent" as const) : ("session" as const),
+      ...(role.execution === "subagent" && typeof role.parentSessionId === "string" && role.parentSessionId !== ""
+        ? { parentSessionId: role.parentSessionId }
+        : {}),
       ...(asRecord(role.diagnostic) && typeof role.diagnostic.code === "string" && typeof role.diagnostic.message === "string"
         ? { diagnostic: { code: role.diagnostic.code, message: role.diagnostic.message } }
         : {}),

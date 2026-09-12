@@ -13,13 +13,43 @@ import { mkdir, readFile, readdir, stat as nodeStat, writeFile } from "node:fs/p
 import type { FsDirEntry, FsInfo, FsTarget } from "@deepseek-ai/dsh-fs";
 // `JsonValue` moved out of `@deepseek-ai/dsh-tools` in DSH 0.1.5-rc.2.
 import type { JsonValue } from "@deepseek-ai/dsh-util-values";
+// Type-only: `orchestra-state` is the single owner of the durable execution
+// vocabulary, and a type import keeps this module free of a runtime cycle.
+import type { TeamRoleExecution } from "./orchestra-state.js";
 
 export type TopologySource = "project" | "global" | "bundled";
+
+/** How a topology author asks for a role's backend, before it is resolved. */
+export type RoleExecutionRequest = "auto" | "session" | "subagent";
 
 export interface RoleConfig {
   id: string;
   name: string;
   preset?: string | null;
+  /**
+   * Requested backend for this role. Omit to keep the historical behavior
+   * (`session`); `"auto"` derives the backend from the preset criterion in
+   * {@link resolveRoleExecution}. A resolved `"subagent"` role may not declare
+   * `preset` or `sandbox` — the native contract cannot honor either.
+   */
+  execution?: RoleExecutionRequest;
+  /**
+   * Native per-child persona for a `subagent` role: it SHADOWS the deployment
+   * persona for that child alone. A `session` role must not declare it — a
+   * session's persona lives inside its Agent Preset, so a field here would be
+   * silently ignored.
+   */
+  persona?: string;
+  /**
+   * Native per-child tool scoping for a `subagent` role: the named tools vanish
+   * from the child's prompt AND refuse to execute.
+   *
+   * This is a AVAILABILITY narrowing, NOT a permission guarantee — the child
+   * inherits its parent's sandbox and a denied tool's underlying capability
+   * (e.g. a shell) may still reach the same effect. A role whose read-only
+   * property must hold is a `session` role with a read-only Permission Preset.
+   */
+  toolFilter?: { allow?: string[]; deny?: string[] };
   compositionTools?: string[];
   orchestraTools?: string[];
   optionalCapabilities?: string[];
@@ -104,6 +134,12 @@ export interface TopologyRoleSummary {
   id: string;
   name: string;
   preset?: string;
+  /** Resolved backend for this role — never the raw `"auto"` request. */
+  execution?: TeamRoleExecution;
+  /** Native per-child persona; only ever present on a `subagent` role. */
+  persona?: string;
+  /** Native per-child tool scoping; only ever present on a `subagent` role. */
+  toolFilter?: { allow?: string[]; deny?: string[] };
   sandbox?: string;
   maxRounds?: number;
   runtime?: Record<string, JsonValue>;
@@ -875,9 +911,71 @@ function validateId(id: string): TopologyDiagnostic | undefined {
   return validTopologyId(id) ? undefined : topologyDiagnostic("invalid_id", `topology id "${String(id)}" must use lower-kebab syntax and must not contain path traversal`);
 }
 
+/**
+ * Resolve a role's execution backend.
+ *
+ * - an explicit `"session"` / `"subagent"` wins;
+ * - `"auto"` derives from the preset criterion: a role that NAMES a preset must
+ *   be a session (only a session can mount its own composition), a role that
+ *   names none is a sub-agent child that joins its parent's live composition;
+ * - an ABSENT value stays `"session"`: the nine built-in topologies keep their
+ *   current behavior until each one opts in deliberately.
+ *
+ * @param role - the role's backend request and its declared preset.
+ * @returns the resolved backend.
+ */
+export function resolveRoleExecution(role: Pick<RoleConfig, "execution" | "preset">): TeamRoleExecution {
+  if (role.execution === "session" || role.execution === "subagent") return role.execution;
+  if (role.execution === "auto") {
+    const preset = role.preset;
+    return typeof preset === "string" && preset !== "" ? "session" : "subagent";
+  }
+  return "session";
+}
+
+/**
+ * Shape problems in a `subagent` role's native per-child knobs.
+ *
+ * Persona and toolFilter are the only per-child knobs the delegated backend
+ * accepts beyond the model route. A malformed one is refused here rather than
+ * at the delegation boundary, where the provider rejects the whole creation
+ * with a message that no longer names the topology role that caused it.
+ *
+ * @param role - the role that resolved to the `subagent` backend.
+ * @returns one diagnostic line per malformed knob (empty when both are usable).
+ */
+function subagentKnobProblems(role: RoleConfig): string[] {
+  const problems: string[] = [];
+  if (role.persona !== undefined && (typeof role.persona !== "string" || role.persona.trim() === "")) {
+    problems.push(`role "${role.id}" persona must be a non-empty string`);
+  }
+  const filter: unknown = role.toolFilter;
+  if (filter === undefined) return problems;
+  if (!isRecord(filter)) {
+    problems.push(`role "${role.id}" toolFilter must be an object with allow and/or deny`);
+    return problems;
+  }
+  const toolNames = (value: unknown): value is string[] =>
+    Array.isArray(value) && value.length > 0 && value.every((entry) => typeof entry === "string" && entry !== "");
+  const allow = filter.allow;
+  const deny = filter.deny;
+  if (allow !== undefined && !toolNames(allow)) problems.push(`role "${role.id}" toolFilter.allow must be a non-empty array of non-empty tool names`);
+  if (deny !== undefined && !toolNames(deny)) problems.push(`role "${role.id}" toolFilter.deny must be a non-empty array of non-empty tool names`);
+  if (allow === undefined && deny === undefined) problems.push(`role "${role.id}" toolFilter declares neither allow nor deny, so it restricts nothing`);
+  return problems;
+}
+
 function roleSummary(role: RoleConfig): TopologyRoleSummary {
   const summary: TopologyRoleSummary = { id: role.id, name: role.name ?? role.id };
   if (role.preset !== undefined && role.preset !== null) summary.preset = role.preset;
+  if (role.execution !== undefined) summary.execution = resolveRoleExecution(role);
+  if (role.persona !== undefined) summary.persona = role.persona;
+  if (role.toolFilter !== undefined) {
+    summary.toolFilter = {
+      ...(role.toolFilter.allow === undefined ? {} : { allow: [...role.toolFilter.allow] }),
+      ...(role.toolFilter.deny === undefined ? {} : { deny: [...role.toolFilter.deny] }),
+    };
+  }
   if (role.sandbox !== undefined) summary.sandbox = role.sandbox;
   if (role.maxRounds !== undefined) summary.maxRounds = role.maxRounds;
   if (role.runtime !== undefined) summary.runtime = role.runtime as Record<string, JsonValue>;
@@ -958,6 +1056,39 @@ export function validateTopology(config: unknown): string[] {
       }
       if (runtime.reasoningEffort !== undefined && (runtime.provider === undefined || runtime.model === undefined)) {
         problems.push(`role "${role.id}" runtime reasoningEffort requires provider and model`);
+      }
+    }
+    if (role.execution !== undefined && role.execution !== "auto" && role.execution !== "session" && role.execution !== "subagent") {
+      problems.push(`role "${role.id}" execution "${String(role.execution)}" is invalid (auto | session | subagent)`);
+    } else if (resolveRoleExecution({ execution: role.execution, preset: role.preset }) === "subagent") {
+      // Fail loud rather than degrade silently: both fields below are accepted
+      // by the schema but structurally unenforceable on a native sub-agent, and
+      // a role that believes it is read-only while it is not is a safety bug.
+      if (typeof role.preset === "string" && role.preset !== "") {
+        problems.push(
+          `role "${role.id}" resolves to the "subagent" backend but declares preset "${role.preset}": a native sub-agent joins its parent's live Agent Preset and cannot mount its own composition, so the preset would never take effect — use execution: "session" for a role that needs its own preset`,
+        );
+      }
+      if (role.sandbox !== undefined) {
+        problems.push(
+          `role "${role.id}" resolves to the "subagent" backend but declares sandbox "${String(role.sandbox)}": a native sub-agent's sandbox mode is frozen from its parent's explicit override at the delegation boundary and its approval policy is pinned to "never", so the declared sandbox would never take effect — use execution: "session" for a read-only or otherwise restricted role`,
+        );
+      }
+      problems.push(...subagentKnobProblems(role as unknown as RoleConfig));
+    } else {
+      // The native knobs are honored ONLY by the delegated backend. A session
+      // role declaring one would see it silently ignored, so the topology is
+      // rejected instead — the same fail-loud rule as the preset/sandbox pair
+      // above, applied in the other direction.
+      if (role.persona !== undefined) {
+        problems.push(
+          `role "${role.id}" resolves to the "session" backend but declares persona: a session role's persona lives inside its Agent Preset, so this field would never take effect — put the persona in the preset, or use execution: "subagent" for a native child persona`,
+        );
+      }
+      if (role.toolFilter !== undefined) {
+        problems.push(
+          `role "${role.id}" resolves to the "session" backend but declares toolFilter: native per-child tool scoping exists only on the delegated backend, so this field would never take effect — narrow the tool set through the role's Agent Preset, or use execution: "subagent"`,
+        );
       }
     }
   }
