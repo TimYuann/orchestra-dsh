@@ -299,15 +299,30 @@ export function OrchestraPanel(): React.JSX.Element {
 /** Services required by the settings registration (Cordis inject contract). */
 export const inject = ["slots"];
 
-/** Browser plugin: register the settings.section list entry. */
+/**
+ * Browser plugin: register the `settings.section` list entry.
+ *
+ * DSH 0.1.5-rc.2 made slot registration declaration-gated: `register()` throws
+ * `slot "…" is not declared (a parent entry's children table must declare it)`
+ * unless the slot's owner has already declared it. `ctx.slots.inject(key, cb)`
+ * runs `cb` synchronously when the declaration exists and otherwise inside the
+ * declaring `register()` call once it commits, so an entry may load before or
+ * after the settings shell. The callback returns the registration's disposer,
+ * which is exactly the effect contract `inject` expects; the controller rides
+ * this plugin's fiber, so unload cancels a pending wait and removes the entry.
+ *
+ * @param ctx - client root context carrying the slot registry.
+ */
 export function apply(ctx: ClientContext): void {
-  ctx.slots.register(
-    {
-      name: "settings.section",
-      id: "orchestra",
-      order: 200,
-      label: "orchestra",
-    },
-    OrchestraPanel,
+  ctx.slots.inject("settings.section", () =>
+    ctx.slots.register(
+      {
+        name: "settings.section",
+        id: "orchestra",
+        order: 200,
+        label: "orchestra",
+      },
+      OrchestraPanel,
+    ),
   );
 }
