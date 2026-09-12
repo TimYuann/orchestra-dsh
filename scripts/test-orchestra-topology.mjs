@@ -361,6 +361,40 @@ test("P6/P9: an authored topology must reach closure and reference every node", 
   );
 });
 
+test("P10: a sub-agent node is reachable only through the controller", () => {
+  const scout = { id: "scout", name: "Scout", execution: "subagent" };
+  const reviewer = { id: "reviewer", name: "Reviewer", preset: "orchestra-reviewer", sandbox: "read-only" };
+  const withEdges = (routes) => ({
+    schemaVersion: 1,
+    id: "p10",
+    controller: { id: "driver", source: "caller" },
+    roles: [scout, reviewer],
+    protocol: { ownership: { closure: "driver" }, completion: { owner: "driver", rule: "done" }, routes },
+  });
+  const hub = [
+    { kind: "to-scout", from: "driver", to: ["scout"] },
+    { kind: "from-scout", from: "scout", to: ["driver"] },
+    { kind: "to-reviewer", from: "driver", to: ["reviewer"] },
+    { kind: "from-reviewer", from: "reviewer", to: ["driver"] },
+  ];
+  assert.deepEqual(validateTopology(withEdges(hub)), [], "the driver is the hub, and that is the legal shape");
+
+  // A session node cannot reach a sub-agent node: it is not the parent.
+  const intoChild = validateTopology(withEdges([...hub, { kind: "reviewer-to-scout", from: "reviewer", to: ["scout"] }]));
+  assert.equal(intoChild.length, 1, intoChild.join(" | "));
+  assert.match(intoChild[0], /only its direct parent/);
+  assert.match(intoChild[0], /a session node cannot message a sub-agent node/);
+
+  // A sub-agent node cannot reach a session node: its only partner is the driver.
+  const outOfChild = validateTopology(withEdges([...hub, { kind: "scout-to-reviewer", from: "scout", to: ["reviewer"] }]));
+  assert.equal(outOfChild.length, 1, outOfChild.join(" | "));
+  assert.match(outOfChild[0], /can only reach its direct parent/);
+
+  // Nor can it be one sender among several.
+  const mixed = validateTopology(withEdges([...hub, { kind: "both", from: ["scout", "reviewer"], to: ["driver"] }]));
+  assert.ok(mixed.some((problem) => /mixes a sub-agent node with other senders/.test(problem)), mixed.join(" | "));
+});
+
 test("catalog summary reports the resolved execution backend", async () => {
   await withRoots(async ({ fs, projectRoot, globalRoot }) => {
     await fs.seed(

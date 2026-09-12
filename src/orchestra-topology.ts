@@ -1348,6 +1348,58 @@ export function validateTopology(config: unknown): string[] {
       if (closure.userOverride !== undefined && typeof closure.userOverride !== "boolean") problems.push("shape: protocol.closure.userOverride must be boolean");
     }
   }
+  // ── P10: a sub-agent node is reachable only through its parent ────────────
+  //
+  // Native delegation authorizes delivery on the direct-parent edge ALONE: the
+  // seam throws when adjacency is rejected, and the platform's generic Session
+  // routing refuses a sub-agent child's id outright. So a session node can never
+  // hand work to a sub-agent node, and a sub-agent node can never reach a
+  // session node — the controller is the only party on either side of such an
+  // exchange. A route that says otherwise describes a message that cannot be
+  // sent, and it would only be discovered when the orchestration stalled.
+  const subagentRoles = new Set<string>();
+  for (const role of Array.isArray(config.roles) ? config.roles : []) {
+    if (!isRecord(role) || typeof role.id !== "string") continue;
+    if (resolveRoleExecution({ execution: role.execution, preset: role.preset }) === "subagent") {
+      subagentRoles.add(role.id.toLowerCase());
+    }
+  }
+  if (subagentRoles.size > 0) {
+    const edges: { label: string; from: unknown[]; to: unknown[] }[] = [];
+    if (Array.isArray(protocol.routes)) {
+      for (const route of protocol.routes) {
+        if (!isRecord(route)) continue;
+        const froms = Array.isArray(route.from) ? route.from : [route.from];
+        const tos = Array.isArray(route.to) ? route.to : [];
+        edges.push({ label: `protocol.routes[${String(route.kind)}]`, from: froms, to: tos });
+      }
+    }
+    if (Array.isArray(protocol.handoffs)) {
+      for (const handoff of protocol.handoffs) {
+        if (!isRecord(handoff)) continue;
+        const froms = Array.isArray(handoff.from) ? handoff.from : [handoff.from];
+        const tos = Array.isArray(handoff.to) ? handoff.to : [];
+        edges.push({ label: `protocol.handoffs[${String(handoff.kind)}]`, from: froms, to: tos });
+      }
+    }
+    const isSubagent = (ref: unknown): boolean => typeof ref === "string" && subagentRoles.has(ref.toLowerCase());
+    const isController = (ref: unknown): boolean => typeof ref === "string" && ref.toLowerCase() === controllerId.toLowerCase();
+    for (const edge of edges) {
+      const subagentSenders = edge.from.filter(isSubagent).length;
+      const subagentTargets = edge.to.filter(isSubagent).length;
+      if (subagentSenders > 0) {
+        if (edge.from.length > subagentSenders) {
+          problems.push(`${edge.label} mixes a sub-agent node with other senders: a delegated child is only reachable by its direct parent, so it cannot be one sender among several (P10)`);
+        } else if (edge.to.length !== 1 || !isController(edge.to[0])) {
+          problems.push(`${edge.label} sends from a sub-agent node to ${edge.to.map(String).join(", ") || "nobody"}: a delegated child can only reach its direct parent ("${controllerId}"), because native delivery authorizes on that edge alone (P10)`);
+        }
+      }
+      if (subagentTargets > 0 && (edge.from.length !== 1 || !isController(edge.from[0]))) {
+        problems.push(`${edge.label} delivers to a sub-agent node from ${edge.from.map(String).join(", ") || "nobody"}: only its direct parent ("${controllerId}") can reach a delegated child; a session node cannot message a sub-agent node (P10)`);
+      }
+    }
+  }
+
   // ── Principles P6 and P9, as far as a static topology can prove them ──────
   //
   // P9: a declared node that nothing references is a design defect, not a

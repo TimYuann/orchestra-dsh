@@ -154,13 +154,17 @@ function presetFromSnapshot(header: SessionHeader, events: readonly SessionEvent
   return state ?? undefined;
 }
 
-async function tryResume(ctx: Context, sessionId: string): Promise<void> {
+async function tryResume(ctx: Context, sessionId: string, senderSessionId: string | undefined): Promise<void> {
   const presets = ctx.get("agentPresets");
   const query = ctx.get("sessionQuery");
   if (presets === undefined || query === undefined) {
     throw new Error(`a2a transport: cannot resume ${sessionId} — sessionQuery/agentPresets services unavailable`);
   }
   const snapshot = await query.readSession(SID(sessionId));
+  // Checked before reviving anything: cold-resuming a sub-agent child is the
+  // same delivery as reaching a live one, and doing it for a non-parent would
+  // also wake a child its owner is not expecting to run.
+  assertSubagentTargetReachable(snapshot.session, sessionId, senderSessionId);
   const governed = readGovernedBlueprint(snapshot.events);
   const lightweight = readLightweightBlueprint(snapshot.events);
   const presetId = governed?.agentPreset ?? lightweight?.agentPreset ?? presetFromSnapshot(snapshot.session, snapshot.events);
@@ -249,6 +253,7 @@ async function deliverMessageOnce(
       });
   const live = ctx.agents.get(SID(toSessionId));
   if (live !== undefined) {
+    assertSubagentTargetReachable(live.session.header, toSessionId, senderSessionId);
     if (options.interrupt === true) {
       live.steer(message);
       const result: DeliverResult = {
@@ -279,6 +284,7 @@ async function deliverMessageOnce(
 
   const session = ctx.sessions.get(SID(toSessionId));
   if (session !== undefined) {
+    assertSubagentTargetReachable(session.header, toSessionId, senderSessionId);
     const target = wake ? "next-turn" : "next-step";
     session.append("agent/inbox/spliced", { target, start: pendingLength(session, target), inserted: [message] });
     const result: DeliverResult = {
@@ -293,7 +299,7 @@ async function deliverMessageOnce(
     return result;
   }
 
-  await tryResume(ctx, toSessionId);
+  await tryResume(ctx, toSessionId, senderSessionId);
   const resumed = ctx.agents.get(SID(toSessionId));
   if (resumed === undefined) throw new Error(`a2a transport: target ${toSessionId} could not be resumed`);
   if (wake) resumed.followup(message);
@@ -308,6 +314,41 @@ async function deliverMessageOnce(
   };
   if (options.idempotencyKey !== undefined) recordReceipt(resumed.session, result);
   return result;
+}
+
+/**
+ * Refuse to hand work to a sub-agent child this sender does not parent.
+ *
+ * A delegated child is addressed ONLY by its direct parent: the native seam
+ * authorizes delivery on that adjacency edge alone ("throws when … adjacency is
+ * rejected"), and the platform's generic Session routing refuses these ids
+ * outright — "use subagent delivery for this child session".
+ *
+ * This transport writes into a target's inbox by bare session id, so without
+ * this guard ANY session could hand a task to a child it did not create. That
+ * would bypass the edge that authorizes delivery and race the parent that owns
+ * the child's lifecycle (and would do it invisibly, since the write looks like
+ * an ordinary inbox splice).
+ *
+ * A sender with no identity at all is refused for the same reason: an
+ * unauthenticated caller cannot demonstrate the parent edge, and the safe
+ * reading of "cannot prove adjacency" is "not adjacent".
+ *
+ * @param header - the resolved target session header.
+ * @param targetSessionId - the addressed session id, for the message.
+ * @param senderSessionId - the caller's session id, or undefined without one.
+ * @throws when the target is a sub-agent child of somebody else.
+ */
+function assertSubagentTargetReachable(
+  header: { origin?: "subagent"; parentSession?: string } | undefined,
+  targetSessionId: string,
+  senderSessionId: string | undefined,
+): void {
+  if (header?.origin !== "subagent") return;
+  if (senderSessionId !== undefined && header.parentSession === senderSessionId) return;
+  throw new Error(
+    `a2a transport: session ${targetSessionId} is a sub-agent child of ${header.parentSession ?? "(unknown parent)"} and only that direct parent may deliver to it — native delegation authorizes on the adjacency edge alone, so no other session can reach it`,
+  );
 }
 
 /** Deliver one raw SessionId-addressed message. No Team/CWD/FS policy is consulted. */

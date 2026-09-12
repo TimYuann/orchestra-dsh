@@ -396,3 +396,28 @@ test("orchestra_send reaches a native node only through its recorded direct pare
   }
   assert.equal(sent.length, 1, "no refused call reached the native seam");
 });
+
+test("a sub-agent child is reachable only by its direct parent", async () => {
+  // The native seam authorizes on the adjacency edge alone, so this transport —
+  // which writes into an inbox by bare session id — must refuse a foreign
+  // sender. Without the guard any session could hand work to a child it did not
+  // create, invisibly, because the write looks like an ordinary inbox splice.
+  const ctx = {
+    agents: {
+      get(id) {
+        return String(id) === "child" ? { session: { header: { origin: "subagent", parentSession: "owner" } } } : undefined;
+      },
+    },
+    sessions: { get: () => undefined },
+  };
+  await assert.rejects(
+    () => deliverMessage(ctx, "intruder", "child", [{ type: "text", text: "do my work" }]),
+    /sub-agent child of owner/,
+    "a non-parent must be refused, and told why",
+  );
+  await assert.rejects(
+    () => deliverMessage(ctx, undefined, "child", [{ type: "text", text: "anonymous" }]),
+    /sub-agent child of owner/,
+    "a sender that cannot demonstrate the parent edge is not adjacent",
+  );
+});

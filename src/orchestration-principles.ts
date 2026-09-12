@@ -48,6 +48,8 @@ export const PRINCIPLES_SECTION_TEXT = [
   "GRAPH: a bounded acyclic graph — finite nodes, every path finite. Loops are its ONLY back edge and every Loop must be bounded: an attempt cap plus three exits (pass / retry / capExhausted). No other back edge may exist. A mission usually has several Loops, each of 2-4 nodes; more nodes is not more rigour.",
   "NODES: one node, one decidable responsibility — if you cannot say in one sentence what makes it complete, split it. Split for ATTENTION (a focused context explores deeper), and merge two duties that need the same deep context rather than forcing a split.",
   "BACKEND: a node that needs its own Agent Preset, the ability to ask the user for approval, its own cwd, or a real read-only guarantee MUST be a session node; anything else is a cheaper subagent node. A subagent inherits the driver's composition and permission, so toolFilter narrows availability and is NOT a permission guarantee — never claim read-only for one.",
+  "PRESET: when a node looks like it wants a role-specific preset, ASK THE USER whether to build that preset into the graph. It is their composition, their cost, and their call — do not decide it silently, and do not fall back to a generic node to avoid asking.",
+  "REACHABILITY: a subagent node talks ONLY to the driver. Native delegation authorizes on the direct-parent edge alone, so a session node cannot message a subagent node and a subagent node cannot reach a session node. Route every exchange with a subagent node THROUGH the driver; any other edge describes a message that cannot be sent.",
   "EDGES: an edge is a contract — declare its kind and the payload fields it carries. The receiver must not need the sender's history to understand a handoff.",
   "AUTHORITY: exactly one owner per decision; two owners means none. The evaluator is never the author. The driver owns decisions but never fabricates a quality verdict.",
   "UNATTENDED: after approval and without the user, the run must still reach a definite terminal state. Every attempt has a deadline and an expiry closes it through an existing exit; limits are enforced by the runtime, not written as discipline in a welcome message; exceeding a limit reports an error rather than silently doing less; a gate that needs a human carries a pre-approved fallback or an explicit blocked/failed destination — never a silent hang; a wake-up must rest on a durable fact.",
@@ -66,6 +68,19 @@ ${PRINCIPLES_SECTION_TEXT.split("\n").slice(1).join("\n")}
 1. **Sketch the mission WITH the user.** objective (one sentence), scope, constraints, acceptance criteria, non-goals. Ask for whichever is missing; never assume one the user did not give and that you cannot verify from the repository.
 2. **Turn it into a graph** under the rules above.
 3. **Explain it in natural language and get approval.** The explanation must let the user judge the plan without reading JSON: what each node does, who owns each decision, where the Loops are, why each one stops, where they are needed, and what happens when something fails. Approval is the ONLY hard gate: \`/team approve <draftId>@<revision>\`. Conversational agreement is not approval.
+
+## Reachability: the driver is the hub
+
+A sub-agent child is addressed only by its direct parent. Native delegation authorizes delivery on that adjacency edge alone, and the platform refuses a sub-agent child's session id on its generic Session routing. So:
+
+- a **session node cannot message a sub-agent node** — it is not the parent;
+- a **sub-agent node cannot message a session node** — its only partner is the driver.
+
+Every exchange involving a sub-agent node therefore goes THROUGH the driver: the child reports to the driver, and the driver relays onward. Draw the edges that way, because the other version describes a message that can never be sent and will only show up as a stalled run.
+
+## Presets are the user's call
+
+When a node looks like it wants a role-specific preset, ask the user whether to build that preset into the graph. The preset is their composition and their cost, and the choice between a preset-carrying session node and a cheaper sub-agent node is exactly the trade-off they should make deliberately — not one you settle silently, and not a reason to quietly pick a generic node instead of asking.
 
 ## Why the backend rule is structural
 
