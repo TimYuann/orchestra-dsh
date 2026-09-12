@@ -170,14 +170,30 @@ export interface PreparedLightweightBlueprint {
   readonly receipt: LightweightBlueprintReceipt;
   readonly agentOptions: AgentOptions;
   readonly meta: { cwd?: string; agentPreset: string };
-  readonly setup: (agentCtx: Context) => Promise<AgentSetupCommit>;
+  /**
+   * Composition window callback. DSH's `AgentSetup` contract passes the
+   * prepared, still-unpublished Agent as the SECOND argument, and during
+   * that window it is the only carrier of the child's Session: the sessions
+   * service registers a Session only at publication. `agentCtx.agent` is not
+   * a declared service and reading it throws where the framework does not set
+   * the property, so the agent is taken from the parameter.
+   */
+  readonly setup: (agentCtx: Context, agent: Agent) => Promise<AgentSetupCommit>;
 }
 
 export interface PreparedGovernedBlueprint {
   readonly receipt: GovernedBlueprintReceipt;
   readonly agentOptions: AgentOptions;
   readonly meta: { cwd: string; agentPreset: string };
-  readonly setup: (agentCtx: Context) => Promise<AgentSetupCommit>;
+  /**
+   * Composition window callback. DSH's `AgentSetup` contract passes the
+   * prepared, still-unpublished Agent as the SECOND argument, and during
+   * that window it is the only carrier of the child's Session: the sessions
+   * service registers a Session only at publication. `agentCtx.agent` is not
+   * a declared service and reading it throws where the framework does not set
+   * the property, so the agent is taken from the parameter.
+   */
+  readonly setup: (agentCtx: Context, agent: Agent) => Promise<AgentSetupCommit>;
 }
 
 export type BlueprintErrorCode =
@@ -229,14 +245,26 @@ async function resolvePresetOrThrow<T extends { resolve(id?: string): Promise<{ 
   }
 }
 
-function sessionFrom(ctx: Context, agentCtx: Context, sessionId: string): Session | undefined {
+function sessionFrom(ctx: Context, agentCtx: Context, sessionId: string, prepared?: Agent): Session | undefined {
   // The agent factory runs setup on the prepared (unpublished) agent's ctx, so
-  // the agent — and its session — are already constructed, while the sessions
-  // service only registers the session at publish. Prefer agentCtx.agent.session
-  // (authoritative identity: agent.id === agent.session.id), then fall back to
-  // the sessions service for tests/agentless callers.
-  const agent = (agentCtx as { agent?: { session?: Session } }).agent;
-  if (agent?.session !== undefined && agent.session.id === sessionId) return agent.session;
+  // the agent — and its session — are already constructed while the sessions
+  // service registers the session only at publish. The prepared agent therefore
+  // comes from the setup PARAMETER (`AgentSetup = (agentCtx, agent) => …`).
+  //
+  // `agentCtx.agent` is NOT a declared service on any DSH context (dsh-agent
+  // publishes `ctx.agents`, the registry, not `ctx.agent`), so reading it where
+  // the framework set no such property throws Cordis's "cannot get property
+  // "agent" without inject" instead of yielding undefined. It is still probed
+  // as a fallback for embedders that do set it, but a throw must not escape.
+  const candidates: (Agent | undefined)[] = [prepared];
+  try {
+    candidates.push((agentCtx as { agent?: Agent }).agent);
+  } catch {
+    // This context carries no `agent` property; the parameter or the service decides.
+  }
+  for (const candidate of candidates) {
+    if (candidate?.session !== undefined && candidate.session.id === sessionId) return candidate.session;
+  }
   const scopedSessions = agentCtx.get("sessions");
   const session = scopedSessions?.get(sessionId as never);
   if (session !== undefined) return session;
@@ -500,7 +528,7 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
   };
   const agentOptions: AgentOptions = { provider: model.provider, model: model.model };
 
-  const setup = async (agentCtx: Context): Promise<AgentSetupCommit> => {
+  const setup = async (agentCtx: Context, agent: Agent): Promise<AgentSetupCommit> => {
     const agentPresets = agentCtx.get("agentPresets") ?? presets;
     if (presetStrategy === "file") {
       try {
@@ -523,7 +551,7 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
       },
       assembled: undefined,
     });
-    const session = sessionFrom(ctx, agentCtx, sessionId);
+    const session = sessionFrom(ctx, agentCtx, sessionId, agent);
     if (session === undefined) throw new SessionBlueprintError("session_unavailable", `unpublished session ${sessionId} is not visible during blueprint setup`);
     const permissionService = agentCtx.get("permissionPresets") ?? permissions;
     permissionService.set(session, permissionPreset);
@@ -717,7 +745,7 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
   };
   const agentOptions: AgentOptions = { provider: model.provider, model: model.model };
 
-  const setup = async (agentCtx: Context): Promise<AgentSetupCommit> => {
+  const setup = async (agentCtx: Context, agent: Agent): Promise<AgentSetupCommit> => {
     const agentPresets = agentCtx.get("agentPresets") ?? presets;
     if (presetStrategy === "file") {
       try {
@@ -736,7 +764,7 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
       },
       assembled: undefined,
     });
-    const session = sessionFrom(ctx, agentCtx, input.sessionId);
+    const session = sessionFrom(ctx, agentCtx, input.sessionId, agent);
     if (session === undefined) throw new SessionBlueprintError("session_unavailable", `unpublished governed session ${input.sessionId} is not visible during blueprint setup`);
     const permissionService = agentCtx.get("permissionPresets") ?? permissions;
     permissionService.set(session, permissionPreset);
