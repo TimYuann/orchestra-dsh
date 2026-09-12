@@ -11,7 +11,8 @@ import { homedir } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
 import { mkdir, readFile, readdir, stat as nodeStat, writeFile } from "node:fs/promises";
 import type { FsDirEntry, FsInfo, FsTarget } from "@deepseek-ai/dsh-fs";
-import type { JsonValue } from "@deepseek-ai/dsh-tools";
+// `JsonValue` moved out of `@deepseek-ai/dsh-tools` in DSH 0.1.5-rc.2.
+import type { JsonValue } from "@deepseek-ai/dsh-util-values";
 
 export type TopologySource = "project" | "global" | "bundled";
 

@@ -9,9 +9,9 @@
 import type { Context } from "@deepseek-ai/cordis";
 import { createUserMessage, freezeMessage, MessageId, ReasoningEffortId } from "@deepseek-ai/dsh-llm";
 import type { ContentBlock, MessageSource } from "@deepseek-ai/dsh-llm";
-import { mountPreset, resolveSessionPreset } from "@deepseek-ai/dsh-agent-presets";
+import { agentPresetProjectionDefinition, mountPreset } from "@deepseek-ai/dsh-agent-presets";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
-import type { SessionEvent } from "@deepseek-ai/dsh-session";
+import type { Session, SessionEvent, SessionHeader } from "@deepseek-ai/dsh-session";
 import { readGovernedBlueprint, readLightweightBlueprint } from "./session-blueprint.js";
 
 const SID = (value: string) => value as import("@deepseek-ai/dsh-session").SessionId;
@@ -107,17 +107,17 @@ async function existingReceipt(ctx: Context, targetSessionId: string, messageId:
   if (cached !== undefined) return cached;
   const live = ctx.agents.get(SID(targetSessionId));
   if (live !== undefined) {
-    const recorded = receiptFromEvents(live.session.events, messageId, targetSessionId);
+    const recorded = receiptFromEvents(live.session.snapshotEvents(), messageId, targetSessionId);
     if (recorded !== undefined) return recorded;
     const pending = [...(live.inbox?.nextTurn ?? []), ...(live.inbox?.nextStep ?? [])];
-    if (pending.some((message) => isA2AMessage(message, messageId)) || eventsContainA2AMessage(live.session.events, messageId)) {
+    if (pending.some((message) => isA2AMessage(message, messageId)) || eventsContainA2AMessage(live.session.snapshotEvents(), messageId)) {
       return acceptedReceipt(messageId, targetSessionId, "live_inbox");
     }
   }
   const session = ctx.sessions.get(SID(targetSessionId));
-  const recorded = session === undefined ? undefined : receiptFromEvents(session.events, messageId, targetSessionId);
+  const recorded = session === undefined ? undefined : receiptFromEvents(session.snapshotEvents(), messageId, targetSessionId);
   if (recorded !== undefined) return recorded;
-  if (session !== undefined && eventsContainA2AMessage(session.events, messageId)) {
+  if (session !== undefined && eventsContainA2AMessage(session.snapshotEvents(), messageId)) {
     return acceptedReceipt(messageId, targetSessionId, "durable_inbox");
   }
   try {
@@ -134,6 +134,26 @@ async function existingReceipt(ctx: Context, targetSessionId: string, messageId:
   return undefined;
 }
 
+/**
+ * The preset a persisted session actually runs, folded from its cold snapshot.
+ *
+ * `resolveSessionPreset` was removed from `@deepseek-ai/dsh-agent-presets`
+ * (DSH 0.1.5-rc.2); the same fold is now published as the `agentPreset`
+ * projection definition, whose `init`/`apply` pair is exactly the removed
+ * helper's body. The header supplies the creation-time value and the last
+ * `agent-preset/selected` event wins — reading the header alone would rebuild a
+ * switched session under the composition it was created with.
+ *
+ * @param header - the snapshot's creation header.
+ * @param events - the snapshot's event log, oldest first.
+ * @returns the preset id, or `undefined` when neither source names one.
+ */
+function presetFromSnapshot(header: SessionHeader, events: readonly SessionEvent[]): string | undefined {
+  let state: string | null = agentPresetProjectionDefinition.init(header);
+  for (const event of events) state = agentPresetProjectionDefinition.apply(state, event);
+  return state ?? undefined;
+}
+
 async function tryResume(ctx: Context, sessionId: string): Promise<void> {
   const presets = ctx.get("agentPresets");
   const query = ctx.get("sessionQuery");
@@ -143,7 +163,7 @@ async function tryResume(ctx: Context, sessionId: string): Promise<void> {
   const snapshot = await query.readSession(SID(sessionId));
   const governed = readGovernedBlueprint(snapshot.events);
   const lightweight = readLightweightBlueprint(snapshot.events);
-  const presetId = governed?.agentPreset ?? lightweight?.agentPreset ?? resolveSessionPreset({ header: snapshot.session, events: snapshot.events });
+  const presetId = governed?.agentPreset ?? lightweight?.agentPreset ?? presetFromSnapshot(snapshot.session, snapshot.events);
   if (typeof presetId !== "string" || presetId === "") throw new Error(`a2a transport: session ${sessionId} has no recoverable Agent Preset`);
   const marker = governed ?? lightweight;
   const presetFile = marker?.presetSource === "file" && marker.presetPath !== undefined
@@ -179,11 +199,23 @@ async function tryResume(ctx: Context, sessionId: string): Promise<void> {
   });
 }
 
-function pendingLength(session: { events: readonly { type: string; data: any }[]; header: { seedLength?: number } }, target: string): number {
+/**
+ * Current length of one pending-inbox list, folded from the session's own log.
+ *
+ * DSH 0.1.5-rc.2 replaced `Session.events` with `snapshotEvents()` and moved
+ * the fork-prefix length off the header onto `inheritedEventCount`; the fold's
+ * meaning is unchanged — only events after the inherited prefix moved.
+ *
+ * @param session - the target session whose log is folded.
+ * @param target - the pending list (`next-turn` or `next-step`).
+ * @returns the non-negative pending length in that list.
+ */
+function pendingLength(session: Session, target: string): number {
+  const events = session.snapshotEvents();
   let length = 0;
-  const start = session.header.seedLength ?? 0;
-  for (let index = start; index < session.events.length; index++) {
-    const event = session.events[index];
+  const start = Number(session.inheritedEventCount);
+  for (let index = start; index < events.length; index++) {
+    const event = events[index];
     if (event.type !== "agent/inbox/spliced" || event.data.target !== target) continue;
     length += event.data.inserted.length - (event.data.removedCount ?? 0);
   }
@@ -343,7 +375,7 @@ export async function queryMessageStatus(ctx: Context, messageId: string, target
     const live = ctx.sessions.get(SID(targetSessionId));
     let events: readonly SessionEvent[];
     if (live !== undefined) {
-      events = live.events;
+      events = live.snapshotEvents();
     } else {
       const query = ctx.get("sessionQuery");
       if (query === undefined) return { message_id: messageId, target_session_id: targetSessionId, state: "unknown", evidence: "sessionQuery unavailable" };

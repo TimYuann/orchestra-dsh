@@ -14,7 +14,9 @@ import type { Context } from "@deepseek-ai/cordis";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import type { ContentBlock, MessageSource } from "@deepseek-ai/dsh-llm";
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import type { ToolExecutionInput, JsonValue } from "@deepseek-ai/dsh-tools";
+import type { ToolExecutionInput } from "@deepseek-ai/dsh-tools";
+// `JsonValue` moved out of `@deepseek-ai/dsh-tools` in DSH 0.1.5-rc.2.
+import type { JsonValue } from "@deepseek-ai/dsh-util-values";
 import type { AgentHandle } from "@deepseek-ai/dsh-agent";
 import type {} from "@deepseek-ai/dsh-session";
 import type { SessionId } from "@deepseek-ai/dsh-session";
@@ -882,13 +884,25 @@ function documentToolStatus(
 
 const quarantinedCharterEvents = new WeakMap<object, Set<unknown>>();
 
-function charterEventsOf(session: { events?: readonly unknown[] }): readonly unknown[] {
-  const events = Array.isArray(session.events) ? session.events : [];
+/**
+ * The session's event log, oldest first.
+ *
+ * DSH 0.1.5-rc.2 removed the public `Session.events` property in favour of
+ * `snapshotEvents()`. This accessor prefers the live accessor and still accepts
+ * a plain `{ events }` double, because the charter tests drive these helpers
+ * with a minimal log stub rather than a real Session.
+ *
+ * @param session - a live Session or an equivalent event-log double.
+ * @returns the session's events, or an empty array when it exposes none.
+ */
+function charterEventsOf(session: { snapshotEvents?: () => readonly unknown[]; events?: readonly unknown[] }): readonly unknown[] {
+  const source = typeof session.snapshotEvents === "function" ? session.snapshotEvents() : session.events;
+  const events = Array.isArray(source) ? source : [];
   const quarantined = quarantinedCharterEvents.get(session as object);
   return quarantined === undefined ? events : events.filter((event) => !quarantined.has(event));
 }
 
-export function charterEventsForSession(session: { events?: readonly unknown[] }): readonly unknown[] {
+export function charterEventsForSession(session: { snapshotEvents?: () => readonly unknown[]; events?: readonly unknown[] }): readonly unknown[] {
   return charterEventsOf(session);
 }
 

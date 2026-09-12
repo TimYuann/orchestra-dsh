@@ -13,7 +13,7 @@ import { ReasoningEffortId } from "@deepseek-ai/dsh-llm";
 import { scopeOf } from "@deepseek-ai/dsh-scope";
 import { installModelSelection, type Agent, type AgentOptions, type AgentSetupCommit } from "@deepseek-ai/dsh-agent";
 import { mountPreset } from "@deepseek-ai/dsh-agent-presets";
-import { effectiveSandboxMode, setSandboxMode } from "@deepseek-ai/dsh-sandbox-policy";
+import { setSandboxMode } from "@deepseek-ai/dsh-sandbox-policy";
 import type { SandboxMode } from "@deepseek-ai/dsh-sandbox";
 import type { Session, SessionEvent } from "@deepseek-ai/dsh-session";
 import type { ToolSchema } from "@deepseek-ai/dsh-llm";
@@ -241,6 +241,28 @@ function sessionFrom(ctx: Context, agentCtx: Context, sessionId: string): Sessio
   const session = scopedSessions?.get(sessionId as never);
   if (session !== undefined) return session;
   return ctx.get("sessions")?.get(sessionId as never);
+}
+
+/**
+ * The session's sandbox-mode override, or `undefined` when it carries none —
+ * in which case the deployment default applies.
+ *
+ * DSH 0.1.5-rc.2 removed the `effectiveSandboxMode(events)` export; the
+ * documented read path is now the `sandboxMode` session projection, whose fold
+ * is "the LAST `sandbox/mode` event wins". This helper performs that same fold
+ * directly over the live log, so a blueprint commit can verify what it just
+ * wrote without depending on a projection service being mounted in scope.
+ *
+ * @param session - the session whose override is read.
+ * @returns the winning mode, or `undefined` without an override.
+ */
+function sandboxOverrideOf(session: Session): SandboxMode | undefined {
+  const events = session.snapshotEvents();
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.type === "sandbox/mode") return event.data.mode;
+  }
+  return undefined;
 }
 
 function currentModel(ctx: Context, caller: Agent | undefined): { provider: string; model: string; reasoningEffort?: string } {
@@ -518,7 +540,7 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
         // default) are expected to resolve a composed preset id here.
         const actualPreset = agentPresets.composedPreset(agentCtx);
         if (presetStrategy !== "file" && actualPreset !== agentPreset) throw new SessionBlueprintError("composition_mismatch", `published composition "${String(actualPreset)}" does not match blueprint "${agentPreset}"`);
-        const actualPermission = permissionService.current(session.events);
+        const actualPermission = permissionService.current(session);
         if (actualPermission !== permissionPreset) throw new SessionBlueprintError("permission_mismatch", `published permission "${actualPermission}" does not match blueprint "${permissionPreset}"`);
         const names = visibleToolNames(agentCtx);
         const missing = required.filter((name) => !names.includes(name));
@@ -719,8 +741,8 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
     const permissionService = agentCtx.get("permissionPresets") ?? permissions;
     permissionService.set(session, permissionPreset);
     setSandboxMode(session, sandbox);
-    const effectivePermissionPreset = permissionService.current(session.events);
-    const effectiveSandbox = effectiveSandboxMode(session.events) ?? sandbox;
+    const effectivePermissionPreset = permissionService.current(session);
+    const effectiveSandbox = sandboxOverrideOf(session) ?? sandbox;
     if (effectiveSandbox !== sandbox) throw new SessionBlueprintError("permission_mismatch", `governed sandbox resolved to "${String(effectiveSandbox)}", expected "${sandbox}"`);
     receipt.effectivePermissionPreset = effectivePermissionPreset;
     if (input.title !== undefined && input.title !== "") {
@@ -760,9 +782,9 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
         // records no standing parent, so composedPreset is undefined there.
         const actualPreset = agentPresets.composedPreset(agentCtx);
         if (presetStrategy !== "file" && actualPreset !== agentPreset) throw new SessionBlueprintError("composition_mismatch", `published governed composition "${String(actualPreset)}" does not match blueprint "${agentPreset}"`);
-        const actualPermission = permissionService.current(session.events);
+        const actualPermission = permissionService.current(session);
         if (actualPermission !== effectivePermissionPreset) throw new SessionBlueprintError("permission_mismatch", `published governed permission "${actualPermission}" does not match blueprint "${effectivePermissionPreset}"`);
-        const actualSandbox = effectiveSandboxMode(session.events);
+        const actualSandbox = sandboxOverrideOf(session);
         if (actualSandbox !== sandbox) throw new SessionBlueprintError("permission_mismatch", `published governed sandbox "${String(actualSandbox)}" does not match blueprint "${sandbox}"`);
         const names = visibleToolNames(agentCtx);
         const legacyOnly = capabilities.legacy.length > 0 && input.compositionTools === undefined && input.orchestraTools === undefined;
