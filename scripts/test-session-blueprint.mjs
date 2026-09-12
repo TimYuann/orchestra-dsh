@@ -11,6 +11,10 @@ function makeRuntime(options = {}) {
   const events = [];
   const session = {
     events,
+    // DSH 0.1.5-rc.2 Session surface: `snapshotEvents()` replaced `.events`.
+    snapshotEvents() {
+      return events;
+    },
     append(type, data) {
       events.push({ type, data });
       return { type, data };
@@ -52,7 +56,10 @@ function makeRuntime(options = {}) {
       calls.permissions.push(name);
       target.append("permission/preset", { preset: name });
     },
-    current(log) {
+    // DSH 0.1.5-rc.2: `PermissionPresets.current` takes the Session itself
+    // (it read a bare event log before), so the stub folds the session's log.
+    current(session) {
+      const log = session.snapshotEvents();
       const event = [...log].reverse().find((entry) => entry.type === "permission/preset");
       return event?.data.preset ?? this.defaultPreset;
     },

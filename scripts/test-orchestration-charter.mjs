@@ -106,6 +106,10 @@ test("charter fold fails loud for malformed, out-of-order, and duplicate authori
 test("/team approve is a direct user-command seam with flush and no natural-language bypass", async () => {
   const session = {
     events: [],
+    // DSH 0.1.5-rc.2 Session surface: `snapshotEvents()` replaced `.events`.
+    snapshotEvents() {
+      return this.events;
+    },
     append(type, data) {
       this.events.push({ type, data });
     },

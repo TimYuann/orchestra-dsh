@@ -89,7 +89,9 @@ function makeRuntime(options = {}) {
     set(session, name) {
       session.append("permission/preset", { preset: name });
     },
-    current(log) {
+    // DSH 0.1.5-rc.2: `PermissionPresets.current` takes the Session itself.
+    current(session) {
+      const log = session.snapshotEvents();
       const preset = [...log].reverse().find((entry) => entry.type === "permission/preset")?.data.preset;
       const sandbox = [...log].reverse().find((entry) => entry.type === "sandbox/mode")?.data.mode;
       if (preset === undefined) return "custom";
@@ -108,6 +110,11 @@ function makeRuntime(options = {}) {
       id,
       events: [],
       header: { cwd },
+      // DSH 0.1.5-rc.2 Session surface.
+      inheritedEventCount: 0,
+      snapshotEvents() {
+        return this.events;
+      },
       append(type, data) {
         this.events.push({ type, data, seq: this.events.length, time: Date.now() });
       },
@@ -387,7 +394,7 @@ test("Governed Blueprint applies explicit model over topology runtime and record
   assert.equal(blueprint.receipt.provider, "explicit-provider");
   assert.equal(blueprint.receipt.model, "explicit-model");
   assert.equal(blueprint.receipt.sandbox, "read-only");
-  runtime.sessions.set("orchestra-team-test-reviewer", { id: "orchestra-team-test-reviewer", events: [], header: { cwd }, append(type, data) { this.events.push({ type, data }); } });
+  runtime.sessions.set("orchestra-team-test-reviewer", { id: "orchestra-team-test-reviewer", events: [], header: { cwd }, snapshotEvents() { return this.events; }, append(type, data) { this.events.push({ type, data }); } });
   const commit = await blueprint.setup({ ...runtime.context, composedPreset: undefined, get: (name) => name === "agentPresets" ? runtime.presets : name === "permissionPresets" ? runtime.permissions : runtime.context.get(name) });
   commit.commit();
   assert.equal(blueprint.receipt.effectivePermissionPreset, "custom");
@@ -398,7 +405,7 @@ test("Governed Blueprint applies explicit model over topology runtime and record
 test("Governed required tool failure rolls setup back before publication", async () => {
   const runtime = makeRuntime({ tools: ["write"] });
   const blueprint = await prepared(runtime, "missing-tool");
-  runtime.sessions.set(blueprint.receipt.sessionId, { id: blueprint.receipt.sessionId, events: [], header: { cwd }, append(type, data) { this.events.push({ type, data }); } });
+  runtime.sessions.set(blueprint.receipt.sessionId, { id: blueprint.receipt.sessionId, events: [], header: { cwd }, snapshotEvents() { return this.events; }, append(type, data) { this.events.push({ type, data }); } });
   await assert.rejects(
     async () => {
       const commit = await blueprint.setup({ ...runtime.context, composedPreset: undefined, get: (name) => name === "agentPresets" ? runtime.presets : name === "permissionPresets" ? runtime.permissions : runtime.context.get(name), on: () => () => {} });

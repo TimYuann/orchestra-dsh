@@ -47,6 +47,10 @@ function blueprintRuntime(spec, missing = []) {
   const session = {
     id: "role-session",
     events,
+    // DSH 0.1.5-rc.2 Session surface: `snapshotEvents()` replaced `.events`.
+    snapshotEvents() {
+      return events;
+    },
     append(type, data) {
       events.push({ type, data });
     },
@@ -78,8 +82,9 @@ function blueprintRuntime(spec, missing = []) {
     set(target, name) {
       target.append("permission/preset", { preset: name });
     },
-    current(log) {
-      const sandbox = [...log].reverse().find((event) => event.type === "sandbox/mode")?.data?.mode;
+    // DSH 0.1.5-rc.2: `PermissionPresets.current` takes the Session itself.
+    current(session) {
+      const sandbox = [...session.snapshotEvents()].reverse().find((event) => event.type === "sandbox/mode")?.data?.mode;
       return sandbox !== undefined && sandbox !== "workspace-write" ? "custom" : "workspace-write";
     },
   };
@@ -119,6 +124,10 @@ function blueprintRuntime(spec, missing = []) {
       const extra = {
         id,
         events: [],
+        // DSH 0.1.5-rc.2 Session surface.
+        snapshotEvents() {
+          return this.events;
+        },
         append(type, data) {
           this.events.push({ type, data });
         },

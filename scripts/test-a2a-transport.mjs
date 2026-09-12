@@ -5,11 +5,18 @@ import { listThreads, sendRawA2A } from "../lib/a2a.js";
 import { createGovernedRoleAddressResolver, GovernedAddressError } from "../lib/orchestra-address.js";
 import { sendGovernedRole } from "../lib/orchestra.js";
 
+// Doubles model the DSH 0.1.5-rc.2 Session surface: `snapshotEvents()` replaces
+// the removed `.events` property, and `inheritedEventCount` replaces
+// `header.seedLength` as the fork-inherited prefix length.
 function session(id, cwd = "/caller") {
   return {
     id,
-    header: { id, cwd, seedLength: 0, agentPreset: "preset" },
+    header: { id, cwd, agentPreset: "preset" },
+    inheritedEventCount: 0,
     events: [],
+    snapshotEvents() {
+      return this.events;
+    },
     append(type, data) {
       this.events.push({ type, data, seq: this.events.length, time: Date.now() });
     },
