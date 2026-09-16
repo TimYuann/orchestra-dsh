@@ -94,9 +94,10 @@ ls node_modules | grep '^@deepseek-ai'   # 期望无输出（*.dup-bak 遗留文
 | P2 | `rolePrompt()`（v0.4 角色预设指令）仍写 "use `orchestra_handoff` for typed milestones" | 同上，且这五个拓扑挂的就是这些预设 | 改为 `a2a_send` |
 | P3 | 模型可见描述提到已删工具：`orchestra_dismiss` 提 `orchestra_spawn`、`orchestra_topologies` 提 `orchestra_spawn`/"fails closed in 4B"；`orchestra_draft` 声称草稿存在 "Driver Session 的 append-only events"（ADR-0002 已改为文件） | 直接误导 driver 的事实与工具选择 | 全部按实现改写 |
 | P4 | `README.md`（随包发布 + GitHub 首页）仍在宣传 `orchestra_spawn` / `orchestra_freeze` / `orchestra_apply_amendment` 与整套 v0.4 graph 工具，路线图还标 0.4.1 未发布 | 用户按 README 调工具必失败 | 工具面按真实注册重写，路线图补 v0.5.0 |
-| P5 | 测试断言本身把 P1 的陈旧文案写死了（`test-cp8-notices.mjs`） | 缺陷被测试锁死 | 断言改为 v0.5 交接纪律，并新增"任何内置拓扑 welcome 都不得出现已删工具名"的守卫 |
+| P1（测试侧） | 测试断言本身把 P1 的陈旧文案写死了（`test-cp8-notices.mjs:205` 要求 welcome 含 `orchestra_handoff`） | 缺陷被测试锁死，改文案会让测试变红 | 断言改为 v0.5 交接纪律（要求 `a2a_send`），并新增"任何内置拓扑 welcome 都不得出现已删工具名"的守卫 |
+| P5 | 内部文档口径漂移：`STATE.md` 正文仍写 v0.4.x（而头部写 v0.5.0）；`DSH-INTEGRATION.md` 让 dev 实例跑 4601（ADR-0009 已改 4600）；v0.5 规格书说内部账本在 `.orchestra/`、外部资产进 `docs/receipts/`，实现是运行时状态在 `orchestra/`（只有配置在 `.orchestra/`）；缺 v0.5.0 发布说明 | 下一个接手的 agent 会照着错的口径干活 | 两文档按实况同步（本轮已含 v0.5.0 同步基线），并补本文件；规格书与实现的差异在此记录，不改实现 |
 
-> 这五条的共同点：**工具被删了，但教模型使用工具的文本没删**。新增的守卫守卫的是这一整类问题，而不是某一条。
+> P1–P3 的共同点：**工具被删了，但教模型使用工具的文本没删**。新增的守卫守卫的是这一整类问题，而不是某一条。
 
 ---
 
@@ -106,7 +107,7 @@ ls node_modules | grep '^@deepseek-ai'   # 期望无输出（*.dup-bak 遗留文
 2. **浏览器验证 5 项清单**（`UPDATE-v0.4.0.md` §8：draft 表格卡片、driver 提醒、team graph 摘要行、welcome 纪律句、投递不可达不炸工具）本轮未重跑。
 3. **受治理全流程的真实 multi-session E2E 仍需用户本人批准一次**（结构性约束，见 §5）：`/team approve` 与"白话批准"都只认真实用户回合，模型侧没有等价工具。**不要**用浏览器自动化替用户批准——那等于 agent 自我批准，绕开了产品唯一的硬控制点。
 4. **headless profile** 未安装 v0.5.0。
-5. **仅在两处安装并验证**：`dev` profile（4600，见 `DSH-INTEGRATION.md` 的 v0.5.0 同步基线）与 `web` profile（4599）。其它 profile 未动。
+5. **4599 的安装尚未生效**：`web` profile 已装好并通过三件套 + 整 profile 冷启动验证（把 web profile 起在 4603，`orchestra-dsh/client.js` 与 `dsh-trinity/client.js` 同时出现在插件清单），但**正在跑的 4599 进程仍是旧组合**——bundle 行只在 boot 时读取，必须重启 `dsh --profile web --port 4599` 才会加载 v0.5.0。重启后请在新会话里跑一次 `orchestra_topologies` / `a2a_list` 完成行为层验收。详见 `DSH-INTEGRATION.md` 的「2026-09-16 v0.5.0 同步基线」。
 
 ---
 
