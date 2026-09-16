@@ -53,6 +53,14 @@
     "topology"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TimYuann/orchestra-dsh.git"
+  },
+  "homepage": "https://github.com/TimYuann/orchestra-dsh#readme",
+  "bugs": {
+    "url": "https://github.com/TimYuann/orchestra-dsh/issues"
+  },
   "dependencies": {
     "js-yaml": "^4.1.0"
   },
