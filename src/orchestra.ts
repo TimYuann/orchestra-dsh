@@ -226,7 +226,7 @@ export type MilestoneNoticeKind = "handoff" | "verdict" | "report" | "gate" | "c
 
 /**
  * One-line driver milestone notice text. The notice is a trigger, not a state
- * source: the driver reports progress from orchestra_team/orchestra_graph, so
+ * source: the driver reports progress from orchestra_team, so
  * the text carries only node-level facts — never payload content or secrets.
  */
 export function milestoneNotice(teamId: string, kind: MilestoneNoticeKind, detail: string): string {
@@ -902,7 +902,7 @@ function prepareSubagentRolePlan(
     throw new Error(`governed role "${roleId}" subagent model reasoningEffort requires provider and model`);
   }
   // The topology role is the durable declaration; a caller-supplied override
-  // (orchestra_spawn) wins for one provisioning only, exactly like presetId.
+  // wins for one provisioning only, exactly like presetId.
   const toolFilter = options.toolFilter ?? options.role.toolFilter;
   if (toolFilter !== undefined) {
     for (const field of ["allow", "deny"] as const) {
@@ -1366,12 +1366,12 @@ function documentReadForTeam(team: TeamState): OrchestrationDocument | undefined
 export function assertSpawnableTeamDocument(state: ActiveTeamRead): void {
   throwIfBlocked("spawn a role", state);
   if (state.kind === "ready" && state.team.document === undefined) {
-    throw new Error("cannot spawn a role: legacy_missing (run orchestra_reconcile first; spawning does not initialize a legacy document)");
+    throw new Error("cannot spawn a role: legacy_missing (spawning does not initialize a legacy document)");
   }
 }
 
 export function rejectDirectGovernedSpawn(): void {
-  throw new Error("approval_required: orchestra_spawn cannot mutate a Governed roster directly; use orchestra_draft → the user's approval (a plain yes) → orchestra_freeze → orchestra_apply_amendment");
+  throw new Error("approval_required: a governed roster cannot be mutated directly; change it through orchestra_draft → the user's approval (a plain yes) → orchestra_create");
 }
 
 function documentToolStatus(
@@ -3166,7 +3166,7 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "orchestra_draft",
       description:
-        "Driver-only Charter Draft command. Creates revision 1 or appends a new revision using expectedRevision. The Draft is stored in the current Driver Session's append-only events; it is not a Team or approval. For an active Team, only the current controller/semantic writer may create an amendment Draft.",
+        "Driver-only Charter Draft command. Creates revision 1 or appends a new revision using expectedRevision. The Draft is recorded in <cwd>/orchestra/charter/records.json (ADR-0002: plugin records live in files, never in Session events); it is not a Team or approval. For an active Team, only the current controller/semantic writer may create an amendment Draft.",
       parameters: {
         draftId: { type: "string", description: "Existing draft id to revise; omit to create a new draft." },
         expectedRevision: { type: "number", description: "Required when revising an existing draft; stale values fail loud." },
@@ -3232,7 +3232,7 @@ export function apply(ctx: Context): void {
         if (observation.kind === "ready") {
           const team = observation.team;
           const document = documentReadForTeam(team);
-          if (document === undefined) throw new Error("cannot create an amendment Draft: legacy_missing (run orchestra_reconcile first)");
+          if (document === undefined) throw new Error("cannot create an amendment Draft: legacy_missing (this team has no orchestration document)");
           if (exec.agent.id !== team.controllerSessionId || exec.agent.id !== document.semanticWriterSessionId) {
             throw new Error("cannot create a charter amendment: permission_denied (current controller/semantic writer required)");
           }
@@ -3710,7 +3710,7 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "orchestra_dismiss",
       description:
-        "Close the current orchestra instance: publish an immutable archive, CAS the active state into an archived marker, then notify every live role session that the team is archived (stop waiting for new tasks). Role sessions are independent assets and stay alive. Requires an instance created by orchestra_create or orchestra_spawn in this working directory.",
+        "Close the current orchestra instance: publish an immutable archive, CAS the active state into an archived marker, then notify every live role session that the team is archived (stop waiting for new tasks). Role sessions are independent assets and stay alive. Requires an instance created by orchestra_create in this working directory.",
       parameters: {},
       output: {
         schema: {
@@ -3873,7 +3873,7 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "orchestra_topologies",
       description:
-        "List available topology templates (spec §4.1): project templates under <cwd>/.orchestra/topologies/*.json, global templates under ~/.dsh/orchestra/topologies/*.json, plus the bundled fallback (duo/trio/oracle/four-role-dev). Each entry shows source, controller, protocol (ownership/routes/completion), and roles. Use a snapshot in orchestra_draft before approval/freeze; direct orchestra_spawn roster mutation is approval-gated and fails closed in 4B.",
+        "List available topology templates (spec §4.1): project templates under <cwd>/.orchestra/topologies/*.json, global templates under ~/.dsh/orchestra/topologies/*.json, plus the bundled fallback (duo/trio/oracle/four-role-dev). Each entry shows source, controller, protocol (ownership/routes/completion), and roles. Snapshot one in orchestra_draft before the user approves; roster mutation is refused outright — changes go through orchestra_draft → the user's approval → orchestra_create.",
       parameters: {},
       output: {
         schema: {

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { BUILTIN_TOPOLOGIES } from "../lib/orchestra-topology.js";
+import { REMOVED_ORCHESTRA_TOOLS } from "../lib/session-blueprint.js";
 import { milestoneNotice, notifyDriverMilestone, renderDraftBlueprintTable } from "../lib/orchestra.js";
 
 function team(overrides = {}) {
@@ -202,7 +203,22 @@ test("all five task topologies carry the driver-progress reporting discipline in
     assert.ok(topology, `${id} must be bundled`);
     for (const role of topology.roles) {
       assert.ok(role.welcome !== undefined && role.welcome.includes(sentence), `${id}/${role.id} welcome must carry the driver-progress discipline`);
-      assert.ok(role.welcome.includes("a2a_reply") && role.welcome.includes("orchestra_handoff"), `${id}/${role.id} welcome must keep the reply/handoff discipline`);
+      assert.ok(role.welcome.includes("a2a_reply") && role.welcome.includes("a2a_send"), `${id}/${role.id} welcome must keep the reply/handoff discipline`);
+    }
+  }
+});
+
+// v0.5 regression guard: slimming deleted 17 tools, and the same commit trimmed the
+// orchestraTools allowlists but left the welcome prose naming them. A role that is
+// told to call a tool that no longer exists burns a turn on a guaranteed failure.
+test("no built-in topology welcome names a removed orchestra tool", () => {
+  const banned = [...REMOVED_ORCHESTRA_TOOLS, "orchestra_spawn"];
+  for (const topology of BUILTIN_TOPOLOGIES) {
+    for (const role of topology.roles) {
+      if (role.welcome === undefined) continue;
+      for (const tool of banned) {
+        assert.ok(!role.welcome.includes(tool), `${topology.id}/${role.id} welcome still names removed tool ${tool}`);
+      }
     }
   }
 });

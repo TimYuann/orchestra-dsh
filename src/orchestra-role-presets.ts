@@ -151,7 +151,7 @@ function rolePrompt(role: RolePresetRole, purpose: string, write: boolean, baseS
     "Do not claim another role's verdict, user approval or closure decision.",
     "Handoff payload fields: " + handoff.requiredPayloadFields.join(", ") + ".",
     "Required evidence kinds: " + handoff.requiredEvidenceKinds.join(", ") + ".",
-    "Use orchestra_report for durable evidence and orchestra_handoff for typed milestones.",
+    "Use orchestra_report for durable evidence and a2a_send for typed handoffs to the next node.",
   ].join(" ");
 }
 
