@@ -445,14 +445,14 @@ test("draft per-role blueprint pre-parsing mirrors create-time resolution facts 
   assert.equal(implementer.model, "default-model");
   assert.equal(implementer.reasoningEffort, "medium");
   assert.deepEqual(implementer.compositionTools, ["tool-bash", "tool-fs", "tool-fs-search"]);
-  assert.deepEqual(implementer.orchestraTools, ["orchestra_report", "orchestra_handoff"]);
+  assert.deepEqual(implementer.orchestraTools, ["orchestra_report"]);
 
   // catalog preset without topology tool lists: falls back to the catalog spec
   const reviewer = await preparseDraftRoleFacts(ctx, "/tmp/fd", { id: "reviewer", name: "Reviewer", preset: "orchestra-v04-reviewer-v1", sandbox: "read-only" });
   assert.equal(reviewer.sandbox, "read-only");
   assert.equal(reviewer.effectivePermissionPreset, "custom");
   assert.deepEqual(reviewer.compositionTools, ["tool-bash", "tool-fs", "tool-fs-search"]);
-  assert.deepEqual(reviewer.orchestraTools, ["orchestra_report", "orchestra_verdict", "orchestra_handoff"]);
+  assert.deepEqual(reviewer.orchestraTools, ["orchestra_report"]);
 
   // topology runtime override pins provider/model/reasoningEffort through the same seam
   const overridden = await preparseDraftRoleFacts(ctx, "/tmp/fd", { id: "verifier", name: "Verifier", preset: "orchestra-v04-verifier-v1", sandbox: "read-only", runtime: { provider: "p", model: "m", reasoningEffort: "low" } });

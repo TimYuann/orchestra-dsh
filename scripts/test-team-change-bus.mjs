@@ -205,3 +205,17 @@ test("a write to another workspace's Team does not wake this waiter", async () =
   await wrapped.replace({ cwd: "/tmp/mine", team: team("t-mine", 1) }, team("t-mine", 2), {});
   assert.equal((await mine).changed, true);
 });
+
+test("an in-place mutated team object still wakes a waiter", async () => {
+  const bus = createTeamChangeBus();
+  const wrapped = withChangeSignal(fakeStore(), bus);
+  const teamObj = team("t1", 1, { reports: [] });
+  const waiting = bus.wait({ timeoutMs: 5_000, baselineRevision: 1 });
+  teamObj.reports.push({ reportId: "r1" });
+  // Snapshot has the mutated object because caller mutated before replace()
+  await wrapped.replace({ team: teamObj }, teamObj, {});
+  const outcome = await waiting;
+  assert.equal(outcome.changed, true);
+  assert.equal(outcome.timedOut, false);
+});
+

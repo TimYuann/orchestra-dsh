@@ -27,9 +27,11 @@ import type {} from "@deepseek-ai/dsh-sandbox-policy";
 import type {} from "@deepseek-ai/dsh-permission-presets";
 import type {} from "@deepseek-ai/dsh-system-prompt";
 import type {} from "@deepseek-ai/dsh-commands";
-import { createSession, installModelOverride, deliverMessage, readDeliveryReceipt } from "./a2a.js";
+import { createSession, installModelOverride, deliverMessage, readDeliveryReceipt, transportStores } from "./a2a.js";
+import { receiptStoreFor } from "./receipt-store.js";
+import { charterRecordStoreFor } from "./charter-store.js";
 import type { ResolvedPresetFile } from "./a2a.js";
-import { hostToolNamesForPreflight, prepareGovernedBlueprint, preflightGovernedRequiredTools, resolveDraftRoleModel, SessionBlueprintError } from "./session-blueprint.js";
+import { hostToolNamesForPreflight, prepareGovernedBlueprint, preflightGovernedRequiredTools, resolveDraftRoleModel, SessionBlueprintError, REMOVED_ORCHESTRA_TOOLS } from "./session-blueprint.js";
 import type { GovernedBlueprintReceipt, PreparedGovernedBlueprint } from "./session-blueprint.js";
 import {
   ensureBuiltinRolePresetArtifacts,
@@ -111,6 +113,7 @@ import {
   startLoop,
   sweepBoundedRun,
   nodeStall,
+  GATE_DECISION_EVENT,
 } from "./orchestra-graph.js";
 import type { GraphCommandResult, GraphRuntimeState, LoopSummary, NodeStall } from "./orchestra-graph.js";
 import { createTeamChangeBus, withChangeSignal } from "./team-change-bus.js";
@@ -134,9 +137,9 @@ const SID = (value: string): SessionId => value as SessionId;
  * busy poll, and a maximum keeps one call from outliving the turn budget that
  * has to notice the run is not advancing.
  */
-const MIN_WAIT_TIMEOUT_MS = 10_000;
-const MAX_WAIT_TIMEOUT_MS = 3_600_000;
-const DEFAULT_WAIT_TIMEOUT_MS = 60_000;
+export const MIN_WAIT_TIMEOUT_MS = 10_000;
+export const MAX_WAIT_TIMEOUT_MS = 3_600_000;
+export const DEFAULT_WAIT_TIMEOUT_MS = 20 * 60 * 1000; // 20 minutes stall heartbeat (1,200,000 ms)
 
 /** DSH home directory (env override wins; default ~/.dsh). */
 function dshHome(): string {
@@ -279,6 +282,27 @@ export interface MilestoneNoticeOptions {
  *   delivery function (the historical signature).
  * @returns nothing; failures are recorded or warned, never raised.
  */
+/**
+ * Durable sinks for a milestone notice, or nothing if we cannot scope them.
+ *
+ * A notice is best-effort BY CONTRACT: it must never fail the tool that
+ * triggered it, and the caller may hand us a context with no agent registry at
+ * all (tests do exactly that, and some compositions omit the service). Delivering
+ * without the sinks is worse than ideal — a cold driver would resume without its
+ * composition marker — but refusing to deliver, or throwing while merely
+ * BUILDING the options, is strictly worse: the notice is how a driver learns a
+ * node finished.
+ */
+function milestoneStores(ctx: Context, actorSessionId: string) {
+  try {
+    const agents = ctx.get("agents");
+    const actor = agents === undefined ? undefined : agents.get(actorSessionId as never);
+    return transportStores(ctx, actor?.session.header.cwd);
+  } catch {
+    return {};
+  }
+}
+
 export async function notifyDriverMilestone(
   ctx: Context,
   team: TeamState,
@@ -292,7 +316,15 @@ export async function notifyDriverMilestone(
   const deliver = resolved.deliver ?? deliverMessage;
   const text = milestoneNotice(team.teamId, kind, detail);
   try {
-    await deliver(ctx, actorSessionId, team.controllerSessionId, [{ type: "text", text }], { wake: true, idempotencyKey: `milestone-${randomUUID()}` });
+    // No idempotency key: this key was a fresh randomUUID on every call, so it
+    // never deduplicated anything — it only forced an acceptance record (a file,
+    // in the durable store) for each best-effort notice. A notice whose whole
+    // contract is "never fail the tool that triggered it" should not create
+    // durable state it cannot honour.
+    await deliver(ctx, actorSessionId, team.controllerSessionId, [{ type: "text", text }], {
+      wake: true,
+      ...milestoneStores(ctx, actorSessionId),
+    });
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     if (resolved.recordFailure !== undefined) {
@@ -1150,7 +1182,7 @@ export async function preparseDraftRoleFacts(ctx: Context, cwd: string, role: Ro
     model: model.model,
     ...(model.reasoningEffort === undefined ? {} : { reasoningEffort: model.reasoningEffort }),
     compositionTools: compositionTools ?? [],
-    orchestraTools: orchestraTools ?? [],
+    orchestraTools: (orchestraTools ?? []).filter((name) => !REMOVED_ORCHESTRA_TOOLS.has(name)),
   };
 }
 
@@ -1339,7 +1371,7 @@ export function assertSpawnableTeamDocument(state: ActiveTeamRead): void {
 }
 
 export function rejectDirectGovernedSpawn(): void {
-  throw new Error("approval_required: orchestra_spawn cannot mutate a Governed roster directly; use orchestra_draft → /team approve <draftId>@<revision> → orchestra_freeze → orchestra_apply_amendment");
+  throw new Error("approval_required: orchestra_spawn cannot mutate a Governed roster directly; use orchestra_draft → the user's approval (a plain yes) → orchestra_freeze → orchestra_apply_amendment");
 }
 
 function documentToolStatus(
@@ -1391,37 +1423,26 @@ function documentToolStatus(
   };
 }
 
-const quarantinedCharterEvents = new WeakMap<object, Set<unknown>>();
-
 /**
- * The session's event log, oldest first.
+ * The charter record list, oldest first.
  *
- * DSH 0.1.5-rc.2 removed the public `Session.events` property in favour of
- * `snapshotEvents()`. This accessor prefers the live accessor and still accepts
- * a plain `{ events }` double, because the charter tests drive these helpers
- * with a minimal log stub rather than a real Session.
+ * These records used to be Session events on the driver's log, folded back out
+ * of it on every read. They are a file now (`docs/adr/0002`), which is also the
+ * authority change the user approved: the charter is a document, and the driver
+ * session merely operates it — so a driver that dies does not take the charter
+ * with it, and a driver log stays readable by the rest of DSH.
  *
- * @param session - a live Session or an equivalent event-log double.
- * @returns the session's events, or an empty array when it exposes none.
+ * The read is async because it hits the filesystem; every caller was already in
+ * an async command handler.
+ *
+ * @param ctx - host context.
+ * @param session - the calling Session, used only for its working directory.
+ * @returns the stored charter records, or an empty list when none exist yet.
  */
-function charterEventsOf(session: { snapshotEvents?: () => readonly unknown[]; events?: readonly unknown[] }): readonly unknown[] {
-  const source = typeof session.snapshotEvents === "function" ? session.snapshotEvents() : session.events;
-  const events = Array.isArray(source) ? source : [];
-  const quarantined = quarantinedCharterEvents.get(session as object);
-  return quarantined === undefined ? events : events.filter((event) => !quarantined.has(event));
-}
-
-export function charterEventsForSession(session: { snapshotEvents?: () => readonly unknown[]; events?: readonly unknown[] }): readonly unknown[] {
-  return charterEventsOf(session);
-}
-
-function quarantineCharterEvent(session: object, event: unknown): void {
-  let quarantined = quarantinedCharterEvents.get(session);
-  if (quarantined === undefined) {
-    quarantined = new Set<unknown>();
-    quarantinedCharterEvents.set(session, quarantined);
-  }
-  quarantined.add(event);
+async function charterEventsOf(ctx: Context, session: { header?: { cwd?: string } }): Promise<readonly unknown[]> {
+  const cwd = session?.header?.cwd;
+  if (cwd === undefined || cwd === "") throw new Error("cannot read the charter records: the calling session has no working directory");
+  return charterRecordStoreFor(ctx, cwd).read();
 }
 
 function charterCommandError(action: string, error: unknown): Error {
@@ -1429,18 +1450,121 @@ function charterCommandError(action: string, error: unknown): Error {
   return new Error(`cannot ${action}: ${error instanceof Error ? error.message : String(error)}`);
 }
 
-async function appendDurableCharterEvent(ctx: Context, session: any, event: CharterEvent): Promise<void> {
-  const beforeLength = Array.isArray(session.events) ? session.events.length : 0;
-  const appended: unknown = session.append(event.type, event.data);
-  const inserted = Array.isArray(session.events) ? session.events[beforeLength] : undefined;
+/**
+ * Record one charter fact.
+ *
+ * The old implementation appended to the session log, flushed it, and — if the
+ * flush was refused — "quarantined" the appended event so the fold would stop
+ * seeing it. That whole dance existed to make an append into someone else's log
+ * look atomic. A guarded file append either lands or reports that it did not, so
+ * there is nothing left to quarantine.
+ */
+async function appendDurableCharterEvent(ctx: Context, session: { header?: { cwd?: string } }, event: CharterEvent): Promise<void> {
+  const cwd = session?.header?.cwd;
+  if (cwd === undefined || cwd === "") throw new Error(`cannot record ${event.type}: the calling session has no working directory`);
+  const policy = ctx.sandboxPolicy?.resolve?.({ session: session as any, mode: "workspace-write" });
+  await charterRecordStoreFor(ctx, cwd).append(event, { policy });
+}
+
+/**
+ * Words that count as a yes, and NOTHING else does.
+ *
+ * The user asked for approval to be one plain sentence instead of a slash
+ * command ("直接让用户回复一句'启动'就行了。打 slash 其实很麻烦"), which means this
+ * set is the new hard gate. Two guards keep it from becoming a loophole:
+ *
+ * - the reply must be SHORT (see {@link AFFIRMATIVE_MAX_LENGTH}). A long message
+ *   that merely contains 可以 is a message about something else, and treating it
+ *   as consent is how a gate turns into a formality.
+ * - it must be the WHOLE message, not a substring of one.
+ */
+const AFFIRMATIVE_REPLY = /^(启动|开始|开工|开始吧|可以|行|好|好的|同意|批准|确认|没问题|ok|okay|go|approve|yes)[\s!！。.，,~～]*$/i;
+const AFFIRMATIVE_MAX_LENGTH = 40;
+
+/** The plain text of one user message, or "" when it carries none. */
+function userMessageText(data: unknown): string {
+  const content = (data as { content?: unknown } | null)?.content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((block): block is { type: string; text: string } => typeof block === "object" && block !== null && (block as { type?: unknown }).type === "text" && typeof (block as { text?: unknown }).text === "string")
+    .map((block) => block.text)
+    .join("\n")
+    .trim();
+}
+
+interface RecordApprovalResult {
+  changed: boolean;
+  digest: string;
+  ref: string;
+  approvalRef: string;
+}
+
+/**
+ * Record one user approval of a charter draft revision.
+ *
+ * Shared by the `/team approve <draftId>@<revision>` command and by a plain
+ * "启动" reply, so both paths produce a byte-identical record — the difference
+ * between them is only HOW the user said yes, never WHAT gets recorded.
+ *
+ * @param provenanceRef - a durable reference to whatever carried the consent
+ *   (a command id, or `message:<sessionId>@<seq>` for a chat reply). It is stored
+ *   as the approval's `commandId`, so the record still answers "what exactly did
+ *   the user approve, and where is that act?".
+ */
+async function recordCharterApproval(
+  ctx: Context,
+  session: { header?: { cwd?: string } },
+  input: {
+    draftId: string;
+    revision: number;
+    approvingSessionId: string;
+    provenanceRef: string;
+    approvedAt: number;
+    /** How the user said yes; recorded verbatim in the approval record. */
+    source: "user-command" | "user-reply";
+  },
+): Promise<RecordApprovalResult> {
+  const events = await charterEventsOf(ctx, session);
+  let command;
   try {
-    const accepted = await ctx.sessions.flush(session as any);
-    if (!accepted) throw new Error(`charter event ${event.type} was appended but did not receive durable flush acceptance`);
+    command = prepareApprovalEvent(events, {
+      draftId: input.draftId,
+      revision: input.revision,
+      commandId: input.provenanceRef,
+      approvingSessionId: input.approvingSessionId,
+      approvedAt: input.approvedAt,
+      source: input.source,
+    });
   } catch (error) {
-    if (appended !== undefined) quarantineCharterEvent(session, appended);
-    if (inserted !== undefined) quarantineCharterEvent(session, inserted);
-    throw error;
+    throw charterCommandError("approve the charter draft", error);
   }
+  if (command.kind === "changed") await appendDurableCharterEvent(ctx, session, command.event);
+  return {
+    changed: command.kind === "changed",
+    digest: command.value.digest,
+    ref: frozenRef(input.draftId, input.revision, command.value.digest),
+    approvalRef: command.value.approvalRef,
+  };
+}
+
+/**
+ * Wake the driver after an approval.
+ *
+ * The approval is durable, but the driver's turn ended when it handed control
+ * back to the user — without a followup it waits forever for a signal that never
+ * comes (4600 实测发现). Single plugin-source notice, same shape as the /team
+ * marker (never split deliveries).
+ */
+function approvalNotice(draftId: string, revision: number, result: RecordApprovalResult, how: string): unknown {
+  return createUserMessage({
+    content: [{ type: "text", text: `(orchestra /team approval notice) Draft ${draftId}@${revision} approved ${how} (digest=${result.digest}, freeze target=${result.ref}). The plan is ready. You can now dispatch tasks using orchestra_dispatch(roleId, task) and wait for reports with orchestra_wait.` }] as ContentBlock[],
+    source: {
+      kind: "plugin",
+      plugin: "orchestra",
+      form: "notice",
+      summary: "orchestra /team charter approval",
+    } as MessageSource,
+  });
 }
 
 export async function handleTeamApprovalCommand(
@@ -1449,44 +1573,93 @@ export async function handleTeamApprovalCommand(
 ): Promise<{ kind: "success"; text: string }> {
   const raw = invocation.rawInput.trim();
   const approvalMatch = raw.match(/^approve\s+([a-z0-9]+(?:-[a-z0-9]+)*)@([1-9]\d*)\s*$/);
-  if (approvalMatch === null) throw new Error("approval command syntax is /team approve <draftId>@<revision>; natural-language consent is not hard approval");
+  if (approvalMatch === null) throw new Error("approval command syntax is /team approve <draftId>@<revision>");
   const draftId = approvalMatch[1];
   const revision = Number(approvalMatch[2]);
-  const events = charterEventsOf(invocation.agent.session);
-  let command;
-  try {
-    command = prepareApprovalEvent(events, {
-      draftId,
-      revision,
-      commandId: String(invocation.commandId),
-      approvingSessionId: invocation.agent.id,
-      approvedAt: Date.now(),
-    });
-  } catch (error) {
-    throw charterCommandError("approve the charter draft", error);
-  }
-  const digest = command.value.digest;
-  const ref = frozenRef(draftId, revision, command.value.digest);
-  // Wake the driver: the approval event is durable, but the agent's turn ended
-  // when it handed the user the command — without a followup the driver waits
-  // forever for a signal that never comes (4600 实测发现). Single plugin-source
-  // notice, same shape as the /team marker (never split deliveries).
-  const notice = createUserMessage({
-    content: [{ type: "text", text: `(orchestra /team approval notice) Draft ${draftId}@${revision} approved by user command. digest=${digest}; freeze target=${ref}. Continue: orchestra_freeze with the exact digest, then orchestra_create(frozenRef=${ref}).` }] as ContentBlock[],
-    source: {
-      kind: "plugin",
-      plugin: "orchestra",
-      form: "notice",
-      summary: "orchestra /team charter approval",
-    } as MessageSource,
+  const result = await recordCharterApproval(ctx, invocation.agent.session, {
+    draftId,
+    revision,
+    approvingSessionId: invocation.agent.id,
+    provenanceRef: String(invocation.commandId),
+    approvedAt: Date.now(),
+    source: "user-command",
   });
-  if (command.kind === "changed") {
-    await appendDurableCharterEvent(ctx, invocation.agent.session, command.event);
-    invocation.agent.followup?.(notice);
-    return { kind: "success", text: `Draft ${draftId}@${revision} approved by user command. digest=${digest}; freeze target=${ref}` };
-  }
-  invocation.agent.followup?.(notice);
-  return { kind: "success", text: `Draft ${draftId}@${revision} was already approved; freeze target=${command.value.approvalRef}` };
+  invocation.agent.followup?.(approvalNotice(draftId, revision, result, "by user command"));
+  return result.changed
+    ? { kind: "success", text: `Draft ${draftId}@${revision} approved by user command. digest=${result.digest}; freeze target=${result.ref}` }
+    : { kind: "success", text: `Draft ${draftId}@${revision} was already approved; freeze target=${result.approvalRef}` };
+}
+
+/**
+ * The newest draft revision this session wrote that no approval covers yet.
+ *
+ * "Pending" is derived from the records themselves rather than from a separate
+ * pointer file: a pointer could drift from the records, and then an approval
+ * would bind to something the user never saw.
+ */
+async function pendingDraftFor(ctx: Context, session: { header?: { cwd?: string; id?: string } }): Promise<{ draftId: string; revision: number } | undefined> {
+  const sessionId = session.header?.id;
+  if (sessionId === undefined) return undefined;
+  const events = await charterEventsOf(ctx, session);
+  const folded = foldCharterEvents(events);
+  if (folded.kind === "blocked") return undefined;
+  const mine = folded.drafts.filter((draft) => draft.authorSessionId === sessionId);
+  if (mine.length === 0) return undefined;
+  const newest = mine.reduce((best, draft) => (draft.revision > best.revision || (draft.revision === best.revision && draft.createdAt > best.createdAt) ? draft : best));
+  const approved = folded.approvals.some((entry) => entry.draftId === newest.draftId && entry.revision === newest.revision);
+  return approved ? undefined : { draftId: newest.draftId, revision: newest.revision };
+}
+
+/**
+ * Let one plain user reply approve the pending charter draft.
+ *
+ * This replaces "natural language is not approval" with the user's own rule:
+ * replying 启动 IS approval. What the old rule was actually protecting is
+ * enforced here instead, by inspecting the message rather than its syntax:
+ *
+ * 1. ONLY a real user turn can approve. `source.kind === "user"` excludes plugin
+ *    notices and messages relayed from another session — including the role
+ *    sessions this plugin creates, which could otherwise approve on the user's
+ *    behalf and make the gate decorative.
+ * 2. The approval binds to the NEWEST revision this session drafted, and
+ *    `prepareApprovalEvent` re-derives that revision's digest from the records.
+ *    If the plan changed after it was shown, the consent applies to what is on
+ *    record now, and the driver is told exactly which revision it got.
+ *
+ * @returns the recorded approval, or undefined when the reply was not a yes or
+ *   there was nothing pending.
+ */
+export async function approvePendingDraftFromUserMessage(
+  ctx: Context,
+  session: { header?: { cwd?: string; id?: string } },
+  event: { seq: number; data?: unknown },
+): Promise<RecordApprovalResult | undefined> {
+  const sessionId = session.header?.id;
+  if (sessionId === undefined) return undefined;
+  // Checked HERE and not only in the listener that calls this: the guarantee is
+  // "only a genuine user turn can approve", and a guarantee that lives in a
+  // caller disappears the moment anything else calls the function. Tests call it
+  // directly, so a missing check here would also be invisible to the listener's
+  // own filter.
+  if ((event.data as { source?: { kind?: unknown } } | undefined)?.source?.kind !== "user") return undefined;
+  const text = userMessageText(event.data);
+  if (text === "" || text.length > AFFIRMATIVE_MAX_LENGTH) return undefined;
+  if (!AFFIRMATIVE_REPLY.test(text)) return undefined;
+  const pending = await pendingDraftFor(ctx, session);
+  if (pending === undefined) return undefined;
+  const result = await recordCharterApproval(ctx, session, {
+    draftId: pending.draftId,
+    revision: pending.revision,
+    approvingSessionId: sessionId,
+    // Names the exact message that carried the consent, so a reader can go and
+    // check what the user actually said.
+    provenanceRef: `message:${sessionId}@${event.seq}`,
+    approvedAt: Date.now(),
+    source: "user-reply",
+  });
+  const agent = ctx.get("agents")?.get(sessionId as never);
+  agent?.followup?.(approvalNotice(pending.draftId, pending.revision, result, "by user reply") as never);
+  return result;
 }
 
 export async function handleTeamGateDecisionCommand(
@@ -1532,7 +1705,7 @@ export async function handleTeamGateDecisionCommand(
     invocation.agent.followup?.(gateNotice);
     return { kind: "success", text: `Gate ${gate.gateInstanceId} was already resolved with option ${match[2]}` };
   }
-  await appendDurableCharterEvent(ctx, invocation.agent.session, { type: "orchestra/gate-decision", data: { gateInstanceId: gate.gateInstanceId, option: match[2], commandId: String(invocation.commandId), decidedAt: Date.now(), approvingSessionId: invocation.agent.id, source: "user-command" } });
+  await appendDurableCharterEvent(ctx, invocation.agent.session, { type: GATE_DECISION_EVENT, data: { gateInstanceId: gate.gateInstanceId, option: match[2], commandId: String(invocation.commandId), decidedAt: Date.now(), approvingSessionId: invocation.agent.id, source: "user-command" } });
   try {
     await persistGraphTransition(ctx, activeTeamState, observed, command.runtime, { agent: invocation.agent } as any);
   } catch (error) {
@@ -2033,11 +2206,46 @@ export async function createGovernedTeam(
     );
   }
   if (args.frozenRef === undefined || args.frozenRef === "") {
-    throw new Error("approval_required: orchestra_create now requires frozenRef from orchestra_freeze; use orchestra_draft → /team approve <draftId>@<revision> → orchestra_freeze");
+    throw new Error("approval_required: orchestra_create requires frozenRef produced upon draft approval; use orchestra_draft → the user's approval (a plain yes; /team approve also works)");
+  }
+  let events = await charterEventsOf(ctx, exec.agent.session);
+  const folded = foldCharterEvents(events);
+  let effectiveFrozenRef = args.frozenRef;
+  if (folded.kind !== "blocked") {
+    if (!folded.approvals.some((a) => a.approvalRef === effectiveFrozenRef) && !folded.freezes.some((f) => f.frozenRef === effectiveFrozenRef)) {
+      const match = folded.approvals.find(
+        (a) =>
+          a.approvalRef === `draft-${effectiveFrozenRef}` ||
+          a.draftId === effectiveFrozenRef ||
+          a.draftId === `draft-${effectiveFrozenRef}` ||
+          effectiveFrozenRef.startsWith(a.draftId) ||
+          effectiveFrozenRef.startsWith(a.draftId.replace(/^draft-/, "")),
+      );
+      if (match !== undefined) {
+        effectiveFrozenRef = match.approvalRef;
+      }
+    }
+    const approval = folded.approvals.find((entry) => entry.approvalRef === effectiveFrozenRef);
+    if (approval !== undefined && !folded.freezes.some((f) => f.frozenRef === effectiveFrozenRef)) {
+      const draft = latestDraft(events, approval.draftId);
+      if (draft !== undefined) {
+        const freeze = prepareFreezeEvent(events, {
+          draftId: draft.draftId,
+          revision: draft.revision,
+          digest: draft.digest,
+          frozenBySessionId: exec.agent.id,
+          frozenAt: Date.now(),
+        });
+        if (freeze.kind === "changed") {
+          await appendDurableCharterEvent(ctx, exec.agent.session, freeze.event);
+          events = await charterEventsOf(ctx, exec.agent.session);
+        }
+      }
+    }
   }
   let frozen: FrozenCharterRevision;
   try {
-    frozen = resolveFrozenCharter(charterEventsOf(exec.agent.session), args.frozenRef);
+    frozen = resolveFrozenCharter(events, effectiveFrozenRef);
   } catch (error) {
     throw charterCommandError("create a team", error);
   }
@@ -2113,6 +2321,150 @@ export async function createGovernedTeam(
       live: ctx.agents.get(SID(role.sessionId)) !== undefined,
       phase: role.phase,
     })),
+  };
+}
+
+export interface OrchestraDispatchArgs {
+  roleId: string;
+  task: string;
+  laneId?: string;
+  preset?: string;
+  timeoutMs?: number;
+}
+
+export interface OrchestraDispatchResult {
+  status: string;
+  team_id: string;
+  role_id: string;
+  session_id: string;
+  created_new_session: boolean;
+  receipt?: unknown;
+}
+
+export async function dispatchRoleTask(
+  ctx: Context,
+  activeTeamState: ActiveTeamStateStore,
+  exec: ToolExecutionInput,
+  args: OrchestraDispatchArgs,
+): Promise<OrchestraDispatchResult> {
+  if (exec.agent === undefined) throw new Error("orchestra_dispatch requires an agent caller");
+  const cwd = exec.agent.session.header.cwd;
+  if (cwd === undefined) throw new Error("current session has no working directory; cannot dispatch task");
+  if (typeof args.roleId !== "string" || args.roleId.trim() === "") {
+    throw new Error('orchestra_dispatch: "roleId" must be a non-empty string');
+  }
+  if (typeof args.task !== "string" || args.task.trim() === "") {
+    throw new Error('orchestra_dispatch: "task" must be a non-empty string');
+  }
+
+  const roleId = args.roleId.trim();
+  const laneId = args.laneId?.trim() || "main";
+
+  const observation = await activeTeamState.read(cwd, { signal: exec.signal });
+  throwIfBlocked("dispatch a task", observation);
+
+  let team: TeamState;
+  let isNewTeam = false;
+
+  if (observation.kind === "ready") {
+    team = observation.team;
+  } else {
+    isNewTeam = true;
+    const teamId = `team-${randomUUID().slice(0, 8)}`;
+    team = {
+      schemaVersion: 1,
+      teamId,
+      topologyRef: { id: "lane-orchestra", source: "bundled" },
+      rootCwd: cwd,
+      controllerSessionId: exec.agent.id,
+      status: "active",
+      createdAt: Date.now(),
+      mission: {
+        objective: args.task.slice(0, 140),
+        scope: [],
+        constraints: [],
+        acceptanceCriteria: [],
+        nonGoals: [],
+        context: "",
+      },
+      controllerHistory: [],
+      activatedFromArchiveId: null,
+      reports: [],
+      roles: [],
+    };
+  }
+
+  let roleEntry = team.roles.find((r) => r.id.toLowerCase() === roleId.toLowerCase());
+  let createdRole = false;
+  let sessionId: string;
+
+  if (roleEntry !== undefined && typeof roleEntry.sessionId === "string" && roleEntry.sessionId !== "") {
+    sessionId = roleEntry.sessionId;
+  } else {
+    createdRole = true;
+    const presetId = args.preset ?? `orchestra-v04-${roleId}-v1`;
+    let effectivePreset = presetId;
+    try {
+      await resolveRolePresetFile(ctx, cwd, presetId, orchestraGlobalRoot());
+    } catch {
+      effectivePreset = "orchestra-v04-worker-v1";
+    }
+
+    const title = roleSessionTitle({ roleId, missionObjective: team.mission.objective, cwd });
+    const created = await createSession(ctx, {
+      cwd,
+      agentPresetId: effectivePreset,
+      title,
+      signal: exec.signal,
+    });
+    sessionId = created.sessionId;
+    roleEntry = {
+      id: roleId,
+      name: roleId,
+      sessionId,
+      execution: "session",
+      phase: "active",
+      sessionHistory: [],
+      preset: effectivePreset,
+      sandbox: "read-write",
+      reportCount: 0,
+      lastReport: null,
+    };
+    team.roles.push(roleEntry);
+  }
+
+  const policy = escrowPolicy(ctx, exec);
+  if (isNewTeam) {
+    await activeTeamState.create(cwd, team, { policy, signal: exec.signal });
+  } else {
+    await activeTeamState.replace(observation as ActiveTeamReady, team, { policy, signal: exec.signal });
+  }
+
+  const dispatchPayload =
+    `[Orchestra Dispatch | Lane: ${laneId} | Role: ${roleId}]\n\n` +
+    `Task:\n${args.task}\n\n` +
+    `---\n` +
+    `Frontline Autonomy Rule: execute independently and coordinate Hard Facts directly with collaborators. ` +
+    `File progress or completion with orchestra_report when ready.`;
+
+  const delivery = await deliverMessage(
+    ctx,
+    exec.agent.id,
+    sessionId,
+    [{ type: "text", text: dispatchPayload }],
+    {
+      wake: true,
+      ...transportStores(ctx, cwd),
+    },
+  );
+
+  return {
+    status: "dispatched",
+    team_id: team.teamId,
+    role_id: roleId,
+    session_id: sessionId,
+    created_new_session: createdRole,
+    receipt: delivery,
   };
 }
 
@@ -2420,7 +2772,12 @@ export async function sendGovernedRole(
   if (address.execution === "subagent") {
     return sendToGovernedSubagentNode(ctx, address, args, exec, blocks);
   }
-  const receipt = await deliverMessage(ctx, exec.agent.id, address.resolved_session_id, blocks, { wake: args.wake, interrupt: args.interrupt === true, idempotencyKey: args.idempotencyKey });
+  const receipt = await deliverMessage(ctx, exec.agent.id, address.resolved_session_id, blocks, {
+    wake: args.wake,
+    interrupt: args.interrupt === true,
+    idempotencyKey: args.idempotencyKey,
+    ...transportStores(ctx, exec.agent.session.header.cwd),
+  });
   return { team_id: address.team_id, role_id: address.role_id, resolved_session_id: address.resolved_session_id, receipt };
 }
 
@@ -2688,9 +3045,9 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "orchestra_create",
       description:
-        "Create a Governed orchestra team only from an exact immutable frozenRef produced by orchestra_freeze after /team approve <draftId>@<revision>. goal/topology alone are not approval and return approval_required. The frozen mission/topology snapshot is used for transactional role provisioning and copied into team.json.document charterRevisions.",
+        "Create a Governed orchestra team from an immutable frozenRef produced after the USER approved the draft. goal/topology alone are not approval and return approval_required. The user approves by replying with a plain yes (启动 / 可以 / ok); /team approve <draftId>@<revision> also works. The frozen mission/topology snapshot is used for role provisioning and recorded into team.json.",
       parameters: {
-        frozenRef: { type: "string", required: true, description: "Exact frozen charter ref: draftId@revision#digest from orchestra_freeze." },
+        frozenRef: { type: "string", required: true, description: "Exact frozen charter ref: draftId@revision#digest produced upon user approval." },
         goal: { type: "string", description: "Deprecated compatibility input; ignored without frozenRef and never substitutes approval." },
         topology: { type: "string", description: "Deprecated compatibility input; frozen topology snapshot is authoritative." },
         scope: { type: "array", items: { type: "string" }, description: "Optional mission scope boundaries." },
@@ -2760,224 +3117,6 @@ export function apply(ctx: Context): void {
     }),
   );
 
-  ctx.tools.register(
-    defineTool({
-      name: "orchestra_spawn",
-      description:
-        "Governed role spawning is approval-gated in 4B and this direct tool fails closed. Use orchestra_draft → /team approve <draftId>@<revision> → orchestra_freeze → orchestra_create for initial Teams, or orchestra_apply_amendment for an approved charter change; no direct roster mutation is performed here.",
-      parameters: {
-        roleName: { type: "string", description: "Role name, e.g. \"implementer\" (required unless templateId+roleId are given)." },
-        mission: { type: "string", description: "Role duties or current task summary; appended to the injected welcome." },
-        presetId: { type: "string", description: "Agent preset id to mount; defaults to the deployment default." },
-        sandbox: { type: "string", enum: ["read-only", "workspace-write"], description: "Optional sandbox mode for the role session." },
-        permissionPreset: { type: "string", description: "Base Permission Preset for the governed role; defaults to the deployment default." },
-        templateId: { type: "string", description: "Topology template id to source the role from (with roleId)." },
-        roleId: { type: "string", description: "Role id inside the template to source preset/sandbox/welcome from." },
-        provider: { type: "string", description: "Model provider override for the role session. Must be paired with model." },
-        model: { type: "string", description: "Model override for the role session. Must be paired with provider." },
-        reasoningEffort: { type: "string", description: "Reasoning effort override for the role session (e.g. \"medium\"). Requires provider and model." },
-      },
-      output: {
-        schema: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            sessionId: { type: "string", required: true },
-            roleName: { type: "string", required: true },
-            topology: { type: "string", required: true },
-            status: { type: "string", required: true },
-            phase: { type: "string", required: true },
-            roles: {
-              type: "array",
-              required: true,
-              items: {
-                type: "object",
-                additionalProperties: false,
-                properties: {
-                  id: { type: "string", required: true },
-                  sessionId: { type: "string", required: true },
-                  phase: { type: "string", required: true },
-                },
-              },
-            },
-          },
-        },
-        render: (_args, value) => [
-          {
-            type: "text",
-            text: `role ${value.roleName} spawned as ${value.sessionId} (instance ${value.topology}, ${value.roles.length} role(s))`,
-          },
-        ],
-      },
-      async execute(
-        args: {
-          roleName?: string;
-          mission?: string;
-          presetId?: string;
-          sandbox?: string;
-          permissionPreset?: string;
-          templateId?: string;
-          roleId?: string;
-          provider?: string;
-          model?: string;
-          reasoningEffort?: string;
-        },
-        exec: ToolExecutionInput,
-      ) {
-        if (exec.agent === undefined) throw new Error("orchestra_spawn requires an agent caller");
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory; cannot create a role");
-        rejectDirectGovernedSpawn();
-        let roleName = String(args.roleName ?? "").trim();
-        if (roleName === "" && args.templateId !== undefined && args.roleId !== undefined) {
-          roleName = args.roleId;
-        }
-        if (roleName === "") throw new Error("roleName must not be empty (or provide templateId+roleId)");
-        let templatePreset: string | null | undefined;
-        let templateSandbox: string | undefined;
-        let templateWelcome: string | undefined;
-        let templateMaxRounds: number | undefined;
-        let templateRuntime: RoleConfig["runtime"] | undefined;
-        let templateProtocol: TopologyProtocol | undefined;
-        let templateTopologyId: string | undefined;
-        let templateTopologySource: "project" | "global" | "bundled" | undefined;
-        if (args.templateId !== undefined || args.roleId !== undefined) {
-          if (args.templateId === undefined || args.roleId === undefined)
-            throw new Error("templateId and roleId must be provided together");
-          const topologyResolution = await topologyCatalog.resolve(cwd, args.templateId, { signal: exec.signal });
-          if (topologyResolution.kind !== "ready") {
-            const available = (await topologyCatalog.list(cwd, { signal: exec.signal })).ready.map((entry) => entry.config.id);
-            throw topologyResolutionError("spawn a role from a template", topologyResolution, available);
-          }
-          const topology = topologyResolution;
-          const source = topology.config.roles.find((role) => role.id === args.roleId);
-          if (source === undefined) throw new Error(`template ${args.templateId} has no role ${args.roleId}`);
-          templatePreset = source.preset;
-          templateSandbox = source.sandbox;
-          templateWelcome = source.welcome;
-          templateMaxRounds = source.maxRounds;
-          templateRuntime = source.runtime;
-          templateProtocol = topology.config.protocol;
-          templateTopologyId = topology.config.id;
-          templateTopologySource = topology.source;
-        } else {
-          const matched = await topologyCatalog.findRole(cwd, roleName, { signal: exec.signal });
-          if (matched !== undefined) {
-            templatePreset = matched.role.preset;
-            templateSandbox = matched.role.sandbox;
-            templateWelcome = matched.role.welcome;
-            templateMaxRounds = matched.role.maxRounds;
-            templateRuntime = matched.role.runtime;
-            templateProtocol = matched.topology.config.protocol;
-            templateTopologyId = matched.topology.config.id;
-            templateTopologySource = matched.topology.source;
-          }
-        }
-        const effectivePreset = args.presetId !== undefined && args.presetId !== "" ? args.presetId : templatePreset;
-        const effectiveSandbox = args.sandbox ?? templateSandbox;
-        const teamObservation = await activeTeamState.read(cwd, { signal: exec.signal });
-        assertSpawnableTeamDocument(teamObservation);
-        if (teamObservation.kind === "ready" && teamObservation.team.status !== "active" && teamObservation.team.status !== "degraded") {
-          throw new Error(`cannot spawn a role while team status is ${teamObservation.team.status}; inspect the failed/provisioning state first`);
-        }
-        let team: TeamState;
-        let existingStatus: "active" | "degraded" = "active";
-        if (teamObservation.kind !== "ready") {
-          team = {
-            schemaVersion: 1,
-            teamId: `team-${randomUUID().slice(0, 8)}`,
-            status: "provisioning",
-            rootCwd: cwd,
-            controllerSessionId: exec.agent.id,
-            controllerHistory: [],
-            topologyRef: { id: templateTopologyId ?? args.templateId ?? "custom", source: templateTopologySource ?? "bundled" },
-            mission: { objective: "", scope: [], constraints: [], acceptanceCriteria: [], nonGoals: [], context: "" },
-            createdAt: Date.now(),
-            activatedFromArchiveId: null,
-            roles: [],
-            reports: [],
-          };
-        } else {
-          team = teamObservation.team;
-          existingStatus = team.status === "degraded" ? "degraded" : "active";
-          if (team.roles.some((role) => role.id.toLowerCase() === roleName.toLowerCase())) {
-            throw new Error(
-              `role id "${roleName}" already exists in this team; choose a distinct roleName (e.g. "${roleName}-2", numeric suffixes still inherit the matching template's sandbox/preset), or pass templateId+roleId / sandbox:"read-only" explicitly`,
-            );
-          }
-          if (team.topologyRef.id !== "custom") {
-            const blueprint = await topologyCatalog.resolve(cwd, team.topologyRef.id, { signal: exec.signal });
-            if (blueprint.kind !== "ready") {
-              const available = (await topologyCatalog.list(cwd, { signal: exec.signal })).ready.map((entry) => entry.config.id);
-              throw topologyResolutionError("check the team topology", blueprint, available);
-            }
-            const base = roleName.replace(/-\d+$/, "").toLowerCase();
-            const inBlueprint = blueprint.config.roles.some(
-              (role) => role.id.toLowerCase() === base || String(role.name ?? role.id).toLowerCase() === base,
-            );
-            if (!inBlueprint) team = { ...team, topologyRef: { id: "custom", source: "bundled" } };
-          }
-        }
-        const roleConfig: RoleConfig = {
-          id: roleName,
-          name: roleName,
-          preset: effectivePreset,
-          sandbox: effectiveSandbox,
-          runtime: templateRuntime,
-          welcome: templateWelcome,
-        };
-        const plan = await prepareGovernedRolePlan(ctx, {
-          cwd,
-          teamId: team.teamId,
-          controllerSessionId: team.controllerSessionId,
-          topologyId: team.topologyRef.id,
-          topologySource: team.topologyRef.source,
-          role: roleConfig,
-          presetId: effectivePreset,
-          sandbox: effectiveSandbox,
-          welcome: [templateWelcome, args.mission].filter((part) => typeof part === "string" && part !== "").join("\n\n") || undefined,
-          protocol: templateProtocol,
-          maxRounds: templateMaxRounds,
-          permissionPreset: args.permissionPreset,
-          provider: args.provider,
-          model: args.model,
-          reasoningEffort: args.reasoningEffort,
-          title: roleSessionTitle({ roleId: roleConfig.id, missionObjective: team.mission.objective, cwd }),
-          signal: exec.signal,
-        });
-        assertUniqueGovernedSessionIds([plan]);
-        const reservedTeam: TeamState = {
-          ...team,
-          status: "provisioning",
-          roles: [...team.roles, reservedRole(plan)],
-        };
-        if (teamObservation.kind !== "ready" && reservedTeam.document === undefined) reservedTeam.document = initializeOrchestrationDocument(reservedTeam, reservedTeam.createdAt);
-        const writeOptions = { policy: escrowPolicy(ctx, exec), signal: exec.signal };
-        const reservation = teamObservation.kind === "ready"
-          ? await activeTeamState.replace(teamObservation, reservedTeam, writeOptions)
-          : await activeTeamState.create(cwd, reservedTeam, writeOptions);
-        const initialSnapshot = await readySnapshotAfterWrite(activeTeamState, cwd, reservation, exec.signal);
-        const provisioned = await provisionGovernedPlans(
-          ctx,
-          activeTeamState,
-          exec,
-          cwd,
-          initialSnapshot,
-          [plan],
-          existingStatus,
-          teamObservation.kind === "ready" ? "degraded" : "failed",
-        );
-        return {
-          sessionId: plan.sessionId,
-          roleName,
-          topology: provisioned.team.topologyRef.id,
-          status: provisioned.team.status,
-          phase: provisioned.team.roles.find((role) => role.id === plan.roleId)?.phase ?? "active",
-          roles: provisioned.team.roles.map((role) => ({ id: role.id, sessionId: role.sessionId, phase: role.phase })),
-        };
-      },
-    }),
-  );
 
   ctx.tools.register(
     defineTool({
@@ -3077,7 +3216,7 @@ export function apply(ctx: Context): void {
         if (cwd === undefined) throw new Error("current session has no working directory");
         const observation = await activeTeamState.read(cwd, { signal: exec.signal });
         throwIfBlocked("create a charter draft", observation);
-        const events = charterEventsOf(exec.agent.session);
+        const events = await charterEventsOf(ctx, exec.agent.session);
         let current: CharterDraft | undefined;
         if (args.draftId !== undefined) {
           try {
@@ -3143,109 +3282,15 @@ export function apply(ctx: Context): void {
 
   ctx.tools.register(
     defineTool({
-      name: "orchestra_charters",
-      description: "Read Draft revisions, durable user approvals, and frozen charter facts from the current Driver Session event log. This is read-only and never infers approval from chat text.",
-      parameters: {
-        draftId: { type: "string", description: "Optional exact draft id filter; all revisions remain visible." },
-      },
-      output: {
-        schema: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            status: { type: "string", required: true },
-            drafts: { type: "array", items: { type: "json" }, required: true },
-            approvals: { type: "array", items: { type: "json" }, required: true },
-            freezes: { type: "array", items: { type: "json" }, required: true },
-            diagnostic: { type: "object", additionalProperties: true },
-          },
-        },
-        render: (_args, value) => [{ type: "text", text: `charter event log ${value.status}: drafts=${value.drafts.length}, approvals=${value.approvals.length}, freezes=${value.freezes.length}` }],
-      },
-      async execute(args: { draftId?: string }, exec: ToolExecutionInput) {
-        if (exec.agent === undefined) throw new Error("orchestra_charters requires an agent caller");
-        return charterListOutput(charterEventsOf(exec.agent.session), args.draftId) as any;
-      },
-    }),
-  );
-
-  ctx.tools.register(
-    defineTool({
-      name: "orchestra_freeze",
+      name: "orchestra_dispatch",
       description:
-        "Freeze an exactly user-approved Charter Draft into an immutable FrozenCharterRevision. The approval must come from /team approve <draftId>@<revision>; model text and natural-language consent are insufficient. Freeze returns the exact frozenRef used by orchestra_create or amendment application.",
+        "Dispatch a concrete task to a team role lane. If the role's Session does not exist yet, it is automatically created and recorded into .orchestra/ state. The task message is sent directly to the role session with wake=true, returning the delivery receipt.",
       parameters: {
-        draftId: { type: "string", required: true },
-        revision: { type: "number", required: true },
-        digest: { type: "string", required: true },
-      },
-      output: {
-        schema: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            frozen_ref: { type: "string", required: true },
-            charter_revision: { type: "number", required: true },
-            draft_id: { type: "string", required: true },
-            draft_revision: { type: "number", required: true },
-            digest: { type: "string", required: true },
-            approval_ref: { type: "string", required: true },
-            mission: { type: "object", additionalProperties: true, required: true },
-            topology: { type: "object", additionalProperties: true, required: true },
-            human_participation: { type: "object", additionalProperties: true, required: true },
-            frozen_by_session_id: { type: "string", required: true },
-            frozen_at: { type: "number", required: true },
-            reason: { type: "string" },
-            impact: { type: "string" },
-          },
-        },
-        render: (_args, value) => [{ type: "text", text: `charter frozen ${value.frozen_ref} (charter revision ${value.charter_revision})` }],
-      },
-      async execute(args: { draftId: string; revision: number; digest: string }, exec: ToolExecutionInput) {
-        if (exec.agent === undefined) throw new Error("orchestra_freeze requires an agent caller");
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory");
-        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("freeze a charter", observation);
-        if (observation.kind === "ready") {
-          const document = documentReadForTeam(observation.team);
-          if (document === undefined) throw new Error("cannot freeze a charter for an active legacy Team: run orchestra_reconcile first");
-          if (exec.agent.id !== observation.team.controllerSessionId || exec.agent.id !== document.semanticWriterSessionId) throw new Error("cannot freeze a charter: permission_denied (current controller/semantic writer required)");
-        }
-        const events = charterEventsOf(exec.agent.session);
-        let current: CharterDraft;
-        try {
-          const summary = charterSummary(events, args.draftId);
-          current = summary.draft;
-        } catch (error) {
-          throw charterCommandError("read the charter draft", error);
-        }
-        if (observation.kind !== "ready" && current.authorSessionId !== exec.agent.id) throw new Error("cannot freeze a charter: permission_denied (draft author Session required)");
-        let command;
-        try {
-          command = prepareFreezeEvent(events, {
-            draftId: args.draftId,
-            revision: args.revision,
-            digest: args.digest,
-            frozenBySessionId: exec.agent.id,
-            frozenAt: Date.now(),
-          });
-        } catch (error) {
-          throw charterCommandError("freeze the charter", error);
-        }
-        if (command.kind === "changed") await appendDurableCharterEvent(ctx, exec.agent.session, command.event);
-        return frozenCharterOutput(command.value) as any;
-      },
-    }),
-  );
-
-  ctx.tools.register(
-    defineTool({
-      name: "orchestra_apply_amendment",
-      description:
-        "Apply an exactly approved and frozen amendment to the current Team document. This appends an immutable charter revision through ActiveTeam CAS and records a Driver decision; it never spawns, dismisses, or rewrites role Session mappings. Topology roster changes return pending_runtime_actions instead of pretending to be applied.",
-      parameters: {
-        frozenRef: { type: "string", required: true, description: "Exact frozen amendment ref from orchestra_freeze." },
+        roleId: { type: "string", required: true, description: "Role identifier to dispatch to (e.g. 'implementer', 'reviewer')." },
+        task: { type: "string", required: true, description: "Actionable, self-contained task description for this role lane." },
+        laneId: { type: "string", description: "Optional lane identifier or phase name." },
+        preset: { type: "string", description: "Optional agent preset name override when lazily creating this role." },
+        timeoutMs: { type: "number", description: "Heartbeat timeout in ms (default 20 minutes)." },
       },
       output: {
         schema: {
@@ -3254,475 +3299,40 @@ export function apply(ctx: Context): void {
           properties: {
             status: { type: "string", required: true },
             team_id: { type: "string", required: true },
-            frozen_ref: { type: "string", required: true },
-            current_charter_revision: { type: "number", required: true },
-            target_charter_revision: { type: "number", required: true },
-            pending_roles: { type: "array", items: { type: "string" }, required: true },
-            markdown_status: { type: "string", required: true },
-            markdown_path: { type: "string", required: true },
-            message: { type: "string" },
-          },
-        },
-        render: (_args, value) => [{ type: "text", text: `charter amendment ${value.status} for ${value.team_id}: revision ${value.current_charter_revision}${value.pending_roles.length === 0 ? "" : `; pending roles=${value.pending_roles.join(", ")}`}` }],
-      },
-      async execute(args: { frozenRef: string }, exec: ToolExecutionInput) {
-        if (exec.agent === undefined) throw new Error("orchestra_apply_amendment requires an agent caller");
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory");
-        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("apply a charter amendment", observation);
-        if (observation.kind !== "ready") throw new Error(`cannot apply a charter amendment: no ready Team state (${observation.kind})`);
-        if (observation.team.status !== "active" && observation.team.status !== "degraded") throw new Error(`cannot apply a charter amendment while Team status is ${observation.team.status}`);
-        const team = observation.team;
-        const document = documentReadForTeam(team);
-        if (document === undefined) throw new Error("cannot apply a charter amendment: legacy_missing (run orchestra_reconcile first)");
-        if (exec.agent.id !== team.controllerSessionId || exec.agent.id !== document.semanticWriterSessionId) throw new Error("cannot apply a charter amendment: permission_denied (current controller/semantic writer required)");
-        let frozen: FrozenCharterRevision;
-        try {
-          frozen = resolveFrozenCharter(charterEventsOf(exec.agent.session), args.frozenRef);
-        } catch (error) {
-          throw charterCommandError("read the frozen amendment", error);
-        }
-        if (frozen.baseTeamId !== team.teamId || frozen.baseCharterRevision !== document.currentCharterRevision) {
-          throw new Error("cannot apply a charter amendment: stale_base (Team id or current charter revision differs)");
-        }
-        const currentRoleIds = new Set(team.roles.map((role) => role.id.toLowerCase()));
-        const frozenRoleIds = new Set(frozen.topology.config.roles.map((role) => role.id.toLowerCase()));
-        const pendingRoles = [...new Set([...team.roles.map((role) => role.id), ...frozen.topology.config.roles.map((role) => role.id)])].filter((roleId) => !currentRoleIds.has(roleId.toLowerCase()) || !frozenRoleIds.has(roleId.toLowerCase()));
-        if (pendingRoles.length > 0) {
-          return {
-            status: "pending_runtime_actions",
-            team_id: team.teamId,
-            frozen_ref: frozen.frozenRef,
-            current_charter_revision: document.currentCharterRevision ?? 0,
-            target_charter_revision: frozen.charterRevision,
-            pending_roles: pendingRoles,
-            markdown_status: "unchanged",
-            markdown_path: document.markdown.path,
-            message: "topology roster differs from the current Team; no Session mapping was changed",
-          };
-        }
-        let applied;
-        try {
-          applied = applyFrozenCharterRevision(document, team, frozen, exec.agent.id, Date.now());
-        } catch (error) {
-          throw documentCommandError("apply the charter amendment", error);
-        }
-        if (applied.kind === "noop") {
-          const markdown = await inspectMarkdownProjection(ctx.fs, cwd, document, isRuntimeProjectionStale(document, team), exec.signal);
-          return {
-            status: "already_applied",
-            team_id: team.teamId,
-            frozen_ref: frozen.frozenRef,
-            current_charter_revision: document.currentCharterRevision ?? 0,
-            target_charter_revision: frozen.charterRevision,
-            pending_roles: [],
-            markdown_status: markdown.status,
-            markdown_path: markdown.path,
-          };
-        }
-        let nextDocument = applied.document;
-        try {
-          nextDocument = appendDriverDecision(nextDocument, team, {
-            decisionId: `charter-amendment:${frozen.frozenRef}`,
-            kind: "charter_amendment",
-            summary: frozen.reason ?? `Applied charter revision ${frozen.charterRevision}`,
-            actorSessionId: exec.agent.id,
-            createdAt: Date.now(),
-            evidence: [{ kind: "message", ref: frozen.approval.approvalRef }],
-            affects: frozen.topology.config.roles.map((role) => role.id),
-          }).document;
-        } catch (error) {
-          throw documentCommandError("record the charter amendment decision", error);
-        }
-        const persisted = await persistDocumentTransition(ctx, activeTeamState, observation, nextDocument, exec);
-        return {
-          status: persisted.markdown.status === "projection_failed" ? "projection_failed" : persisted.markdown.status === "stale" ? "stale" : "applied",
-          team_id: team.teamId,
-          frozen_ref: frozen.frozenRef,
-          current_charter_revision: persisted.document.currentCharterRevision ?? 0,
-          target_charter_revision: frozen.charterRevision,
-          pending_roles: [],
-          markdown_status: persisted.markdown.status,
-          markdown_path: persisted.markdown.path,
-        };
-      },
-    }),
-  );
-
-  ctx.tools.register(
-    defineTool({
-      name: "orchestra_document",
-      description:
-        "Read the canonical Living Orchestration Document for the current Team. The structured document is authoritative; orchestration.md is a derived projection only and is never parsed as state. Legacy Teams report legacy_missing until the Driver explicitly reconciles them.",
-      parameters: {},
-      output: {
-        schema: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            status: { type: "string", required: true },
-            team_id: { oneOf: [{ type: "string" }, { type: "null" }], required: true },
-            document_revision: { type: "number", required: true },
-            charter_status: { type: "string", required: true },
-            runtime_stale: { type: "boolean", required: true },
-            current_charter_revision: { type: "number" },
-            charter_digest: { type: "string" },
-            approval_ref: { type: "string" },
-            runtime_projection: {
-              oneOf: [
-                {
-                  type: "object",
-                  additionalProperties: false,
-                  properties: {
-                    teamId: { type: "string", required: true },
-                    status: { type: "string", required: true },
-                    controllerSessionId: { type: "string", required: true },
-                    topologyRef: { type: "object", additionalProperties: true, required: true },
-                    mission: { type: "object", additionalProperties: true, required: true },
-                    roles: { type: "array", required: true },
-                    reports: { type: "array", required: true },
-                    activatedFromArchiveId: { oneOf: [{ type: "string" }, { type: "null" }], required: true },
-                    projectionAt: { type: "number", required: true },
-                    graph: { type: "object", additionalProperties: true },
-                  },
-                },
-                { type: "null" },
-              ],
-              required: true,
-            },
-            decisions: {
-              type: "array",
-              required: true,
-              items: {
-                type: "object",
-                additionalProperties: false,
-                properties: {
-                  decisionId: { type: "string", required: true },
-                  kind: { type: "string", required: true },
-                  summary: { type: "string", required: true },
-                  rationale: { type: "string" },
-                  actorSessionId: { type: "string", required: true },
-                  createdAt: { type: "number", required: true },
-                  evidence: { type: "array", required: true },
-                  affects: { type: "array" },
-                },
-              },
-            },
-            markdown: {
-              type: "object",
-              additionalProperties: false,
-              required: true,
-              properties: {
-                path: { type: "string", required: true },
-                status: { type: "string", required: true },
-                message: { type: "string" },
-              },
-            },
-            diagnostic: {
-              type: "object",
-              additionalProperties: false,
-              properties: {
-                code: { type: "string", required: true },
-                message: { type: "string", required: true },
-              },
-            },
+            role_id: { type: "string", required: true },
+            session_id: { type: "string", required: true },
+            created_new_session: { type: "boolean", required: true },
+            receipt: { type: "json" },
           },
         },
         render: (_args, value) => [
           {
             type: "text",
-            text: `orchestration document ${value.status}${value.team_id === null ? "" : ` for ${value.team_id}`} (revision ${value.document_revision}, charter ${value.charter_status}, runtime ${value.runtime_stale ? "stale" : "current"}); Markdown ${value.markdown.status}`,
+            text: `orchestra_dispatch: dispatched to role '${value.role_id}' (session ${value.session_id}${value.created_new_session ? ", newly provisioned" : ""}), status=${value.status}`,
           },
         ],
       },
-      async execute(_args, exec: ToolExecutionInput) {
-        if (exec.agent === undefined) throw new Error("orchestra_document requires an agent caller");
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory");
-        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
-        if (observation.kind === "blocked") {
-          return documentToolStatus(undefined, undefined, undefined, {
-            code: observation.diagnostic.code,
-            message: observation.diagnostic.message,
-          }) as any;
-        }
-        if (observation.kind !== "ready") return documentToolStatus(undefined, undefined, undefined) as any;
-        const team = observation.team;
-        const document = documentReadForTeam(team);
-        if (document === undefined) return documentToolStatus(team, undefined, undefined) as any;
-        const markdown = await inspectMarkdownProjection(ctx.fs, cwd, document, isRuntimeProjectionStale(document, team), exec.signal);
-        return documentToolStatus(team, document, markdown) as any;
+      async execute(args: { roleId: string; task: string; laneId?: string; preset?: string; timeoutMs?: number }, exec: ToolExecutionInput) {
+        return dispatchRoleTask(ctx, activeTeamState, exec, args) as any;
       },
     }),
   );
 
-  ctx.tools.register(
-    defineTool({
-      name: "orchestra_reconcile",
-      description:
-        "Driver-only checkpoint command: initialize a legacy Team's missing canonical document or reconcile its Runtime Projection from active Team state, using one ActiveTeamState CAS. Only after canonical CAS succeeds does it refresh the derived Markdown projection.",
-      parameters: {},
-      output: {
-        schema: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            status: { type: "string", required: true },
-            team_id: { type: "string", required: true },
-            document_revision: { type: "number", required: true },
-            charter_status: { type: "string", required: true },
-            runtime_stale: { type: "boolean", required: true },
-            current_charter_revision: { type: "number" },
-            charter_digest: { type: "string" },
-            approval_ref: { type: "string" },
-            runtime_projection: { type: "object", additionalProperties: true, required: true },
-            decisions: { type: "array", required: true },
-            markdown: {
-              type: "object",
-              additionalProperties: false,
-              required: true,
-              properties: {
-                path: { type: "string", required: true },
-                status: { type: "string", required: true },
-                message: { type: "string" },
-              },
-            },
-            diagnostic: {
-              type: "object",
-              additionalProperties: false,
-              properties: {
-                code: { type: "string", required: true },
-                message: { type: "string", required: true },
-              },
-            },
-          },
-        },
-        render: (_args, value) => [{ type: "text", text: `orchestration document ${value.status} for ${value.team_id} at revision ${value.document_revision}; Markdown ${value.markdown.status}` }],
-      },
-      async execute(_args, exec: ToolExecutionInput) {
-        if (exec.agent === undefined) throw new Error("orchestra_reconcile requires an agent caller");
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory");
-        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("reconcile the orchestration document", observation);
-        if (observation.kind !== "ready") throw new Error(`cannot reconcile the orchestration document: no ready Team state (${observation.kind})`);
-        const team = observation.team;
-        if (exec.agent.id !== team.controllerSessionId) throw new Error("cannot reconcile the orchestration document: permission_denied (Driver/controller required)");
-        let next: OrchestrationDocument;
-        try {
-          const current = documentReadForTeam(team);
-          next = current === undefined
-            ? initializeOrchestrationDocument(team, Date.now())
-            : reconcileOrchestrationDocument(current, team, exec.agent.id, Date.now()).document;
-        } catch (error) {
-          throw documentCommandError("reconcile the orchestration document", error);
-        }
-        const persisted = await persistDocumentTransition(ctx, activeTeamState, observation, next, exec);
-        return documentToolStatus(persisted.snapshot.team, persisted.document, persisted.markdown) as any;
-      },
-    }),
-  );
 
-  ctx.tools.register(
-    defineTool({
-      name: "orchestra_decision",
-      description:
-        "Driver-only append to the canonical Driver Decision Journal. Entries are append-only and idempotent by decisionId; the operation is CAS-guarded and refreshes only the derived Markdown projection after canonical persistence.",
-      parameters: {
-        decisionId: { type: "string", required: true, description: "Stable id for this decision; retrying the same payload is a no-op." },
-        kind: { type: "string", required: true, description: "Decision category, for example scope, route, review, or escalation." },
-        summary: { type: "string", required: true, description: "Short decision summary." },
-        rationale: { type: "string", description: "Optional rationale." },
-        createdAt: { type: "number", description: "Optional finite timestamp; defaults to the current time." },
-        evidence: {
-          type: "array",
-          description: "Evidence references; refs are recorded, not read.",
-          items: {
-            type: "object",
-            additionalProperties: false,
-            properties: {
-              kind: { type: "string", required: true },
-              ref: { type: "string", required: true },
-              label: { type: "string" },
-            },
-          },
-        },
-        affects: { type: "array", items: { type: "string" }, description: "Optional affected role/decision summaries." },
-      },
-      output: {
-        schema: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            status: { type: "string", required: true },
-            team_id: { type: "string", required: true },
-            document_revision: { type: "number", required: true },
-            charter_status: { type: "string", required: true },
-            runtime_stale: { type: "boolean", required: true },
-            current_charter_revision: { type: "number" },
-            charter_digest: { type: "string" },
-            approval_ref: { type: "string" },
-            runtime_projection: { type: "object", additionalProperties: true, required: true },
-            decisions: { type: "array", required: true },
-            markdown: {
-              type: "object",
-              additionalProperties: false,
-              required: true,
-              properties: {
-                path: { type: "string", required: true },
-                status: { type: "string", required: true },
-                message: { type: "string" },
-              },
-            },
-            diagnostic: {
-              type: "object",
-              additionalProperties: false,
-              properties: {
-                code: { type: "string", required: true },
-                message: { type: "string", required: true },
-              },
-            },
-          },
-        },
-        render: (_args, value) => [{ type: "text", text: `orchestration decision ${value.status} for ${value.team_id}; document revision ${value.document_revision}; Markdown ${value.markdown.status}` }],
-      },
-      async execute(
-        args: DecisionInput & { createdAt?: number },
-        exec: ToolExecutionInput,
-      ) {
-        if (exec.agent === undefined) throw new Error("orchestra_decision requires an agent caller");
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory");
-        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("append a Driver decision", observation);
-        if (observation.kind !== "ready") throw new Error(`cannot append a Driver decision: no ready Team state (${observation.kind})`);
-        const team = observation.team;
-        if (exec.agent.id !== team.controllerSessionId) throw new Error("cannot append a Driver decision: permission_denied (Driver/controller required)");
-        const current = documentReadForTeam(team);
-        if (current === undefined) throw new Error("cannot append a Driver decision: legacy_missing (run orchestra_reconcile first)");
-        let command;
-        try {
-          const existing = current.decisions.find((entry) => entry.decisionId === args.decisionId);
-          command = appendDriverDecision(current, team, {
-            decisionId: args.decisionId,
-            kind: args.kind,
-            summary: args.summary,
-            ...(args.rationale === undefined ? {} : { rationale: args.rationale }),
-            actorSessionId: exec.agent.id,
-            createdAt: args.createdAt ?? existing?.createdAt ?? Date.now(),
-            evidence: args.evidence,
-            affects: args.affects,
-          });
-        } catch (error) {
-          throw documentCommandError("append a Driver decision", error);
-        }
-        if (command.kind === "noop") {
-          const markdown = await inspectMarkdownProjection(ctx.fs, cwd, current, isRuntimeProjectionStale(current, team), exec.signal);
-          return documentToolStatus(team, current, markdown) as any;
-        }
-        const persisted = await persistDocumentTransition(ctx, activeTeamState, observation, command.document, exec);
-        return documentToolStatus(persisted.snapshot.team, persisted.document, persisted.markdown) as any;
-      },
-    }),
-  );
 
-  ctx.tools.register(
-    defineTool({
-      name: "orchestra_gate_open",
-      description: "Driver-only open of a Human Gate declared by the current Frozen Charter. Gate scope/options/fallback are copied into append-only Graph facts; arbitrary runtime gates are rejected.",
-      parameters: {
-        gateId: { type: "string", required: true },
-        gateInstanceId: { type: "string", required: true },
-        evidence: { type: "array", items: { type: "json" } },
-      },
-      output: {
-        schema: graphOutputSchema,
-        render: (_args, value) => [{ type: "text", text: `gate open ${value.team_id}: ${value.status}, runtime revision ${value.runtime_revision}` }],
-      },
-      async execute(args: { gateId: string; gateInstanceId: string; evidence?: unknown[] }, exec: ToolExecutionInput) {
-        if (exec.agent === undefined) throw new Error("orchestra_gate_open requires an agent caller");
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory");
-        const initial = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("open a Human Gate", initial);
-        if (initial.kind !== "ready") throw new Error(`cannot open a Human Gate: no ready Team (${initial.kind})`);
-        const observation = await sweepTeamBoundedRun(ctx, activeTeamState, initial, exec);
-        const team = observation.team;
-        const { runtime, stale } = currentGraphRuntime(team);
-        if (stale) throw new Error("cannot open a Human Gate: stale_charter");
-        const frozen = currentFrozenCharter(team);
-        const definition = frozen.topology.config.protocol?.gates?.find((gate) => gate.gateId === args.gateId);
-        if (definition === undefined) throw new Error(`cannot open a Human Gate: gate ${args.gateId} is not declared by Frozen Charter`);
-        let command;
-        try {
-          command = openGate(runtime, team, definition, { gateInstanceId: args.gateInstanceId, actorSessionId: exec.agent.id, now: Date.now(), humanMode: frozen.humanParticipationPolicy.mode, evidence: args.evidence as EvidenceRef[] | undefined });
-        } catch (error) {
-          throw graphCommandError("open a Human Gate", error);
-        }
-        const snapshot = command.kind === "noop" ? observation : await persistGraphTransition(ctx, activeTeamState, observation, command.runtime, exec);
-        return graphToolOutput(snapshot.team, command.runtime, false) as any;
-      },
-    }),
-  );
 
-  ctx.tools.register(
-    defineTool({
-      name: "orchestra_gate_fallback",
-      description: "Driver-only explicit checkpoint fallback for a declared Human Gate. Before expiry it requires an explicit unavailable fact; it may only apply the pre-approved onUnavailable action and never invents a new option.",
-      parameters: {
-        gateInstanceId: { type: "string", required: true },
-        unavailableConfirmed: { type: "boolean", required: true },
-        reason: { type: "string", required: true },
-        evidence: { type: "array", items: { type: "json" } },
-      },
-      output: {
-        schema: graphOutputSchema,
-        render: (_args, value) => [{ type: "text", text: `gate fallback ${value.team_id}: ${value.status}, runtime revision ${value.runtime_revision}` }],
-      },
-      async execute(args: { gateInstanceId: string; unavailableConfirmed: boolean; reason: string; evidence?: unknown[] }, exec: ToolExecutionInput) {
-        if (exec.agent === undefined) throw new Error("orchestra_gate_fallback requires an agent caller");
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory");
-        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("apply a Human Gate fallback", observation);
-        if (observation.kind !== "ready") throw new Error(`cannot apply a Human Gate fallback: no ready Team (${observation.kind})`);
-        const team = observation.team;
-        const { runtime, stale } = currentGraphRuntime(team);
-        if (stale) throw new Error("cannot apply a Human Gate fallback: stale_charter");
-        const frozen = currentFrozenCharter(team);
-        const gate = graphGates(runtime).find((entry) => entry.gateInstanceId === args.gateInstanceId);
-        if (gate === undefined) throw new Error(`cannot apply a Human Gate fallback: gate ${args.gateInstanceId} is unknown`);
-        const definition = frozen.topology.config.protocol?.gates?.find((entry) => entry.gateId === gate.gateId);
-        if (definition === undefined) throw new Error(`cannot apply a Human Gate fallback: definition ${gate.gateId} is missing`);
-        let command;
-        try {
-          command = applyGateFallback(runtime, team, definition, { gateInstanceId: args.gateInstanceId, actorSessionId: exec.agent.id, now: Date.now(), unavailableConfirmed: args.unavailableConfirmed, reason: args.reason, evidence: args.evidence as EvidenceRef[] | undefined });
-        } catch (error) {
-          throw graphCommandError("apply a Human Gate fallback", error);
-        }
-        const snapshot = command.kind === "noop" ? observation : await persistGraphTransition(ctx, activeTeamState, observation, command.runtime, exec);
-        if (command.kind === "changed") {
-          const after = graphGates(command.runtime).find((entry) => entry.gateInstanceId === args.gateInstanceId);
-          await notifyDriverMilestone(ctx, team, exec.agent.id, "gate", `${args.gateInstanceId} resolved: ${after?.selectedOption ?? after?.status ?? "noop"}`, {
-            recordFailure: noticeRecorderFor(ctx, activeTeamState, cwd, exec),
-          });
-        }
-        return graphToolOutput(snapshot.team, command.runtime, false) as any;
-      },
-    }),
-  );
+
 
   ctx.tools.register(
     defineTool({
       name: "orchestra_wait",
       description:
-        "Sleep until the active Team changes, or until the timeout elapses. Reports ONLY whether something happened — never what it was — so the caller re-reads orchestra_team / orchestra_graph after waking; that split keeps the wake-up from racing the state read it stands for. A change is any committed Team write: graph milestones, a role filing a report through orchestra_report, a gate decision, provisioning progress. The wait is ONE-SHOT: it ends at the first change or the timeout, and the caller decides whether to wait again. Use this INSTEAD of polling in a loop: after dispatching work, sleep here; on waking (or timing out) re-read state, advance whatever can advance, then wait again. A timeout is not a failure — it means nothing was committed, and bounded Attempt deadlines still guarantee the run ends even if every wait times out.",
+        "Sleep until an active Team change occurs (such as a role filing an orchestra_report or a state change), or until the 20-minute heartbeat timeout elapses. Reports whether a change occurred. Use this instead of polling in a loop: after dispatching work via orchestra_dispatch, sleep here; on waking or heartbeat timeout, re-read orchestra_team and advance whichever lane can advance.",
       parameters: {
         teamId: { type: "string", description: "Team to wait on; defaults to the active Team of the calling session's working directory." },
         timeoutMs: {
           type: "number",
-          description: `Maximum wait in milliseconds (${MIN_WAIT_TIMEOUT_MS}..${MAX_WAIT_TIMEOUT_MS}); defaults to ${DEFAULT_WAIT_TIMEOUT_MS}. Values outside the range are refused rather than clamped, so a caller can never believe it waited longer than it did.`,
+          description: `Maximum wait in milliseconds (${MIN_WAIT_TIMEOUT_MS}..${MAX_WAIT_TIMEOUT_MS}); defaults to ${DEFAULT_WAIT_TIMEOUT_MS} (20 minutes heartbeat).`,
         },
       },
       output: {
@@ -3745,8 +3355,8 @@ export function apply(ctx: Context): void {
             text: value.cancelled === true
               ? `orchestra_wait ${value.team_id}: cancelled after ${value.waited_ms}ms — re-read state before deciding`
               : value.changed
-                ? `orchestra_wait ${value.team_id}: a change was committed after ${value.waited_ms}ms — re-read orchestra_team / orchestra_graph`
-                : `orchestra_wait ${value.team_id}: nothing changed within ${value.waited_ms}ms — re-read state, then decide whether to wait again`,
+                ? `orchestra_wait ${value.team_id}: a change was committed after ${value.waited_ms}ms — inspect orchestra_team / reports`
+                : `orchestra_wait ${value.team_id}: heartbeat interval reached after ${value.waited_ms}ms — inspect team progress`,
           },
         ],
       },
@@ -3789,374 +3399,10 @@ export function apply(ctx: Context): void {
     }),
   );
 
-  ctx.tools.register(
-    defineTool({
-      name: "orchestra_graph",
-      description: "Read the current Frozen-Charter-bound execution DAG summary: bounded Loops/attempts, pending typed handoffs, cap exhaustion, runtime revision, and stale status. It never dumps or mutates the event log.",
-      parameters: {},
-      output: {
-        schema: graphOutputSchema,
-        render: (_args, value) => [{ type: "text", text: `graph ${value.team_id}: ${value.status}, runtime revision ${value.runtime_revision}, pending handoffs=${value.pending_handoffs.length}, cap exhausted=${value.cap_exhausted.length}` }],
-      },
-      async execute(_args, exec: ToolExecutionInput) {
-        if (exec.agent === undefined) throw new Error("orchestra_graph requires an agent caller");
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory");
-        const initial = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("read the graph runtime", initial);
-        if (initial.kind !== "ready") throw new Error(`cannot read the graph runtime: ${initial.kind}`);
-        const observationSwept = await sweepTeamBoundedRun(ctx, activeTeamState, initial, exec);
-        const { runtime, stale } = currentGraphRuntime(observationSwept.team);
-        return graphToolOutput(observationSwept.team, runtime, stale) as any;
-      },
-    }),
-  );
 
-  ctx.tools.register(
-    defineTool({
-      name: "orchestra_loop_start",
-      description: "Driver-only start of a Loop declared by the current Frozen Charter. The loop contract, evaluator, participants, exits, hard cap, and required evidence are resolved from the frozen snapshot.",
-      parameters: {
-        loopId: { type: "string", required: true },
-        loopInstanceId: { type: "string" },
-        evidence: { type: "array", items: { type: "json" } },
-      },
-      output: {
-        schema: graphOutputSchema,
-        render: (_args, value) => [{ type: "text", text: `loop start ${value.team_id}: ${value.status}, runtime revision ${value.runtime_revision}` }],
-      },
-      async execute(args: { loopId: string; loopInstanceId?: string; evidence?: unknown[] }, exec: ToolExecutionInput) {
-        if (exec.agent === undefined) throw new Error("orchestra_loop_start requires an agent caller");
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory");
-        const initial = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("start a Loop", initial);
-        if (initial.kind !== "ready") throw new Error(`cannot start a Loop: no ready Team (${initial.kind})`);
-        const observation = await sweepTeamBoundedRun(ctx, activeTeamState, initial, exec);
-        const team = observation.team;
-        const { runtime, stale } = currentGraphRuntime(team);
-        if (stale) throw new Error("cannot start a Loop: stale_charter (reconcile or create a new runtime branch after amendment)");
-        const frozen = currentFrozenCharter(team);
-        const contract = frozen.topology.config.protocol?.loops?.find((loop) => loop.loopId === args.loopId);
-        if (contract === undefined) throw new Error(`cannot start a Loop: loop ${args.loopId} is not declared by Frozen Charter ${frozen.frozenRef}`);
-        let command;
-        try {
-          command = startLoop(runtime, team, contract, { actorSessionId: exec.agent.id, loopInstanceId: args.loopInstanceId, now: Date.now(), evidence: args.evidence as EvidenceRef[] | undefined });
-        } catch (error) {
-          throw graphCommandError("start a Loop", error);
-        }
-        const snapshot = command.kind === "noop" ? observation : await persistGraphTransition(ctx, activeTeamState, observation, command.runtime, exec);
-        return graphToolOutput(snapshot.team, command.runtime, false) as any;
-      },
-    }),
-  );
 
-  ctx.tools.register(
-    defineTool({
-      name: "orchestra_attempt_start",
-      description: "Start the next continuous attempt of a declared bounded Loop. Attempt number is derived from immutable graph history; a participant or Driver may start it, but cap/passed/blocked Loops cannot retry.",
-      parameters: {
-        loopInstanceId: { type: "string", required: true },
-        participantRoleId: { type: "string", required: true },
-        candidate: { type: "json" },
-        evidence: { type: "array", items: { type: "json" } },
-      },
-      output: {
-        schema: graphOutputSchema,
-        render: (_args, value) => [{ type: "text", text: `attempt start ${value.team_id}: ${value.status}, runtime revision ${value.runtime_revision}` }],
-      },
-      async execute(args: { loopInstanceId: string; participantRoleId: string; candidate?: unknown; evidence?: unknown[] }, exec: ToolExecutionInput) {
-        if (exec.agent === undefined) throw new Error("orchestra_attempt_start requires an agent caller");
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory");
-        const initial = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("start a Loop attempt", initial);
-        if (initial.kind !== "ready") throw new Error(`cannot start a Loop attempt: no ready Team (${initial.kind})`);
-        const observation = await sweepTeamBoundedRun(ctx, activeTeamState, initial, exec);
-        const team = observation.team;
-        const { runtime, stale } = currentGraphRuntime(team);
-        if (stale) throw new Error("cannot start a Loop attempt: stale_charter");
-        const loop = graphLoops(runtime).find((entry) => entry.loopInstanceId === args.loopInstanceId);
-        if (loop === undefined) throw new Error(`cannot start a Loop attempt: Loop ${args.loopInstanceId} was not found`);
-        const frozen = currentFrozenCharter(team);
-        const contract = frozen.topology.config.protocol?.loops?.find((entry) => entry.loopId === loop.loopId);
-        if (contract === undefined) throw new Error(`cannot start a Loop attempt: contract ${loop.loopId} is missing from the current Frozen Charter`);
-        let command;
-        try {
-          command = startAttempt(runtime, team, contract, { loopInstanceId: args.loopInstanceId, actorSessionId: exec.agent.id, participantRoleId: args.participantRoleId, candidate: args.candidate as Record<string, unknown> | undefined, now: Date.now(), evidence: args.evidence as EvidenceRef[] | undefined });
-        } catch (error) {
-          throw graphCommandError("start a Loop attempt", error);
-        }
-        const snapshot = command.kind === "noop" ? observation : await persistGraphTransition(ctx, activeTeamState, observation, command.runtime, exec);
-        return graphToolOutput(snapshot.team, command.runtime, false) as any;
-      },
-    }),
-  );
 
-  ctx.tools.register(
-    defineTool({
-      name: "orchestra_verdict",
-      description: "Record PASS/FAIL/BLOCKED only from the declared evaluator's current active Session. PASS closes the Loop; FAIL below cap permits a later attempt; FAIL at cap emits cap_exhausted; BLOCKED does not silently retry.",
-      parameters: {
-        loopInstanceId: { type: "string", required: true },
-        verdict: { type: "string", enum: ["PASS", "FAIL", "BLOCKED"], required: true },
-        findings: { type: "array", items: { type: "string" } },
-        evidence: { type: "array", items: { type: "json" } },
-      },
-      output: {
-        schema: graphOutputSchema,
-        render: (_args, value) => [{ type: "text", text: `verdict ${value.team_id}: ${value.status}, runtime revision ${value.runtime_revision}` }],
-      },
-      async execute(args: { loopInstanceId: string; verdict: "PASS" | "FAIL" | "BLOCKED"; findings?: string[]; evidence?: unknown[] }, exec: ToolExecutionInput) {
-        if (exec.agent === undefined) throw new Error("orchestra_verdict requires an agent caller");
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory");
-        const initial = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("record a Loop verdict", initial);
-        if (initial.kind !== "ready") throw new Error(`cannot record a Loop verdict: no ready Team (${initial.kind})`);
-        const observation = await sweepTeamBoundedRun(ctx, activeTeamState, initial, exec);
-        const team = observation.team;
-        const { runtime, stale } = currentGraphRuntime(team);
-        if (stale) throw new Error("cannot record a Loop verdict: stale_charter");
-        const loop = graphLoops(runtime).find((entry) => entry.loopInstanceId === args.loopInstanceId);
-        if (loop === undefined) throw new Error(`cannot record a Loop verdict: Loop ${args.loopInstanceId} was not found`);
-        const frozen = currentFrozenCharter(team);
-        const contract = frozen.topology.config.protocol?.loops?.find((entry) => entry.loopId === loop.loopId);
-        if (contract === undefined) throw new Error(`cannot record a Loop verdict: contract ${loop.loopId} is missing from the current Frozen Charter`);
-        let command;
-        try {
-          command = recordVerdict(runtime, team, contract, { loopInstanceId: args.loopInstanceId, actorSessionId: exec.agent.id, evaluatorRole: contract.evaluatorRole, verdict: args.verdict, findings: args.findings, now: Date.now(), evidence: args.evidence as EvidenceRef[] | undefined });
-        } catch (error) {
-          throw graphCommandError("record a Loop verdict", error);
-        }
-        const snapshot = command.kind === "noop" ? observation : await persistGraphTransition(ctx, activeTeamState, observation, command.runtime, exec);
-        if (command.kind === "changed") {
-          const updated = graphLoops(command.runtime).find((entry) => entry.loopInstanceId === args.loopInstanceId);
-          const attempt = updated?.attempts.at(-1)?.attempt;
-          const capped = command.runtime.events.at(-1)?.type === "cap_exhausted";
-          await notifyDriverMilestone(ctx, team, exec.agent.id, "verdict", `${args.verdict}: ${args.loopInstanceId} attempt ${attempt ?? "?"}${capped ? " cap_exhausted" : ""}`, {
-            recordFailure: noticeRecorderFor(ctx, activeTeamState, cwd, exec),
-          });
-        }
-        return graphToolOutput(snapshot.team, command.runtime, false) as any;
-      },
-    }),
-  );
 
-  ctx.tools.register(
-    defineTool({
-      name: "orchestra_graph_reconcile",
-      description: "Driver-only graph checkpoint. Initializes a missing graph runtime for a Frozen Team; an existing runtime bound to an older charter is reported stale and is never silently migrated.",
-      parameters: {},
-      output: {
-        schema: graphOutputSchema,
-        render: (_args, value) => [{ type: "text", text: `graph reconcile ${value.team_id}: ${value.status}, runtime revision ${value.runtime_revision}` }],
-      },
-      async execute(_args, exec: ToolExecutionInput) {
-        if (exec.agent === undefined) throw new Error("orchestra_graph_reconcile requires an agent caller");
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory");
-        const initial = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("reconcile the graph runtime", initial);
-        if (initial.kind !== "ready") throw new Error(`cannot reconcile the graph runtime: no ready Team (${initial.kind})`);
-        const observation = await sweepTeamBoundedRun(ctx, activeTeamState, initial, exec);
-        const team = observation.team;
-        if (exec.agent.id !== team.controllerSessionId) throw new Error("cannot reconcile the graph runtime: permission_denied (Driver/controller required)");
-        const frozen = currentFrozenCharter(team);
-        if (team.graphRuntime === undefined) {
-          const runtime = initializeGraphRuntime(team.teamId, frozen.charterRevision, frozen.digest, Date.now());
-          const snapshot = await persistGraphTransition(ctx, activeTeamState, observation, runtime, exec);
-          return graphToolOutput(snapshot.team, runtime, false) as any;
-        }
-        const read = readGraphRuntime(team.graphRuntime, team.teamId, frozen.charterRevision, frozen.digest);
-        if (read.kind === "blocked") throw new Error(`cannot reconcile the graph runtime: ${read.diagnostic.code}: ${read.diagnostic.message}`);
-        if (read.kind === "stale") throw new Error("cannot reconcile the graph runtime: stale_charter (start a new runtime branch in a later checkpoint)");
-        if (read.kind === "legacy_missing") throw new Error("cannot reconcile the graph runtime: legacy_missing");
-        let runtime = read.runtime;
-        let snapshot = observation;
-        for (const pending of graphHandoffs(runtime).filter((handoff) => handoff.status === "pending")) {
-          if (pending.targetSessionId === undefined) continue;
-          const receipt = await readDeliveryReceipt(ctx, pending.targetSessionId, pending.handoffId);
-          if (receipt === undefined) continue;
-          const accepted = appendHandoffResult(runtime, snapshot.team, { handoffId: pending.handoffId, actorSessionId: exec.agent.id, accepted: true, receipt: receipt as unknown as Record<string, unknown>, now: Date.now() });
-          if (accepted.kind === "noop") continue;
-          try {
-            snapshot = await persistGraphTransition(ctx, activeTeamState, snapshot, accepted.runtime, exec);
-            runtime = accepted.runtime;
-          } catch (error) {
-            throw graphCommandError("reconcile an accepted typed handoff", error);
-          }
-        }
-        return graphToolOutput(snapshot.team, runtime, false) as any;
-      },
-    }),
-  );
-
-  ctx.tools.register(
-    defineTool({
-      name: "orchestra_handoff",
-      description: "Send a route-aware typed milestone through the same A2A Transport while recording a CAS-guarded Graph pending/accepted/failed transaction. Ordinary a2a_send/orchestra_send remain untyped and unaffected. Reusing handoffId never enqueues a duplicate.",
-      parameters: {
-        handoffId: { type: "string", required: true, description: "Stable idempotency key for this typed handoff." },
-        kind: { type: "string", required: true },
-        fromRole: { type: "string", required: true },
-        toRole: { type: "string", required: true },
-        loopInstanceId: { type: "string" },
-        attempt: { type: "number" },
-        summary: { type: "string", required: true },
-        payload: { type: "json" },
-        evidence: { type: "array", items: { type: "json" } },
-        wake: { type: "boolean" },
-        interrupt: { type: "boolean" },
-      },
-      output: {
-        schema: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            status: { type: "string", required: true },
-            handoff_id: { type: "string", required: true },
-            team_id: { type: "string", required: true },
-            from_role: { type: "string", required: true },
-            to_role: { type: "string", required: true },
-            resolved_session_id: { type: "string", required: true },
-            runtime_revision: { type: "number", required: true },
-            receipt: { type: "json" },
-            error: { type: "string" },
-            reconcile_required: { type: "boolean" },
-          },
-        },
-        render: (_args, value) => [{ type: "text", text: `handoff ${value.handoff_id} ${value.status}: ${value.from_role} → ${value.to_role}${value.reconcile_required ? " (reconcile required)" : ""}` }],
-      },
-      async execute(args: { handoffId: string; kind: string; fromRole: string; toRole: string; loopInstanceId?: string; attempt?: number; summary: string; payload?: unknown; evidence?: unknown[]; wake?: boolean; interrupt?: boolean }, exec: ToolExecutionInput): Promise<any> {
-        if (exec.agent === undefined) throw new Error("orchestra_handoff requires an agent caller");
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory");
-        const initial = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("send a typed handoff", initial);
-        if (initial.kind !== "ready") throw new Error(`cannot send a typed handoff: no ready Team (${initial.kind})`);
-        const observation = await sweepTeamBoundedRun(ctx, activeTeamState, initial, exec);
-        if (initial.team.status !== "active" && initial.team.status !== "degraded") throw new Error(`cannot send a typed handoff while Team status is ${initial.team.status}`);
-        const team = observation.team;
-        const { runtime, stale } = currentGraphRuntime(team);
-        if (stale) throw new Error("cannot send a typed handoff: stale_charter (runtime is bound to an older Frozen Charter)");
-        const frozen = currentFrozenCharter(team);
-        const controllerRoleId = frozen.topology.config.controller?.id ?? "driver";
-        const contract = frozen.topology.config.protocol?.handoffs?.find((entry) => entry.kind === args.kind);
-        if (contract === undefined) throw new Error(`cannot send a typed handoff: route ${args.kind} is not declared by Frozen Charter ${frozen.frozenRef}`);
-        const payload = jsonRecord(args.payload) ? { ...args.payload, summary: args.summary } : { summary: args.summary };
-        let pendingCommand;
-        try {
-          pendingCommand = appendHandoffPending(runtime, team, contract, {
-            handoffId: args.handoffId,
-            kind: args.kind,
-            fromRole: args.fromRole,
-            toRole: args.toRole,
-            loopInstanceId: args.loopInstanceId,
-            attempt: args.attempt,
-            summary: args.summary,
-            payload,
-            actorSessionId: exec.agent.id,
-            now: Date.now(),
-            evidence: args.evidence as EvidenceRef[] | undefined,
-            controllerRoleId,
-          });
-        } catch (error) {
-          throw graphCommandError("prepare a typed handoff", error);
-        }
-        let pendingSnapshot = observation;
-        let pendingRuntime = runtime;
-        const existing = graphHandoffs(runtime).find((handoff) => handoff.handoffId === args.handoffId);
-        if (pendingCommand.kind === "changed") {
-          pendingRuntime = pendingCommand.runtime;
-          try {
-            pendingSnapshot = await persistGraphTransition(ctx, activeTeamState, observation, pendingRuntime, exec);
-          } catch (error) {
-            throw graphCommandError("reserve a typed handoff", error);
-          }
-        } else if (existing?.status === "accepted" || existing?.status === "failed") {
-          return {
-            status: existing.status,
-            handoff_id: existing.handoffId,
-            team_id: team.teamId,
-            from_role: existing.fromRole,
-            to_role: existing.toRole,
-            resolved_session_id: resolveHandoffTarget(team, existing.toRole, controllerRoleId).sessionId,
-            runtime_revision: runtime.runtimeRevision,
-            ...(existing.receipt === undefined ? {} : { receipt: existing.receipt }),
-            ...(existing.error === undefined ? {} : { error: existing.error }),
-          };
-        }
-        const pendingFact = graphHandoffs(pendingRuntime).find((handoff) => handoff.handoffId === args.handoffId);
-        if (pendingFact === undefined) throw new Error("typed handoff pending fact could not be reconstructed");
-        const targetSessionId = resolveHandoffTarget(team, pendingFact.toRole, controllerRoleId).sessionId;
-        let receipt: Record<string, unknown>;
-        try {
-          receipt = await deliverMessage(ctx, exec.agent.id, targetSessionId, [{ type: "text", text: JSON.stringify({ type: "orchestra_handoff", handoff_id: args.handoffId, kind: args.kind, summary: args.summary, payload, evidence: args.evidence ?? [] }) }], { wake: args.wake, interrupt: args.interrupt, idempotencyKey: args.handoffId }) as any;
-        } catch (error) {
-          try {
-            const failed = appendHandoffResult(pendingRuntime, pendingSnapshot.team, { handoffId: args.handoffId, actorSessionId: exec.agent.id, accepted: false, error: error instanceof Error ? error.message : String(error), now: Date.now() });
-            const failedSnapshot = await persistGraphTransition(ctx, activeTeamState, pendingSnapshot, failed.runtime, exec);
-            return { status: "failed", handoff_id: args.handoffId, team_id: team.teamId, from_role: pendingFact.fromRole, to_role: pendingFact.toRole, resolved_session_id: targetSessionId, runtime_revision: failedSnapshot.team.graphRuntime?.runtimeRevision ?? failed.runtime.runtimeRevision, error: error instanceof Error ? error.message : String(error) };
-          } catch (stateError) {
-            return { status: "delivery_failed_state_pending", handoff_id: args.handoffId, team_id: team.teamId, from_role: pendingFact.fromRole, to_role: pendingFact.toRole, resolved_session_id: targetSessionId, runtime_revision: pendingRuntime.runtimeRevision, error: error instanceof Error ? error.message : String(error), reconcile_required: true };
-          }
-        }
-        try {
-          const accepted = appendHandoffResult(pendingRuntime, pendingSnapshot.team, { handoffId: args.handoffId, actorSessionId: exec.agent.id, accepted: true, receipt, now: Date.now() });
-          const acceptedSnapshot = await persistGraphTransition(ctx, activeTeamState, pendingSnapshot, accepted.runtime, exec);
-          await notifyDriverMilestone(ctx, team, exec.agent.id, "handoff", `${args.kind} accepted: ${pendingFact.fromRole} → ${pendingFact.toRole}`, {
-            recordFailure: noticeRecorderFor(ctx, activeTeamState, cwd, exec),
-          });
-          return { status: "accepted", handoff_id: args.handoffId, team_id: team.teamId, from_role: pendingFact.fromRole, to_role: pendingFact.toRole, resolved_session_id: targetSessionId, runtime_revision: acceptedSnapshot.team.graphRuntime?.runtimeRevision ?? accepted.runtime.runtimeRevision, receipt };
-        } catch (error) {
-          return { status: "delivery_accepted_state_pending", handoff_id: args.handoffId, team_id: team.teamId, from_role: pendingFact.fromRole, to_role: pendingFact.toRole, resolved_session_id: targetSessionId, runtime_revision: pendingRuntime.runtimeRevision, receipt, reconcile_required: true };
-        }
-      },
-    }),
-  );
-
-  ctx.tools.register(
-    defineTool({
-      name: "orchestra_close",
-      description: "Request semantic terminal closure under the Frozen Charter's single closure owner. Machine-checks loops, verdicts, evidence, handoffs, and required Human Gates; terminal closure blocks further Graph mutation and is required before dismissing a Frozen Team.",
-      parameters: {
-        outcome: { type: "string", enum: ["completed", "failed", "abandoned"], required: true },
-        reason: { type: "string" },
-        evidence: { type: "array", items: { type: "json" } },
-      },
-      output: {
-        schema: graphOutputSchema,
-        render: (_args, value) => [{ type: "text", text: `closure ${value.team_id}: ${value.status}, outcome=${value.closure?.outcome ?? "rejected"}` }],
-      },
-      async execute(args: { outcome: "completed" | "failed" | "abandoned"; reason?: string; evidence?: unknown[] }, exec: ToolExecutionInput) {
-        if (exec.agent === undefined) throw new Error("orchestra_close requires an agent caller");
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory");
-        const observation = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("close the Team", observation);
-        if (observation.kind !== "ready") throw new Error(`cannot close the Team: no ready Team (${observation.kind})`);
-        const team = observation.team;
-        const { runtime, stale } = currentGraphRuntime(team);
-        if (stale) throw new Error("cannot close the Team: stale_charter");
-        const definition = currentClosureDefinition(team);
-        let command;
-        try {
-          command = recordClosure(runtime, team, definition, { outcome: args.outcome, actorSessionId: exec.agent.id, reason: args.reason, now: Date.now(), evidence: args.evidence as EvidenceRef[] | undefined });
-        } catch (error) {
-          throw graphCommandError("close the Team", error);
-        }
-        if (command.kind === "noop") return graphToolOutput(team, runtime, false) as any;
-        const terminalStatus: TeamState["status"] | undefined = command.accepted ? args.outcome === "completed" ? "completed" : args.outcome === "abandoned" ? "abandoned" : "failed" : undefined;
-        const snapshot = await persistGraphTransition(ctx, activeTeamState, observation, command.runtime, exec, terminalStatus);
-        if (!command.accepted) throw new Error(`closure rejected: ${command.diagnostic ?? "requirements not satisfied"}`);
-        await notifyDriverMilestone(ctx, team, exec.agent.id, "close", args.outcome, {
-          recordFailure: noticeRecorderFor(ctx, activeTeamState, cwd, exec),
-        });
-        return graphToolOutput(snapshot.team, command.runtime, false) as any;
-      },
-    }),
-  );
 
   ctx.tools.register(
     defineTool({
@@ -4492,10 +3738,6 @@ export function apply(ctx: Context): void {
         throwIfBlocked("dismiss the team", teamObservation);
         if (teamObservation.kind !== "ready") throw new Error(`cannot dismiss the team: ${teamObservation.diagnostic.message}`);
         const team = teamObservation.team;
-        if (team.document?.charterStatus === "frozen") {
-          const graph = currentGraphRuntime(team);
-          if (graph.stale || graphClosure(graph.runtime).status !== "recorded") throw new Error("cannot dismiss a Frozen Team before terminal closure; run orchestra_close with an allowed outcome first");
-        }
         const dismissedAt = Date.now();
         const archived = await archiveStore.create(cwd, team, {
           dismissedAt,
@@ -4591,22 +3833,34 @@ export function apply(ctx: Context): void {
         if (teamObservation.kind === "ready") {
           const team = teamObservation.team;
           const role = team.roles.find((entry) => entry.sessionId === agentId);
+          let updatedTeam = team;
           if (role !== undefined) {
-            role.reportCount = (role.reportCount ?? 0) + 1;
-            role.lastReport = canonical;
-            team.reports.push({
-              reportId: `report-${randomUUID().slice(0, 8)}`,
-              roleId: role.id,
-              sessionId: agentId,
-              path: canonical,
-              createdAt: Date.now(),
-            });
-            await activeTeamState.replace(teamObservation, team, {
+            const nextRoles = team.roles.map((entry) =>
+              entry.sessionId === agentId
+                ? { ...entry, reportCount: (entry.reportCount ?? 0) + 1, lastReport: canonical }
+                : entry,
+            );
+            const nextReports = [
+              ...team.reports,
+              {
+                reportId: `report-${randomUUID().slice(0, 8)}`,
+                roleId: role.id,
+                sessionId: agentId,
+                path: canonical,
+                createdAt: Date.now(),
+              },
+            ];
+            updatedTeam = {
+              ...team,
+              roles: nextRoles,
+              reports: nextReports,
+            };
+            await activeTeamState.replace(teamObservation, updatedTeam, {
               policy: escrowPolicy(ctx, exec),
               signal: exec.signal,
             });
           }
-          await notifyDriverMilestone(ctx, team, agentId, "report", `written: ${rel}`, {
+          await notifyDriverMilestone(ctx, updatedTeam, agentId, "report", `written: ${rel}`, {
             recordFailure: noticeRecorderFor(ctx, activeTeamState, cwd, exec),
           });
         }
@@ -4878,6 +4132,55 @@ export function apply(ctx: Context): void {
     );
   };
   registerWebSurface();
+
+  // Approving with a plain reply instead of a slash command (user decision,
+  // 2026-09-15 — see docs/adr/0006). `session/event` is a post-commit feed, so by
+  // the time this runs the user's message is already durable and the approval it
+  // triggers can cite it.
+  //
+  // The filter is deliberately cheap and first: this listener sees EVERY appended
+  // event of EVERY session, so anything that is not a user-authored text message
+  // must cost two property reads and return. The approval work itself is async
+  // and detached — an observer failure must never touch the append that triggered
+  // it (the event contract says so explicitly), and a thrown error here would be
+  // a plugin breaking a session's log write.
+  ctx.on("session/event", (session: any, event: any) => {
+    if (event?.type !== "user/message") return;
+    if (event?.data?.source?.kind !== "user") return;
+    void approvePendingDraftFromUserMessage(ctx, session, { seq: event.seq, data: event.data }).catch((error) => {
+      const reason = error instanceof Error ? error.message : String(error);
+      // A thrown approval is the worst silence in this plugin: the user's reply
+      // IS the approval gesture now, so if the record is not written they will
+      // believe they approved while nothing was frozen. A console line is not
+      // enough — the failure is injected into the conversation, the same channel
+      // a successful approval uses, so the driver learns it must not proceed.
+      console.warn(`orchestra: could not read a plain-reply approval from ${String(session?.id)} seq ${String(event?.seq)}: ${reason}`);
+      try {
+        const agent = ctx.get("agents")?.get(session?.id);
+        agent?.followup?.(
+          createUserMessage({
+            content: [
+              {
+                type: "text",
+                text: `(orchestra approval failure) The user's reply was NOT recorded as an approval: ${reason}. Nothing was frozen and no role was created. Do not treat the plan as approved; fix the cause and ask the user to reply again.`,
+              },
+            ] as ContentBlock[],
+            source: {
+              kind: "plugin",
+              plugin: "orchestra",
+              form: "notice",
+              summary: "orchestra approval failure",
+            } as MessageSource,
+          }) as never,
+        );
+      } catch (noticeError) {
+        console.warn(
+          `orchestra: could not report the approval failure into ${String(session?.id)} either (${noticeError instanceof Error ? noticeError.message : String(noticeError)}); the user's approval was dropped and nobody was told`,
+        );
+      }
+    });
+  });
+
   ctx.on("internal/service", (name) => {
     if ((WEB_SERVER_KEYS as readonly string[]).includes(name) || name === "workspaceRegistry") {
       registerWebSurface();
@@ -4894,23 +4197,16 @@ export function apply(ctx: Context): void {
       name: SECTION_NAME,
       order: SECTION_ORDER,
       text:
-        "Orchestra: you are the team driver — the role that starts a team toward a goal and owns decisions. When the user says /team or expresses intent to open a team / collaborate / delegate, follow the FIXED onboarding protocol below (do not skip steps 4-5):\n" +
+        "Orchestra: you are the team driver — the role that starts a team toward a goal and owns decisions. When the user says /team or expresses intent to open a team / collaborate / delegate, follow the onboarding protocol below:\n" +
         "1. Goal: ask the user to state the goal — what \"done\" looks like. One topology run completes one goal; a clear goal defines when to stop.\n" +
         "2. Constraints: ask about limits/constraints (time, quality, boundaries). Merge into the same round when possible.\n" +
         "3. Context: read the project context relevant to the goal (files, docs) to ground your understanding.\n" +
-        "4. Proposal: call orchestra_draft to persist the exact mission/topology/human-policy Draft in your Session events, then report its draftId@revision and digest to the user. The proposal report MUST include a per-role roster card straight from orchestra_draft's role_blueprint_preview: for every role, its preset id, sandbox, permission preset, model provider/model, reasoningEffort, and compositionTools/orchestraTools, so the user can verify each role's configuration before approving. A proposal IS a collaboration charter (编排 = 协作宪章): it must answer who does what; who owns each decision; routes and handoffs; escalation; round limits; and closure.\n" +
-        "5. Approval: proposal text or natural-language \"可以/放行\" is NOT approval. Tell the user to run the exact command /team approve <draftId>@<revision>; only the durable user-command approval event permits orchestra_freeze. Until that command succeeds, do NOT freeze or create/spawn any Governed role session.\n" +
-        "6. Freeze and execute: after the approval command, call orchestra_freeze with the exact digest, then orchestra_create with frozenRef; for active Teams use orchestra_draft → user command → orchestra_freeze → orchestra_apply_amendment. Dispatch Governed roles via orchestra_send(teamId+roleId); use raw a2a_send only for explicit free SessionId communication.\n" +
-        "Dispatch tightness: dispatch every spawned role's task immediately — in the same round, or the round right after spawning. Never leave a spawned role taskless (a spawn-to-dispatch vacuum makes roles start working on their own).\n" +
-        "Parallelism discipline: parallelize everything that CAN run in parallel (dispatch independent tasks together in one round; never serialize independent work) but NEVER parallelize anything that would BLOCK or conflict (dependency-aware: wait for that specific signal — orchestra_team / a2a_read / report path — before dispatching, and declare the dependency explicitly in the task).\n" +
-        "No filler messages: creation injects the welcome; injection IS the confirmation. Do NOT send extra confirmation/ack messages after a role is created or a delivery is confirmed — they pile up in the target's inbox (queue buildup). To check session state use orchestra_team (activity, reportCount, lastReport) or a2a_read (history) — never send a message to ask. Dispatch each task once; use interrupt:true only when a message must surface mid-turn.\n" +
-        "Lightweight mode: for one-off collaboration (check a session, ask a question, read history) use the A2A tools directly (a2a_list/a2a_send/a2a_reply/a2a_read/a2a_status) — no team needed. Governed role dispatch uses orchestra_send so replacement mappings remain current.\n" +
-        "Stay in your role: you are the driver, not an implementer or a reviewer. Never fix, polish, or take over any role's work — implementation issues loop back to the implementer (via the implementer-reviewer flow), review findings go to the reviewer. Your job is decisions, dispatch, and coordination, not edits.\n" +
-        "Deterministic routing (no mindless relaying): you are NOT an information hub. Messages inside a fixed flow go directly between roles — never through you. Example flow: implementer finishes and hands the result directly to reviewer; reviewer finds issues and sends them directly back to implementer for another round; reviewer's targeted re-check passes and THEN reviewer notifies you to advance. You only receive decision points: advances, blockers, new directions, cross-flow coordination. Do not forward what you do not need to know. Roles may call orchestra_team themselves to check team progress (team transparency).\n" +
-        "All created roles are told to reply to you (their driver) via a2a_reply, never directly to the user; users interact with roles only through you. Track progress with orchestra_team; inspect the canonical Living Orchestration Document with orchestra_document; at a Driver checkpoint use orchestra_reconcile for runtime projection and orchestra_decision for append-only decisions. For Frozen-Charter execution use orchestra_graph/orchestra_loop_start/orchestra_attempt_start/orchestra_verdict and route milestones through orchestra_handoff; a cap_exhausted Loop has no next attempt in this checkpoint. Roles may read the document but only the Driver may mutate it. Recover after restart or after dismissal with orchestra_activate (archive_id required — list archives via orchestra_team); close the instance with orchestra_dismiss (archives the team, notifies roles, frees the cwd); list templates with orchestra_topologies.\n" +
-        "Review flow: to task a reviewer, send via orchestra_send using teamId+roleId a review_request message stating scope, changed locations, and the goal; fix findings one by one; at most two rounds (R2 only re-checks R1 findings); stop after R2 regardless of outcome; new issues go to the backlog for the user to decide. Read handoff reports (paths returned by roles) under orchestra/reports/. All cross-role messages must be self-contained.\n" +
-        "Delivery contract: a raw a2a_send/a2a_reply receipt state=accepted means the Transport accepted the message, not that it was claimed or answered; use a2a_status for proven lifecycle facts. orchestra_send adds the resolved teamId/roleId mapping but has the same accepted-only semantics.\n" +
-        "Concurrency discipline (avoid information blocking): you are the bottleneck — every role report lands in your context. Minimize fan-in: ask roles to return concise summaries plus report paths, not full dumps; read report files only when needed. Do not over-orchestrate: if one session can do the job, do not spawn roles.",
+        "4. Proposal: call orchestra_draft to persist the mission and topology Draft, then report its draftId@revision and digest to the user with a per-role roster card preview.\n" +
+        "5. Approval: ask the user to approve by replying with a plain yes — 启动 (or 可以 / 同意 / ok). Their reply is recorded automatically against the exact draft revision. Only the USER can approve. Until approval lands, do not dispatch roles.\n" +
+        "6. Dispatch and Execute: dispatch concrete lane tasks using orchestra_dispatch(roleId, task, { laneId, preset }). orchestra_dispatch automatically provisions the role session if not already running. Roles work autonomously.\n" +
+        "7. Sleep & Heartbeat: after dispatching, call orchestra_wait to sleep with a 20-minute heartbeat. Filing an orchestra_report wakes you early; if 20 minutes elapse without activity, the heartbeat wakes you to inspect orchestra_team and intervene.\n" +
+        "8. Session Control: use a2a_stop(sessionId, reason) to immediately abort a runaway or stuck session. Use a2a_list(query) to inspect or search sessions sorted by recent activity. Use a2a_read for progressive turn review.\n" +
+        "Stay in your role: you are the driver, not an implementer or reviewer. Do not edit code or do the role's work yourself. Dispatch tasks, monitor with orchestra_wait, and verify objective facts with orchestra_team and report files. Close the run with orchestra_dismiss when done.",
     });
   }
 

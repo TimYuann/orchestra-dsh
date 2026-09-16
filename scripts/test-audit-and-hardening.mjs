@@ -382,13 +382,11 @@ test("audit-and-hardening audit roles are read-only: no direct code or risk-stat
   // hardening-auditor / investigator / verifier / reviewer: read-only sandbox, report/handoff-only write channel
   for (const id of ["hardening-auditor", "investigator", "verifier", "reviewer"]) {
     assert.equal(byId(id).sandbox, "read-only", `${id} must be read-only`);
-    assert.ok(!byId(id).orchestraTools.includes("orchestra_verdict") || id === "reviewer", `${id} must not hold verdict authority`);
   }
-  assert.deepEqual(byId("hardening-auditor").orchestraTools, ["orchestra_report", "orchestra_handoff"]);
-  assert.deepEqual(byId("investigator").orchestraTools, ["orchestra_report", "orchestra_handoff"]);
-  assert.deepEqual(byId("verifier").orchestraTools, ["orchestra_report", "orchestra_handoff"]);
-  // reviewer is the only evaluator
-  assert.deepEqual(byId("reviewer").orchestraTools, ["orchestra_report", "orchestra_verdict", "orchestra_handoff"]);
+  assert.deepEqual(byId("hardening-auditor").orchestraTools, ["orchestra_report"]);
+  assert.deepEqual(byId("investigator").orchestraTools, ["orchestra_report"]);
+  assert.deepEqual(byId("verifier").orchestraTools, ["orchestra_report"]);
+  assert.deepEqual(byId("reviewer").orchestraTools, ["orchestra_report"]);
   // implementer is the only workspace-write role
   assert.equal(byId("implementer").sandbox, "workspace-write");
 });

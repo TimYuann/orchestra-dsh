@@ -12,24 +12,10 @@ import type { ContentBlock, MessageSource } from "@deepseek-ai/dsh-llm";
 import { agentPresetProjectionDefinition, mountPreset } from "@deepseek-ai/dsh-agent-presets";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
 import type { Session, SessionEvent, SessionHeader } from "@deepseek-ai/dsh-session";
-import { readGovernedBlueprint, readLightweightBlueprint } from "./session-blueprint.js";
+import type { BlueprintStore } from "./session-blueprint.js";
+import type { ReceiptStore } from "./receipt-store.js";
 
 const SID = (value: string) => value as import("@deepseek-ai/dsh-session").SessionId;
-const A2A_ACCEPTED_EVENT = "orchestra/a2a-accepted" as const;
-
-declare module "@deepseek-ai/dsh-session/types" {
-  interface SessionEventMap {
-    "orchestra/a2a-accepted": {
-      message_id: string;
-      target_session_id: string;
-      accepted_at_ms: number;
-      delivery_mode: DeliveryMode;
-      state: "accepted";
-      interrupt?: boolean;
-      reply_to_message_id?: string;
-    };
-  }
-}
 
 export type DeliveryMode = "live_inbox" | "durable_inbox" | "resumed_inbox";
 
@@ -52,7 +38,27 @@ export interface MessageStatusResult {
   evidence?: string;
 }
 
-type TransportOptions = { wake?: boolean; replyTo?: string; interrupt?: boolean; idempotencyKey?: string };
+type TransportOptions = {
+  wake?: boolean;
+  replyTo?: string;
+  interrupt?: boolean;
+  idempotencyKey?: string;
+  receiptPolicy?: unknown;
+  /**
+   * Durable receipt sink. Injected rather than imported so this module keeps its
+   * documented "no filesystem, cwd, or roster policy" seam; see
+   * `receipt-store.ts` for why the record may not live in the session log.
+   */
+  receiptStore?: ReceiptStore;
+  /**
+   * Resolve the composition-marker store for a session being cold-resumed.
+   *
+   * A factory rather than a store because the cwd is only known AFTER the cold
+   * snapshot is read — and a factory rather than a direct import so this module
+   * keeps its documented "no filesystem, cwd, or roster policy" seam.
+   */
+  resolveBlueprintStore?: (cwd: string | undefined) => BlueprintStore;
+};
 
 const receiptCache = new WeakMap<object, Map<string, DeliverResult>>();
 const inflightCache = new WeakMap<object, Map<string, Promise<DeliverResult>>>();
@@ -82,41 +88,57 @@ function acceptedReceipt(messageId: string, targetSessionId: string, deliveryMod
   return { message_id: messageId, target_session_id: targetSessionId, accepted_at_ms: acceptedAt, delivery_mode: deliveryMode, state: "accepted" };
 }
 
-function receiptFromEvents(events: readonly { type: string; data: any }[], messageId: string, targetSessionId: string): DeliverResult | undefined {
-  for (const event of events) {
-    if (event.type !== A2A_ACCEPTED_EVENT || event.data.message_id !== messageId || event.data.target_session_id !== targetSessionId) continue;
-    return {
-      message_id: event.data.message_id,
-      target_session_id: event.data.target_session_id,
-      accepted_at_ms: event.data.accepted_at_ms,
-      delivery_mode: event.data.delivery_mode,
-      state: "accepted",
-      ...(event.data.interrupt === undefined ? {} : { interrupt: event.data.interrupt }),
-      ...(event.data.reply_to_message_id === undefined ? {} : { reply_to_message_id: event.data.reply_to_message_id }),
-    };
-  }
-  return undefined;
+/**
+ * Persist an acceptance record through the injected store.
+ *
+ * Delivery has ALREADY happened by the time this runs. A write failure is
+ * therefore surfaced rather than swallowed — but it must never be turned into
+ * "not delivered", because that would provoke exactly the duplicate dispatch the
+ * receipt exists to prevent. Recording after delivery matches the behaviour of
+ * the event append this replaced.
+ *
+ * With no store there is nothing durable to write to, and this returns without
+ * recording. That is a real reduction in guarantee (dedup becomes process-local)
+ * and NOT a silent failure of a write that was attempted — the caller decides
+ * whether to supply a store, and `receipt-store.ts` states the consequence.
+ */
+async function recordReceipt(store: ReceiptStore | undefined, receipt: DeliverResult, options?: { policy?: unknown; signal?: AbortSignal }): Promise<void> {
+  if (store === undefined) return;
+  await store.record(receipt, options);
 }
 
-function recordReceipt(session: { append(type: typeof A2A_ACCEPTED_EVENT, data: DeliverResult): unknown }, receipt: DeliverResult): void {
-  session.append(A2A_ACCEPTED_EVENT, receipt);
-}
-
-async function existingReceipt(ctx: Context, targetSessionId: string, messageId: string): Promise<DeliverResult | undefined> {
+/**
+ * Resolve an already-recorded acceptance for one (target, message) pair.
+ *
+ * Two independent sources, in trust order:
+ *
+ * 1. The durable receipt store — the only source that records WHICH idempotency
+ *    key we accepted, and survives a restart.
+ * 2. The target's own log/inbox, using harness-known events only
+ *    (`agent/inbox/spliced`, `user/message`). This is what proves the message
+ *    physically landed when no receipt was kept (deliveries without an
+ *    idempotency key never record one).
+ */
+async function existingReceipt(
+  ctx: Context,
+  targetSessionId: string,
+  messageId: string,
+  receiptStore: ReceiptStore | undefined,
+): Promise<DeliverResult | undefined> {
   const cached = receiptCache.get(ctx)?.get(`${targetSessionId}\0${messageId}`);
   if (cached !== undefined) return cached;
+  if (receiptStore !== undefined) {
+    const stored = await receiptStore.read(targetSessionId, messageId);
+    if (stored !== undefined) return stored;
+  }
   const live = ctx.agents.get(SID(targetSessionId));
   if (live !== undefined) {
-    const recorded = receiptFromEvents(live.session.snapshotEvents(), messageId, targetSessionId);
-    if (recorded !== undefined) return recorded;
     const pending = [...(live.inbox?.nextTurn ?? []), ...(live.inbox?.nextStep ?? [])];
     if (pending.some((message) => isA2AMessage(message, messageId)) || eventsContainA2AMessage(live.session.snapshotEvents(), messageId)) {
       return acceptedReceipt(messageId, targetSessionId, "live_inbox");
     }
   }
   const session = ctx.sessions.get(SID(targetSessionId));
-  const recorded = session === undefined ? undefined : receiptFromEvents(session.snapshotEvents(), messageId, targetSessionId);
-  if (recorded !== undefined) return recorded;
   if (session !== undefined && eventsContainA2AMessage(session.snapshotEvents(), messageId)) {
     return acceptedReceipt(messageId, targetSessionId, "durable_inbox");
   }
@@ -124,8 +146,6 @@ async function existingReceipt(ctx: Context, targetSessionId: string, messageId:
     const query = ctx.get("sessionQuery");
     if (query !== undefined) {
       const snapshot = await query.readSession(SID(targetSessionId));
-      const recorded = receiptFromEvents(snapshot.events, messageId, targetSessionId);
-      if (recorded !== undefined) return recorded;
       if (eventsContainA2AMessage(snapshot.events, messageId)) return acceptedReceipt(messageId, targetSessionId, "durable_inbox");
     }
   } catch {
@@ -154,7 +174,12 @@ function presetFromSnapshot(header: SessionHeader, events: readonly SessionEvent
   return state ?? undefined;
 }
 
-async function tryResume(ctx: Context, sessionId: string, senderSessionId: string | undefined): Promise<void> {
+async function tryResume(
+  ctx: Context,
+  sessionId: string,
+  senderSessionId: string | undefined,
+  options: TransportOptions = {},
+): Promise<void> {
   const presets = ctx.get("agentPresets");
   const query = ctx.get("sessionQuery");
   if (presets === undefined || query === undefined) {
@@ -165,8 +190,14 @@ async function tryResume(ctx: Context, sessionId: string, senderSessionId: strin
   // same delivery as reaching a live one, and doing it for a non-parent would
   // also wake a child its owner is not expecting to run.
   assertSubagentTargetReachable(snapshot.session, sessionId, senderSessionId);
-  const governed = readGovernedBlueprint(snapshot.events);
-  const lightweight = readLightweightBlueprint(snapshot.events);
+  // The composition marker is a plugin record beside the other orchestra files,
+  // not a Session event: recording it in the log is what made every created
+  // session unreadable after a restart (docs/adr/0002). Without a store the
+  // resume still works from the header's own preset projection below.
+  const store = options.resolveBlueprintStore?.(snapshot.session.cwd);
+  const stored = store === undefined ? undefined : await store.read(sessionId);
+  const governed = stored?.mode === "governed" ? stored : undefined;
+  const lightweight = stored?.mode === "lightweight" ? stored : undefined;
   const presetId = governed?.agentPreset ?? lightweight?.agentPreset ?? presetFromSnapshot(snapshot.session, snapshot.events);
   if (typeof presetId !== "string" || presetId === "") throw new Error(`a2a transport: session ${sessionId} has no recoverable Agent Preset`);
   const marker = governed ?? lightweight;
@@ -265,7 +296,7 @@ async function deliverMessageOnce(
         interrupt: true,
         ...(options.replyTo === undefined ? {} : { reply_to_message_id: options.replyTo }),
       };
-      if (options.idempotencyKey !== undefined) recordReceipt(live.session, result);
+      if (options.idempotencyKey !== undefined) await recordReceipt(options.receiptStore, result, { policy: options.receiptPolicy });
       return result;
     }
     if (wake) live.followup(message);
@@ -278,7 +309,7 @@ async function deliverMessageOnce(
       state: "accepted",
       ...(options.replyTo === undefined ? {} : { reply_to_message_id: options.replyTo }),
     };
-    if (options.idempotencyKey !== undefined) recordReceipt(live.session, result);
+    if (options.idempotencyKey !== undefined) await recordReceipt(options.receiptStore, result, { policy: options.receiptPolicy });
     return result;
   }
 
@@ -295,11 +326,11 @@ async function deliverMessageOnce(
       state: "accepted",
       ...(options.replyTo === undefined ? {} : { reply_to_message_id: options.replyTo }),
     };
-    if (options.idempotencyKey !== undefined) recordReceipt(session, result);
+    if (options.idempotencyKey !== undefined) await recordReceipt(options.receiptStore, result, { policy: options.receiptPolicy });
     return result;
   }
 
-  await tryResume(ctx, toSessionId, senderSessionId);
+  await tryResume(ctx, toSessionId, senderSessionId, options);
   const resumed = ctx.agents.get(SID(toSessionId));
   if (resumed === undefined) throw new Error(`a2a transport: target ${toSessionId} could not be resumed`);
   if (wake) resumed.followup(message);
@@ -312,7 +343,7 @@ async function deliverMessageOnce(
     state: "accepted",
     ...(options.replyTo === undefined ? {} : { reply_to_message_id: options.replyTo }),
   };
-  if (options.idempotencyKey !== undefined) recordReceipt(resumed.session, result);
+  if (options.idempotencyKey !== undefined) await recordReceipt(options.receiptStore, result, { policy: options.receiptPolicy });
   return result;
 }
 
@@ -368,7 +399,7 @@ export async function deliverMessage(
   const promise = (async () => {
     const cached = receiptCache.get(ctx)?.get(cacheKey);
     if (cached !== undefined) return cached;
-    const existing = await existingReceipt(ctx, toSessionId, key);
+    const existing = await existingReceipt(ctx, toSessionId, key, options.receiptStore);
     if (existing !== undefined) {
       const cache = receiptCache.get(ctx) ?? new Map<string, DeliverResult>();
       cache.set(cacheKey, existing);
@@ -391,10 +422,15 @@ export async function deliverMessage(
 }
 
 /** Read an existing idempotent receipt without enqueueing or resending anything. */
-export async function readDeliveryReceipt(ctx: Context, targetSessionId: string, idempotencyKey: string): Promise<DeliverResult | undefined> {
+export async function readDeliveryReceipt(
+  ctx: Context,
+  targetSessionId: string,
+  idempotencyKey: string,
+  receiptStore?: ReceiptStore,
+): Promise<DeliverResult | undefined> {
   const key = keyOf({ idempotencyKey });
   if (key === undefined) return undefined;
-  return existingReceipt(ctx, targetSessionId, key);
+  return existingReceipt(ctx, targetSessionId, key, receiptStore);
 }
 
 function idOf(value: unknown): string | undefined {
@@ -409,30 +445,49 @@ function replyToOf(value: unknown): string | undefined {
     : undefined;
 }
 
-/** Reconstruct only lifecycle facts proven by the target Session log. */
-export async function queryMessageStatus(ctx: Context, messageId: string, targetSessionId: string): Promise<MessageStatusResult> {
+/**
+ * Reconstruct only lifecycle facts that are actually proven.
+ *
+ * The acceptance fact now comes from the durable receipt store when one is
+ * supplied; the target's own log still proves it through `agent/inbox/spliced`
+ * and `user/message`, which are harness-known events. Nothing here reads a
+ * plugin-private event type any more — that is what used to make the target
+ * session unreadable after a restart (see `docs/adr/0002`).
+ */
+export async function queryMessageStatus(
+  ctx: Context,
+  messageId: string,
+  targetSessionId: string,
+  receiptStore?: ReceiptStore,
+): Promise<MessageStatusResult> {
   if (messageId === "" || targetSessionId === "") return { message_id: messageId, target_session_id: targetSessionId, state: "not_found" };
   try {
+    // A recorded acceptance precedes anything the target wrote, so it sorts
+    // before every event index: -1 is not a placeholder, it is the fact that
+    // our record was written before the message entered the log.
+    const stored = receiptStore === undefined ? undefined : await receiptStore.read(targetSessionId, messageId);
+    let accepted = stored !== undefined;
+    let firstAcceptedOrClaimed = stored === undefined ? Number.POSITIVE_INFINITY : -1;
     const live = ctx.sessions.get(SID(targetSessionId));
     let events: readonly SessionEvent[];
     if (live !== undefined) {
       events = live.snapshotEvents();
     } else {
       const query = ctx.get("sessionQuery");
-      if (query === undefined) return { message_id: messageId, target_session_id: targetSessionId, state: "unknown", evidence: "sessionQuery unavailable" };
+      if (query === undefined) {
+        // Without the log we can still report a proven acceptance; only the
+        // claimed/answered half is unavailable.
+        if (accepted) return { message_id: messageId, target_session_id: targetSessionId, state: "accepted", evidence: "durable delivery receipt; session log unavailable" };
+        return { message_id: messageId, target_session_id: targetSessionId, state: "unknown", evidence: "sessionQuery unavailable" };
+      }
       const snapshot = await query.readSession(SID(targetSessionId));
       events = snapshot.events;
     }
-    let accepted = false;
     let claimed = false;
     let answered = false;
-    let firstAcceptedOrClaimed = Number.POSITIVE_INFINITY;
     let firstAnswer = Number.POSITIVE_INFINITY;
     for (const [index, event] of events.entries()) {
-      if (event.type === A2A_ACCEPTED_EVENT && event.data.message_id === messageId && event.data.target_session_id === targetSessionId) {
-        accepted = true;
-        firstAcceptedOrClaimed = Math.min(firstAcceptedOrClaimed, index);
-      } else if (event.type === "agent/inbox/spliced") {
+      if (event.type === "agent/inbox/spliced") {
         if (event.data.inserted.some((message: unknown) => isA2AMessage(message, messageId))) {
           accepted = true;
           firstAcceptedOrClaimed = Math.min(firstAcceptedOrClaimed, index);
@@ -452,7 +507,14 @@ export async function queryMessageStatus(ctx: Context, messageId: string, target
     if (answered && firstAnswer <= firstAcceptedOrClaimed) return { message_id: messageId, target_session_id: targetSessionId, state: "unknown", evidence: "assistant response precedes accepted/claimed fact" };
     if (answered && (accepted || claimed) && firstAnswer > firstAcceptedOrClaimed) return { message_id: messageId, target_session_id: targetSessionId, state: "answered", evidence: "correlated assistant response after accepted/claimed" };
     if (claimed) return { message_id: messageId, target_session_id: targetSessionId, state: "claimed", evidence: "target A2A user/message event" };
-    if (accepted) return { message_id: messageId, target_session_id: targetSessionId, state: "accepted", evidence: "durable inbox splice" };
+    if (accepted) {
+      return {
+        message_id: messageId,
+        target_session_id: targetSessionId,
+        state: "accepted",
+        evidence: stored === undefined ? "durable inbox splice" : "durable delivery receipt",
+      };
+    }
     return { message_id: messageId, target_session_id: targetSessionId, state: "unknown", evidence: "no correlated lifecycle event" };
   } catch (error) {
     const code = (error as { code?: unknown })?.code;

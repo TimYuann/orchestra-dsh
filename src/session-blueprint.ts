@@ -16,15 +16,26 @@ import { mountPreset } from "@deepseek-ai/dsh-agent-presets";
 import { setSandboxMode } from "@deepseek-ai/dsh-sandbox-policy";
 import type { SandboxMode } from "@deepseek-ai/dsh-sandbox";
 import type { Session, SessionEvent } from "@deepseek-ai/dsh-session";
+import { parseRecordJson, readRecordText, resolveRecordFileSystem, safeSegment, writeRecordJson, type RecordFileSystem } from "./orchestra-records.js";
 import type { ToolSchema } from "@deepseek-ai/dsh-llm";
 import type {} from "@deepseek-ai/dsh-agent-presets";
 import type {} from "@deepseek-ai/dsh-permission-presets";
 import type {} from "@deepseek-ai/dsh-session-title";
 
 export const LIGHTWEIGHT_BLUEPRINT_SCHEMA_VERSION = 1;
-export const LIGHTWEIGHT_BLUEPRINT_EVENT = "orchestra/blueprint" as const;
 export const GOVERNED_BLUEPRINT_SCHEMA_VERSION = 1;
-export const GOVERNED_BLUEPRINT_EVENT = "orchestra/governed-blueprint" as const;
+
+/*
+ * These were the Session event types `orchestra/blueprint` and
+ * `orchestra/governed-blueprint`. They are deliberately NOT kept as constants:
+ * nothing writes or reads them any more, and a constant nothing consumes is a
+ * claim that something might. The composition marker is a file now
+ * (`docs/adr/0002`), and `scripts/check-session-readable.mjs` names the old
+ * literals where that matters.
+ */
+
+/** Directory (relative to the role session's cwd) holding one marker per session. */
+export const BLUEPRINT_DIRECTORY = "orchestra/blueprints";
 
 export interface LightweightBlueprintMarker {
   schemaVersion: 1;
@@ -68,13 +79,6 @@ export interface GovernedBlueprintMarker {
   orchestraTools?: string[];
   optionalCapabilities?: string[];
   createdAt: number;
-}
-
-declare module "@deepseek-ai/dsh-session/types" {
-  interface SessionEventMap {
-    "orchestra/blueprint": LightweightBlueprintMarker;
-    "orchestra/governed-blueprint": GovernedBlueprintMarker;
-  }
 }
 
 export interface BlueprintPresetFile {
@@ -335,6 +339,26 @@ function requiredTools(input: { requiredTools?: string[] }): string[] {
   return [...new Set(names)];
 }
 
+export const REMOVED_ORCHESTRA_TOOLS = new Set([
+  "orchestra_handoff",
+  "orchestra_verdict",
+  "orchestra_loop_start",
+  "orchestra_attempt_start",
+  "orchestra_gate_open",
+  "orchestra_gate_fallback",
+  "orchestra_close",
+  "orchestra_graph",
+  "orchestra_graph_reconcile",
+  "orchestra_document",
+  "orchestra_reconcile",
+  "orchestra_decision",
+  "orchestra_charters",
+  "orchestra_apply_amendment",
+  "orchestra_freeze",
+  "orchestra_draft_revise",
+  "orchestra_draft_retract",
+]);
+
 function capabilityTools(input: { requiredTools?: string[]; compositionTools?: string[]; orchestraTools?: string[] }): {
   legacy: string[];
   composition: string[];
@@ -350,12 +374,26 @@ function capabilityTools(input: { requiredTools?: string[]; compositionTools?: s
     }
   }
   const composition = [...new Set([...legacy, ...compositionInput])];
-  const orchestra = [...new Set(orchestraInput)];
+  const orchestra = [...new Set(orchestraInput.filter((name) => !REMOVED_ORCHESTRA_TOOLS.has(name)))];
   return { legacy, composition, orchestra, all: [...new Set([...composition, ...orchestra])] };
 }
 
+const COMPOSITION_ROW_TOOLS: Record<string, string[]> = {
+  "tool-bash": ["bash", "tool-bash"],
+  "tool-fs": ["read", "write", "edit", "read_image", "tool-fs"],
+  "tool-fs-search": ["glob", "grep", "tool-fs-search"],
+  "tool-todo": ["todo", "tool-todo"],
+  "tool-skill": ["skill", "tool-skill"],
+};
+
+function hasCompositionTool(visibleNames: readonly string[], requiredRow: string): boolean {
+  if (visibleNames.includes(requiredRow)) return true;
+  const aliases = COMPOSITION_ROW_TOOLS[requiredRow];
+  return aliases !== undefined && aliases.some((alias) => visibleNames.includes(alias));
+}
+
 function toolReadiness(names: readonly string[], required: readonly string[]): LightweightToolReadiness {
-  const selected = [...new Set(names)].filter((name) => required.includes(name)).sort();
+  const selected = [...new Set(required)].filter((name) => hasCompositionTool(names, name)).sort();
   return { names: selected, count: selected.length };
 }
 
@@ -558,7 +596,12 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
     if (input.title !== undefined && input.title !== "") {
       session.append("session/title", { title: input.title, messageSeqs: [], source: { kind: "user" } });
     }
-    session.append(LIGHTWEIGHT_BLUEPRINT_EVENT, marker);
+    // The marker records HOW this session was composed, so a cold resume can
+    // rebuild it. It used to be a Session event, which made the session itself
+    // unreadable after a restart (docs/adr/0002); it is now a file beside the
+    // other plugin records.
+    const blueprintPolicy = (ctx as any).sandboxPolicy?.resolve?.({ session: session as any, mode: "workspace-write" });
+    await blueprintStoreFor(ctx, marker.cwd ?? session.header.cwd).write(input.sessionId, marker, { policy: blueprintPolicy });
     return {
       commit() {
         // file strategy mounts the preset tree directly into the agent scope
@@ -802,7 +845,8 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
       ...(input.optionalCapabilities === undefined ? {} : { optionalCapabilities: [...input.optionalCapabilities] }),
       createdAt: Date.now(),
     };
-    session.append(GOVERNED_BLUEPRINT_EVENT, marker);
+    const blueprintPolicy = (ctx as any).sandboxPolicy?.resolve?.({ session: session as any, mode: "workspace-write" });
+    await blueprintStoreFor(ctx, marker.cwd ?? session.header.cwd).write(input.sessionId, marker, { policy: blueprintPolicy });
     return {
       commit() {
         // See the lightweight commit: the file strategy (catalog presets,
@@ -820,7 +864,7 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
         if (legacyOnly && missingLegacy.length > 0) {
           throw new SessionBlueprintError("required_tools_missing", "required governed tools are not visible in the composed scope: " + missingLegacy.join(", "), { missing: missingLegacy, visible: names, roleId: input.roleId });
         }
-        const missingComposition = (legacyOnly ? [] : capabilities.composition).filter((name) => !names.includes(name));
+        const missingComposition = (legacyOnly ? [] : capabilities.composition).filter((name) => !hasCompositionTool(names, name));
         if (missingComposition.length > 0) {
           throw new SessionBlueprintError("composition_tools_missing", "required composition tools are not visible in the composed scope: " + missingComposition.join(", "), { missing: missingComposition, visible: names, roleId: input.roleId, plane: "composition" });
         }
@@ -862,60 +906,149 @@ const GOVERNED_IDENTITY_FIELDS = [
   "topologyRef",
 ] as const;
 
-/** Read a lightweight marker without inventing facts for old sessions. */
-export function readLightweightBlueprint(events: readonly SessionEvent[]): LightweightBlueprintMarker | undefined {
-  for (let index = events.length - 1; index >= 0; index--) {
-    const event = events[index];
-    if (event.type !== LIGHTWEIGHT_BLUEPRINT_EVENT) continue;
-    try {
-      const marker = event.data;
-      if (!isPlainObject(marker)) return undefined;
-      if (marker.schemaVersion !== LIGHTWEIGHT_BLUEPRINT_SCHEMA_VERSION || marker.mode !== "lightweight") return undefined;
-      if (!nonEmptyString(marker.agentPreset) || !nonEmptyString(marker.permissionPreset) || !nonEmptyString(marker.provider) || !nonEmptyString(marker.model) || !nonEmptyString(marker.createdBySessionId)) return undefined;
-      if (typeof marker.createdAt !== "number" || !Number.isFinite(marker.createdAt)) return undefined;
-      if (("reasoningEffort" in marker && typeof marker.reasoningEffort !== "string") || ("cwd" in marker && typeof marker.cwd !== "string") || ("title" in marker && typeof marker.title !== "string")) return undefined;
-      if (marker.presetSource !== undefined && marker.presetSource !== "file" && marker.presetSource !== "dsh") return undefined;
-      if (marker.presetSource === "file" && (!nonEmptyString(marker.presetPath) || (marker.presetTrust !== "system" && marker.presetTrust !== "user"))) return undefined;
-      if (marker.presetPath !== undefined && typeof marker.presetPath !== "string") return undefined;
-      if (marker.presetTrust !== undefined && marker.presetTrust !== "system" && marker.presetTrust !== "user") return undefined;
-      if (GOVERNED_IDENTITY_FIELDS.some((field) => field in marker)) return undefined;
-      return marker as LightweightBlueprintMarker;
-    } catch {
-      return undefined;
-    }
+/**
+ * Validate one stored lightweight marker without inventing facts for old data.
+ *
+ * A record that fails validation is reported as `undefined` — "this file does
+ * not describe a lightweight session" — which is the pre-existing contract and
+ * lets a caller fall back to the header's own preset projection. Malformed JSON
+ * is NOT swallowed here: that is caught by the store, which fails loudly, so a
+ * truncated file cannot masquerade as "no marker".
+ */
+export function parseLightweightBlueprint(value: unknown): LightweightBlueprintMarker | undefined {
+  try {
+    const marker = value as Record<string, unknown> & { data?: unknown };
+    if (!isPlainObject(marker)) return undefined;
+    if (marker.schemaVersion !== LIGHTWEIGHT_BLUEPRINT_SCHEMA_VERSION || marker.mode !== "lightweight") return undefined;
+    if (!nonEmptyString(marker.agentPreset) || !nonEmptyString(marker.permissionPreset) || !nonEmptyString(marker.provider) || !nonEmptyString(marker.model) || !nonEmptyString(marker.createdBySessionId)) return undefined;
+    if (typeof marker.createdAt !== "number" || !Number.isFinite(marker.createdAt)) return undefined;
+    if (("reasoningEffort" in marker && typeof marker.reasoningEffort !== "string") || ("cwd" in marker && typeof marker.cwd !== "string") || ("title" in marker && typeof marker.title !== "string")) return undefined;
+    if (marker.presetSource !== undefined && marker.presetSource !== "file" && marker.presetSource !== "dsh") return undefined;
+    if (marker.presetSource === "file" && (!nonEmptyString(marker.presetPath) || (marker.presetTrust !== "system" && marker.presetTrust !== "user"))) return undefined;
+    if (marker.presetPath !== undefined && typeof marker.presetPath !== "string") return undefined;
+    if (marker.presetTrust !== undefined && marker.presetTrust !== "system" && marker.presetTrust !== "user") return undefined;
+    if (GOVERNED_IDENTITY_FIELDS.some((field) => field in marker)) return undefined;
+    return marker as unknown as LightweightBlueprintMarker;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Read Governed identity/facts without treating malformed durable data as a live role. */
+export function parseGovernedBlueprint(value: unknown): GovernedBlueprintMarker | undefined {
+  try {
+    const marker = value as Record<string, unknown> & { data?: unknown };
+    if (!isPlainObject(marker)) return undefined;
+    if (marker.schemaVersion !== GOVERNED_BLUEPRINT_SCHEMA_VERSION || marker.mode !== "governed") return undefined;
+    if (!nonEmptyString(marker.teamId) || !nonEmptyString(marker.roleId) || !nonEmptyString(marker.topologyId) || !nonEmptyString(marker.controllerSessionId)) return undefined;
+    if (!nonEmptyString(marker.agentPreset) || !nonEmptyString(marker.permissionPreset) || !nonEmptyString(marker.effectivePermissionPreset) || !nonEmptyString(marker.approval)) return undefined;
+    if (marker.topologySource !== "project" && marker.topologySource !== "global" && marker.topologySource !== "bundled") return undefined;
+    if (marker.sandbox !== "read-only" && marker.sandbox !== "workspace-write" && marker.sandbox !== "danger-full-access") return undefined;
+    if (!nonEmptyString(marker.provider) || !nonEmptyString(marker.model)) return undefined;
+    if (typeof marker.createdAt !== "number" || !Number.isFinite(marker.createdAt)) return undefined;
+    if (!nonEmptyString(marker.cwd)) return undefined;
+    if (("reasoningEffort" in marker && typeof marker.reasoningEffort !== "string") || ("title" in marker && typeof marker.title !== "string")) return undefined;
+    if (marker.presetSource !== undefined && marker.presetSource !== "file" && marker.presetSource !== "dsh") return undefined;
+    if (marker.presetSource === "file" && (!nonEmptyString(marker.presetPath) || (marker.presetTrust !== "system" && marker.presetTrust !== "user"))) return undefined;
+    if (marker.presetPath !== undefined && typeof marker.presetPath !== "string") return undefined;
+    if (marker.presetTrust !== undefined && marker.presetTrust !== "system" && marker.presetTrust !== "user") return undefined;
+    if (marker.compositionTools !== undefined && (!Array.isArray(marker.compositionTools) || marker.compositionTools.some((name) => typeof name !== "string" || name === ""))) return undefined;
+    if (marker.orchestraTools !== undefined && (!Array.isArray(marker.orchestraTools) || marker.orchestraTools.some((name) => typeof name !== "string" || name === ""))) return undefined;
+    if (marker.optionalCapabilities !== undefined && (!Array.isArray(marker.optionalCapabilities) || marker.optionalCapabilities.some((name) => typeof name !== "string" || name === ""))) return undefined;
+    if ("createdBySessionId" in marker || "topology" in marker || "roles" in marker) return undefined;
+    return marker as unknown as GovernedBlueprintMarker;
+  } catch {
+    return undefined;
   }
   return undefined;
 }
 
-/** Read Governed identity/facts without treating malformed durable data as a live role. */
-export function readGovernedBlueprint(events: readonly SessionEvent[]): GovernedBlueprintMarker | undefined {
-  for (let index = events.length - 1; index >= 0; index--) {
-    const event = events[index];
-    if (event.type !== GOVERNED_BLUEPRINT_EVENT) continue;
-    try {
-      const marker = event.data;
-      if (!isPlainObject(marker)) return undefined;
-      if (marker.schemaVersion !== GOVERNED_BLUEPRINT_SCHEMA_VERSION || marker.mode !== "governed") return undefined;
-      if (!nonEmptyString(marker.teamId) || !nonEmptyString(marker.roleId) || !nonEmptyString(marker.topologyId) || !nonEmptyString(marker.controllerSessionId)) return undefined;
-      if (!nonEmptyString(marker.agentPreset) || !nonEmptyString(marker.permissionPreset) || !nonEmptyString(marker.effectivePermissionPreset) || !nonEmptyString(marker.approval)) return undefined;
-      if (marker.topologySource !== "project" && marker.topologySource !== "global" && marker.topologySource !== "bundled") return undefined;
-      if (marker.sandbox !== "read-only" && marker.sandbox !== "workspace-write" && marker.sandbox !== "danger-full-access") return undefined;
-      if (!nonEmptyString(marker.provider) || !nonEmptyString(marker.model)) return undefined;
-      if (typeof marker.createdAt !== "number" || !Number.isFinite(marker.createdAt)) return undefined;
-      if (!nonEmptyString(marker.cwd)) return undefined;
-      if (("reasoningEffort" in marker && typeof marker.reasoningEffort !== "string") || ("title" in marker && typeof marker.title !== "string")) return undefined;
-      if (marker.presetSource !== undefined && marker.presetSource !== "file" && marker.presetSource !== "dsh") return undefined;
-      if (marker.presetSource === "file" && (!nonEmptyString(marker.presetPath) || (marker.presetTrust !== "system" && marker.presetTrust !== "user"))) return undefined;
-      if (marker.presetPath !== undefined && typeof marker.presetPath !== "string") return undefined;
-      if (marker.presetTrust !== undefined && marker.presetTrust !== "system" && marker.presetTrust !== "user") return undefined;
-      if (marker.compositionTools !== undefined && (!Array.isArray(marker.compositionTools) || marker.compositionTools.some((name) => typeof name !== "string" || name === ""))) return undefined;
-      if (marker.orchestraTools !== undefined && (!Array.isArray(marker.orchestraTools) || marker.orchestraTools.some((name) => typeof name !== "string" || name === ""))) return undefined;
-      if (marker.optionalCapabilities !== undefined && (!Array.isArray(marker.optionalCapabilities) || marker.optionalCapabilities.some((name) => typeof name !== "string" || name === ""))) return undefined;
-      if ("createdBySessionId" in marker || "topology" in marker || "roles" in marker) return undefined;
-      return marker as GovernedBlueprintMarker;
-    } catch {
-      return undefined;
-    }
+/** Either composition marker, as stored. */
+export type BlueprintMarker = LightweightBlueprintMarker | GovernedBlueprintMarker;
+
+/**
+ * Where a session's composition marker lives.
+ *
+ * Keyed by session id under the session's own cwd, because that is what a cold
+ * resume has in hand: the persisted header gives the id and the cwd, and nothing
+ * else about the session is readable without waking it.
+ */
+export interface BlueprintWriteOptions {
+  policy?: unknown;
+  signal?: AbortSignal;
+}
+
+export interface BlueprintStore {
+  read(sessionId: string): Promise<BlueprintMarker | undefined>;
+  write(sessionId: string, marker: BlueprintMarker, options?: BlueprintWriteOptions): Promise<void>;
+}
+
+/** Process-local markers: the fallback when no `fs` service is composed. */
+export function createMemoryBlueprintStore(): BlueprintStore {
+  const records = new Map<string, BlueprintMarker>();
+  return {
+    async read(sessionId) {
+      return records.get(sessionId);
+    },
+    async write(sessionId, marker) {
+      records.set(sessionId, marker);
+    },
+  };
+}
+
+/** File-backed markers under `<cwd>/orchestra/blueprints/`. */
+export function createFsBlueprintStore(fs: RecordFileSystem, cwd: string): BlueprintStore {
+  const pathOf = (sessionId: string): string => `${BLUEPRINT_DIRECTORY}/${safeSegment(sessionId, "session id")}.json`;
+  return {
+    async read(sessionId) {
+      const relative = pathOf(sessionId);
+      const found = await readRecordText(fs, relative, cwd);
+      if (found === undefined) return undefined;
+      const value = parseRecordJson(found.text, relative);
+      // Shape failures answer "no marker" (the pre-existing contract, so a caller
+      // can still fall back); a syntax failure already threw above.
+      const record = value as { mode?: unknown };
+      return record?.mode === "governed" ? parseGovernedBlueprint(value) : parseLightweightBlueprint(value);
+    },
+    async write(sessionId, marker, options) {
+      // A session is composed once. If a marker already exists for this id the
+      // id is being reused, which means two different compositions claim one
+      // session — that must be loud, not last-writer-wins.
+      const outcome = await writeRecordJson(fs, pathOf(sessionId), cwd, marker, { kind: "createIfAbsent" }, options);
+      if (outcome === "exists") {
+        throw new SessionBlueprintError("composition_mismatch", `a composition marker already exists for session ${sessionId}; refusing to overwrite it`);
+      }
+    },
+  };
+}
+
+const blueprintStores = new WeakMap<object, Map<string, BlueprintStore>>();
+
+/**
+ * Resolve the marker store for one cwd.
+ *
+ * Without an `fs` service there is nothing durable to write to, so this returns a
+ * process-local store — which means a cold resume after a restart falls back to
+ * the header's preset projection. That reduction is stated here rather than
+ * hidden: writing the marker back into the session log is what made sessions
+ * unreadable in the first place.
+ */
+export function blueprintStoreFor(ctx: Context, cwd: string | undefined): BlueprintStore {
+  const fs = resolveRecordFileSystem(ctx);
+  if (fs === undefined || cwd === undefined || cwd === "") {
+    const existing = blueprintStores.get(ctx)?.get("\0memory");
+    if (existing !== undefined) return existing;
+    const created = createMemoryBlueprintStore();
+    const table = blueprintStores.get(ctx) ?? new Map<string, BlueprintStore>();
+    table.set("\0memory", created);
+    blueprintStores.set(ctx, table);
+    return created;
   }
-  return undefined;
+  const existing = blueprintStores.get(ctx)?.get(cwd);
+  if (existing !== undefined) return existing;
+  const created = createFsBlueprintStore(fs, cwd);
+  const table = blueprintStores.get(ctx) ?? new Map<string, BlueprintStore>();
+  table.set(cwd, created);
+  blueprintStores.set(ctx, table);
+  return created;
 }

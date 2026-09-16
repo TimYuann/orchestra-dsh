@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createActiveTeamStateStore, normalizeTeam } from "../lib/orchestra-state.js";
-import { prepareGovernedBlueprint, readGovernedBlueprint } from "../lib/session-blueprint.js";
+import { blueprintStoreFor, parseGovernedBlueprint, prepareGovernedBlueprint } from "../lib/session-blueprint.js";
+import { charterRecordStoreFor } from "../lib/charter-store.js";
 import { assertUniqueGovernedSessionIds, createGovernedTeam, prepareGovernedRolePlan, provisionGovernedPlans, abbreviateMissionObjective, roleSessionTitle } from "../lib/orchestra.js";
 import { preflightGovernedRequiredTools } from "../lib/session-blueprint.js";
 import { prepareApprovalEvent, prepareDraftEvent, prepareFreezeEvent } from "../lib/orchestration-charter.js";
@@ -205,7 +206,8 @@ function makeRuntime(options = {}) {
     });
     return { sessionId: String(createOptions.sessionId), handle };
   };
-  return { context, fs, store: createActiveTeamStateStore(fs), events, sessions, agents, presets, permissions, controller, createSessionAdapter };
+  const charter = charterRecordStoreFor(context, controllerSession.header.cwd);
+  return { context, fs, store: createActiveTeamStateStore(fs), events, sessions, agents, presets, permissions, controller, createSessionAdapter, charter };
 }
 
 function planTeam(teamId, roles) {
@@ -250,7 +252,7 @@ function topologyCatalog(roles) {
   };
 }
 
-function approvedFrozenRef(runtime, roles, draftId) {
+async function approvedFrozenRef(runtime, roles, draftId) {
   const config = {
     schemaVersion: 1,
     id: "integration-topology",
@@ -273,23 +275,36 @@ function approvedFrozenRef(runtime, roles, draftId) {
     authorSessionId: runtime.controller.id,
     now: 1,
   });
-  runtime.controller.session.append(draft.event.type, draft.event.data);
-  const approval = prepareApprovalEvent(runtime.controller.session.events, {
+  // Charter records are a file now, not Session events (docs/adr/0002): the
+  // driver's log must stay readable by the rest of DSH. The store is resolved
+  // from the controller's own cwd so it lands exactly where orchestra_create
+  // will look for it.
+  const records = [draft.event];
+  const approval = prepareApprovalEvent(records, {
     draftId,
     revision: 1,
     commandId: `command-${draftId}`,
     approvingSessionId: runtime.controller.id,
     approvedAt: 2,
   });
-  runtime.controller.session.append(approval.event.type, approval.event.data);
-  const frozen = prepareFreezeEvent(runtime.controller.session.events, {
+  records.push(approval.event);
+  const frozen = prepareFreezeEvent(records, {
     draftId,
     revision: 1,
     digest: draft.value.digest,
     frozenBySessionId: runtime.controller.id,
     frozenAt: 3,
   });
-  runtime.controller.session.append(frozen.event.type, frozen.event.data);
+  records.push(frozen.event);
+
+  for (const event of records) {
+    await runtime.charter.append(event);
+  }
+  assert.equal(
+    runtime.controller.session.events.some((event) => typeof event.type === "string" && event.type.startsWith("orchestra/")),
+    false,
+    "charter records must not be written into the driver's session log",
+  );
   return frozen.value.frozenRef;
 }
 
@@ -330,12 +345,12 @@ test("Governed marker read is total and requires mode-specific identity", () => 
     cwd,
     createdAt: 1,
   };
-  assert.deepEqual(readGovernedBlueprint([{ type: "orchestra/governed-blueprint", data: valid }]), valid);
+  assert.deepEqual(parseGovernedBlueprint(valid), valid);
   for (const data of [null, [], { ...valid, teamId: "" }, { ...valid, roleId: "" }, { ...valid, topologyId: "" }, { ...valid, mode: "lightweight" }, { ...valid, createdAt: Infinity }, { ...valid, createdBySessionId: "driver" }]) {
-    assert.doesNotThrow(() => readGovernedBlueprint([{ type: "orchestra/governed-blueprint", data }]));
-    assert.equal(readGovernedBlueprint([{ type: "orchestra/governed-blueprint", data }]), undefined);
+    assert.doesNotThrow(() => parseGovernedBlueprint(data));
+    assert.equal(parseGovernedBlueprint(data), undefined);
   }
-  assert.equal(readGovernedBlueprint([{ type: "orchestra/blueprint", data: {} }]), undefined);
+  assert.equal(parseGovernedBlueprint({ mode: "lightweight" }), undefined);
 });
 
 test("team state preserves provisioning phases and reads legacy roles as active with a warning", async () => {
@@ -411,7 +426,13 @@ test("Governed Blueprint applies explicit model over topology runtime and record
   commit.commit();
   assert.equal(blueprint.receipt.effectivePermissionPreset, "custom");
   assert.deepEqual(blueprint.receipt.tools, { names: ["read", "write"], count: 2 });
-  assert.equal(readGovernedBlueprint(runtime.sessions.get("orchestra-team-test-reviewer").events).teamId, "team-test");
+  const storedMarker = await blueprintStoreFor(runtime.context, cwd).read("orchestra-team-test-reviewer");
+  assert.equal(storedMarker.teamId, "team-test");
+  assert.equal(
+    runtime.sessions.get("orchestra-team-test-reviewer").events.some((event) => typeof event.type === "string" && event.type.startsWith("orchestra/")),
+    false,
+    "the marker must not be written into the session log",
+  );
 });
 
 test("Governed required tool failure rolls setup back before publication", async () => {
@@ -452,7 +473,7 @@ test("actual orchestra_create bounded entrypoint rejects missing required tool b
   const runtime = makeRuntime();
   const roles = [{ id: "reviewer", name: "reviewer", preset: "preset-reviewer", sandbox: "read-only", requiredTools: ["missing-tool"] }];
   const catalog = topologyCatalog(roles);
-  const frozenRef = approvedFrozenRef(runtime, roles, "draft-required-tool");
+  const frozenRef = await approvedFrozenRef(runtime, roles, "draft-required-tool");
   await assert.rejects(
     () => createGovernedTeam(runtime.context, runtime.store, catalog, { frozenRef }, { agent: runtime.controller }, { createSession: runtime.createSessionAdapter }),
     (error) => error?.code === "required_tools_unproven" && /reservation was not attempted/.test(error.message),
@@ -528,7 +549,7 @@ test("create session titles follow the three-part roleId · mission · cwd schem
     { id: "implementer", name: "Implementer", preset: "preset-reviewer", sandbox: "workspace-write" },
   ];
   const catalog = topologyCatalog(roles);
-  const frozenRef = approvedFrozenRef(runtime, roles, "draft-title");
+  const frozenRef = await approvedFrozenRef(runtime, roles, "draft-title");
   await createGovernedTeam(runtime.context, runtime.store, catalog, { frozenRef }, { agent: runtime.controller }, { createSession: runtime.createSessionAdapter });
   const observed = await runtime.store.read(cwd);
   assert.equal(observed.kind, "ready");
@@ -551,7 +572,7 @@ test("actual orchestra_create preserves durable one-to-one mappings for a/b and 
     { id: "a-b", name: "a-b", preset: "preset-reviewer", sandbox: "workspace-write" },
   ];
   const catalog = topologyCatalog(roles);
-  const frozenRef = approvedFrozenRef(runtime, roles, "draft-mapping");
+  const frozenRef = await approvedFrozenRef(runtime, roles, "draft-mapping");
   const result = await createGovernedTeam(runtime.context, runtime.store, catalog, { frozenRef }, { agent: runtime.controller }, { createSession: runtime.createSessionAdapter });
   const observed = await runtime.store.read(cwd);
   assert.equal(observed.kind, "ready");

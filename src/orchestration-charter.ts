@@ -11,15 +11,18 @@ import { createHash, randomUUID } from "node:crypto";
 import type { TopologyConfig, TopologySource } from "./orchestra-topology.js";
 import { validateTopology } from "./orchestra-topology.js";
 
-declare module "@deepseek-ai/dsh-session/types" {
-  interface SessionEventMap {
-    "orchestra/charter-draft": { draft: CharterDraft };
-    "orchestra/charter-approved": { approval: CharterApproval };
-    "orchestra/charter-frozen": { frozen: FrozenCharterRevision };
-  }
-}
-
 export const CHARTER_SCHEMA_VERSION = 1;
+
+/**
+ * Record labels inside the charter record file.
+ *
+ * These were Session event types, registered through a `declare module`
+ * augmentation on `SessionEventMap`. They are NOT events any more: nothing
+ * appends them to a session, and the augmentation is gone, because an event type
+ * the harness does not know makes a persisted log unreadable (`docs/adr/0002`).
+ * The names survive only as the `type` field of a stored record, which is what
+ * `foldCharterEvents` switches on.
+ */
 export const CHARTER_DRAFT_EVENT = "orchestra/charter-draft";
 export const CHARTER_APPROVAL_EVENT = "orchestra/charter-approved";
 export const CHARTER_FROZEN_EVENT = "orchestra/charter-frozen";
@@ -77,10 +80,22 @@ export interface CharterApproval {
   revision: number;
   digest: string;
   approvalRef: string;
+  /**
+   * Durable reference to whatever carried the consent: a command id, or
+   * `message:<sessionId>@<seq>` for a plain chat reply.
+   */
   commandId: string;
   approvedAt: number;
   approvingSessionId: string;
-  source: "user-command";
+  /**
+   * HOW the user said yes.
+   *
+   * This was hard-coded to `"user-command"`, which stopped being true once a
+   * plain reply could approve (docs/adr/0006). A field that names the wrong
+   * provenance is worse than a missing one: it is the record a reader consults
+   * to answer "what did the user actually do?".
+   */
+  source: "user-command" | "user-reply";
 }
 
 export interface FrozenCharterRevision {
@@ -252,7 +267,7 @@ function validDraft(value: unknown): value is CharterDraft {
 }
 
 function validApproval(value: unknown): value is CharterApproval {
-  if (!record(value) || value.schemaVersion !== CHARTER_SCHEMA_VERSION || !validDraftId(value.draftId) || !safeInteger(value.revision) || !DIGEST.test(String(value.digest)) || !nonEmpty(value.commandId) || !finite(value.approvedAt) || !nonEmpty(value.approvingSessionId) || value.source !== "user-command") return false;
+  if (!record(value) || value.schemaVersion !== CHARTER_SCHEMA_VERSION || !validDraftId(value.draftId) || !safeInteger(value.revision) || !DIGEST.test(String(value.digest)) || !nonEmpty(value.commandId) || !finite(value.approvedAt) || !nonEmpty(value.approvingSessionId) || (value.source !== "user-command" && value.source !== "user-reply")) return false;
   return value.approvalRef === frozenRef(value.draftId, value.revision, value.digest);
 }
 
@@ -412,6 +427,8 @@ export interface ApprovalCommandInput {
   commandId: string;
   approvingSessionId: string;
   approvedAt: number;
+  /** Defaults to `"user-command"` for the `/team approve` seam. */
+  source?: "user-command" | "user-reply";
 }
 
 export function prepareApprovalEvent(events: readonly unknown[], input: ApprovalCommandInput): CharterCommandResult<CharterApproval> {
@@ -432,7 +449,7 @@ export function prepareApprovalEvent(events: readonly unknown[], input: Approval
     commandId: input.commandId,
     approvedAt: input.approvedAt,
     approvingSessionId: input.approvingSessionId,
-    source: "user-command",
+    source: input.source ?? "user-command",
   };
   if (!validApproval(approval)) throw new CharterError("invalid_shape", "approval facts are invalid");
   return { kind: "changed", event: { type: CHARTER_APPROVAL_EVENT, data: { approval } }, value: approval };

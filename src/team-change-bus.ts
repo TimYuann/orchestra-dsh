@@ -192,6 +192,13 @@ export function createTeamChangeBus(): TeamChangeBus {
  * re-read — the safe direction for this test.
  */
 function sameCommittedTeam(before: TeamState, after: TeamState): boolean {
+  if (before === after) {
+    // If before and after refer to the exact same object in memory, the caller
+    // mutated the team in place before passing it to replace(). Comparing an
+    // object to itself would always yield equal, falsely hiding mutations
+    // like role.reportCount or team.reports.
+    return false;
+  }
   return JSON.stringify(before) === JSON.stringify(after);
 }
 

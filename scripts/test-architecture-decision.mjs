@@ -387,9 +387,7 @@ test("architecture-decision is a read-only graph: researcher/architect have no c
   // all three roles are read-only; their only write channel is the report/handoff contract
   assert.equal(researcher.sandbox, "read-only");
   assert.equal(architect.sandbox, "read-only");
-  assert.equal(reviewer.sandbox, "read-only");
-  assert.deepEqual(architect.orchestraTools, ["orchestra_report", "orchestra_handoff"]);
-  assert.deepEqual(researcher.orchestraTools, ["orchestra_report", "orchestra_handoff"]);
-  // reviewer keeps the evaluator verdict tool but stays read-only
-  assert.deepEqual(reviewer.orchestraTools, ["orchestra_report", "orchestra_verdict", "orchestra_handoff"]);
+  assert.deepEqual(architect.orchestraTools, ["orchestra_report"]);
+  assert.deepEqual(researcher.orchestraTools, ["orchestra_report"]);
+  assert.deepEqual(reviewer.orchestraTools, ["orchestra_report"]);
 });

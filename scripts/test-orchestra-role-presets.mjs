@@ -13,7 +13,7 @@ import {
   resolveRolePresetFile,
   validateAllRolePresetSpecs,
 } from "../lib/orchestra-role-presets.js";
-import { prepareGovernedBlueprint, preflightGovernedRequiredTools, SessionBlueprintError } from "../lib/session-blueprint.js";
+import { blueprintStoreFor, prepareGovernedBlueprint, preflightGovernedRequiredTools, SessionBlueprintError } from "../lib/session-blueprint.js";
 import { prepareGovernedRolePlan } from "../lib/orchestra.js";
 
 function nativeFs() {
@@ -46,6 +46,9 @@ function blueprintRuntime(spec, missing = []) {
   const events = [];
   const session = {
     id: "role-session",
+    // A real Session always has a header, and the composition marker is filed
+    // under this cwd now.
+    header: { id: "role-session", cwd: "/tmp/role-preset" },
     events,
     // DSH 0.1.5-rc.2 Session surface: `snapshotEvents()` replaced `.events`.
     snapshotEvents() {
@@ -371,7 +374,15 @@ test("every v0.4 preset mounts in an unpublished Blueprint harness with plane fa
     assert.deepEqual(prepared.receipt.orchestraTools.names, [...spec.orchestraTools].sort());
     assert.deepEqual(prepared.receipt.optionalCapabilities, spec.optionalCapabilities);
     assert.equal(prepared.receipt.sandbox, spec.sandbox);
-    assert.equal(runtime.session.events.some((event) => event.type === "orchestra/governed-blueprint"), true);
+    // The composition marker is a record on disk now, not a Session event: a
+    // custom event type makes the whole session log unreadable on reread.
+    const marker = await blueprintStoreFor(runtime.context, "/tmp/role-preset").read(runtime.session.id);
+    assert.equal(marker?.teamId, "team");
+    assert.equal(
+      runtime.session.events.some((event) => typeof event.type === "string" && event.type.startsWith("orchestra/")),
+      false,
+      "no orchestra/* event may be written into a governed role session",
+    );
   }
 });
 

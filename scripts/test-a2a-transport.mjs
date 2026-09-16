@@ -4,6 +4,7 @@ import { deliverMessage, queryMessageStatus } from "../lib/a2a-transport.js";
 import { listThreads, sendRawA2A } from "../lib/a2a.js";
 import { createGovernedRoleAddressResolver, GovernedAddressError } from "../lib/orchestra-address.js";
 import { sendGovernedRole } from "../lib/orchestra.js";
+import { createMemoryReceiptStore } from "../lib/receipt-store.js";
 
 // Doubles model the DSH 0.1.5-rc.2 Session surface: `snapshotEvents()` replaces
 // the removed `.events` property, and `inheritedEventCount` replaces
@@ -133,10 +134,19 @@ test("raw transport remains cross-cwd reachable when discovery/fs is unavailable
   assert.equal(receipt.state, "accepted");
 });
 
-test("cold resume uses persisted file-backed Blueprint source without DSH resolver, while legacy falls back", async () => {
-  const snapshot = {
-    session: { id: "cold-file", agentPreset: "project-preset" },
-    events: [{ type: "orchestra/blueprint", data: { schemaVersion: 1, mode: "lightweight", agentPreset: "project-preset", presetSource: "file", presetPath: "/project/.orchestra/presets/project-preset/agent.cordis.yml", presetTrust: "user", permissionPreset: "workspace", provider: "p", model: "m", createdBySessionId: "caller", createdAt: 1 } }],
+test("cold resume takes the composition marker from its store, not from the session log", async () => {
+  // The marker is a plugin record now. It is deliberately NOT in `events`: a
+  // custom event type in a persisted log makes DSH refuse the whole log.
+  const markers = new Map([
+    ["cold-file", { schemaVersion: 1, mode: "lightweight", agentPreset: "project-preset", presetSource: "file", presetPath: "/project/.orchestra/presets/project-preset/agent.cordis.yml", presetTrust: "user", permissionPreset: "workspace", provider: "p", model: "m", createdBySessionId: "caller", createdAt: 1 }],
+  ]);
+  const markerStore = {
+    async read(sessionId) { return markers.get(sessionId); },
+    async write(sessionId, marker) { markers.set(sessionId, marker); },
+  };
+  const fileSnapshot = {
+    session: { id: "cold-file", cwd: "/project", agentPreset: "project-preset" },
+    events: [],
   };
   let live;
   let resumeOptions;
@@ -151,22 +161,47 @@ test("cold resume uses persisted file-backed Blueprint source without DSH resolv
     },
     sessions: { get() { return undefined; } },
     get(name) {
-      if (name === "sessionQuery") return { async readSession() { return snapshot; } };
+      // Every cold snapshot has an EMPTY log: nothing about the composition is
+      // readable from it any more, which is the point of the store.
+      if (name === "sessionQuery") return { async readSession(id) { return { session: { ...fileSnapshot.session, id: String(id) }, events: [] }; } };
       if (name === "agentPresets") return { async resolve() { resolveCalls += 1; throw new Error("unknown preset"); }, async mount() {} };
       return undefined;
     },
   };
-  const receipt = await deliverMessage(ctx, "caller", "cold-file", [{ type: "text", text: "file resume" }]);
+  const receipt = await deliverMessage(ctx, "caller", "cold-file", [{ type: "text", text: "file resume" }], { resolveBlueprintStore: () => markerStore });
   assert.equal(receipt.delivery_mode, "resumed_inbox");
+  // The file-path marker needs no roster lookup: prove it by the resolver still
+  // being untouched while the log the marker supposedly came from is EMPTY.
   assert.equal(resolveCalls, 0);
   assert.ok(resumeOptions?.setup, "resume received a public setup path");
 
+  // A marker with no file path still resolves through the roster — that path is
+  // unchanged, it just gets its marker from the same store.
   live = undefined;
   resolveCalls = 0;
-  const legacy = { ...snapshot, session: { id: "cold-legacy", agentPreset: "legacy-preset" }, events: [{ type: "orchestra/blueprint", data: { schemaVersion: 1, mode: "lightweight", agentPreset: "legacy-preset", permissionPreset: "workspace", provider: "p", model: "m", createdBySessionId: "caller", createdAt: 1 } }] };
-  const legacyCtx = { ...ctx, agents: { get() { return live; }, async resume() { throw new Error("resume should not happen"); } }, get(name) { if (name === "sessionQuery") return { async readSession() { return legacy; } }; if (name === "agentPresets") return { async resolve() { resolveCalls += 1; throw new Error("unknown legacy preset"); } }; return undefined; } };
-  await assert.rejects(() => deliverMessage(legacyCtx, "caller", "cold-legacy", [{ type: "text", text: "legacy" }]), /unknown legacy preset/);
+  markers.set("cold-legacy", { schemaVersion: 1, mode: "lightweight", agentPreset: "legacy-preset", permissionPreset: "workspace", provider: "p", model: "m", createdBySessionId: "caller", createdAt: 1 });
+  await assert.rejects(
+    () => deliverMessage(ctx, "caller", "cold-legacy", [{ type: "text", text: "legacy" }], { resolveBlueprintStore: () => markerStore }),
+    /unknown preset/,
+  );
   assert.equal(resolveCalls, 1);
+
+  // No store at all: the resume still works off the header's preset projection,
+  // which is the documented degradation rather than a crash.
+  live = undefined;
+  let headerResolves = 0;
+  const headerCtx = {
+    ...ctx,
+    agents: { get() { return live; }, async resume(options) { resumeOptions = options; live = { id: "cold-file", followup() {}, inject() {}, steer() {} }; } },
+    get(name) {
+      if (name === "sessionQuery") return { async readSession(id) { return { session: { id: String(id), cwd: "/project", agentPreset: "header-preset" }, events: [] }; } };
+      if (name === "agentPresets") return { async resolve(id) { headerResolves += 1; return { id }; }, async mount() {} };
+      return undefined;
+    },
+  };
+  const headerReceipt = await deliverMessage(headerCtx, "caller", "cold-file", [{ type: "text", text: "no store" }]);
+  assert.equal(headerReceipt.delivery_mode, "resumed_inbox");
+  assert.equal(headerResolves, 1, "without a store the header projection is the fallback");
 });
 
 test("explicit idempotency key deduplicates live, durable, and cold retries", async () => {
@@ -328,19 +363,47 @@ test("orchestra_send resolves role address and reuses raw transport receipt", as
   await assert.rejects(() => sendGovernedRole(env.context, createGovernedRoleAddressResolver({ async read() { return teamState("active", "active", "driver"); } }), { teamId: "team-address", roleId: "reviewer", message: "self" }, { agent: env.agents.get(caller.id) }), /own Governed role/);
 });
 
-test("durable idempotency replay in a fresh context returns the original receipt facts", async () => {
+test("durable idempotency replay returns the original receipt facts without writing a Session event", async () => {
   const env = runtime();
   const target = session("fresh-durable");
   env.sessions.set(target.id, target);
-  const first = await deliverMessage(env.context, "sender", target.id, [{ type: "text", text: "retry" }], { idempotencyKey: "fresh-key", replyTo: "original" });
+  // Durability now comes from the injected receipt store, not from the target's
+  // own log: recording a receipt in the log is what made every delivered-to
+  // session unreadable after a restart (docs/adr/0002).
+  const receipts = createMemoryReceiptStore();
+  const first = await deliverMessage(env.context, "sender", target.id, [{ type: "text", text: "retry" }], { idempotencyKey: "fresh-key", replyTo: "original", receiptStore: receipts });
   const freshContext = {
     agents: { get() { return undefined; } },
     sessions: { get() { return target; } },
     get() { return undefined; },
   };
-  const replay = await deliverMessage(freshContext, "sender", target.id, [{ type: "text", text: "retry" }], { idempotencyKey: "fresh-key", replyTo: "original" });
+  const replay = await deliverMessage(freshContext, "sender", target.id, [{ type: "text", text: "retry" }], { idempotencyKey: "fresh-key", replyTo: "original", receiptStore: receipts });
   assert.deepEqual(replay, first);
   assert.equal(target.events.filter((event) => event.type === "agent/inbox/spliced").length, 1);
+});
+
+test("a delivery writes no plugin-private event type into the target session", async () => {
+  // Regression guard for the P0 blocker: any `orchestra/*` event in a persisted
+  // log makes DSH refuse the whole log on reread, and an out-of-repo plugin
+  // cannot mark its own events ignorable. Delivery is the path that poisoned
+  // sessions the plugin does not even own, so it is the one that must stay clean.
+  const env = runtime();
+  const live = session("clean-live", "/caller");
+  env.sessions.set(live.id, live);
+  env.agents.set(live.id, { id: live.id, session: live, status: "idle", followup() {}, inject() {}, steer() {} });
+  const durable = session("clean-durable", "/caller");
+  env.sessions.set(durable.id, durable);
+  const receipts = createMemoryReceiptStore();
+
+  await deliverMessage(env.context, "sender", live.id, [{ type: "text", text: "a" }], { idempotencyKey: "clean-1", receiptStore: receipts });
+  await deliverMessage(env.context, "sender", live.id, [{ type: "text", text: "b" }], { interrupt: true, idempotencyKey: "clean-2", receiptStore: receipts });
+  await deliverMessage(env.context, "sender", durable.id, [{ type: "text", text: "c" }], { wake: false, idempotencyKey: "clean-3", receiptStore: receipts });
+
+  for (const target of [live, durable]) {
+    const foreign = target.events.filter((event) => typeof event.type === "string" && event.type.startsWith("orchestra/"));
+    assert.deepEqual(foreign, [], `${target.id} must contain no orchestra/* session event`);
+  }
+  assert.equal(await receipts.read(live.id, "clean-1") !== undefined, true, "the receipt is durable in the store instead");
 });
 
 test("orchestra_send reaches a native node only through its recorded direct parent", async () => {
@@ -420,4 +483,54 @@ test("a sub-agent child is reachable only by its direct parent", async () => {
     /sub-agent child of owner/,
     "a sender that cannot demonstrate the parent edge is not adjacent",
   );
+});
+
+test("a2a_list reports a real creation time, never a fake last-activity one", async () => {
+  const env = runtime();
+  const live = session("live-one", "/caller");
+  live.header.createdAt = 1700000000000;
+  env.sessions.set(live.id, live);
+  env.agents.set(live.id, { id: live.id, session: live, status: "idle" });
+  env.queryRecords.push({ header: { id: "cold-one", cwd: "/caller", createdAt: 1690000000000 }, live: false, persisted: true });
+  const listed = await listThreads(env.context, { driverCwd: "/caller" });
+  const byId = new Map(listed.threads.map((t) => [t.sessionId, t]));
+  assert.equal(byId.get("live-one").createdAt, 1700000000000);
+  assert.equal(byId.get("cold-one").createdAt, 1690000000000);
+  // The field must be named for what it is: the host exposes no last-activity
+  // timestamp, so no such key may appear anywhere in the projection.
+  for (const thread of listed.threads) {
+    assert.equal("lastActivityAt" in thread || "lastActivatedAt" in thread, false);
+  }
+});
+
+test("a discovery record without a usable timestamp simply omits it", async () => {
+  const env = runtime();
+  const live = session("no-time", "/caller");
+  live.header.createdAt = "not a number";
+  env.sessions.set(live.id, live);
+  env.agents.set(live.id, { id: live.id, session: live, status: "idle" });
+  const listed = await listThreads(env.context, { driverCwd: "/caller" });
+  assert.equal(listed.threads[0].createdAt, undefined);
+  assert.equal("createdAt" in listed.threads[0], false);
+});
+
+test("the discovery cap cannot starve the caller's own working directory", async () => {
+  const env = runtime();
+  const mine = session("mine-live", "/my-cwd");
+  env.sessions.set(mine.id, mine);
+  env.agents.set(mine.id, { id: mine.id, session: mine, status: "idle" });
+  // A host whose newest 200 persisted sessions all belong to OTHER cwds, plus one
+  // older session in the caller's own cwd. Before the fix that one was invisible
+  // at every offset, because it never entered the list at all.
+  for (let i = 0; i < 210; i++) {
+    env.queryRecords.push({ header: { id: `other-${String(i).padStart(3, "0")}`, cwd: "/elsewhere", createdAt: 1700000000000 - i }, live: false, persisted: true });
+  }
+  env.queryRecords.push({ header: { id: "my-old-session", cwd: "/my-cwd", createdAt: 1600000000000 }, live: false, persisted: true });
+
+  const listed = await listThreads(env.context, { driverCwd: "/my-cwd", limit: 100 });
+  const ids = listed.threads.map((t) => t.sessionId);
+  assert.equal(ids.includes("my-old-session"), true, "a session in the caller's own cwd must survive the cap");
+  assert.equal(ids.includes("mine-live"), true);
+  assert.match(listed.discovery_note ?? "", /discovery cap 200/);
+  assert.match(listed.discovery_note ?? "", /other working directories/);
 });

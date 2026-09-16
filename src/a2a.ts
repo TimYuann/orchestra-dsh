@@ -22,9 +22,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolExecutionInput } from "@deepseek-ai/dsh-tools";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
 import type { AgentHandle, AgentSetup } from "@deepseek-ai/dsh-agent";
-import type {} from "@deepseek-ai/dsh-session";
-import type {} from "@deepseek-ai/dsh-session-title";
-import type { SessionId } from "@deepseek-ai/dsh-session";
+import type { SessionId, AgentCancelCause } from "@deepseek-ai/dsh-session";
 import type {} from "@deepseek-ai/dsh-fs";
 import type {} from "@deepseek-ai/dsh-system-prompt";
 import type {} from "@deepseek-ai/cordis-plugin-timer";
@@ -33,6 +31,8 @@ import { prepareLightweightBlueprint } from "./session-blueprint.js";
 import { createSubagentNode } from "./subagent-node.js";
 import type { GovernedBlueprintReceipt, PreparedGovernedBlueprint, LightweightBlueprintReceipt } from "./session-blueprint.js";
 import { deliverMessage, queryMessageStatus, readDeliveryReceipt } from "./a2a-transport.js";
+import { receiptStoreFor } from "./receipt-store.js";
+import { blueprintStoreFor } from "./session-blueprint.js";
 export { deliverMessage, queryMessageStatus, readDeliveryReceipt } from "./a2a-transport.js";
 export type { DeliverResult, MessageLifecycleState, MessageStatusResult } from "./a2a-transport.js";
 import "./relay-types.js";
@@ -389,35 +389,132 @@ function textOf(message: { content?: unknown } | undefined | null): string {
   return parts.join("\n");
 }
 
-/** Read the recent user/assistant messages of one session (live or persisted). */
+/** Stop an active session immediately by cancelling its agent driver and clearing inbox. */
+export async function stopSession(
+  ctx: Context,
+  sessionId: string,
+  reason?: string,
+): Promise<{
+  sessionId: string;
+  stopped: boolean;
+  status: string;
+  reason?: string;
+  message: string;
+}> {
+  if (typeof sessionId !== "string" || sessionId === "") {
+    throw new Error('a2a_stop: "sessionId" must be a non-empty string');
+  }
+  const live = ctx.agents.get(SID(sessionId));
+  if (live === undefined) {
+    const session = ctx.sessions?.get(SID(sessionId));
+    if (session === undefined) {
+      return {
+        sessionId,
+        stopped: false,
+        status: "not_found",
+        message: `session ${sessionId} does not exist or has no active agent`,
+      };
+    }
+    return {
+      sessionId,
+      stopped: false,
+      status: "idle",
+      message: `session ${sessionId} is cold or idle (no running agent to cancel)`,
+    };
+  }
+
+  const prevStatus = live.status;
+  const cause: AgentCancelCause = typeof reason === "string" && reason.trim() !== ""
+    ? { kind: "hook", reason: reason.trim() }
+    : { kind: "user" };
+
+  live.cancel(cause, { keepInbox: false });
+
+  return {
+    sessionId,
+    stopped: true,
+    status: live.status,
+    ...(reason !== undefined ? { reason } : {}),
+    message: `session ${sessionId} execution stopped (was ${prevStatus}, inbox cleared)`,
+  };
+}
+
+/** Read the recent user/assistant messages of one session (live or persisted), progressive disclosure. */
 export async function readSessionText(
   ctx: Context,
   sessionId: string,
-  limit = 8,
-): Promise<{ sessionId: string; messages: { role: string; text: string }[] }> {
+  options?: number | { limit?: number; turns?: number },
+): Promise<{
+  sessionId: string;
+  total_turns?: number;
+  returned_turns?: number;
+  messages: { role: string; text: string; turn?: number }[];
+}> {
   const query = ctx.get("sessionQuery");
   if (query === undefined) throw new Error("a2a: sessionQuery service is unavailable");
   if (typeof sessionId !== "string" || sessionId === "") throw new Error("a2a: \"sessionId\" must be a non-empty string");
   const snapshot = await query.readSession(SID(sessionId));
-  const messages: { role: string; text: string }[] = [];
+
+  let limit: number | undefined;
+  let turns = 2; // Default progressive disclosure: 2 turns
+
+  if (typeof options === "number") {
+    limit = Math.max(1, Math.min(options, 20));
+  } else if (typeof options === "object" && options !== null) {
+    if (typeof options.turns === "number") turns = Math.max(1, Math.min(options.turns, 10));
+    if (typeof options.limit === "number") limit = Math.max(1, Math.min(options.limit, 30));
+  }
+
+  interface RawMessage {
+    role: string;
+    text: string;
+  }
+  const turnGroups: { turnNumber: number; messages: RawMessage[] }[] = [];
+  let currentGroup: RawMessage[] = [];
+
   for (const event of snapshot.events) {
     if (event.type === "user/message") {
       const kind = event.data.source === undefined ? undefined : (event.data.source as any).kind;
       if (kind !== "a2a" && kind !== "user") continue;
       const text = textOf(event.data);
       if (text === "") continue;
-      messages.push({ role: "user", text });
+
+      if (currentGroup.length > 0) {
+        turnGroups.push({ turnNumber: turnGroups.length + 1, messages: currentGroup });
+        currentGroup = [];
+      }
+      currentGroup.push({ role: "user", text });
     } else if (event.type === "assistant/message") {
       const text = textOf(event.data.message);
       if (text === "") continue;
-      messages.push({ role: "assistant", text });
+      currentGroup.push({ role: "assistant", text });
     }
   }
-  const picked = messages.slice(-Math.max(1, Math.min(limit, 20)));
+  if (currentGroup.length > 0) {
+    turnGroups.push({ turnNumber: turnGroups.length + 1, messages: currentGroup });
+  }
+
+  const totalTurns = turnGroups.length;
+  let pickedMessages: { role: string; text: string; turn?: number }[] = [];
+  let returnedTurns = 0;
+
+  if (limit !== undefined) {
+    const allMsgs = turnGroups.flatMap((g) => g.messages.map((m) => ({ ...m, turn: g.turnNumber })));
+    pickedMessages = allMsgs.slice(-limit);
+    returnedTurns = new Set(pickedMessages.map((m) => m.turn)).size;
+  } else {
+    const pickedGroups = turnGroups.slice(-turns);
+    returnedTurns = pickedGroups.length;
+    pickedMessages = pickedGroups.flatMap((g) => g.messages.map((m) => ({ ...m, turn: g.turnNumber })));
+  }
+
   return {
     sessionId,
-    messages: picked.map((entry) => ({
+    total_turns: totalTurns,
+    returned_turns: returnedTurns > 0 ? returnedTurns : undefined,
+    messages: pickedMessages.map((entry) => ({
       role: entry.role,
+      turn: entry.turn,
       text: entry.text.length > 600 ? `${entry.text.slice(0, 600)}…` : entry.text,
     })),
   };
@@ -575,10 +672,30 @@ async function readCurrentCwdTeam(ctx: Context, cwd: string | undefined): Promis
   return map;
 }
 
+export function formatRelativeTime(diffMs: number): string {
+  if (diffMs < 10_000) return "just now";
+  const sec = Math.floor(diffMs / 1000);
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const days = Math.floor(hr / 24);
+  return `${days}d ago`;
+}
+
 export interface ThreadEntry {
   sessionId: string;
   title?: string;
   cwd?: string;
+  /** When the session was CREATED (ms since epoch), from its own header. */
+  createdAt?: number;
+  /** Relative time since last activity (e.g. "2m ago", "just now"). */
+  lastActivity?: string;
+  /** Milliseconds timestamp of last known activity. */
+  lastActivityMs?: number;
+  /** Team role id if assigned to current cwd team. */
+  role?: string;
   status: string;
   live: boolean;
   archived?: boolean;
@@ -589,22 +706,26 @@ export interface ThreadEntry {
 }
 
 /**
- * List live + recent cold threads with title/status/cwd — progressive
- * disclosure (spec §11):
+ * List live + recent cold threads with title/status/cwd/lastActivity/role — progressive
+ * disclosure (spec §11 + v0.5 slimming):
  *
- * - Sorting: the caller's cwd group first, other cwds after (only when
- *   includeOtherCwds); within a group, live entries first, then cold entries
- *   in newest-first session-corpus order.
+ * - Sorting: the caller's cwd group first, sorted strictly by recent activity descending;
+ *   other cwds after, also sorted by recent activity descending.
+ * - Query: optional case-insensitive keyword filter across title, role, and sessionId.
  * - Default return: all host sessions, caller cwd first, capped by `limit`.
- * - Archived roles are folded away by default; pass includeArchived to reveal
- *   them (labeled archived).
- * - `includeOtherCwds` remains a compatibility input but never acts as a
- *   Transport ACL; annotations distinguish other cwd and wild sessions.
+ * - Archived roles are folded away by default; pass includeArchived to reveal them.
  */
 export async function listThreads(
   ctx: Context,
-  options: { limit?: number; offset?: number; driverCwd?: string; includeOtherCwds?: boolean; includeArchived?: boolean } = {},
-): Promise<{ threads: ThreadEntry[] }> {
+  options: {
+    limit?: number;
+    offset?: number;
+    driverCwd?: string;
+    includeOtherCwds?: boolean;
+    includeArchived?: boolean;
+    query?: string;
+  } = {},
+): Promise<{ threads: ThreadEntry[]; discovery_note?: string }> {
   const limit = Math.max(1, Math.min(options.limit ?? 30, 100));
   const offset = Math.max(0, options.offset ?? 0);
   const driverCwd = options.driverCwd;
@@ -612,40 +733,97 @@ export async function listThreads(
   // is host-wide and cannot be narrowed by Team/CWD policy.
   void options.includeOtherCwds;
   const includeArchived = options.includeArchived === true;
+  const now = Date.now();
   const live = ctx.agents.list();
-  const liveEntries = live.map((agent) => ({
-    sessionId: agent.id,
-    cwd: agent.session.header.cwd,
-    status: agent.status,
-    live: true,
-  }));
-  let query;
+  const liveEntries = live.map((agent) => {
+    let lastTime = asTimestamp(agent.session?.header?.createdAt);
+    try {
+      const events = agent.session?.snapshotEvents?.();
+      if (events && events.length > 0) {
+        const latestTime = events[events.length - 1].time;
+        if (typeof latestTime === "number" && Number.isFinite(latestTime)) {
+          lastTime = latestTime;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    if (lastTime === undefined || lastTime === asTimestamp(agent.session?.header?.createdAt)) {
+      try {
+        const steps = (agent as any).activity?.steps;
+        if (Array.isArray(steps) && steps.length > 0) {
+          const stepTime = steps[steps.length - 1]?.timestamp ?? steps[steps.length - 1]?.time;
+          if (typeof stepTime === "number" && Number.isFinite(stepTime)) {
+            lastTime = stepTime;
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+    const sess = agent.session as any;
+    const statusStr = typeof agent.status === "string" ? agent.status : ((agent.status as any)?.kind ?? "unknown");
+    const agentTitle = (agent as any).title ?? sess?.title ?? sess?.header?.title;
+    const agentRole = (agent as any).role ?? sess?.role ?? sess?.header?.role;
+    return {
+      sessionId: agent.id,
+      cwd: agent.session?.header?.cwd,
+      status: statusStr,
+      live: true,
+      lastActivityMs: lastTime,
+      lastActivity: lastTime !== undefined ? formatRelativeTime(Math.max(0, now - lastTime)) : undefined,
+      ...(agentTitle !== undefined ? { title: agentTitle } : {}),
+      ...(agentRole !== undefined ? { role: agentRole } : {}),
+      ...(asTimestamp(agent.session?.header?.createdAt) === undefined
+        ? {}
+        : { createdAt: asTimestamp(agent.session?.header?.createdAt) }),
+    };
+  });
+  // Every degraded answer below says so in `discovery_note`. A caller that gets
+  // a SHORT list must be able to tell "there is nothing else" from "I could not
+  // look", because for a discovery tool those are opposite facts and this list is
+  // what an agent picks a target from.
+  let query: any;
+  let discovery_note: string | undefined;
   try {
-    query = ctx.get("sessionQuery");
+    query = typeof ctx.get === "function" ? ctx.get("sessionQuery") : undefined;
   } catch {
-    return { threads: liveEntries };
+    query = undefined;
   }
-  if (query === undefined) return { threads: liveEntries };
-  let records: any[];
-  try {
-    records = await query.listSessions();
-  } catch {
-    // Discovery is progressive: a failed corpus adapter must not hide live reachability.
-    return { threads: liveEntries };
+  if (query === undefined) {
+    discovery_note = "sessionQuery service unavailable: only live sessions are listed";
   }
-  const cold = records
-    .filter((record: any) => record.live !== true && !liveEntries.some((entry: any) => entry.sessionId === record.header.id))
-    .slice(0, 200);
-  const ids = [...liveEntries.map((entry: any) => entry.sessionId), ...cold.map((record: any) => record.header.id)];
+  let records: any[] = [];
+  if (query !== undefined) {
+    try {
+      records = await query.listSessions();
+    } catch (error) {
+      // Discovery is progressive: a failed corpus adapter must not hide live reachability.
+      discovery_note = `persisted-session corpus could not be listed (${error instanceof Error ? error.message : String(error)}): only live sessions are listed`;
+    }
+  }
+  const coldCandidates = records.filter(
+    (record: any) => record.live !== true && !liveEntries.some((entry: any) => entry.sessionId === record.header?.id),
+  );
+  // The cap must not be allowed to starve the sessions the caller most needs.
+  const ownCwd = typeof driverCwd === "string" && driverCwd !== "" ? driverCwd : undefined;
+  const ownFirst = ownCwd === undefined ? [] : coldCandidates.filter((record: any) => record.header?.cwd === ownCwd);
+  const ownFirstIds = new Set(ownFirst.map((record: any) => record.header?.id));
+  const rest = coldCandidates.filter((record: any) => !ownFirstIds.has(record.header?.id));
+  const cold = [...ownFirst, ...rest.slice(0, Math.max(0, COLD_DISCOVERY_LIMIT - ownFirst.length))];
+  const starvedByCap = ownCwd === undefined ? 0 : Math.max(0, ownFirst.length - COLD_DISCOVERY_LIMIT);
+  const ids = [...liveEntries.map((entry: any) => entry.sessionId), ...cold.map((record: any) => record.header?.id)];
   let observations: any[] = [];
-  try {
-    observations = await query.readTitleSnapshots(ids);
-  } catch {
-    // Titles are optional annotations; keep the session rows visible.
+  if (query !== undefined) {
+    try {
+      observations = await query.readTitleSnapshots(ids);
+    } catch {
+      // Titles are optional annotations; keep the session rows visible.
+    }
   }
   const titles = new Map<string, string>();
   for (const observation of observations) {
-    if (observation.status === "fulfilled" && observation.value.title !== undefined) {
+    if (observation.status === "fulfilled" && observation.value?.title !== undefined) {
       titles.set(observation.sessionId, observation.value.title.title);
     }
   }
@@ -653,11 +831,16 @@ export async function listThreads(
   // by session id with category (active | archived).
   const unknownCwds = new Set<string>();
   for (const entry of liveEntries) if (entry.cwd !== undefined) unknownCwds.add(entry.cwd);
-  for (const record of cold) if (record.header.cwd !== undefined) unknownCwds.add(record.header.cwd);
+  for (const record of cold) if (record.header?.cwd !== undefined) unknownCwds.add(record.header.cwd);
   if (driverCwd !== undefined && driverCwd !== "") unknownCwds.add(driverCwd);
-  const roster = await scanTeamRoster(ctx, unknownCwds);
-  // Caller-relative annotation: only the caller's cwd ACTIVE team.
-  const teamMembership = await readCurrentCwdTeam(ctx, driverCwd);
+  let roster = new Map<string, { cwd: string; category: "active" | "archived" }>();
+  let teamMembership = new Map<string, { team_id: string; role_id: string }>();
+  try {
+    roster = await scanTeamRoster(ctx, unknownCwds);
+    teamMembership = await readCurrentCwdTeam(ctx, driverCwd);
+  } catch {
+    // team roster inspection is best-effort
+  }
   const classified = (sid: string): {
     keep: boolean;
     archived: boolean;
@@ -677,51 +860,99 @@ export async function listThreads(
   for (const entry of liveEntries) {
     const cls = classified(entry.sessionId);
     if (!cls.keep) continue;
+    const teamMem = teamMembership.get(entry.sessionId);
+    const role = teamMem ? teamMem.role_id : (entry.role ?? (entry.title !== undefined ? entry.title : undefined));
+    const title = titles.get(entry.sessionId) ?? entry.title;
     threads.push({
       ...entry,
-      ...(titles.get(entry.sessionId) === undefined ? {} : { title: titles.get(entry.sessionId) }),
+      ...(role !== undefined ? { role } : {}),
+      ...(title !== undefined ? { title } : {}),
       ...(cls.archived ? { archived: true } : {}),
       ...(cls.category === undefined ? {} : { category: cls.category }),
-      ...(teamMembership.has(entry.sessionId)
-        ? { current_cwd_team: teamMembership.get(entry.sessionId) }
+      ...(teamMem !== undefined
+        ? { current_cwd_team: teamMem }
         : { current_cwd_team: null }),
     });
   }
   for (const record of cold) {
-    const cls = classified(record.header.id);
+    const cls = classified(record.header?.id);
     if (!cls.keep) continue;
+    const cTime = asTimestamp(record.header?.createdAt);
+    const teamMem = teamMembership.get(record.header?.id);
+    const role = teamMem ? teamMem.role_id : undefined;
+    const title = titles.get(record.header?.id) ?? record.header?.title;
     threads.push({
-      sessionId: record.header.id,
-      cwd: record.header.cwd,
+      sessionId: record.header?.id,
+      cwd: record.header?.cwd,
       status: "cold",
       live: false,
-      ...(titles.get(record.header.id) === undefined ? {} : { title: titles.get(record.header.id) }),
+      lastActivityMs: cTime,
+      lastActivity: cTime !== undefined ? formatRelativeTime(Math.max(0, now - cTime)) : undefined,
+      ...(role !== undefined ? { role } : {}),
+      ...(asTimestamp(record.header?.createdAt) === undefined
+        ? {}
+        : { createdAt: asTimestamp(record.header?.createdAt) }),
+      ...(title !== undefined ? { title } : {}),
       ...(cls.archived ? { archived: true } : {}),
       ...(cls.category === undefined ? {} : { category: cls.category }),
-      ...(teamMembership.has(record.header.id)
-        ? { current_cwd_team: teamMembership.get(record.header.id) }
+      ...(teamMem !== undefined
+        ? { current_cwd_team: teamMem }
         : { current_cwd_team: null }),
     });
   }
-  // Progressive-disclosure ordering (spec §11):
-  // caller cwd first (live before cold, corpus newest-first within), then
-  // other cwds grouped by cwd, then archived (when included).
-  const liveOrder = new Map<string, number>(liveEntries.map((entry, index) => [String(entry.sessionId), index]));
-  const coldOrder = new Map<string, number>(cold.map((record: any, index: number) => [String(record.header.id), index]));
-  const rank = (t: ThreadEntry): [number, number, number, number] => {
-    const sameCwd = driverCwd !== undefined && t.cwd === driverCwd ? 0 : 1;
-    const liveRank = t.live ? 0 : 1;
-    const archivedRank = t.archived === true ? 1 : 0;
-    const recency = t.live ? liveOrder.get(t.sessionId) ?? Number.MAX_SAFE_INTEGER : coldOrder.get(t.sessionId) ?? Number.MAX_SAFE_INTEGER;
-    return [sameCwd, liveRank, archivedRank, recency];
-  };
-  threads.sort((a, b) => {
-    const ra = rank(a);
-    const rb = rank(b);
-    for (let i = 0; i < 4; i++) if (ra[i] !== rb[i]) return ra[i] - rb[i];
+
+  let filtered = threads;
+  if (typeof options.query === "string" && options.query.trim() !== "") {
+    const q = options.query.trim().toLowerCase();
+    filtered = filtered.filter((t) => {
+      if (t.title?.toLowerCase().includes(q)) return true;
+      if (t.sessionId.toLowerCase().includes(q)) return true;
+      if (t.role?.toLowerCase().includes(q)) return true;
+      return false;
+    });
+  }
+
+  // Progressive-disclosure ordering (spec §11 + v0.5 slimming):
+  // caller cwd first, sorted strictly by last activity descending (most recently active first),
+  // then other cwds sorted by last activity descending.
+  filtered.sort((a, b) => {
+    const sameCwdA = driverCwd !== undefined && a.cwd === driverCwd ? 0 : 1;
+    const sameCwdB = driverCwd !== undefined && b.cwd === driverCwd ? 0 : 1;
+    if (sameCwdA !== sameCwdB) return sameCwdA - sameCwdB;
+
+    const liveRankA = a.live ? 0 : 1;
+    const liveRankB = b.live ? 0 : 1;
+    if (liveRankA !== liveRankB) return liveRankA - liveRankB;
+
+    const actA = a.lastActivityMs ?? 0;
+    const actB = b.lastActivityMs ?? 0;
+    if (actA !== actB) return actB - actA;
+
     return a.sessionId.localeCompare(b.sessionId);
   });
-  return { threads: threads.slice(offset, offset + limit) };
+  const dropped = coldCandidates.length - cold.length;
+  return {
+    threads: filtered.slice(offset, offset + limit),
+    // Never a silent cap: P13 forbids one, and a truncated discovery list is
+    // exactly the shape that makes an agent conclude a target does not exist.
+    ...(discovery_note !== undefined
+      ? { discovery_note }
+      : dropped === 0
+      ? {}
+      : {
+          discovery_note:
+            `discovery cap ${COLD_DISCOVERY_LIMIT}: ${dropped} older persisted session(s) from other working directories were not listed` +
+            (starvedByCap === 0 ? "" : `; this working directory alone has ${starvedByCap} more than the cap`),
+        }),
+  };
+}
+
+/** How many persisted sessions one discovery pass will consider. */
+const COLD_DISCOVERY_LIMIT = 200;
+
+/** A header timestamp is only worth showing when it is a real finite number. */
+function asTimestamp(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 const SECTION_NAME = "tool:a2a";
@@ -737,14 +968,36 @@ export interface RawA2ASendArgs {
   idempotencyKey?: string;
 }
 
+/**
+ * The plugin-owned durable sinks one delivery needs.
+ *
+ * Both are scoped to the CALLER's cwd: that is where a retry, an `a2a_status`
+ * lookup and a handoff replay will look for them again. The blueprint resolver
+ * takes the target's cwd instead, because a cold resume reads it off the target's
+ * own persisted header.
+ */
+export function transportStores(ctx: Context, cwd: string | undefined) {
+  return {
+    receiptStore: receiptStoreFor(ctx, cwd),
+    resolveBlueprintStore: (targetCwd: string | undefined) => blueprintStoreFor(ctx, targetCwd),
+  };
+}
+
 /** Bounded raw-send entrypoint shared by a2a_send and its cross-cwd harness. */
 export async function sendRawA2A(ctx: Context, args: RawA2ASendArgs, exec: ToolExecutionInput) {
   if (exec.agent === undefined) throw new Error("a2a_send requires an agent caller");
   if (args.to === exec.agent.id) throw new Error("a2a: cannot send a message to yourself");
+  const policy = (ctx as any).sandboxPolicy?.resolve?.({ session: exec.agent.session, mode: "workspace-write" });
   return deliverMessage(ctx, exec.agent.id, args.to, [
     { type: "text", text: `Message from agent ${exec.agent.id}:` },
     { type: "text", text: args.message },
-  ], { wake: args.wake, interrupt: args.interrupt === true, idempotencyKey: args.idempotencyKey });
+  ], {
+    wake: args.wake,
+    interrupt: args.interrupt === true,
+    idempotencyKey: args.idempotencyKey,
+    receiptPolicy: policy,
+    ...transportStores(ctx, exec.agent.session.header.cwd),
+  });
 }
 
 export function apply(ctx: Context): void {
@@ -792,8 +1045,9 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "a2a_list",
       description:
-        "List the host's A2A sessions with session id, title, working directory, status, liveness, and honest Team/archive annotations. The caller cwd sorts first, but other cwd and wild sessions remain visible; annotations are not Transport ACLs. Archived roles are folded unless includeArchived:true. includeOtherCwds is retained for compatibility and does not hide sessions. Use the session id with a2a_send / a2a_reply / a2a_read / a2a_create.",
+        "List the host's A2A sessions with session id, title, working directory, status, liveness, last activity, role, and honest Team/archive annotations. The caller cwd sorts first by recent activity descending; other cwds also sort by recent activity. Archived roles are folded unless includeArchived:true. Supports fast keyword search via query.",
       parameters: {
+        query: { type: "string", description: "Optional case-insensitive keyword query to filter sessions by title, role, or sessionId." },
         limit: { type: "number", description: "Max threads returned. Defaults to 30, max 100." },
         offset: { type: "number", description: "Pagination offset. Defaults to 0." },
         includeOtherCwds: {
@@ -818,6 +1072,22 @@ export function apply(ctx: Context): void {
                 additionalProperties: false,
                 properties: {
                   sessionId: { type: "string", required: true },
+                  createdAt: {
+                    type: "number",
+                    description: "Session creation time (ms since epoch).",
+                  },
+                  lastActivity: {
+                    type: "string",
+                    description: "Relative time since last activity (e.g. \"2m ago\", \"just now\").",
+                  },
+                  lastActivityMs: {
+                    type: "number",
+                    description: "Milliseconds timestamp of last known activity.",
+                  },
+                  role: {
+                    type: "string",
+                    description: "Team role id if this session belongs to an active team.",
+                  },
                   title: { type: "string" },
                   cwd: { type: "string" },
                   status: { type: "string", required: true },
@@ -840,13 +1110,18 @@ export function apply(ctx: Context): void {
                 },
               },
             },
+            discovery_note: {
+              type: "string",
+              description:
+                "Present only when discovery was incomplete (a missing service, a failed corpus read, or the discovery cap). A short list WITHOUT this field means there is nothing else to find.",
+            },
           },
         },
         render: (_args, value): ContentBlock[] => [
           {
             type: "text",
             text:
-              value.threads.length === 0
+              (value.threads.length === 0
                 ? "no threads"
                 : `${value.threads.length} thread(s): ${value.threads
                     .map((t) => {
@@ -860,18 +1135,23 @@ export function apply(ctx: Context): void {
                               : t.archived === true
                                 ? " (archived)"
                                 : "";
-                      return `${t.sessionId}${t.live ? "" : " (cold)"}${tag}${t.title === undefined ? "" : ` (${t.title})`}`;
+                      const roleStr = t.role ? ` [role: ${t.role}]` : "";
+                      const actStr = t.lastActivity ? ` [${t.lastActivity}]` : "";
+                      const created = t.createdAt === undefined ? "" : ` [created ${new Date(t.createdAt).toISOString().slice(0, 16).replace("T", " ")}]`;
+                      return `${t.sessionId}${t.live ? "" : " (cold)"}${roleStr}${actStr}${tag}${t.title === undefined ? "" : ` (${t.title})`}${created}`;
                     })
-                    .join(", ")}`,
+                    .join(", ")}`) +
+              (value.discovery_note === undefined ? "" : `\nINCOMPLETE DISCOVERY: ${value.discovery_note}`),
           },
         ] as ContentBlock[],
       },
       async execute(
-        args: { limit?: number; offset?: number; includeOtherCwds?: boolean; includeArchived?: boolean },
+        args: { query?: string; limit?: number; offset?: number; includeOtherCwds?: boolean; includeArchived?: boolean },
         exec: ToolExecutionInput,
       ) {
         const driverCwd = exec.agent === undefined ? undefined : exec.agent.session.header.cwd;
         return listThreads(ctx, {
+          query: args.query,
           limit: args.limit,
           offset: args.offset,
           driverCwd,
@@ -884,12 +1164,12 @@ export function apply(ctx: Context): void {
 
   ctx.tools.register(
     defineTool({
-      name: "a2a_read",
+      name: "a2a_stop",
       description:
-        "Read the recent conversation of another agent thread (session): the last user/assistant messages, newest last. Useful to inspect what a thread is working on before messaging it. Reads the persisted log, so cold threads work too.",
+        "Instantly cancel the target session's active turn and clear its pending inbox (equivalent to the Composer Stop button). Directly invokes agent.cancel({ keepInbox: false }) on the target. Returns immediately, bringing the target to idle.",
       parameters: {
-        sessionId: { type: "string", required: true, description: "Target session id (see a2a_list)." },
-        limit: { type: "number", description: "How many recent messages to return. Defaults to 8, max 20." },
+        sessionId: { type: "string", required: true, description: "Target session id to stop (see a2a_list)." },
+        reason: { type: "string", description: "Optional reason for cancellation." },
       },
       output: {
         schema: {
@@ -897,6 +1177,43 @@ export function apply(ctx: Context): void {
           additionalProperties: false,
           properties: {
             sessionId: { type: "string", required: true },
+            stopped: { type: "boolean", required: true },
+            status: { type: "string", required: true },
+            reason: { type: "string" },
+            message: { type: "string", required: true },
+          },
+        },
+        render: (_args, value): ContentBlock[] => [
+          {
+            type: "text",
+            text: `[a2a_stop] session ${value.sessionId}: ${value.message}`,
+          },
+        ] as ContentBlock[],
+      },
+      async execute(args: { sessionId: string; reason?: string }) {
+        return stopSession(ctx, args.sessionId, args.reason);
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
+      name: "a2a_read",
+      description:
+        "Read recent conversation of another agent thread (session) with progressive disclosure: defaults to inspecting the last 1~2 turns of interaction to save context. Supports specifying turns or limit.",
+      parameters: {
+        sessionId: { type: "string", required: true, description: "Target session id (see a2a_list)." },
+        turns: { type: "number", description: "Number of recent turns to return. Defaults to 2 (max 10)." },
+        limit: { type: "number", description: "Optional raw message count limit (legacy compatibility, max 30)." },
+      },
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            sessionId: { type: "string", required: true },
+            total_turns: { type: "number" },
+            returned_turns: { type: "number" },
             messages: {
               type: "array",
               required: true,
@@ -905,6 +1222,7 @@ export function apply(ctx: Context): void {
                 additionalProperties: false,
                 properties: {
                   role: { type: "string", required: true },
+                  turn: { type: "number" },
                   text: { type: "string", required: true },
                 },
               },
@@ -917,14 +1235,15 @@ export function apply(ctx: Context): void {
             text:
               value.messages.length === 0
                 ? `thread ${value.sessionId} has no readable messages`
-                : `thread ${value.sessionId}: ${value.messages
-                    .map((m) => `${m.role}: ${m.text.length > 120 ? `${m.text.slice(0, 120)}…` : m.text}`)
-                    .join(" | ")}`,
+                : `thread ${value.sessionId}${value.returned_turns !== undefined ? ` (${value.returned_turns}/${value.total_turns ?? "?"} turns)` : ""}:\n` +
+                  value.messages
+                    .map((m) => `${m.turn !== undefined ? `[Turn ${m.turn}] ` : ""}${m.role}: ${m.text.length > 120 ? `${m.text.slice(0, 120)}…` : m.text}`)
+                    .join("\n"),
           },
         ] as ContentBlock[],
       },
-      execute(args: { sessionId: string; limit?: number }) {
-        return readSessionText(ctx, args.sessionId, args.limit);
+      execute(args: { sessionId: string; turns?: number; limit?: number }) {
+        return readSessionText(ctx, args.sessionId, { turns: args.turns, limit: args.limit });
       },
     }),
   );
@@ -967,7 +1286,12 @@ export function apply(ctx: Context): void {
         return deliverMessage(ctx, exec.agent.id, args.to, [
           { type: "text", text: `Reply from agent ${exec.agent.id} (to message ${args.reply_to}):` },
           { type: "text", text: args.message },
-        ], { replyTo: args.reply_to, interrupt: args.interrupt === true, idempotencyKey: args.idempotency_key });
+        ], {
+          replyTo: args.reply_to,
+          interrupt: args.interrupt === true,
+          idempotencyKey: args.idempotency_key,
+          ...transportStores(ctx, exec.agent.session.header.cwd),
+        });
       },
     }),
   );
@@ -993,8 +1317,8 @@ export function apply(ctx: Context): void {
         },
         render: (_args, value) => [{ type: "text", text: `message ${value.message_id} for ${value.target_session_id}: ${value.state}${value.evidence === undefined ? "" : ` (${value.evidence})`}` }] as ContentBlock[],
       },
-      execute(args: { messageId: string; targetSessionId: string }) {
-        return queryMessageStatus(ctx, args.messageId, args.targetSessionId);
+      execute(args: { messageId: string; targetSessionId: string }, exec: ToolExecutionInput) {
+        return queryMessageStatus(ctx, args.messageId, args.targetSessionId, receiptStoreFor(ctx, exec.agent?.session.header.cwd));
       },
     }),
   );

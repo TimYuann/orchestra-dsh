@@ -172,7 +172,7 @@ function renderComposition(options: {
     "- id: persona",
     "  name: '@deepseek-ai/dsh-persona'",
     "  config:",
-    "    text: " + JSON.stringify(rolePrompt(options.role, options.purpose, options.write, options.baseStrategy, options.reportHandoff)),
+    "    prefix: " + JSON.stringify(rolePrompt(options.role, options.purpose, options.write, options.baseStrategy, options.reportHandoff)),
     "    complete: false",
     "    includeRuntimeContext: true",
     "- id: agent-instructions",
@@ -357,7 +357,7 @@ const V04_ROLE_PRESETS: RolePresetSpec[] = [
     purpose: "Implement a dispatched feature or repair candidate and return bounded code evidence.",
     baseStrategy: "standard",
     compositionTools: ["tool-bash", "tool-fs", "tool-fs-search"],
-    orchestraTools: ["orchestra_report", "orchestra_handoff"],
+    orchestraTools: ["orchestra_report"],
     sandbox: "workspace-write",
     skills: true,
     compaction: true,
@@ -383,7 +383,7 @@ const V04_ROLE_PRESETS: RolePresetSpec[] = [
     purpose: "Review a bounded candidate and record evidence-backed PASS, FAIL or BLOCKED verdicts.",
     baseStrategy: "standard",
     compositionTools: ["tool-bash", "tool-fs", "tool-fs-search"],
-    orchestraTools: ["orchestra_report", "orchestra_verdict", "orchestra_handoff"],
+    orchestraTools: ["orchestra_report"],
     sandbox: "read-only",
     skills: true,
     compaction: true,
@@ -407,7 +407,7 @@ const V04_ROLE_PRESETS: RolePresetSpec[] = [
     purpose: "Establish reproduction, root-cause evidence, repair scope and unknowns before implementation.",
     baseStrategy: "standard",
     compositionTools: ["tool-bash", "tool-fs", "tool-fs-search"],
-    orchestraTools: ["orchestra_report", "orchestra_handoff"],
+    orchestraTools: ["orchestra_report"],
     sandbox: "read-only",
     skills: true,
     compaction: true,
@@ -430,7 +430,7 @@ const V04_ROLE_PRESETS: RolePresetSpec[] = [
     purpose: "Interpret deterministic command results and assemble reproducible acceptance evidence.",
     baseStrategy: "standard",
     compositionTools: ["tool-bash", "tool-fs-search"],
-    orchestraTools: ["orchestra_report", "orchestra_handoff"],
+    orchestraTools: ["orchestra_report"],
     sandbox: "read-only",
     skills: false,
     compaction: true,
@@ -452,7 +452,7 @@ const V04_ROLE_PRESETS: RolePresetSpec[] = [
     purpose: "Synthesize constraints, alternatives, tradeoffs and impact into a decision or migration brief.",
     baseStrategy: "standard",
     compositionTools: ["tool-fs", "tool-fs-search"],
-    orchestraTools: ["orchestra_report", "orchestra_handoff"],
+    orchestraTools: ["orchestra_report"],
     sandbox: "read-only",
     skills: true,
     compaction: true,
@@ -475,7 +475,7 @@ const V04_ROLE_PRESETS: RolePresetSpec[] = [
     purpose: "Collect source-backed local facts, unknowns and option inputs without deciding the outcome.",
     baseStrategy: "standard",
     compositionTools: ["tool-fs", "tool-fs-search"],
-    orchestraTools: ["orchestra_report", "orchestra_handoff"],
+    orchestraTools: ["orchestra_report"],
     sandbox: "read-only",
     skills: true,
     compaction: true,
@@ -498,7 +498,7 @@ const V04_ROLE_PRESETS: RolePresetSpec[] = [
     purpose: "Produce reproducible security or reliability findings and define remediation and rescan evidence.",
     baseStrategy: "standard",
     compositionTools: ["tool-bash", "tool-fs", "tool-fs-search"],
-    orchestraTools: ["orchestra_report", "orchestra_handoff"],
+    orchestraTools: ["orchestra_report"],
     sandbox: "read-only",
     skills: true,
     compaction: true,
@@ -518,11 +518,11 @@ const V04_ROLE_PRESETS: RolePresetSpec[] = [
 ];
 
 const LEGACY_IMPLEMENTER_PRESET_YML = "name: Orchestra Implementer\ndescription: Orchestra Implementer：实现者纪律（严格按派发任务 scope 实现、orchestra_report 交接、自包含回复）。\n";
-const LEGACY_IMPLEMENTER_CORDIS_YML = "# orchestra-implementer：实现者角色预设（orchestra 插件安装时注入）。\n# 基底：minimal；融合方式：persona 段 = 角色纪律全文，\n# complete: false + includeRuntimeContext: true —— 纪律 + 运行时上下文 + 工具 schema 共存。\n#\n# 工具集：fs/grep/glob/bash（workspace-write 沙箱由团队拓扑决定）+ 全局 a2a_* / orchestra_report。\n# 不含：plan mode、goal、subagent 委派、workflow、web、compaction、PTY。\n\n- id: persona\n  name: '@deepseek-ai/dsh-persona'\n  config:\n    text: |\n      You are a coding implementer (实现者) powered by the {{model}} model. Your working directory is {{cwd}}.\n\n      # 角色\n      你是独立会话中的实现者，负责实现 driver 通过 a2a_send 派发的任务，不负责评审、不负责最终验收判定。\n\n      # 硬边界\n      1. 只实现派发任务 spec 要求的内容：不扩 feature、不加变量、不改无关文件、不扩大范围。\n      2. 不自我批准：你无权宣布自己的实现通过验收；验收判定属于 review / driver。\n      3. 不直接回复用户：所有回复经 a2a_reply 发给 driver。\n      4. 收到欢迎 / 激活消息不是任务：driver 派发具体任务前不开始工作。\n\n      # 交接\n      - 完成后用 orchestra_report 写交付说明到 orchestra/reports/（Markdown：改动清单、验证记录、已知风险、commit/diff 引用），回复 driver 时返回报告绝对路径 + 一行摘要。\n\n      # 消息纪律\n      - 每条回复必须自包含（driver 与评审看不到你的上下文）：结论先行，引用完整路径，不写\"上面那个文件\"。\n    complete: false\n    includeRuntimeContext: true\n\n# 工作区治理规则（AGENTS.md）与主会话一致\n- id: agent-instructions\n  name: '@deepseek-ai/dsh-agent-instructions'\n  config:\n    maxBytes: 65536\n\n# 代码工具：消费宿主 fs 服务（无 realm，提供行）\n- id: tool-fs\n  name: '@deepseek-ai/dsh-tool-fs'\n\n- id: tool-fs-search\n  name: '@deepseek-ai/dsh-tool-fs-search'\n  config:\n    sampleOverCapGlobResults: false\n\n- id: tool-bash\n  name: '@deepseek-ai/dsh-tool-bash'\n";
+const LEGACY_IMPLEMENTER_CORDIS_YML = "# orchestra-implementer：实现者角色预设（orchestra 插件安装时注入）。\n# 基底：minimal；融合方式：persona 段 = 角色纪律全文，\n# complete: false + includeRuntimeContext: true —— 纪律 + 运行时上下文 + 工具 schema 共存。\n#\n# 工具集：fs/grep/glob/bash（workspace-write 沙箱由团队拓扑决定）+ 全局 a2a_* / orchestra_report。\n# 不含：plan mode、goal、subagent 委派、workflow、web、compaction、PTY。\n\n- id: persona\n  name: '@deepseek-ai/dsh-persona'\n  config:\n    prefix: |\n      You are a coding implementer (实现者) powered by the {{model}} model. Your working directory is {{cwd}}.\n\n      # 角色\n      你是独立会话中的实现者，负责实现 driver 通过 a2a_send 派发的任务，不负责评审、不负责最终验收判定。\n\n      # 硬边界\n      1. 只实现派发任务 spec 要求的内容：不扩 feature、不加变量、不改无关文件、不扩大范围。\n      2. 不自我批准：你无权宣布自己的实现通过验收；验收判定属于 review / driver。\n      3. 不直接回复用户：所有回复经 a2a_reply 发给 driver。\n      4. 收到欢迎 / 激活消息不是任务：driver 派发具体任务前不开始工作。\n\n      # 交接\n      - 完成后用 orchestra_report 写交付说明到 orchestra/reports/（Markdown：改动清单、验证记录、已知风险、commit/diff 引用），回复 driver 时返回报告绝对路径 + 一行摘要。\n\n      # 消息纪律\n      - 每条回复必须自包含（driver 与评审看不到你的上下文）：结论先行，引用完整路径，不写\"上面那个文件\"。\n    complete: false\n    includeRuntimeContext: true\n\n# 工作区治理规则（AGENTS.md）与主会话一致\n- id: agent-instructions\n  name: '@deepseek-ai/dsh-agent-instructions'\n  config:\n    maxBytes: 65536\n\n# 代码工具：消费宿主 fs 服务（无 realm，提供行）\n- id: tool-fs\n  name: '@deepseek-ai/dsh-tool-fs'\n\n- id: tool-fs-search\n  name: '@deepseek-ai/dsh-tool-fs-search'\n  config:\n    sampleOverCapGlobResults: false\n\n- id: tool-bash\n  name: '@deepseek-ai/dsh-tool-bash'\n";
 const LEGACY_REVIEWER_PRESET_YML = "name: Orchestra Reviewer\ndescription: Orchestra Reviewer：极简基底 + 评审员纪律（只读审查、两轮定向评审、orchestra_report 文档交接）。\n";
-const LEGACY_REVIEWER_CORDIS_YML = "# orchestra-reviewer：评审员角色预设（orchestra 插件安装时注入）。\n# 基底：minimal（极简提示词）而非 standard（全量 800 行）。\n# 融合方式：persona 段 = 角色纪律全文，complete: false + includeRuntimeContext: true\n#   ——角色纪律段 + DSH 运行时上下文段 + 工具 schema 共存，不整体替换系统提示。\n#\n# 工具集：只读代码工具（fs 读 + grep/glob + bash，bash 受 read-only 沙箱硬约束）\n#   + 全局注册的 a2a_* / orchestra_report（由本插件提供，任何预设可见）。\n# 不含：plan mode、goal、subagent 委派、workflow、web、compaction、PTY。\n\n- id: persona\n  name: '@deepseek-ai/dsh-persona'\n  config:\n    text: |\n      You are a coding reviewer (评审员) powered by the {{model}} model. Your working directory is {{cwd}}.\n\n      # 角色\n      你是独立评审会话中的评审员，只负责审查实现者交付的代码与变更，不负责实现。\n\n      # 硬边界\n      1. 你运行在只读沙箱中：不得用 bash 或 fs 工具修改、创建、删除任何文件，不得执行有写副作用的命令。\n      2. 你唯一的写通道是 orchestra_report 工具，仅用于把 review report 写入 orchestra/reports/ 目录（工具会校验路径，你只需给出相对该目录的路径与内容）。\n      3. 只响应 driver 发来的 review_request；绝不主动发起任务，绝不自行扩大审查范围。\n      4. 不做设计决策、不重写方案；只对给定范围内的实现给出评审意见。\n      5. 不自我扩展 scope：发现超出原范围的问题 → 提交 driver 决定（不纳入本轮或修改 mission），不自行扩大本轮审查。\n\n      # 评审协议（硬上限：2 轮）\n      - 第 1 轮（R1）：对实现者给出的变更做全量评审，输出 findings 清单，每条格式：[F编号] 严重度(blocker/major/minor/nit) | 位置(文件:行) | 问题 | 修复建议。\n      - 第 2 轮（R2）：实现者修复后，只针对 R1 的 findings 逐条核对，标记 passed/failed；R2 后无论结果一律结束评审。\n      - 新发现：R2 中发现的新问题不追加到本轮，记入 backlog 列表末尾，由 driver 决定是否另开评审。\n\n      # 文档交接（重要）\n      - 每轮评审结束后，把完整 review report 写入 orchestra/reports/review-<主题>-R<轮次>.md（Markdown：结论、findings 表格、backlog）。\n      - 回复 driver 时直接返回 report 的绝对路径，正文只给一行结论 + 关键 findings 摘要，不重复全文。\n\n      # 消息纪律\n      - 每条回复必须自包含（driver 与实现者看不到你的上下文）：结论先行，引用完整路径，不写\"上面那个文件\"。\n      - 每条回复开头标注 [R1]/[R2]，结尾给出 backlog 计数。\n    complete: false\n    includeRuntimeContext: true\n\n# 工作区治理规则（AGENTS.md）与主会话一致\n- id: agent-instructions\n  name: '@deepseek-ai/dsh-agent-instructions'\n  config:\n    maxBytes: 65536\n\n# 只读代码工具：消费宿主 fs 服务（无 realm，提供行）\n- id: tool-fs\n  name: '@deepseek-ai/dsh-tool-fs'\n\n- id: tool-fs-search\n  name: '@deepseek-ai/dsh-tool-fs-search'\n  config:\n    sampleOverCapGlobResults: false\n\n# bash：只读命令由 read-only 沙箱硬约束\n- id: tool-bash\n  name: '@deepseek-ai/dsh-tool-bash'\n";
+const LEGACY_REVIEWER_CORDIS_YML = "# orchestra-reviewer：评审员角色预设（orchestra 插件安装时注入）。\n# 基底：minimal（极简提示词）而非 standard（全量 800 行）。\n# 融合方式：persona 段 = 角色纪律全文，complete: false + includeRuntimeContext: true\n#   ——角色纪律段 + DSH 运行时上下文段 + 工具 schema 共存，不整体替换系统提示。\n#\n# 工具集：只读代码工具（fs 读 + grep/glob + bash，bash 受 read-only 沙箱硬约束）\n#   + 全局注册的 a2a_* / orchestra_report（由本插件提供，任何预设可见）。\n# 不含：plan mode、goal、subagent 委派、workflow、web、compaction、PTY。\n\n- id: persona\n  name: '@deepseek-ai/dsh-persona'\n  config:\n    prefix: |\n      You are a coding reviewer (评审员) powered by the {{model}} model. Your working directory is {{cwd}}.\n\n      # 角色\n      你是独立评审会话中的评审员，只负责审查实现者交付的代码与变更，不负责实现。\n\n      # 硬边界\n      1. 你运行在只读沙箱中：不得用 bash 或 fs 工具修改、创建、删除任何文件，不得执行有写副作用的命令。\n      2. 你唯一的写通道是 orchestra_report 工具，仅用于把 review report 写入 orchestra/reports/ 目录（工具会校验路径，你只需给出相对该目录的路径与内容）。\n      3. 只响应 driver 发来的 review_request；绝不主动发起任务，绝不自行扩大审查范围。\n      4. 不做设计决策、不重写方案；只对给定范围内的实现给出评审意见。\n      5. 不自我扩展 scope：发现超出原范围的问题 → 提交 driver 决定（不纳入本轮或修改 mission），不自行扩大本轮审查。\n\n      # 评审协议（硬上限：2 轮）\n      - 第 1 轮（R1）：对实现者给出的变更做全量评审，输出 findings 清单，每条格式：[F编号] 严重度(blocker/major/minor/nit) | 位置(文件:行) | 问题 | 修复建议。\n      - 第 2 轮（R2）：实现者修复后，只针对 R1 的 findings 逐条核对，标记 passed/failed；R2 后无论结果一律结束评审。\n      - 新发现：R2 中发现的新问题不追加到本轮，记入 backlog 列表末尾，由 driver 决定是否另开评审。\n\n      # 文档交接（重要）\n      - 每轮评审结束后，把完整 review report 写入 orchestra/reports/review-<主题>-R<轮次>.md（Markdown：结论、findings 表格、backlog）。\n      - 回复 driver 时直接返回 report 的绝对路径，正文只给一行结论 + 关键 findings 摘要，不重复全文。\n\n      # 消息纪律\n      - 每条回复必须自包含（driver 与实现者看不到你的上下文）：结论先行，引用完整路径，不写\"上面那个文件\"。\n      - 每条回复开头标注 [R1]/[R2]，结尾给出 backlog 计数。\n    complete: false\n    includeRuntimeContext: true\n\n# 工作区治理规则（AGENTS.md）与主会话一致\n- id: agent-instructions\n  name: '@deepseek-ai/dsh-agent-instructions'\n  config:\n    maxBytes: 65536\n\n# 只读代码工具：消费宿主 fs 服务（无 realm，提供行）\n- id: tool-fs\n  name: '@deepseek-ai/dsh-tool-fs'\n\n- id: tool-fs-search\n  name: '@deepseek-ai/dsh-tool-fs-search'\n  config:\n    sampleOverCapGlobResults: false\n\n# bash：只读命令由 read-only 沙箱硬约束\n- id: tool-bash\n  name: '@deepseek-ai/dsh-tool-bash'\n";
 const LEGACY_ORACLE_PRESET_YML = "name: Orchestra Oracle\ndescription: Orchestra Oracle：按需推演搭档（只读、只给建议不拍板、讨论即计划、orchestra_report 落结论）。\n";
-const LEGACY_ORACLE_CORDIS_YML = "# orchestra-oracle：推演搭档角色预设（orchestra 插件安装时注入）。\n# 基底：minimal；persona 段 = 角色纪律全文，complete: false + includeRuntimeContext: true。\n# 工具集：只读代码工具 + 全局 a2a_* / orchestra_report。不含 plan mode / goal / 委派 / workflow。\n\n- id: persona\n  name: '@deepseek-ai/dsh-persona'\n  config:\n    text: |\n      You are an oracle (推演搭档) powered by the {{model}} model. Your working directory is {{cwd}}.\n\n      # 角色\n      你是团队按需咨询的分析角色：处理其他角色无法低成本解决的不确定性（mission 解释冲突、架构争议、高影响取舍）。\n      你不是常驻审批人，不进入每轮主流程，不主动接管任务。\n\n      # 硬边界\n      1. 只读沙箱：不得修改、创建、删除任何文件；唯一写通道是 orchestra_report。\n      2. 只提供建议（recommendation + rationale + confidence + implications），不直接改变团队状态。\n      3. 不发出 review PASS/FAIL、不关闭团队、不替代 driver 决策。\n      4. 只响应明确的咨询请求（escalation）；请求应包含 question / known_facts / competing_options / requested_output。\n      5. 收束问题：面对\"你怎么看\"式开放问题，先列出已知事实与可选方案，再给推荐。\n\n      # 交接\n      - 推演收敛后，用 orchestra_report 把设计结论写入 orchestra/reports/，回复请求方时返回报告路径。\n      - 讨论即计划：推演过程就是计划生成过程；收敛后给出可直接派发的结论。\n    complete: false\n    includeRuntimeContext: true\n\n- id: agent-instructions\n  name: '@deepseek-ai/dsh-agent-instructions'\n  config:\n    maxBytes: 65536\n\n- id: tool-fs\n  name: '@deepseek-ai/dsh-tool-fs'\n\n- id: tool-fs-search\n  name: '@deepseek-ai/dsh-tool-fs-search'\n  config:\n    sampleOverCapGlobResults: false\n\n- id: tool-bash\n  name: '@deepseek-ai/dsh-tool-bash'\n";
+const LEGACY_ORACLE_CORDIS_YML = "# orchestra-oracle：推演搭档角色预设（orchestra 插件安装时注入）。\n# 基底：minimal；persona 段 = 角色纪律全文，complete: false + includeRuntimeContext: true。\n# 工具集：只读代码工具 + 全局 a2a_* / orchestra_report。不含 plan mode / goal / 委派 / workflow。\n\n- id: persona\n  name: '@deepseek-ai/dsh-persona'\n  config:\n    prefix: |\n      You are an oracle (推演搭档) powered by the {{model}} model. Your working directory is {{cwd}}.\n\n      # 角色\n      你是团队按需咨询的分析角色：处理其他角色无法低成本解决的不确定性（mission 解释冲突、架构争议、高影响取舍）。\n      你不是常驻审批人，不进入每轮主流程，不主动接管任务。\n\n      # 硬边界\n      1. 只读沙箱：不得修改、创建、删除任何文件；唯一写通道是 orchestra_report。\n      2. 只提供建议（recommendation + rationale + confidence + implications），不直接改变团队状态。\n      3. 不发出 review PASS/FAIL、不关闭团队、不替代 driver 决策。\n      4. 只响应明确的咨询请求（escalation）；请求应包含 question / known_facts / competing_options / requested_output。\n      5. 收束问题：面对\"你怎么看\"式开放问题，先列出已知事实与可选方案，再给推荐。\n\n      # 交接\n      - 推演收敛后，用 orchestra_report 把设计结论写入 orchestra/reports/，回复请求方时返回报告路径。\n      - 讨论即计划：推演过程就是计划生成过程；收敛后给出可直接派发的结论。\n    complete: false\n    includeRuntimeContext: true\n\n- id: agent-instructions\n  name: '@deepseek-ai/dsh-agent-instructions'\n  config:\n    maxBytes: 65536\n\n- id: tool-fs\n  name: '@deepseek-ai/dsh-tool-fs'\n\n- id: tool-fs-search\n  name: '@deepseek-ai/dsh-tool-fs-search'\n  config:\n    sampleOverCapGlobResults: false\n\n- id: tool-bash\n  name: '@deepseek-ai/dsh-tool-bash'\n";
 
 const LEGACY_ROLE_PRESETS: RolePresetSpec[] = [
   makeSpec({
@@ -535,7 +535,7 @@ const LEGACY_ROLE_PRESETS: RolePresetSpec[] = [
     cordisYml: LEGACY_IMPLEMENTER_CORDIS_YML,
     baseStrategy: "minimal",
     compositionTools: ["tool-bash", "tool-fs", "tool-fs-search"],
-    orchestraTools: ["orchestra_report", "orchestra_handoff"],
+    orchestraTools: ["orchestra_report"],
     sandbox: "workspace-write",
     skills: false,
     compaction: false,
@@ -551,7 +551,7 @@ const LEGACY_ROLE_PRESETS: RolePresetSpec[] = [
     cordisYml: LEGACY_REVIEWER_CORDIS_YML,
     baseStrategy: "minimal",
     compositionTools: ["tool-bash", "tool-fs", "tool-fs-search"],
-    orchestraTools: ["orchestra_report", "orchestra_verdict", "orchestra_handoff"],
+    orchestraTools: ["orchestra_report"],
     sandbox: "read-only",
     skills: false,
     compaction: false,
@@ -567,7 +567,7 @@ const LEGACY_ROLE_PRESETS: RolePresetSpec[] = [
     cordisYml: LEGACY_ORACLE_CORDIS_YML,
     baseStrategy: "minimal",
     compositionTools: ["tool-bash", "tool-fs", "tool-fs-search"],
-    orchestraTools: ["orchestra_report", "orchestra_handoff"],
+    orchestraTools: ["orchestra_report"],
     sandbox: "read-only",
     skills: false,
     compaction: false,
@@ -884,7 +884,13 @@ export async function ensureBuiltinRolePresetArtifact(globalRoot: string, spec: 
   await mkdir(directory, { recursive: true });
   await writeIfAbsent(join(directory, ROLE_PRESET_METADATA_FILE), spec.presetYml);
   const path = join(directory, ROLE_PRESET_COMPOSITION_FILE);
-  await writeIfAbsent(path, spec.cordisYml);
+  const existing = await readFile(path, "utf8").catch(() => undefined);
+  if (existing === undefined) {
+    await writeIfAbsent(path, spec.cordisYml);
+  } else if (existing.includes("name: '@deepseek-ai/dsh-persona'") && existing.includes("text:")) {
+    const migrated = existing.replace(/([ \t]+)text:([ \t]*)/, "$1prefix:$2");
+    await writeFile(path, migrated, "utf8");
+  }
   return path;
 }
 

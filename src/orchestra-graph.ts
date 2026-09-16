@@ -12,18 +12,15 @@ import type { EvidenceRef } from "./orchestration-document.js";
 import type { TeamRole, TeamState } from "./orchestra-state.js";
 import type { TopologyClosureDefinition, TopologyGateDefinition, TopologyHandoffContract, TopologyLoopContract } from "./orchestra-topology.js";
 
-declare module "@deepseek-ai/dsh-session/types" {
-  interface SessionEventMap {
-    "orchestra/gate-decision": {
-      gateInstanceId: string;
-      option: string;
-      commandId: string;
-      decidedAt: number;
-      approvingSessionId: string;
-      source: "user-command";
-    };
-  }
-}
+/**
+ * Record label for one human gate decision, stored in the charter record file.
+ *
+ * This was a Session event type with a `declare module` augmentation; that is
+ * gone, because a gate decision written into the driver's log made the whole log
+ * unreadable on reread (`docs/adr/0002`). It is now only the `type` field of a
+ * stored record.
+ */
+export const GATE_DECISION_EVENT = "orchestra/gate-decision";
 
 export const GRAPH_RUNTIME_SCHEMA_VERSION = 1;
 

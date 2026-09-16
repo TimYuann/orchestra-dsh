@@ -3,13 +3,17 @@ import assert from "node:assert/strict";
 import { createSession } from "../lib/a2a.js";
 import {
   SessionBlueprintError,
+  blueprintStoreFor,
+  parseLightweightBlueprint,
   prepareLightweightBlueprint,
-  readLightweightBlueprint,
 } from "../lib/session-blueprint.js";
 
 function makeRuntime(options = {}) {
   const events = [];
   const session = {
+    // A real Session always carries a header; the composition marker is filed
+    // under this cwd now, so the double needs it.
+    header: { id: "child", cwd: "/tmp/blueprint" },
     events,
     // DSH 0.1.5-rc.2 Session surface: `snapshotEvents()` replaced `.events`.
     snapshotEvents() {
@@ -130,7 +134,12 @@ test("explicit preset mounts, pins permission/model, fixes title, and records ma
   assert.equal(prepared.receipt.reasoningEffort, "high");
   assert.deepEqual(prepared.receipt.tools, { names: ["read", "write"], count: 2 });
   assert.equal(runtime.events.some((event) => event.type === "session/title"), true);
-  const marker = readLightweightBlueprint(runtime.events);
+  const marker = await blueprintStoreFor(runtime.context, "/tmp/blueprint").read("child");
+  assert.equal(
+    runtime.events.some((event) => typeof event.type === "string" && event.type.startsWith("orchestra/")),
+    false,
+    "the marker must not be written into the session log",
+  );
   assert.equal(marker.mode, "lightweight");
   assert.equal(marker.agentPreset, "explicit-preset");
   assert.equal("teamId" in marker, false);
@@ -248,7 +257,8 @@ test("createSession lightweight output carries complete receipt and rollback doe
 });
 
 test("old sessions without a marker remain unknown rather than gaining invented facts", () => {
-  assert.equal(readLightweightBlueprint([{ type: "session/end-seed", data: {}, seq: 0, time: 1 }]), undefined);
+  assert.equal(parseLightweightBlueprint(undefined), undefined);
+  assert.equal(parseLightweightBlueprint({ type: "session/end-seed", data: {} }), undefined);
 });
 
 test("malformed durable markers are rejected without throwing or inventing facts", () => {
@@ -280,9 +290,8 @@ test("malformed durable markers are rejected without throwing or inventing facts
     ["topologyId", { ...valid, topologyId: "topology" }],
   ];
   for (const [label, data] of malformed) {
-    const event = { type: "orchestra/blueprint", data, seq: 0, time: 1 };
-    assert.doesNotThrow(() => readLightweightBlueprint([event]), label);
-    assert.equal(readLightweightBlueprint([event]), undefined, label);
+    assert.doesNotThrow(() => parseLightweightBlueprint(data), label);
+    assert.equal(parseLightweightBlueprint(data), undefined, label);
   }
-  assert.deepEqual(readLightweightBlueprint([{ type: "orchestra/blueprint", data: valid, seq: 0, time: 1 }]), valid);
+  assert.deepEqual(parseLightweightBlueprint(valid), valid);
 });

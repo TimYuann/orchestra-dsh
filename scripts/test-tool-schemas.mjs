@@ -92,7 +92,7 @@ function objectSchemas(node, out = []) {
 
 test("every registered tool declares the keys its own values can carry", () => {
   const { registered } = captureTools();
-  assert.ok(registered.length >= 25, `expected the full tool surface, captured ${registered.length}`);
+  assert.ok(registered.length >= 8, `expected the v0.5 slimmed tool surface, captured ${registered.length}`);
   for (const tool of registered) assert.equal(typeof tool.name, "string");
 
   const violations = [];
