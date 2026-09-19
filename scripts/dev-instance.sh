@@ -25,4 +25,8 @@ rm -f node_modules/.modules.yaml node_modules/.pnpm-workspace-state-v1.json node
 pnpm install >/dev/null 2>&1 || true
 
 echo "orchestra-dsh dev instance -> http://127.0.0.1:$PORT (Ctrl-C 停止；端口归属见 docs/adr/0009)"
-exec dsh --profile dev --port "$PORT"
+# --no-open: this script is run repeatedly while iterating, and every start
+# without it opens ANOTHER tab in the user's own browser (DSH's web command
+# opens the default browser by default). The dev instance is reached on purpose
+# with its printed token URL, so the auto-open is pure noise.
+exec dsh --profile dev --port "$PORT" --no-open

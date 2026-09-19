@@ -28,6 +28,8 @@
  * @module dsh-orchestra/team-change-bus
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { ActiveTeamStateStore, TeamState } from "./orchestra-state.js";
 
 /** One committed team-state write, as the store choke point observed it. */
@@ -99,6 +101,7 @@ interface Waiter {
   readonly startedAt: number;
   readonly resolve: (outcome: TeamChangeWaitOutcome) => void;
   timer?: ReturnType<typeof setTimeout>;
+  pollTimer?: ReturnType<typeof setInterval>;
   detach?: () => void;
 }
 
@@ -123,6 +126,10 @@ export function createTeamChangeBus(): TeamChangeBus {
     if (waiter.timer !== undefined) {
       clearTimeout(waiter.timer);
       waiter.timer = undefined;
+    }
+    if (waiter.pollTimer !== undefined) {
+      clearInterval(waiter.pollTimer);
+      waiter.pollTimer = undefined;
     }
     waiter.detach?.();
     waiter.detach = undefined;
@@ -169,6 +176,34 @@ export function createTeamChangeBus(): TeamChangeBus {
           signal.addEventListener("abort", onAbort, { once: true });
           waiter.detach = () => signal.removeEventListener("abort", onAbort);
         }
+
+        // Active workspace fallback: if a role written a report file under
+        // <cwd>/orchestra/reports/ (e.g. via direct fs/write tool), detect it
+        // and wake early rather than burning the entire 20-minute heartbeat.
+        if (options.cwd !== undefined) {
+          const reportsDir = path.join(options.cwd, "orchestra", "reports");
+          let initialReportFiles = new Set<string>();
+          try {
+            if (fs.existsSync(reportsDir)) {
+              initialReportFiles = new Set(fs.readdirSync(reportsDir));
+            }
+          } catch {}
+          waiter.pollTimer = setInterval(() => {
+            try {
+              if (fs.existsSync(reportsDir)) {
+                const currentFiles = fs.readdirSync(reportsDir);
+                const hasNew = currentFiles.some((f) => !initialReportFiles.has(f));
+                if (hasNew) {
+                  settle(waiter, { changed: true, timedOut: false, observedAt: Date.now(), waitedMs: Date.now() - startedAt });
+                }
+              }
+            } catch {}
+          }, 2000);
+          if (typeof waiter.pollTimer.unref === "function") {
+            waiter.pollTimer.unref();
+          }
+        }
+
         waiters.add(waiter);
       });
     },
@@ -244,6 +279,13 @@ export function withChangeSignal(store: ActiveTeamStateStore, bus: TeamChangeBus
     async archive(snapshot, marker, options) {
       const result = await store.archive(snapshot, marker, options);
       observe(snapshot.cwd, snapshot.team, undefined);
+      return result;
+    },
+    async mutate(cwd, updater, options) {
+      const result = await store.mutate(cwd, updater, options);
+      if ("roles" in result.state) {
+        observe(cwd, result.previousState, result.state);
+      }
       return result;
     },
   };

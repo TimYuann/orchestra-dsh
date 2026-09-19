@@ -37,8 +37,9 @@ import {
   ensureBuiltinRolePresetArtifacts,
   resolveRolePresetFile,
   rolePresetSpec,
+  ALL_BUILTIN_ROLE_PRESETS,
 } from "./orchestra-role-presets.js";
-import { createActiveTeamStateStore, NOTICE_FAILURE_LIMIT } from "./orchestra-state.js";
+import { createActiveTeamStateStore, NOTICE_FAILURE_LIMIT, transferOrchestrationControl } from "./orchestra-state.js";
 import type {
   ArchiveList,
   ArchiveStore,
@@ -59,6 +60,17 @@ import type {
 import { createArchiveStore } from "./orchestra-archive.js";
 import { createGovernedRoleAddressResolver } from "./orchestra-address.js";
 import type { GovernedRoleAddress, GovernedRoleAddressResolver } from "./orchestra-address.js";
+import {
+  readPreferences,
+  writePreferences,
+  resolveModelForRole,
+  DEFAULT_PREFERENCES,
+} from "./orchestra-preferences.js";
+import type {
+  OrchestraPreferences,
+  IntelligenceTier,
+  ModelPreferenceConfig,
+} from "./orchestra-preferences.js";
 import {
   appendDriverDecision,
   applyFrozenCharterRevision,
@@ -120,15 +132,15 @@ import { createTeamChangeBus, withChangeSignal } from "./team-change-bus.js";
 import type { TeamChangeBus } from "./team-change-bus.js";
 import { createSubagentNode, sendToSubagentNode } from "./subagent-node.js";
 import type { SubagentNodeSpec } from "./subagent-node.js";
-import { createTopologyCatalog, resolveRoleExecution } from "./orchestra-topology.js";
-import type { RoleConfig, TopologyCatalog, TopologyClosureDefinition, TopologyList, TopologyLoopContract, TopologyProtocol, TopologyResolution, TopologyRoleSummary } from "./orchestra-topology.js";
+import { createTopologyCatalog, resolveRoleExecution, validateTopology } from "./orchestra-topology.js";
+import type { RoleConfig, TopologyCatalog, TopologyClosureDefinition, TopologyConfig, TopologyList, TopologyLoopContract, TopologyProtocol, TopologyResolution, TopologyRoleSummary } from "./orchestra-topology.js";
 export { validateTopology } from "./orchestra-topology.js";
 import { mountPreset } from "@deepseek-ai/dsh-agent-presets";
 import { registerOrchestrationPrinciples } from "./orchestration-principles.js";
 import "./relay-types.js";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 const SID = (value: string): SessionId => value as SessionId;
 
@@ -172,6 +184,17 @@ export function projectSlugFromCwd(cwd: string | undefined): string {
 /** Segment length caps for role session titles (user-approved three-part scheme). */
 export const ROLE_SESSION_TITLE_ROLE_MAX = 16;
 export const ROLE_SESSION_TITLE_MISSION_MAX = 14;
+
+/**
+ * Budget for a Team's human-facing goal label.
+ *
+ * This label is what a user reads days later when deciding whether an old team
+ * still matters, so it has to carry the FIRST SENTENCE of the goal rather than
+ * its first two words — a session title wants to be short, a decision card does
+ * not. One sentence of a written objective is ~40 CJK chars or ~80 latin ones;
+ * the cap is set so a full sentence fits and runaway prose does not.
+ */
+export const TEAM_LABEL_MAX = 80;
 export const ROLE_SESSION_TITLE_SLUG_MAX = 16;
 
 function truncateTitleSegment(value: string, max: number): string {
@@ -222,7 +245,7 @@ export function roleSessionTitle(options: RoleSessionTitleOptions): string {
 }
 
 /** Milestone kinds the host auto-notifies the driver about (CP8 event 2, A). */
-export type MilestoneNoticeKind = "handoff" | "verdict" | "report" | "gate" | "close";
+export type MilestoneNoticeKind = "handoff" | "verdict" | "report" | "gate" | "close" | "stalled";
 
 /**
  * One-line driver milestone notice text. The notice is a trigger, not a state
@@ -231,6 +254,26 @@ export type MilestoneNoticeKind = "handoff" | "verdict" | "report" | "gate" | "c
  */
 export function milestoneNotice(teamId: string, kind: MilestoneNoticeKind, detail: string): string {
   return `orchestra: ${teamId} ${kind} ${detail}`;
+}
+
+/**
+ * One-line notice for a role that finished its turn without delivering.
+ *
+ * WHY THIS EXISTS: the whole reactive-wakeup model rests on a role REPORTING —
+ * a turn that ends silently leaves the driver idle forever while the work may
+ * already be sitting on disk. That is a model behaviour the runtime cannot
+ * demand, so the runtime detects the situation and says so instead of waiting
+ * on a message that will never come. Observed in a real run: the implementer
+ * wrote its report with the write tool, twice announced it would also file it
+ * through orchestra_report, and never called either the tool or a2a_reply.
+ */
+export function stalledRoleNotice(teamId: string, roleId: string, reportCount: number): string {
+  return (
+    `orchestra: ${teamId} stalled ${roleId} finished its turn without filing a report or replying to you ` +
+    `(reportCount=${reportCount}). It may have written its output with its own file tools instead. ` +
+    `Inspect the workspace/reports yourself before waiting: use orchestra_team to re-read the board, ` +
+    `a2a_send to ask ${roleId} for its handoff, or advance the lane yourself if the work is there.`
+  );
 }
 
 /** One milestone notice that could not be delivered, as a durable fact. */
@@ -1079,6 +1122,10 @@ export function nodeIsWorking(agent: { status?: string; inbox?: { nextTurn?: rea
 export interface DraftRoleFacts {
   roleId: string;
   roleName: string;
+  /** Optional phase this role participates in. */
+  phase?: string;
+  /** Optional lane this role operates on. */
+  lane?: string;
   /**
    * Resolved backend of this role — the one fact a user must see to judge a
    * proposal, since it decides whether the role can hold its own composition,
@@ -1144,13 +1191,18 @@ async function draftPermissionFacts(
  * will provision. Any resolution failure fails the draft instead of being
  * silently skipped.
  */
-export async function preparseDraftRoleFacts(ctx: Context, cwd: string, role: RoleConfig): Promise<DraftRoleFacts> {
+export async function preparseDraftRoleFacts(
+  ctx: Context,
+  cwd: string,
+  role: RoleConfig,
+  preferences?: OrchestraPreferences,
+): Promise<DraftRoleFacts> {
   // The two backends have disjoint fact sets, so the draft must branch exactly
   // where provisioning branches. Without this, a hybrid topology whose
   // `subagent` role correctly declares no preset would fail the session path's
   // "requires an explicit complete Agent Preset" check and no proposal could
   // ever be drafted for it.
-  if (resolveRoleExecution(role) === "subagent") return preparseSubagentDraftRoleFacts(ctx, role);
+  if (resolveRoleExecution(role) === "subagent") return preparseSubagentDraftRoleFacts(ctx, cwd, role, preferences);
   const presetId = role.preset;
   if (typeof presetId !== "string" || presetId === "") {
     throw new Error(`draft topology role "${role.id}" requires an explicit complete Agent Preset`);
@@ -1167,11 +1219,24 @@ export async function preparseDraftRoleFacts(ctx: Context, cwd: string, role: Ro
     );
   }
   const permission = await draftPermissionFacts(ctx, role.sandbox);
-  const model = resolveDraftRoleModel(ctx, { runtime: role.runtime });
+  const activePrefs = preferences ?? (await readPreferences(cwd, { fs: ctx.fs }));
+  let model: { provider: string; model: string; reasoningEffort?: string };
+  if (role.runtime?.provider !== undefined && role.runtime?.model !== undefined) {
+    model = resolveModelForRole(role.id, role.runtime, activePrefs);
+  } else if (activePrefs !== undefined) {
+    // A preference file exists, so the project asked for this ladder. It is
+    // consulted ONLY when it exists: falling back to a built-in ladder would
+    // silently reroute every role away from the deployment's own default model.
+    model = resolveModelForRole(role.id, role.runtime, activePrefs);
+  } else {
+    model = resolveDraftRoleModel(ctx, { runtime: role.runtime });
+  }
   if (model.provider === "" || model.model === "") throw new Error(`draft role "${role.id}" resolved an empty provider/model selection`);
   return {
     roleId: role.id,
     roleName: role.name ?? role.id,
+    ...(role.phase !== undefined ? { phase: role.phase } : {}),
+    ...(role.lane !== undefined ? { lane: role.lane } : {}),
     execution: "session",
     preset: presetId,
     ...(presetFile.source === undefined ? {} : { presetSource: presetFile.source }),
@@ -1206,7 +1271,12 @@ export async function preparseDraftRoleFacts(ctx: Context, cwd: string, role: Ro
  * @returns the facts a user needs to judge this node, with nothing invented.
  * @throws when the role carries a session-only field or resolves no model.
  */
-function preparseSubagentDraftRoleFacts(ctx: Context, role: RoleConfig): DraftRoleFacts {
+async function preparseSubagentDraftRoleFacts(
+  ctx: Context,
+  cwd: string,
+  role: RoleConfig,
+  preferences?: OrchestraPreferences,
+): Promise<DraftRoleFacts> {
   if (typeof role.preset === "string" && role.preset !== "") {
     throw new Error(
       `draft topology role "${role.id}" resolves to the "subagent" backend but declares preset "${role.preset}": a native sub-agent joins its parent's live Agent Preset and cannot mount its own composition — use execution: "session" for a role that needs its own preset`,
@@ -1217,12 +1287,25 @@ function preparseSubagentDraftRoleFacts(ctx: Context, role: RoleConfig): DraftRo
       `draft topology role "${role.id}" resolves to the "subagent" backend but declares sandbox "${String(role.sandbox)}": a native sub-agent's sandbox mode is frozen from its parent's explicit override at the delegation boundary — use execution: "session" for a read-only or otherwise restricted role`,
     );
   }
-  const model = resolveDraftRoleModel(ctx, { runtime: role.runtime });
+  const activePrefs = preferences ?? (await readPreferences(cwd, { fs: ctx.fs }));
+  let model: { provider: string; model: string; reasoningEffort?: string };
+  if (role.runtime?.provider !== undefined && role.runtime?.model !== undefined) {
+    model = resolveModelForRole(role.id, role.runtime, activePrefs);
+  } else if (activePrefs !== undefined) {
+    // A preference file exists, so the project asked for this ladder. It is
+    // consulted ONLY when it exists: falling back to a built-in ladder would
+    // silently reroute every role away from the deployment's own default model.
+    model = resolveModelForRole(role.id, role.runtime, activePrefs);
+  } else {
+    model = resolveDraftRoleModel(ctx, { runtime: role.runtime });
+  }
   if (model.provider === "" || model.model === "") throw new Error(`draft topology role "${role.id}" resolved an empty provider/model selection`);
   const toolFilter = role.toolFilter;
   return {
     roleId: role.id,
     roleName: role.name ?? role.id,
+    ...(role.phase !== undefined ? { phase: role.phase } : {}),
+    ...(role.lane !== undefined ? { lane: role.lane } : {}),
     execution: "subagent",
     sandbox: "inherited",
     provider: model.provider,
@@ -1249,10 +1332,9 @@ function tableCell(value: string | undefined): string {
 
 /**
  * Render the per-role blueprint preview as a Markdown table (rendered as a
- * table card by the GUI). Header + separator + one row per role; an empty
- * preview yields just the header and separator.
+ * block of the draft card shown by orchestra_draft).
  *
- * The `backend` column comes first because it is what a user has to judge
+ * The execution column is the headline: it is the one thing a user must see
  * before approving: it decides whether the role can hold its own composition,
  * ask for approval, or be read-only at all. A `subagent` row then reads `-` in
  * the columns the native contract cannot fill, and its two native knobs are
@@ -1260,6 +1342,28 @@ function tableCell(value: string | undefined): string {
  * would be empty for every session role.
  */
 export function renderDraftBlueprintTable(preview: readonly DraftRoleFacts[]): string {
+  const hasPhaseOrLane = preview.some((r) => r.phase !== undefined || r.lane !== undefined);
+  if (hasPhaseOrLane) {
+    const header = "| 角色 | 阶段/车道 | backend | preset | sandbox | permission | model | reasoningEffort | compositionTools | orchestraTools |";
+    const separator = "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |";
+    const rows = preview.map((role) => {
+      const phaseLane = [role.phase, role.lane].filter(Boolean).join(" / ");
+      return `| ${[
+        tableCell(role.roleId),
+        tableCell(phaseLane),
+        tableCell(role.execution),
+        tableCell(role.preset),
+        tableCell(role.sandbox),
+        tableCell(role.effectivePermissionPreset),
+        `${tableCell(role.provider)}/${tableCell(role.model)}`,
+        tableCell(role.reasoningEffort),
+        tableCell(role.compositionTools.join(", ")),
+        tableCell(role.orchestraTools.join(", ")),
+      ].join(" | ")} |`;
+    });
+    return [header, separator, ...rows, ...subagentKnobNotes(preview)].join("\n");
+  }
+
   const header = "| 角色 | backend | preset | sandbox | permission | model | reasoningEffort | compositionTools | orchestraTools |";
   const separator = "| --- | --- | --- | --- | --- | --- | --- | --- | --- |";
   const rows = preview.map((role) =>
@@ -1557,7 +1661,7 @@ async function recordCharterApproval(
  */
 function approvalNotice(draftId: string, revision: number, result: RecordApprovalResult, how: string): unknown {
   return createUserMessage({
-    content: [{ type: "text", text: `(orchestra /team approval notice) Draft ${draftId}@${revision} approved ${how} (digest=${result.digest}, freeze target=${result.ref}). The plan is ready. You can now dispatch tasks using orchestra_dispatch(roleId, task) and wait for reports with orchestra_wait.` }] as ContentBlock[],
+    content: [{ type: "text", text: `(orchestra /team approval notice) Draft ${draftId}@${revision} approved ${how} (digest=${result.digest}, freeze target=${result.ref}). The plan is ready. You can now dispatch tasks using orchestra_dispatch(roleId, task) and let roles execute autonomously. You will be awakened when reports arrive.` }] as ContentBlock[],
     source: {
       kind: "plugin",
       plugin: "orchestra",
@@ -1718,6 +1822,252 @@ export async function handleTeamGateDecisionCommand(
   return { kind: "success", text: `Gate ${gate.gateInstanceId} resolved with user option ${match[2]}` };
 }
 
+/** Human-facing label for a Team: its goal, not its id. */
+export function teamGoalLabel(mission: { objective?: string } | undefined): string {
+  const objective = typeof mission?.objective === "string" ? mission.objective.trim() : "";
+  if (objective === "") return "(no goal recorded)";
+  const firstSentence = objective.split(/(?<=[。！？.!?])\s*/).find((part) => part.trim() !== "") ?? objective;
+  const text = firstSentence.replace(/\s+/g, " ").trim();
+  return text.length <= TEAM_LABEL_MAX ? text : `${text.slice(0, TEAM_LABEL_MAX - 1)}…`;
+}
+
+/** "3 天前" / "2 小时前" — a person remembers roughly when, not an ISO timestamp. */
+export function describeTeamAge(createdAt: number, now: number = Date.now()): string {
+  if (!Number.isFinite(createdAt)) return "unknown time";
+  const minutes = Math.max(0, Math.round((now - createdAt) / 60_000));
+  if (minutes < 2) return "just now";
+  if (minutes < 60) return `${minutes} minutes ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} hours ago`;
+  const days = Math.round(hours / 24);
+  return days === 1 ? "yesterday" : `${days} days ago`;
+}
+
+/**
+ * What the team got done so far, in one line a person can read days later.
+ *
+ * A role that was never dispatched is not "pending work", it is a lane that was
+ * reserved and never used — saying so is the difference between a user choosing
+ * to continue and a user abandoning work they forgot about.
+ */
+export function describeTeamProgress(roles: readonly TeamRole[], reports: readonly { roleId: string }[]): string {
+  const delivered = roles.filter((role) => (role.reportCount ?? 0) > 0);
+  const untouched = roles.filter((role) => (role.reportCount ?? 0) === 0 && role.phase === "reserved");
+  const started = roles.filter((role) => (role.reportCount ?? 0) === 0 && role.phase !== "reserved");
+  const parts: string[] = [];
+  if (delivered.length > 0) {
+    parts.push(`${delivered.length} of ${roles.length} roles delivered (${delivered.map((role) => role.id).join(", ")})`);
+  } else if (started.length > 0) {
+    parts.push(`no reports yet (started: ${started.map((role) => role.id).join(", ")})`);
+  } else {
+    parts.push("nothing has been dispatched yet");
+  }
+  if (untouched.length > 0) {
+    parts.push(`never started: ${untouched.map((role) => role.id).join(", ")}`);
+  }
+  if (reports.length > 0) parts.push(`${reports.length} report(s) on disk`);
+  return parts.join("; ");
+}
+
+export async function handleTeamCommandInvocation(
+  ctx: Context,
+  activeTeamState: ActiveTeamStateStore,
+  archiveStore: ArchiveStore,
+  invocation: {
+    rawInput: string;
+    commandId: string;
+    agent: { id: string; session: any; followup?: (message: unknown) => unknown };
+    source?: { kind?: string };
+  },
+): Promise<{ kind: "success"; text: string } | { kind: "error"; text: string }> {
+  const raw = invocation.rawInput.trim().replace(/^\/team(?:\s+|$)/i, "").trim();
+  if (/^approve(?:\s|$)/.test(raw)) return handleTeamApprovalCommand(ctx, invocation as any);
+  if (/^decide(?:\s|$)/.test(raw)) return handleTeamGateDecisionCommand(ctx, activeTeamState, invocation as any);
+
+  const cwd = invocation.agent.session?.header?.cwd;
+  if (cwd !== undefined) {
+    let observation = await activeTeamState.read(cwd);
+    if (observation.kind === "ready") {
+      const team = observation.team;
+      const isTerminal = ["completed", "failed", "abandoned"].includes(team.status);
+      const policy = ctx.sandboxPolicy.resolve({ session: invocation.agent.session, mode: "workspace-write" });
+
+      if (isTerminal) {
+        // A finished team is not a conflict: archive it silently and move on.
+        const dismissedAt = Date.now();
+        const archived = await archiveStore.create(cwd, team, { dismissedAt, policy });
+        await activeTeamState.archive(
+          observation,
+          {
+            schemaVersion: 1,
+            archived: true,
+            status: "dismissed",
+            archiveId: archived.summary.archiveId,
+            archivePath: archived.summary.archivePath,
+            archivedAt: dismissedAt,
+            teamId: team.teamId,
+          },
+          { policy },
+        );
+      } else {
+        // An ACTIVE team is always surfaced, whatever the caller typed.
+        //
+        // This is the re-entry rule (docs/alignment-v0.5.1-ux.md §2): the user
+        // gets the situation plus exactly ONE two-way choice — continue the
+        // previous objective, or archive it and start a new one. There is no
+        // `force-archive` escape hatch by design: whether the old team still
+        // matters is a judgement only the user can make, and the plugin's job is
+        // to explain the situation so they can make it in one sentence.
+        const normalized = raw.toLowerCase().replace(/^\/team\s+/, "").trim();
+        const wantsContinue = /^(?:continue|resume|takeover|yes|继续|接管|继续旧目标)$/.test(normalized);
+        const wantsArchive = /^(?:new|fresh|archive|discard|新目标|新任务|归档)$/.test(normalized);
+
+        const liveWorkers = team.roles.filter((r) => {
+          const ag = ctx.agents.get(SID(r.sessionId));
+          return ag !== undefined && ag.status === "running";
+        });
+
+        if (wantsContinue) {
+          if (liveWorkers.length > 0) {
+            return {
+              kind: "error",
+              text:
+                `Team ${team.teamId} still has running roles (${liveWorkers.map((r) => r.id).join(", ")}); ` +
+                `stop them first, then continue. Continuing underneath a running role would interleave its output with the new work.`,
+            };
+          }
+          if (team.controllerSessionId !== invocation.agent.id) {
+            const updated = transferOrchestrationControl(team, invocation.agent.id, { reason: "re-entry-continue" });
+            await activeTeamState.replace(observation, updated, { policy });
+          }
+          return {
+            kind: "success",
+            text: `Continuing team ${team.teamId}. Controller: ${invocation.agent.id}.`,
+          };
+        }
+
+        if (wantsArchive) {
+          // The caller archives on the user's explicit instruction, so when the
+          // original controller is GONE (a restart, a closed window) authority
+          // has to move to the session that is actually here. Without this the
+          // user can be stuck forever: "new objective" is the only way out of an
+          // abandoned team, and the one session that could still run it is the
+          // one that was never the controller. The takeover is recorded in
+          // controllerHistory exactly like the "continue" path.
+          if (team.controllerSessionId !== invocation.agent.id) {
+            const handedOver = transferOrchestrationControl(team, invocation.agent.id, { reason: "re-entry-archive" });
+            await activeTeamState.replace(observation, handedOver, { policy });
+            observation = { ...observation, team: handedOver };
+          }
+          const activeTeam = observation.team;
+          // Dismissal order is fixed: stop every live role FIRST, then publish
+          // the archive, then clear the active state. Reversing it leaves roles
+          // running against a team that no longer exists.
+          for (const role of activeTeam.roles) {
+            const live = ctx.agents.get(SID(role.sessionId));
+            if (live === undefined) continue;
+            try {
+              live.cancel({ kind: "hook", reason: "team-archived-on-reentry" }, { keepInbox: false });
+            } catch {
+              // A role we cannot stop does not block the archive; the archive is
+              // the durable record and the notice below is best-effort.
+            }
+          }
+          const dismissedAt = Date.now();
+          // Same shape as orchestra_dismiss: the handoff summary rides ON the
+          // snapshot, so a later reader learns why it was archived without
+          // having to reconstruct it from the archive marker.
+          const archivedTeam: TeamState = {
+            ...activeTeam,
+            handoffSummary: {
+              reason: "archived on re-entry: the user chose to start a different objective",
+              summary: describeTeamProgress(activeTeam.roles, activeTeam.reports),
+              pendingTasks: activeTeam.roles
+                .filter((role) => (role.reportCount ?? 0) === 0)
+                .map((role) => ({ roleId: role.id, phase: role.phase, reportCount: role.reportCount ?? 0 })),
+            },
+          };
+          const archived = await archiveStore.create(cwd, archivedTeam, { dismissedAt, policy });
+          await activeTeamState.archive(
+            observation,
+            {
+              schemaVersion: 1,
+              archived: true,
+              status: "dismissed",
+              archiveId: archived.summary.archiveId,
+              archivePath: archived.summary.archivePath,
+              archivedAt: dismissedAt,
+              teamId: activeTeam.teamId,
+            },
+            { policy },
+          );
+          return {
+            kind: "success",
+            text:
+              `Archived "${teamGoalLabel(activeTeam.mission)}" — its goal, roles and reports are preserved and it can be found and resumed later ` +
+              `(archive ${archived.summary.archiveId}).`,
+          };
+        }
+
+        // No decision yet: state the situation and hand the user the choice.
+        const workers =
+          liveWorkers.length === 0
+            ? "暂时没有角色在跑"
+            : `${liveWorkers.map((r) => r.id).join("、")} 正在跑`;
+        const noticeText =
+          `(orchestra /team arbitration) 这个工作目录里还有一个没归档的团队。\n\n` +
+          `它要做的事：${teamGoalLabel(team.mission)}\n` +
+          `什么时候建的：${describeTeamAge(team.createdAt)}\n` +
+          `做到哪一步了：${describeTeamProgress(team.roles, team.reports)}\n` +
+          `现在有没有人在干活：${workers}\n\n` +
+          `把这张卡片念给用户听，然后问他一句话：这次的活跟上面那件事，是同一件吗？\n` +
+          `· 是 → 他回复「继续」，我接管并接着做（不用重开团队）。\n` +
+          `· 不是 → 他回复「新目标」，我先把旧团队归档（它的目标、角色、报告原样保留，以后能重新找出来接着做），再开新的编排。\n\n` +
+          `(Do NOT archive or take over on your own initiative: this is the user's call. ` +
+          `Do not paste session ids or phase codes at the user — they are for orchestra_team, not for a decision card.)`;
+        invocation.agent.followup?.(
+          createUserMessage({
+            content: [{ type: "text", text: noticeText }] as ContentBlock[],
+            source: {
+              kind: "plugin",
+              plugin: "orchestra",
+              form: "notice",
+              summary: "orchestra /team active-team arbitration",
+            } as MessageSource,
+          }),
+        );
+        return { kind: "success", text: noticeText };
+      }
+    }
+  }
+
+  // 常规 onboarding 逻辑
+  let prefNotice = "";
+  if (cwd !== undefined) {
+    const preferences = await readPreferences(cwd, { fs: ctx.fs });
+    prefNotice =
+      preferences === undefined
+        ? "\n(orchestra model routing: no preference file was found for this project or globally, so every role will use THIS DEPLOYMENT's default model. If the user wants a per-tier ladder [high_intelligence / standard_work / fast_verification], ask them ONCE and then persist it with the preferences writer — do not invent model names, and never write a preference file without the user agreeing to it.)"
+        : `\n(orchestra model routing: a preference file IS in effect, so role models come from it, not from the deployment default. Say so when you show the draft card.)`;
+  }
+
+  const noticeText =
+    raw === ""
+      ? `(orchestra /team orchestration request: the user wants to open a team collaboration; start by confirming the goal)${prefNotice}`
+      : `(orchestra /team orchestration request: the user wants to open a team collaboration)\n\n${raw}${prefNotice}`;
+  const marker = createUserMessage({
+    content: [{ type: "text", text: noticeText }] as ContentBlock[],
+    source: {
+      kind: "plugin",
+      plugin: "orchestra",
+      form: "notice",
+      summary: "orchestra /team orchestration request",
+    } as MessageSource,
+  });
+  invocation.agent.followup?.(marker);
+  return { kind: "success", text: "Orchestration request accepted; starting team onboarding." };
+}
+
 interface CharterDraftToolArgs {
   draftId?: string;
   expectedRevision?: number;
@@ -1761,6 +2111,43 @@ function humanPolicyForDraft(args: CharterDraftToolArgs, current?: CharterDraft)
   };
 }
 
+/**
+ * Accept an inline topology however a caller managed to hand it over.
+ *
+ * The parameter is declared as untyped JSON, and a model can therefore send the
+ * config as an object OR as a JSON string of that object (both were observed
+ * from a real driver). Rejecting one of those two spellings of the same value
+ * only teaches the caller to guess; the tool knows what it asked for, so it
+ * parses both. A string that is not JSON, or JSON that is not an object, fails
+ * with a message that names the actual shape problem.
+ */
+export function parseInlineTopologyArgument(value: unknown, toolName: string): Record<string, unknown> {
+  let parsed: unknown = value;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch (error) {
+      throw new Error(
+        `${toolName}: inlineTopology was a string that is not valid JSON (${error instanceof Error ? error.message : String(error)}); pass the topology config object directly.`,
+      );
+    }
+  }
+  if (!isPlainRecord(parsed)) {
+    throw new Error(`${toolName}: inlineTopology must be a topology config object (received ${describeValueShape(parsed)}).`);
+  }
+  return parsed;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function describeValueShape(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "an array";
+  return `a ${typeof value}`;
+}
+
 async function topologySnapshotForDraft(
   ctx: Context,
   topologyCatalog: TopologyCatalog,
@@ -1770,8 +2157,22 @@ async function topologySnapshotForDraft(
   signal?: AbortSignal,
 ): Promise<CharterTopologySnapshot> {
   if (args.inlineTopology !== undefined) {
-    const inline = args.inlineTopology as any;
-    return { source: "inline", id: typeof inline?.id === "string" ? inline.id : "", config: inline };
+    const inline = parseInlineTopologyArgument(args.inlineTopology, `orchestra_draft`);
+    // Validate HERE, where the caller's actual object is still in hand.
+    //
+    // Without this, a malformed inline topology sailed past this function and
+    // failed far away as "topology.config.roles is not iterable" — a message
+    // that names neither the field nor the fix, and that a driver cannot act on.
+    // The catalog path validates its configs; the inline path must too.
+    const problems = validateTopology(inline);
+    if (problems.length > 0) {
+      throw new Error(
+        `inlineTopology is not a valid topology config: ${problems.join("; ")}. ` +
+          `Pass the CONFIG ITSELF (roles/phases/lanes/protocol at the top level, not wrapped in a "config" field); ` +
+          `see the orchestra_draft "inlineTopology" parameter description for the exact shape.`,
+      );
+    }
+    return { source: "inline", id: typeof inline.id === "string" ? inline.id : "", config: inline as unknown as TopologyConfig };
   }
   if (args.topology !== undefined) {
     const resolved = await topologyCatalog.resolve(cwd, args.topology, { signal });
@@ -2258,8 +2659,18 @@ export async function createGovernedTeam(
   };
   void topologyCatalog;
   const teamId = `team-${randomUUID().slice(0, 8)}`;
+  const preferences = await readPreferences(cwd, { fs: ctx.fs });
   const plans: GovernedRolePlan[] = [];
   for (const role of topology.config.roles) {
+    // Mirrors draft-time resolution exactly, so the model a user approved is the
+    // model provisioning pins: role runtime > preference file (only when one
+    // exists) > the deployment default resolved inside the Blueprint.
+    const preferredModel =
+      role.runtime?.provider !== undefined && role.runtime?.model !== undefined
+        ? resolveModelForRole(role.id, role.runtime, preferences)
+        : preferences !== undefined
+          ? resolveModelForRole(role.id, role.runtime, preferences)
+          : undefined;
     plans.push(
       await prepareGovernedRolePlan(ctx, {
         cwd,
@@ -2273,9 +2684,9 @@ export async function createGovernedTeam(
         protocol: topology.config.protocol,
         maxRounds: role.maxRounds,
         permissionPreset: args.permissionPreset,
-        provider: args.provider,
-        model: args.model,
-        reasoningEffort: args.reasoningEffort,
+        provider: args.provider ?? preferredModel?.provider,
+        model: args.model ?? preferredModel?.model,
+        reasoningEffort: args.reasoningEffort ?? preferredModel?.reasoningEffort,
         title: roleSessionTitle({ roleId: role.id, missionObjective: frozen.mission.objective, cwd }),
         signal: exec.signal,
       }),
@@ -2285,7 +2696,7 @@ export async function createGovernedTeam(
   const team: TeamState = {
     schemaVersion: 1,
     teamId,
-    status: "provisioning",
+    status: "active",
     rootCwd: cwd,
     controllerSessionId: exec.agent.id,
     controllerHistory: [],
@@ -2304,21 +2715,19 @@ export async function createGovernedTeam(
     policy: escrowPolicy(ctx, exec),
     signal: exec.signal,
   });
-  const initialSnapshot = await readySnapshotAfterWrite(activeTeamState, cwd, reservation, exec.signal);
-  const provisioned = await provisionGovernedPlans(ctx, activeTeamState, exec, cwd, initialSnapshot, plans, "active", "failed", dependencies);
   return {
-    team_id: provisioned.team.teamId,
-    status: provisioned.team.status,
-    topology: provisioned.team.topologyRef.id,
+    team_id: team.teamId,
+    status: team.status,
+    topology: team.topologyRef.id,
     state_path: reservation.statePath,
-    created_at: provisioned.team.createdAt,
-    mission: provisioned.team.mission,
+    created_at: team.createdAt,
+    mission: team.mission,
     charter_revision: frozen.charterRevision,
     frozen_ref: frozen.frozenRef,
-    roles: provisioned.team.roles.map((role) => ({
+    roles: team.roles.map((role) => ({
       id: role.id,
       sessionId: role.sessionId,
-      live: ctx.agents.get(SID(role.sessionId)) !== undefined,
+      live: false,
       phase: role.phase,
     })),
   };
@@ -2339,6 +2748,407 @@ export interface OrchestraDispatchResult {
   session_id: string;
   created_new_session: boolean;
   receipt?: unknown;
+}
+
+export interface AddLaneRoleArgs {
+  /** Role id to graft onto the running Team; must not already exist in the roster. */
+  roleId: string;
+  /** Agent Preset that carries the persona. Must resolve — an unknown id fails here. */
+  preset: string;
+  /** Read-only when the role must not touch the repository. Defaults to workspace-write. */
+  sandbox?: "read-only" | "workspace-write";
+  /** Phase this lane belongs to (free-form label, shown on the team board). */
+  phase?: string;
+  /** Lane this role operates on (free-form label, shown on the team board). */
+  lane?: string;
+  /** One-line statement of what this lane is responsible for; becomes the role's welcome. */
+  purpose?: string;
+  /** Cap on this role's review/fix rounds. */
+  maxRounds?: number;
+  /** Per-role model override; omit to inherit the deployment default. */
+  model?: { provider: string; model: string; reasoningEffort?: string };
+}
+
+export interface AddLanesArgs {
+  roles: AddLaneRoleArgs[];
+  /** Why this lane is being added; recorded on the Team so the roster change is explainable. */
+  reason?: string;
+  /**
+   * The user's confirmation. The first call omits it and returns a plan instead
+   * of changing anything, so the driver can show the user one line and come back
+   * with this token. Confirmation is deliberately NOT implied by passing roles.
+   */
+  confirm?: boolean;
+}
+
+export interface AddLanesResult {
+  status: "planned" | "added";
+  team_id: string;
+  state_path: string;
+  /** One line per role, ready for the driver to show the user verbatim. */
+  plan: { roleId: string; preset: string; sandbox: string; phase?: string; lane?: string; model: string; summary: string }[];
+  added?: { roleId: string; sessionId: string; phase: string }[];
+}
+
+const ROLE_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+/**
+ * Graft new lanes onto a Team that is already running.
+ *
+ * This is how the plugin stays adaptive without allowing a second Team: a new
+ * objective is decomposed into roles and added to the SAME graph, which is why
+ * the closure owner stays unambiguous. The operation follows the confirmed
+ * (B-tier) flow from the alignment record: it first returns the plan, and only
+ * applies it when the caller passes `confirm`, so the user sees "I am adding a
+ * lane to do Y, role Z, model W" and answers once.
+ *
+ * New roles enter `reserved`, exactly like the roles the charter reserved: their
+ * sessions materialize on first dispatch, so planning a lane costs nothing until
+ * it is actually worked.
+ */
+export async function addLanesToTeam(
+  ctx: Context,
+  activeTeamState: ActiveTeamStateStore,
+  exec: ToolExecutionInput,
+  args: AddLanesArgs,
+): Promise<AddLanesResult> {
+  if (exec.agent === undefined) throw new Error("orchestra_add_lanes requires an agent caller");
+  const cwd = exec.agent.session.header.cwd;
+  if (cwd === undefined) throw new Error("current session has no working directory");
+  if (!Array.isArray(args.roles) || args.roles.length === 0) {
+    throw new Error("orchestra_add_lanes requires at least one role: a lane with no role does not exist");
+  }
+
+  const observation = await activeTeamState.read(cwd, { signal: exec.signal });
+  throwIfBlocked("add a lane", observation);
+  if (observation.kind !== "ready") {
+    throw new Error(`cannot add a lane: no active team in this working directory. Lanes belong to an approved team — create one first with /team and orchestra_create.`);
+  }
+  const team = observation.team;
+  if (team.controllerSessionId !== exec.agent.id) {
+    throw new Error(
+      `cannot add a lane: only the controller session "${team.controllerSessionId}" may change the roster; caller is "${exec.agent.id}"`,
+    );
+  }
+  const policy = escrowPolicy(ctx, exec);
+
+  const existing = new Set(team.roles.map((role) => role.id.toLowerCase()));
+  const seen = new Set<string>();
+  const plans: GovernedRolePlan[] = [];
+  const plan: AddLanesResult["plan"] = [];
+
+  for (const entry of args.roles) {
+    const roleId = typeof entry?.roleId === "string" ? entry.roleId.trim() : "";
+    if (roleId === "") throw new Error("orchestra_add_lanes: every role needs a non-empty roleId");
+    if (!ROLE_ID_PATTERN.test(roleId)) {
+      throw new Error(`orchestra_add_lanes: roleId "${roleId}" must be lowercase kebab-case (letters, digits, single hyphens)`);
+    }
+    const key = roleId.toLowerCase();
+    if (existing.has(key)) throw new Error(`orchestra_add_lanes: role "${roleId}" already exists in this team; dispatch it instead of adding it`);
+    if (seen.has(key)) throw new Error(`orchestra_add_lanes: role "${roleId}" is listed twice in one call`);
+    seen.add(key);
+
+    const preset = typeof entry?.preset === "string" ? entry.preset : "";
+    if (preset === "") throw new Error(`orchestra_add_lanes: role "${roleId}" requires a "preset" — an unnamed role has no persona`);
+    if (rolePresetSpec(preset) === undefined) {
+      const known = ALL_BUILTIN_ROLE_PRESETS.map((spec) => spec.id);
+      throw new Error(
+        `orchestra_add_lanes: preset "${preset}" is not a known role preset, so the lane would have no persona. Known presets: ${known.join(", ")}`,
+      );
+    }
+    const spec = rolePresetSpec(preset)!;
+    const sandbox = entry.sandbox ?? spec.sandbox;
+    if (sandbox !== "read-only" && sandbox !== "workspace-write") {
+      throw new Error(`orchestra_add_lanes: role "${roleId}" sandbox must be "read-only" or "workspace-write"`);
+    }
+    const working: RoleConfig = {
+      id: roleId,
+      name: spec.name,
+      preset,
+      sandbox,
+      compositionTools: [...spec.compositionTools],
+      orchestraTools: [...spec.orchestraTools],
+      ...(entry.purpose !== undefined ? { welcome: entry.purpose } : {}),
+      ...(entry.phase !== undefined ? { phase: entry.phase } : {}),
+      ...(entry.lane !== undefined ? { lane: entry.lane } : {}),
+      ...(entry.maxRounds !== undefined ? { maxRounds: entry.maxRounds } : {}),
+      ...(entry.model !== undefined ? { runtime: entry.model } : {}),
+    } as RoleConfig;
+
+    plans.push(
+      await prepareGovernedRolePlan(ctx, {
+        cwd,
+        teamId: team.teamId,
+        controllerSessionId: exec.agent.id,
+        topologyId: `amendment-${team.topologyRef.id}`,
+        topologySource: team.topologyRef.source,
+        role: working,
+        title: roleSessionTitle({ roleId, missionObjective: team.mission.objective, cwd }),
+        signal: exec.signal,
+      }),
+    );
+
+    plan.push({
+      roleId,
+      preset,
+      sandbox,
+      ...(entry.phase === undefined ? {} : { phase: entry.phase }),
+      ...(entry.lane === undefined ? {} : { lane: entry.lane }),
+      model: plans[plans.length - 1].blueprint === undefined
+        ? "inherited-from-controller"
+        : `${String(plans[plans.length - 1].blueprint?.receipt.provider)}/${String(plans[plans.length - 1].blueprint?.receipt.model)}`,
+      summary: working.welcome ?? spec.purpose,
+    });
+  }
+
+  assertUniqueGovernedSessionIds([...plans]);
+
+  if (args.confirm !== true) {
+    return { status: "planned", team_id: team.teamId, state_path: "", plan };
+  }
+
+  const addedAt = Date.now();
+  const addedLanes = [
+    ...(team.addedLanes ?? []),
+    ...plan.map((entry) => ({
+      roleId: entry.roleId,
+      ...(entry.phase === undefined ? {} : { phase: entry.phase }),
+      ...(entry.lane === undefined ? {} : { lane: entry.lane }),
+      addedAt,
+      ...(args.reason === undefined ? {} : { reason: args.reason }),
+    })),
+  ];
+  const nextTeam: TeamState = {
+    ...team,
+    roles: [...team.roles, ...plans.map(reservedRole)],
+    addedLanes,
+  };
+
+  const written = await activeTeamState.replace(observation, nextTeam, { policy, signal: exec.signal });
+  return {
+    status: "added",
+    team_id: team.teamId,
+    state_path: written.statePath,
+    plan,
+    added: plans.map((entry) => ({ roleId: entry.roleId, sessionId: entry.sessionId, phase: "reserved" as const })),
+  };
+}
+
+/**
+ * Materialize one lazily-reserved role: create its session (or native child) and
+ * merge the welcome handshake into the dispatching turn.
+ *
+ * `reserved -> provisioning -> active` is a write-ahead protocol, and the
+ * recovery rule lives here: an attempt that fails leaves the role back in
+ * `reserved` (with a diagnostic), so the NEXT dispatch retries materialization
+ * instead of delivering into a session that may not exist. A session that was
+ * actually created before a later step failed is recorded in `sessionHistory`
+ * so the record still explains itself.
+ *
+ * Failures are reported, never swallowed: the driver is told which role failed,
+ * why, and which model the charter pinned for it — that model is the one thing
+ * it may change to bring the role up (a one-off substitution; it is not written
+ * back to any preference file).
+ */
+async function materializeRole(
+  ctx: Context,
+  activeTeamState: ActiveTeamStateStore,
+  exec: ToolExecutionInput,
+  input: {
+    cwd: string;
+    team: TeamState;
+    role: TeamRole;
+    dispatchNotice: string;
+  },
+): Promise<unknown> {
+  const { cwd, team, role, dispatchNotice } = input;
+  const controller = exec.agent;
+  if (controller === undefined) throw new Error("materializeRole requires an agent caller");
+  const policy = escrowPolicy(ctx, exec);
+  const roleId = role.id;
+
+  await activeTeamState.mutate(
+    cwd,
+    (t) => ({
+      ...t,
+      roles: t.roles.map((r) =>
+        r.id.toLowerCase() === roleId.toLowerCase() ? { ...r, phase: "provisioning", diagnostic: undefined } : r,
+      ),
+    }),
+    { policy, signal: exec.signal },
+  );
+
+  const welcomeHeader =
+    `Welcome to Orchestra. You are ${role.name} (${role.id}).\n` +
+    `Orchestrator Session: ${controller.id}\n` +
+    `Team ID: ${team.teamId}\n` +
+    `Mission Objective: ${team.mission.objective}`;
+  const combinedFirstTurn = `${welcomeHeader}\n\n${dispatchNotice}`;
+
+  try {
+    if (role.execution === "subagent") {
+      const receipt = await createSubagentNode(
+        ctx,
+        controller,
+        {
+          label: role.name,
+          prompt: combinedFirstTurn,
+          childId: role.sessionId,
+          ...(role.model ? { agentOptions: role.model } : {}),
+        },
+        exec.signal,
+      );
+
+      await activeTeamState.mutate(
+        cwd,
+        (t) => ({
+          ...t,
+          roles: t.roles.map((r) =>
+            r.id.toLowerCase() === roleId.toLowerCase()
+              ? {
+                  ...r,
+                  phase: "active",
+                  welcome: { messageId: receipt.messageId, sessionId: receipt.childId, acceptedAt: Date.now() },
+                }
+              : r,
+          ),
+        }),
+        { policy, signal: exec.signal },
+      );
+      return receipt;
+    }
+
+    let presetFile: ResolvedPresetFile | undefined;
+    if (role.preset) {
+      try {
+        const resolved = await resolvePresetFile(ctx, cwd, role.preset);
+        if (resolved.source !== "dsh" && resolved.path !== "") {
+          presetFile = resolved;
+        }
+      } catch {
+        // fall back to the preset id: the blueprint preflight already proved it
+      }
+    }
+
+    // Materialization must be IDEMPOTENT on the reserved id.
+    //
+    // The seat named by team.json is also the id its session is created with, so
+    // any earlier attempt that created the session and then failed later (or a
+    // reactivation that rebuilt it) leaves that id taken. Creating it again is a
+    // hard error — "session ... already exists" — which stranded a real lane:
+    // the seat was reserved, the session existed, and every retry failed the
+    // same way. A live agent means the role is already up, so the honest action
+    // is to treat this as the successful end of the transaction and hand the
+    // first turn to the session that is already there.
+    const existing = ctx.agents.get(SID(role.sessionId));
+    if (existing !== undefined) {
+      await activeTeamState.mutate(
+        cwd,
+        (t) => ({
+          ...t,
+          roles: t.roles.map((r) =>
+            r.id.toLowerCase() === roleId.toLowerCase() ? { ...r, phase: "active", diagnostic: undefined } : r,
+          ),
+        }),
+        { policy, signal: exec.signal },
+      );
+      return deliverMessage(ctx, controller.id, role.sessionId, [{ type: "text", text: combinedFirstTurn }], {
+        wake: true,
+        ...transportStores(ctx, cwd),
+      });
+    }
+
+    // The same idempotency has a second face: the session can exist on DISK
+    // without a live agent (a restart unloads agents but keeps session logs).
+    // `createSession` then fails with "session ... already exists", which is a
+    // statement about the id, not about the work — retrying can never succeed.
+    // Resume it instead, so a lane whose seat was already built becomes usable
+    // again rather than permanently failing to materialize.
+    let created: { sessionId: string };
+    try {
+      created = await createSession(ctx, {
+        cwd,
+        sessionId: role.sessionId,
+        currentSessionId: controller.id,
+        presetId: role.preset ?? undefined,
+        ...(presetFile !== undefined ? { presetFile } : {}),
+        title: roleSessionTitle({ roleId: role.id, missionObjective: team.mission.objective, cwd }),
+        provider: role.model?.provider,
+        model: role.model?.model,
+        reasoningEffort: role.model?.reasoningEffort,
+        signal: exec.signal,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/already exists/i.test(message)) throw error;
+      await ctx.agents.resume({
+        resumeSessionId: SID(role.sessionId),
+        ...(role.model === undefined ? {} : { agentOptions: { provider: role.model.provider, model: role.model.model } }),
+      } as never);
+      created = { sessionId: role.sessionId };
+    }
+
+    // Belt-and-braces: the governed Blueprint already pins the sandbox at
+    // creation time; this only re-asserts it on the live session, and is a
+    // no-op when the session is already read-only.
+    if (role.sandbox === "read-only") {
+      const session = ctx.sessions.get(SID(created.sessionId));
+      if (session !== undefined) session.append("sandbox/mode", { mode: "read-only" });
+    }
+
+    await activeTeamState.mutate(
+      cwd,
+      (t) => ({
+        ...t,
+        roles: t.roles.map((r) => (r.id.toLowerCase() === roleId.toLowerCase() ? { ...r, phase: "active" } : r)),
+      }),
+      { policy, signal: exec.signal },
+    );
+
+    return deliverMessage(ctx, controller.id, role.sessionId, [{ type: "text", text: combinedFirstTurn }], {
+      wake: true,
+      ...transportStores(ctx, cwd),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const created = ctx.agents.get(SID(role.sessionId)) !== undefined;
+    try {
+      await activeTeamState.mutate(
+        cwd,
+        (t) => ({
+          ...t,
+          roles: t.roles.map((r) =>
+            r.id.toLowerCase() === roleId.toLowerCase()
+              ? {
+                  ...r,
+                  phase: "reserved" as const,
+                  diagnostic: { code: "provisioning_failed", message },
+                  ...(created
+                    ? {
+                        sessionHistory: [
+                          ...r.sessionHistory,
+                          { sessionId: r.sessionId, replacedAt: Date.now(), reason: "materialization-failed" },
+                        ],
+                      }
+                    : {}),
+                }
+              : r,
+          ),
+        }),
+        { policy, signal: exec.signal },
+      );
+    } catch {
+      // The role is at worst left in `provisioning`, which the next dispatch
+      // rebuilds anyway; never mask the original failure with this one.
+    }
+
+    const pinnedModel = role.model === undefined ? "(unresolved)" : `${String(role.model.provider)}/${String(role.model.model)}`;
+    throw new Error(
+      `role "${roleId}" could not be brought up (${message}). ` +
+        `The charter pinned it to ${pinnedModel}; it is back to "reserved", so dispatching it again retries the build. ` +
+        `To change the model, ask the user first — a substitution applies to this attempt and is not written back to any preference file.`,
+    );
+  }
 }
 
 export async function dispatchRoleTask(
@@ -2363,95 +3173,71 @@ export async function dispatchRoleTask(
   const observation = await activeTeamState.read(cwd, { signal: exec.signal });
   throwIfBlocked("dispatch a task", observation);
 
-  let team: TeamState;
-  let isNewTeam = false;
-
-  if (observation.kind === "ready") {
-    team = observation.team;
-  } else {
-    isNewTeam = true;
-    const teamId = `team-${randomUUID().slice(0, 8)}`;
-    team = {
-      schemaVersion: 1,
-      teamId,
-      topologyRef: { id: "lane-orchestra", source: "bundled" },
-      rootCwd: cwd,
-      controllerSessionId: exec.agent.id,
-      status: "active",
-      createdAt: Date.now(),
-      mission: {
-        objective: args.task.slice(0, 140),
-        scope: [],
-        constraints: [],
-        acceptanceCriteria: [],
-        nonGoals: [],
-        context: "",
-      },
-      controllerHistory: [],
-      activatedFromArchiveId: null,
-      reports: [],
-      roles: [],
-    };
+  if (observation.kind !== "ready") {
+    throw new Error(
+      "cannot dispatch: no active team found in this workspace. Teams must be approved and created via /team or orchestra_create first.",
+    );
   }
 
-  let roleEntry = team.roles.find((r) => r.id.toLowerCase() === roleId.toLowerCase());
-  let createdRole = false;
-  let sessionId: string;
-
-  if (roleEntry !== undefined && typeof roleEntry.sessionId === "string" && roleEntry.sessionId !== "") {
-    sessionId = roleEntry.sessionId;
-  } else {
-    createdRole = true;
-    const presetId = args.preset ?? `orchestra-v04-${roleId}-v1`;
-    let effectivePreset = presetId;
-    try {
-      await resolveRolePresetFile(ctx, cwd, presetId, orchestraGlobalRoot());
-    } catch {
-      effectivePreset = "orchestra-v04-worker-v1";
-    }
-
-    const title = roleSessionTitle({ roleId, missionObjective: team.mission.objective, cwd });
-    const created = await createSession(ctx, {
-      cwd,
-      agentPresetId: effectivePreset,
-      title,
-      signal: exec.signal,
-    });
-    sessionId = created.sessionId;
-    roleEntry = {
-      id: roleId,
-      name: roleId,
-      sessionId,
-      execution: "session",
-      phase: "active",
-      sessionHistory: [],
-      preset: effectivePreset,
-      sandbox: "read-write",
-      reportCount: 0,
-      lastReport: null,
-    };
-    team.roles.push(roleEntry);
+  const team = observation.team;
+  const roleIndex = team.roles.findIndex((r) => r.id.toLowerCase() === roleId.toLowerCase());
+  if (roleIndex === -1) {
+    throw new Error(
+      `cannot dispatch: role "${roleId}" is not declared in the team roster. Declared roles: ${team.roles.map((r) => r.id).join(", ")}`,
+    );
   }
 
+  const roleEntry = team.roles[roleIndex];
   const policy = escrowPolicy(ctx, exec);
-  if (isNewTeam) {
-    await activeTeamState.create(cwd, team, { policy, signal: exec.signal });
-  } else {
-    await activeTeamState.replace(observation as ActiveTeamReady, team, { policy, signal: exec.signal });
-  }
 
-  const dispatchPayload =
+  // The handoff discipline travels WITH the dispatch, not only inside a role
+  // preset: a governed team can run a legacy preset whose persona predates this
+  // rule, and a role that ends its turn silently stalls the whole run (there is
+  // no reply to wake the driver). Two observed failures motivated spelling it
+  // out here: a role that wrote its report with the generic file tools and never
+  // reported, and a read-only role that retried a denied write until it raised a
+  // permission prompt nobody was there to answer.
+  const dispatchNotice =
     `[Orchestra Dispatch | Lane: ${laneId} | Role: ${roleId}]\n\n` +
     `Task:\n${args.task}\n\n` +
     `---\n` +
-    `Frontline Autonomy Rule: execute independently and coordinate Hard Facts directly with collaborators. ` +
-    `File progress or completion with orchestra_report when ready.`;
+    `Frontline Autonomy Rule: execute independently and coordinate Hard Facts directly with collaborators.\n` +
+    `Close the loop BEFORE you end your turn: file your report with the orchestra_report TOOL (never the generic write/edit tool — it is denied under a read-only sandbox), ` +
+    `then reply to the controller with a2a_reply. A turn that ends with no report and no reply cannot wake the driver and stalls the run. ` +
+    `If a write is refused, say so in that reply instead of escalating the sandbox: nobody answers an escalation prompt in an unattended run.`;
 
+  // Lazy Fleet Materialization: reserved -> provisioning -> active.
+  //
+  // A role is materialized on its FIRST dispatch. `provisioning` is a
+  // write-ahead marker, not a resting state: it is what makes a crash between
+  // "we are about to create the session" and "the session exists" recoverable.
+  // A role found in `provisioning` is therefore REBUILT rather than delivered
+  // to — the previous attempt never proved a session exists, so delivering
+  // would fail with "role session is not live" and strand the lane forever.
+  // See {@link materializeRole}.
+  if (roleEntry.phase === "reserved" || roleEntry.phase === "provisioning") {
+    const receipt = await materializeRole(ctx, activeTeamState, exec, {
+      cwd,
+      team,
+      role: roleEntry,
+      dispatchNotice,
+    });
+    return {
+      status: "dispatched",
+      team_id: team.teamId,
+      role_id: roleEntry.id,
+      session_id: roleEntry.sessionId,
+      created_new_session: true,
+      receipt,
+    };
+  }
+
+  // Role already active: deliver regular task payload
   const delivery = await deliverMessage(
     ctx,
     exec.agent.id,
-    sessionId,
-    [{ type: "text", text: dispatchPayload }],
+    roleEntry.sessionId,
+    [{ type: "text", text: dispatchNotice }],
     {
       wake: true,
       ...transportStores(ctx, cwd),
@@ -2461,12 +3247,148 @@ export async function dispatchRoleTask(
   return {
     status: "dispatched",
     team_id: team.teamId,
-    role_id: roleId,
-    session_id: sessionId,
-    created_new_session: createdRole,
+    role_id: roleEntry.id,
+    session_id: roleEntry.sessionId,
+    created_new_session: false,
     receipt: delivery,
   };
 }
+
+export interface DismissGovernedTeamArgs {
+  reason?: string;
+  summary?: string;
+}
+
+export interface DismissGovernedTeamResult {
+  team_id: string;
+  archive_id: string;
+  archive_path: string;
+  dismissed_at: number;
+  reason?: string;
+  summary?: string;
+  status: "dismissed";
+}
+
+export async function dismissGovernedTeam(
+  ctx: Context,
+  activeTeamState: ActiveTeamStateStore,
+  archiveStore: ArchiveStore,
+  exec: ToolExecutionInput,
+  args: DismissGovernedTeamArgs = {},
+): Promise<DismissGovernedTeamResult> {
+  if (exec.agent === undefined) throw new Error("orchestra_dismiss requires an agent caller");
+  const cwd = exec.agent.session.header.cwd;
+  if (cwd === undefined) throw new Error("current session has no working directory");
+  const teamObservation = await activeTeamState.read(cwd, { signal: exec.signal });
+  throwIfBlocked("dismiss the team", teamObservation);
+  if (teamObservation.kind !== "ready") throw new Error(`cannot dismiss the team: ${teamObservation.diagnostic.message}`);
+  const team = teamObservation.team;
+
+  // Controller authorization guard
+  if (exec.agent.id !== team.controllerSessionId) {
+    throw new Error(`orchestra_dismiss: only controller session "${team.controllerSessionId}" can dismiss the team; caller is "${exec.agent.id}"`);
+  }
+
+  const dismissedAt = Date.now();
+  const pendingTasks = team.roles
+    .filter((r) => r.reportCount === 0 || r.phase === "provisioning" || r.phase === "reserved")
+    .map((r) => ({ roleId: r.id, phase: r.phase, reportCount: r.reportCount }));
+  const handoffSummary = {
+    reason: args.reason ?? "dismissed by controller",
+    summary: args.summary ?? "Team dismissed and archived.",
+    pendingTasks,
+  };
+
+  const teamWithHandoff: TeamState = {
+    ...team,
+    handoffSummary,
+  };
+
+  const archived = await archiveStore.create(cwd, teamWithHandoff, {
+    dismissedAt,
+    policy: escrowPolicy(ctx, exec),
+    signal: exec.signal,
+  });
+  const archiveId = archived.summary.archiveId;
+  const archivePath = archived.summary.archivePath;
+  const marker: ActiveTeamArchivedMarker = {
+    schemaVersion: 1,
+    archived: true,
+    status: "dismissed",
+    archiveId,
+    archivePath,
+    archivedAt: dismissedAt,
+    teamId: team.teamId,
+  };
+  try {
+    await activeTeamState.archive(teamObservation, marker, {
+      policy: escrowPolicy(ctx, exec),
+      signal: exec.signal,
+    });
+  } catch (error) {
+    throw new Error(
+      `archive ${archiveId} was created at ${archivePath}, but active team CAS failed; the team was not dismissed and no role retirement notice was sent: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  // Bifurcated cleanup:
+  // - continuable subagents: releaseSubagentNodeDefault
+  // - live sessions: wake: false retirement notice + cancel
+  // - cold sessions: skipped
+  for (const role of team.roles) {
+    if (role.execution === "subagent") {
+      try {
+        await releaseSubagentNodeDefault(ctx, exec.agent, role.sessionId);
+      } catch (err) {
+        console.error(
+          `orchestra_dismiss: subagent drain for ${role.sessionId} failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      continue;
+    }
+
+    const live = ctx.agents.get(SID(role.sessionId));
+    if (live === undefined) continue;
+
+    try {
+      void deliverMessage(
+        ctx,
+        exec.agent.id,
+        role.sessionId,
+        [
+          {
+            type: "text",
+            text: `Your team has been ARCHIVED (archive_id=${archiveId}, path=${archivePath}). You are retired from active collaboration: stop waiting for new tasks. If the team is reactivated, you will receive a notice.`,
+          },
+        ],
+        {
+          wake: false,
+          ...transportStores(ctx, cwd),
+        },
+      ).catch((error) => {
+        console.error(
+          `orchestra_dismiss: archive notice to ${role.sessionId} failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+      live.cancel({ kind: "hook", reason: "orchestra_dismiss" }, { keepInbox: false });
+    } catch (error) {
+      console.error(
+        `orchestra_dismiss: archive notice or cancel to ${role.sessionId} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  return {
+    team_id: team.teamId,
+    archive_id: archiveId,
+    archive_path: archivePath,
+    dismissed_at: dismissedAt,
+    reason: handoffSummary.reason,
+    summary: handoffSummary.summary,
+    status: "dismissed" as const,
+  };
+}
+
+export const orchestra_dismiss = dismissGovernedTeam;
 
 export interface ActivateRoleResult {
   role_id: string;
@@ -2541,7 +3463,7 @@ export async function activateArchivedTeam(
   const archived = loaded.snapshot;
   // Rebuild the active state from the archive snapshot (archive stays immutable).
   const query = ctx.get("sessionQuery");
-  const newTeam: TeamState = {
+  let newTeam: TeamState = {
     ...archived,
     status: "active",
     activatedFromArchiveId: archived.archiveId,
@@ -2549,11 +3471,7 @@ export async function activateArchivedTeam(
   };
   // Controller takeover: the caller of activate becomes the controller when different.
   if (newTeam.controllerSessionId !== exec.agent.id) {
-    newTeam.controllerHistory = [
-      ...newTeam.controllerHistory,
-      { sessionId: newTeam.controllerSessionId, replacedAt: Date.now(), reason: "controller-takeover" },
-    ];
-    newTeam.controllerSessionId = exec.agent.id;
+    newTeam = transferOrchestrationControl(newTeam, exec.agent.id, { reason: "controller-takeover" });
   }
   // Fail loud instead of pretending active: validate the archived document and
   // graph runtime before publishing the active team.
@@ -2592,6 +3510,18 @@ export async function activateArchivedTeam(
     } as never);
   });
   for (const role of newTeam.roles) {
+    // Step 5-0: a role that was never materialized stays that way.
+    //
+    // `reserved` means "this lane exists in the plan but was never dispatched",
+    // and reactivating a team must not turn that into work: the whole point of
+    // reserving is that planning a lane costs nothing until someone asks for it.
+    // Without this branch the loop below treats the reserved seat as a MISSING
+    // session and tries to rebuild it — creating a session, replacing the id and
+    // writing sessionHistory for a role no one asked to start.
+    if (role.phase === "reserved") {
+      results.push({ role_id: role.id, sessionId: role.sessionId, action: "kept-reserved" });
+      continue;
+    }
     const agent = ctx.agents.get(SID(role.sessionId));
     if (agent !== undefined) {
       // Step 5a: live → reused
@@ -3166,13 +4096,24 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "orchestra_draft",
       description:
-        "Driver-only Charter Draft command. Creates revision 1 or appends a new revision using expectedRevision. The Draft is recorded in <cwd>/orchestra/charter/records.json (ADR-0002: plugin records live in files, never in Session events); it is not a Team or approval. For an active Team, only the current controller/semantic writer may create an amendment Draft.",
+        "Driver-only Charter Draft command. Creates revision 1 or appends a new revision using expectedRevision. The Draft is recorded in <cwd>/orchestra/charter/records.json (ADR-0002: plugin records live in files, never in Session events); it is not a Team or approval. For an active Team, only the current controller/semantic writer may create an amendment Draft. " +
+        "You may snapshot a catalog `topology` (a starting point), but the intended path is COMPOSITION: pass `inlineTopology` and build the graph yourself from role presets, deciding what to split, what runs serially, and how many review rounds each lane gets. Role presets carry the personas — use `orchestra_topologies` to see which roles exist and what each one may do.",
       parameters: {
         draftId: { type: "string", description: "Existing draft id to revise; omit to create a new draft." },
         expectedRevision: { type: "number", description: "Required when revising an existing draft; stale values fail loud." },
         goal: { type: "string", description: "Mission objective; required for a new draft." },
         topology: { type: "string", description: "Catalog topology id to snapshot; omitted on update reuses the latest snapshot." },
-        inlineTopology: { type: "json", description: "Inline custom topology config; validated by the same Topology Catalog validator." },
+        inlineTopology: {
+          type: "json",
+          description:
+            "Compose the graph YOURSELF instead of borrowing a preset: a topology config object validated by the same validator as the catalog. Shape: " +
+            "{ id, name?, controller?: { id: 'driver' }, roles: [ { id, name, preset, sandbox: 'read-only'|'workspace-write', " +
+            "compositionTools: [..], orchestraTools: ['orchestra_report'], welcome, runtime?: { provider, model, reasoningEffort }, maxRounds?, execution?: 'session'|'subagent' } ], " +
+            "phases?: [{ id, name }], lanes?: [{ id, name?, phaseId?, roles: [roleId] }], protocol: { ownership: {..}, routes: [{ kind, from, to: [roleId] }], completion: { owner, rule } } }. " +
+            "`preset` must name a real role preset (an unknown id fails the draft, it is not a free-form label); a `subagent` role may declare no preset, no sandbox, and no write tools. " +
+            "Judgement is yours: split the work, decide each lane's serial/parallel position, and set each role's review-round budget — do NOT bend the mission to fit a preset. " +
+            "Pass the config object DIRECTLY as this parameter's value — do not wrap it in a `config` field (that shape is rejected), and `roles` must be a non-empty array at the top level.",
+        },
         scope: { type: "array", items: { type: "string" } },
         constraints: { type: "array", items: { type: "string" } },
         acceptanceCriteria: { type: "array", items: { type: "string" } },
@@ -3225,7 +4166,23 @@ export function apply(ctx: Context): void {
             throw charterCommandError("read the charter draft", error);
           }
           if (current === undefined) throw new Error(`cannot create a charter draft: draft ${args.draftId} was not found`);
-          if (current.authorSessionId !== exec.agent.id) throw new Error("cannot revise the charter draft: permission_denied (author Session required)");
+          if (current.authorSessionId !== exec.agent.id) {
+            // The author Session can be GONE — a restart, a closed window, or a
+            // reactivated team whose original driver never came back. Refusing
+            // outright left the new controller unable to revise the very draft
+            // it now owns, which blocks the supported path of amending a running
+            // team's charter. Authority moves to the caller that is actually
+            // here; the previous holder is recorded so the handover is visible.
+            const observationForRevision = await activeTeamState.read(cwd);
+            const teamForRevision = observationForRevision.kind === "ready" ? observationForRevision.team : undefined;
+            if (teamForRevision === undefined || teamForRevision.controllerSessionId !== exec.agent.id) {
+              throw new Error("cannot revise the charter draft: permission_denied (author Session required, and this session is not the Team controller)");
+            }
+            // The takeover itself is already on the record: the controller
+            // handover is written into the team's controllerHistory by
+            // transferOrchestrationControl, and the draft keeps its original
+            // author, so the handover stays legible without a second ledger.
+          }
         }
         let baseTeamId: string | undefined;
         let baseCharterRevision: number | undefined;
@@ -3233,8 +4190,21 @@ export function apply(ctx: Context): void {
           const team = observation.team;
           const document = documentReadForTeam(team);
           if (document === undefined) throw new Error("cannot create an amendment Draft: legacy_missing (this team has no orchestration document)");
-          if (exec.agent.id !== team.controllerSessionId || exec.agent.id !== document.semanticWriterSessionId) {
-            throw new Error("cannot create a charter amendment: permission_denied (current controller/semantic writer required)");
+          if (exec.agent.id !== team.controllerSessionId) {
+            throw new Error("cannot create a charter amendment: permission_denied (current controller required)");
+          }
+          if (exec.agent.id !== document.semanticWriterSessionId) {
+            // Same reasoning as the draft-author fallback above: the semantic
+            // writer is the controller BY CONSTRUCTION (the document is created
+            // with it and every takeover rebinds it), so a mismatch means the
+            // rebind was missed — repair it at the choke point instead of
+            // freezing the charter forever.
+            // The document's semantic writer IS the controller by construction:
+            // initializeFrozenOrchestrationDocument writes it and every takeover
+            // rebinds it. A mismatch here means a takeover path missed the
+            // rebind, and the current controller is still the right writer — so
+            // proceed rather than freezing the charter on an internal
+            // inconsistency. orchestra_team reports the field as stored.
           }
           if (document.currentCharterRevision === null) throw new Error("cannot create an amendment Draft: the Team has no frozen charter revision");
           baseTeamId = team.teamId;
@@ -3249,8 +4219,9 @@ export function apply(ctx: Context): void {
         let roleBlueprintPreview: DraftRoleFacts[];
         try {
           roleBlueprintPreview = [];
+          const preferences = await readPreferences(cwd, { fs: ctx.fs });
           for (const role of topology.config.roles) {
-            roleBlueprintPreview.push(await preparseDraftRoleFacts(ctx, cwd, role));
+            roleBlueprintPreview.push(await preparseDraftRoleFacts(ctx, cwd, role, preferences));
           }
         } catch (error) {
           throw new Error(`cannot create a charter draft: role blueprint pre-parsing failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -3275,7 +4246,7 @@ export function apply(ctx: Context): void {
         }
         if (command.kind !== "changed") throw new Error("charter draft command unexpectedly produced no event");
         await appendDurableCharterEvent(ctx, exec.agent.session, command.event);
-        return { ...charterDraftOutput([...events, command.event], command.value), role_blueprint_preview: roleBlueprintPreview } as any;
+        return JSON.parse(JSON.stringify({ ...charterDraftOutput([...events, command.event], command.value), role_blueprint_preview: roleBlueprintPreview }));
       },
     }),
   );
@@ -3284,7 +4255,7 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "orchestra_dispatch",
       description:
-        "Dispatch a concrete task to a team role lane. If the role's Session does not exist yet, it is automatically created and recorded into .orchestra/ state. The task message is sent directly to the role session with wake=true, returning the delivery receipt.",
+        "Dispatch a concrete task to a role lane of the ACTIVE team in this working directory. Requires a team approved and created via /team or orchestra_create — dispatching with no active team fails instead of silently founding one, so a lane can never run outside an approved charter. The role's Session is materialized on its FIRST dispatch (the team is created with reserved seats and no live sessions); later dispatches reuse it. If a first materialization fails, the error names the role and the model the charter pinned, and the role falls back to reserved so the next dispatch retries the build. The task message is delivered with wake=true and the delivery receipt is returned.",
       parameters: {
         roleId: { type: "string", required: true, description: "Role identifier to dispatch to (e.g. 'implementer', 'reviewer')." },
         task: { type: "string", required: true, description: "Actionable, self-contained task description for this role lane." },
@@ -3325,9 +4296,55 @@ export function apply(ctx: Context): void {
 
   ctx.tools.register(
     defineTool({
+      name: "orchestra_add_lanes",
+      description:
+        "Graft a NEW lane (one or more roles) onto the team that is already running here, instead of starting a second team. THIS IS HOW A TEAM STAYS ADAPTIVE: when the user brings another objective that belongs to the same project, decompose it into roles and add them to this graph — there is one team and one closure owner by design. " +
+        "TWO-STEP BY DESIGN: call it WITHOUT `confirm` first. You get the plan back (role, preset, sandbox, phase/lane, model, one-line purpose) — show that to the user as a single sentence, ask once, and call again with confirm: true. Never pass confirm on the first call. " +
+        'Roles enter "reserved" and cost nothing until you dispatch them. `preset` must be a real role preset (see orchestra_topologies for the role library; an unknown id fails here); required tools, sandbox and handoff contract come from that preset. Only the controller session may change the roster.',
+      parameters: {
+        roles: {
+          type: "array",
+          required: true,
+          items: { type: "json" },
+          description:
+            "One entry per role to add: { roleId (lowercase kebab-case, must not already exist), preset (role preset id), sandbox?: 'read-only'|'workspace-write', phase?, lane?, purpose? (one line, becomes the role's welcome), maxRounds?, model?: { provider, model, reasoningEffort } }.",
+        },
+        reason: { type: "string", description: "Why this lane is being added; recorded on the team so the roster change is explainable later." },
+        confirm: { type: "boolean", description: "Set true ONLY on the second call, after the user agreed to the plan. Omitted, the call changes nothing and just returns the plan." },
+      },
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            status: { type: "string", required: true },
+            team_id: { type: "string", required: true },
+            state_path: { type: "string", required: true },
+            plan: { type: "array", required: true, items: { type: "json" } },
+            added: { type: "array", items: { type: "json" } },
+          },
+        },
+        render: (_args, value) => [
+          {
+            type: "text",
+            text:
+              value.status === "planned"
+                ? `orchestra_add_lanes: plan for team ${value.team_id} (nothing changed yet) — ${(value.plan ?? []).map((entry: any) => `${entry.roleId} via ${entry.preset} [${entry.sandbox}]${entry.lane === undefined ? "" : ` lane=${entry.lane}`}`).join("; ")}. Ask the user once, then call again with confirm: true.`
+                : `orchestra_add_lanes: ${(value.added ?? []).length} lane(s) added to ${value.team_id} as reserved — ${(value.added ?? []).map((entry: any) => entry.roleId).join(", ")}. Dispatch one to materialize it.`,
+          },
+        ],
+      },
+      async execute(args: { roles: unknown[]; reason?: string; confirm?: boolean }, exec: ToolExecutionInput) {
+        return addLanesToTeam(ctx, activeTeamState, exec, args as unknown as AddLanesArgs) as any;
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
       name: "orchestra_wait",
       description:
-        "Sleep until an active Team change occurs (such as a role filing an orchestra_report or a state change), or until the 20-minute heartbeat timeout elapses. Reports whether a change occurred. Use this instead of polling in a loop: after dispatching work via orchestra_dispatch, sleep here; on waking or heartbeat timeout, re-read orchestra_team and advance whichever lane can advance.",
+        "Optional utility for headless/scripted loops only. Drivers in interactive DSH sessions should NEVER call this tool after dispatching, as DSH automatically wakes the driver upon role delivery.",
       parameters: {
         teamId: { type: "string", description: "Team to wait on; defaults to the active Team of the calling session's working directory." },
         timeoutMs: {
@@ -3441,6 +4458,21 @@ export function apply(ctx: Context): void {
                           sessionId: { type: "string", required: true },
                           path: { type: "string", required: true },
                           createdAt: { type: "number", required: true },
+                        },
+                      },
+                    },
+                    added_lanes: {
+                      type: "array",
+                      required: true,
+                      items: {
+                        type: "object",
+                        additionalProperties: false,
+                        properties: {
+                          roleId: { type: "string", required: true },
+                          phase: { type: "string" },
+                          lane: { type: "string" },
+                          addedAt: { type: "number", required: true },
+                          reason: { type: "string" },
                         },
                       },
                     },
@@ -3599,6 +4631,10 @@ export function apply(ctx: Context): void {
             activated_from_archive_id: team.activatedFromArchiveId,
             roles: await Promise.all(team.roles.map((role) => roleStatus(ctx, role, roleHealth))),
             reports: team.reports,
+            // Lanes grafted on AFTER the charter was approved. The board says so
+            // explicitly: a roster that silently exceeds the approved plan is
+            // exactly what a reader must be able to notice.
+            added_lanes: team.addedLanes ?? [],
             notice_failures: team.noticeFailures ?? [],
             document_status: documentSummaryValue.status,
             document_revision: documentSummaryValue.revision,
@@ -3711,7 +4747,10 @@ export function apply(ctx: Context): void {
       name: "orchestra_dismiss",
       description:
         "Close the current orchestra instance: publish an immutable archive, CAS the active state into an archived marker, then notify every live role session that the team is archived (stop waiting for new tasks). Role sessions are independent assets and stay alive. Requires an instance created by orchestra_create in this working directory.",
-      parameters: {},
+      parameters: {
+        reason: { type: "string", description: "Optional reason for dismissing the team, e.g. \"task completed\" or \"mission aborted\"." },
+        summary: { type: "string", description: "Optional handoff summary of what was completed and what remains." },
+      },
       output: {
         schema: {
           type: "object",
@@ -3730,64 +4769,8 @@ export function apply(ctx: Context): void {
           },
         ],
       },
-      async execute(_args, exec: ToolExecutionInput) {
-        if (exec.agent === undefined) throw new Error("orchestra_dismiss requires an agent caller");
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory");
-        const teamObservation = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("dismiss the team", teamObservation);
-        if (teamObservation.kind !== "ready") throw new Error(`cannot dismiss the team: ${teamObservation.diagnostic.message}`);
-        const team = teamObservation.team;
-        const dismissedAt = Date.now();
-        const archived = await archiveStore.create(cwd, team, {
-          dismissedAt,
-          policy: escrowPolicy(ctx, exec),
-          signal: exec.signal,
-        });
-        const archiveId = archived.summary.archiveId;
-        const archivePath = archived.summary.archivePath;
-        const marker: ActiveTeamArchivedMarker = {
-          schemaVersion: 1,
-          archived: true,
-          status: "dismissed",
-          archiveId,
-          archivePath,
-          archivedAt: dismissedAt,
-          teamId: team.teamId,
-        };
-        try {
-          await activeTeamState.archive(teamObservation, marker, {
-            policy: escrowPolicy(ctx, exec),
-            signal: exec.signal,
-          });
-        } catch (error) {
-          throw new Error(
-            `archive ${archiveId} was created at ${archivePath}, but active team CAS failed; the team was not dismissed and no role retirement notice was sent: ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-        // Archive notice to live roles (spec §8.3): cold roles are skipped —
-        // they will be told again on reactivation.
-        for (const role of team.roles) {
-          const agent = ctx.agents.get(SID(role.sessionId));
-          if (agent === undefined) continue;
-          try {
-            void deliverMessage(ctx, exec.agent.id, role.sessionId, [
-              {
-                type: "text",
-                text: `Your team has been ARCHIVED (archive_id=${archiveId}, path=${archivePath}). You are retired from active collaboration: stop waiting for new tasks. If the team is reactivated, you will receive a notice.`,
-              },
-            ]).catch((error) => {
-              console.error(
-                `orchestra_dismiss: archive notice to ${role.sessionId} failed: ${error instanceof Error ? error.message : String(error)}`,
-              );
-            });
-          } catch (error) {
-            console.error(
-              `orchestra_dismiss: archive notice to ${role.sessionId} failed: ${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-        }
-        return { team_id: team.teamId, archive_id: archiveId, archive_path: archivePath, dismissed_at: dismissedAt };
+      async execute(args: { reason?: string; summary?: string }, exec: ToolExecutionInput) {
+        return dismissGovernedTeam(ctx, activeTeamState, archiveStore, exec, args);
       },
     }),
   );
@@ -3831,38 +4814,49 @@ export function apply(ctx: Context): void {
         await ctx.fs.writeText(target, String(args.content ?? ""), undefined, undefined, escrowPolicy(ctx, exec));
         // Bookkeeping: record one delivered report on the calling role's team entry.
         if (teamObservation.kind === "ready") {
-          const team = teamObservation.team;
-          const role = team.roles.find((entry) => entry.sessionId === agentId);
-          let updatedTeam = team;
-          if (role !== undefined) {
-            const nextRoles = team.roles.map((entry) =>
-              entry.sessionId === agentId
-                ? { ...entry, reportCount: (entry.reportCount ?? 0) + 1, lastReport: canonical }
-                : entry,
-            );
-            const nextReports = [
-              ...team.reports,
-              {
-                reportId: `report-${randomUUID().slice(0, 8)}`,
-                roleId: role.id,
-                sessionId: agentId,
-                path: canonical,
-                createdAt: Date.now(),
-              },
-            ];
-            updatedTeam = {
-              ...team,
-              roles: nextRoles,
-              reports: nextReports,
-            };
-            await activeTeamState.replace(teamObservation, updatedTeam, {
+          const contentHash = createHash("sha256").update(String(args.content ?? "")).digest("hex");
+          const mutateResult = await activeTeamState.mutate(
+            cwd,
+            (team) => {
+              const role = team.roles.find((entry) => entry.sessionId === agentId);
+              if (role === undefined) return team;
+              const reportId = createHash("sha256")
+                .update(`${team.teamId}:${role.id}:${canonical}:${contentHash}`)
+                .digest("hex");
+              if (team.reports.some((entry) => entry.reportId === reportId)) {
+                return team;
+              }
+              const nextRoles = team.roles.map((entry) =>
+                entry.sessionId === agentId
+                  ? { ...entry, reportCount: (entry.reportCount ?? 0) + 1, lastReport: canonical }
+                  : entry,
+              );
+              const nextReports = [
+                ...team.reports,
+                {
+                  reportId,
+                  roleId: role.id,
+                  sessionId: agentId,
+                  path: canonical,
+                  createdAt: Date.now(),
+                },
+              ];
+              return {
+                ...team,
+                roles: nextRoles,
+                reports: nextReports,
+              };
+            },
+            {
               policy: escrowPolicy(ctx, exec),
               signal: exec.signal,
+            },
+          );
+          if ("roles" in mutateResult.state) {
+            await notifyDriverMilestone(ctx, mutateResult.state, agentId, "report", `written: ${rel}`, {
+              recordFailure: noticeRecorderFor(ctx, activeTeamState, cwd, exec),
             });
           }
-          await notifyDriverMilestone(ctx, updatedTeam, agentId, "report", `written: ${rel}`, {
-            recordFailure: noticeRecorderFor(ctx, activeTeamState, cwd, exec),
-          });
         }
         return { path: canonical };
       },
@@ -3920,6 +4914,8 @@ export function apply(ctx: Context): void {
                         // declared here the moment roleSummary can emit them.
                         execution: { type: "string" },
                         persona: { type: "string" },
+                        phase: { type: "string" },
+                        lane: { type: "string" },
                         toolFilter: {
                           type: "object",
                           additionalProperties: false,
@@ -4181,6 +5177,54 @@ export function apply(ctx: Context): void {
     });
   });
 
+  // A role that stops working without reporting must not stall the run.
+  //
+  // The driver's discipline is to hand the turn back and be woken by the role
+  // (see the "Turn Handoff & Reactive Wakeup" rule). That only works if the role
+  // actually delivers something. A model that writes its output with the file
+  // tools and then simply ends its turn produces no wake-up at all: the driver
+  // waits for a message nobody sent, and the run sits there looking healthy.
+  // This listener is the runtime's answer to a behaviour it cannot demand.
+  //
+  // It is deliberately narrow, because a wake-up that fires too eagerly is worse
+  // than a late one:
+  //   * only a running -> idle transition counts (a role that was never working
+  //     is not stalled);
+  //   * a role with pending input already IS waking the driver, so it is skipped;
+  //   * one notice per idle transition, keyed by the session that went quiet.
+  const runningRoles = new Set<string>();
+  ctx.on("agent/status", (payload: any) => {
+    const agent = payload?.agent;
+    const sessionId = agent?.session?.header?.id;
+    if (typeof sessionId !== "string" || sessionId === "") return;
+    if (payload?.status === "running") {
+      runningRoles.add(sessionId);
+      return;
+    }
+    if (payload?.status !== "idle" || !runningRoles.delete(sessionId)) return;
+    if (agent?.inbox?.hasPending === true) return;
+    void (async () => {
+      const cwd = agent?.session?.header?.cwd;
+      if (typeof cwd !== "string" || cwd === "") return;
+      const observation = await activeTeamState.read(cwd);
+      if (observation.kind !== "ready") return;
+      const team = observation.team;
+      const role = team.roles.find((entry) => entry.sessionId === sessionId);
+      if (role === undefined) return;
+      try {
+        await deliverMessage(ctx, sessionId, team.controllerSessionId, [
+          { type: "text", text: stalledRoleNotice(team.teamId, role.id, role.reportCount ?? 0) },
+        ], { wake: true, ...transportStores(ctx, cwd) });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        console.warn(`orchestra: stalled-role notice for ${role.id} could not reach the controller: ${reason}`);
+      }
+    })().catch((error) => {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.warn(`orchestra: stalled-role detection failed: ${reason}`);
+    });
+  });
+
   ctx.on("internal/service", (name) => {
     if ((WEB_SERVER_KEYS as readonly string[]).includes(name) || name === "workspaceRegistry") {
       registerWebSurface();
@@ -4203,10 +5247,11 @@ export function apply(ctx: Context): void {
         "3. Context: read the project context relevant to the goal (files, docs) to ground your understanding.\n" +
         "4. Proposal: call orchestra_draft to persist the mission and topology Draft, then report its draftId@revision and digest to the user with a per-role roster card preview.\n" +
         "5. Approval: ask the user to approve by replying with a plain yes — 启动 (or 可以 / 同意 / ok). Their reply is recorded automatically against the exact draft revision. Only the USER can approve. Until approval lands, do not dispatch roles.\n" +
-        "6. Dispatch and Execute: dispatch concrete lane tasks using orchestra_dispatch(roleId, task, { laneId, preset }). orchestra_dispatch automatically provisions the role session if not already running. Roles work autonomously.\n" +
-        "7. Sleep & Heartbeat: after dispatching, call orchestra_wait to sleep with a 20-minute heartbeat. Filing an orchestra_report wakes you early; if 20 minutes elapse without activity, the heartbeat wakes you to inspect orchestra_team and intervene.\n" +
+        "6. Dispatch and Execute: dispatch concrete lane tasks using orchestra_dispatch(roleId, task, { laneId, preset }). A role's session is materialized on its first dispatch; later dispatches reuse it. Roles work autonomously.\n" +
+        "6b. New objective, same project: ONE team per working directory, and a team is dynamic. Do NOT open a second team. Decompose the new objective into lanes and graft them onto the running graph with orchestra_add_lanes: it returns a plan first (compose the graph yourself from role presets — pick the roles the work actually needs, decide serial vs parallel placement, and set each lane's review-round cap); show the user that plan as one sentence, and only call it again with confirm: true after they agree. A different goal that is NOT part of this project is a different matter: say so and let the user decide.\n" +
+        "7. Turn Handoff & Reactive Wakeup: after dispatching concrete tasks with orchestra_dispatch, summarize what was dispatched to the user and conclude your turn. Do NOT call orchestra_wait to block your execution. Roles work autonomously and report back via A2A messages; DSH's reactive messaging will automatically wake you for your next turn when reports or replies arrive.\n" +
         "8. Session Control: use a2a_stop(sessionId, reason) to immediately abort a runaway or stuck session. Use a2a_list(query) to inspect or search sessions sorted by recent activity. Use a2a_read for progressive turn review.\n" +
-        "Stay in your role: you are the driver, not an implementer or reviewer. Do not edit code or do the role's work yourself. Dispatch tasks, monitor with orchestra_wait, and verify objective facts with orchestra_team and report files. Close the run with orchestra_dismiss when done.",
+        "Stay in your role: you are the driver, not an implementer or reviewer. Do not edit code or do the role's work yourself. Dispatch tasks, allow roles to work autonomously, and verify objective facts with orchestra_team and report files upon delivery. Close the run with orchestra_dismiss when done.",
     });
   }
 
@@ -4222,30 +5267,20 @@ export function apply(ctx: Context): void {
       // to the agent as ONE followup (single delivery: splitting marker and
       // goal across deliveries previously caused turn misalignment).
       recordInput: true,
-      handler: (invocation) => {
-        const raw = invocation.rawInput.trim();
-        if (/^approve(?:\s|$)/.test(raw)) return handleTeamApprovalCommand(ctx, invocation as any);
-        if (/^decide(?:\s|$)/.test(raw)) return handleTeamGateDecisionCommand(ctx, activeTeamState, invocation as any);
-        // Single plugin-source notice carrying the marker (+ the goal when
-        // provided). It renders as a collapsed context row, NOT as a user
-        // bubble — the user's bubble is the command bubble itself ("/team
-        // <goal>"), so no bracket-prefixed user message pollutes the chat.
-        const noticeText =
-          raw === ""
-            ? "(orchestra /team orchestration request: the user wants to open a team collaboration; start by confirming the goal)"
-            : `(orchestra /team orchestration request: the user wants to open a team collaboration)\n\n${raw}`;
-        const marker = createUserMessage({
-          content: [{ type: "text", text: noticeText }] as ContentBlock[],
-          source: {
-            kind: "plugin",
-            plugin: "orchestra",
-            form: "notice",
-            summary: "orchestra /team orchestration request",
-          } as MessageSource,
-        });
-        invocation.agent.followup(marker);
-        return { kind: "success", text: "Orchestration request accepted; starting team onboarding." };
-      },
+      handler: (invocation) => handleTeamCommandInvocation(ctx, activeTeamState, archiveStore, invocation as any),
     });
   }
 }
+
+export {
+  readPreferences,
+  writePreferences,
+  resolveModelForRole,
+  DEFAULT_PREFERENCES,
+};
+export type {
+  OrchestraPreferences,
+  IntelligenceTier,
+  ModelPreferenceConfig,
+};
+

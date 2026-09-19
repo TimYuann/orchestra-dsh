@@ -22,7 +22,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { apply } from "../lib/orchestra.js";
+import { apply, parseInlineTopologyArgument } from "../lib/orchestra.js";
 
 /** Every key `roleSummary` can place on a `TopologyRoleSummary`. */
 const ROLE_SUMMARY_KEYS = [
@@ -126,4 +126,16 @@ test("orchestra_topologies declares the full role summary, including the node ba
   assert.equal(roleSchema.properties.toolFilter.type, "object");
   assert.equal(roleSchema.properties.toolFilter.additionalProperties, false);
   assert.deepEqual(Object.keys(roleSchema.properties.toolFilter.properties).sort(), ["allow", "deny"]);
+});
+
+test("inlineTopology accepts the config as an object OR as a JSON string of it", () => {
+  const config = { schemaVersion: 1, id: "topo", roles: [{ id: "a", name: "A", preset: "p" }] };
+  // A model can hand the same value over either way; the tool knows what it
+  // asked for, so it must not make the caller guess the spelling.
+  assert.deepEqual(parseInlineTopologyArgument(config, "orchestra_draft"), config);
+  assert.deepEqual(parseInlineTopologyArgument(JSON.stringify(config), "orchestra_draft"), config);
+  assert.throws(() => parseInlineTopologyArgument("{not json", "orchestra_draft"), /not valid JSON/);
+  assert.throws(() => parseInlineTopologyArgument([1, 2], "orchestra_draft"), /must be a topology config object/);
+  assert.throws(() => parseInlineTopologyArgument(null, "orchestra_draft"), /must be a topology config object/);
+  assert.throws(() => parseInlineTopologyArgument(42, "orchestra_draft"), /must be a topology config object/);
 });

@@ -25,7 +25,6 @@ import type { AgentHandle, AgentSetup } from "@deepseek-ai/dsh-agent";
 import type { SessionId, AgentCancelCause } from "@deepseek-ai/dsh-session";
 import type {} from "@deepseek-ai/dsh-fs";
 import type {} from "@deepseek-ai/dsh-system-prompt";
-import type {} from "@deepseek-ai/cordis-plugin-timer";
 import { randomUUID } from "node:crypto";
 import { prepareLightweightBlueprint } from "./session-blueprint.js";
 import { createSubagentNode } from "./subagent-node.js";
@@ -344,8 +343,13 @@ export async function createSession(ctx: Context, options: CreateSessionOptions 
     let workspace;
     if (typeof options.workspaceId === "string" && options.workspaceId !== "") {
       workspace = registry.get(options.workspaceId);
-    } else if (typeof options.currentSessionId === "string" && options.currentSessionId !== "") {
-      workspace = registry.list().find((entry: any) => entry.sessionIds.includes(options.currentSessionId));
+    }
+    if (workspace === undefined && typeof options.currentSessionId === "string" && options.currentSessionId !== "") {
+      workspace = registry.list().find((entry: any) => entry.sessionIds?.includes(options.currentSessionId));
+    }
+    if (workspace === undefined && typeof cwd === "string" && cwd !== "") {
+      // 兜底：通过 CWD 路径直接匹配工作区
+      workspace = registry.list().find((entry: any) => entry.path === cwd);
     }
     if (workspace !== undefined) {
       try {
@@ -356,6 +360,16 @@ export async function createSession(ctx: Context, options: CreateSessionOptions 
         );
       }
     }
+  } else {
+    // No workspace registry service in this deployment (headless/CLI). The
+    // session is attached to no workspace, which the GUI shows as an ungrouped
+    // session. That is the honest outcome: `~/.dsh/storages/workspace.json` is
+    // owned by the workspace domain and its `attachSession` is what enforces
+    // the account's invariants (the session's canonical cwd must equal the
+    // workspace path, unknown ids are refused, `updatedAt` is stamped, invalid
+    // accounts are pruned). Writing that file ourselves from a read-modify-write
+    // would bypass every one of those checks and race the domain's own write
+    // chain, so the sessions plugin never does it.
   }
   return {
     sessionId: sid,

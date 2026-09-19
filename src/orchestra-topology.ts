@@ -22,10 +22,32 @@ export type TopologySource = "project" | "global" | "bundled";
 /** How a topology author asks for a role's backend, before it is resolved. */
 export type RoleExecutionRequest = "auto" | "session" | "subagent";
 
+export interface TopologyLane {
+  id: string;
+  name?: string;
+  description?: string;
+  phaseId?: string;
+  roles?: string[];
+  ownerRole?: string;
+  tasks?: string[];
+}
+
+export interface TopologyPhase {
+  id: string;
+  name?: string;
+  description?: string;
+  order?: number;
+  lanes?: TopologyLane[];
+}
+
 export interface RoleConfig {
   id: string;
   name: string;
   preset?: string | null;
+  /** Optional phase this role primarily participates in. */
+  phase?: string;
+  /** Optional lane this role operates on. */
+  lane?: string;
   /**
    * Requested backend for this role. Omit to keep the historical behavior
    * (`session`); `"auto"` derives the backend from the preset criterion in
@@ -68,6 +90,8 @@ export interface TopologyProtocol {
   gates?: TopologyGateDefinition[];
   closure?: TopologyClosureDefinition;
   budgets?: TopologyBudgets;
+  phases?: TopologyPhase[];
+  lanes?: TopologyLane[];
 }
 
 /**
@@ -163,6 +187,8 @@ export interface TopologyConfig {
   controller?: { id: string; source?: string };
   roles: RoleConfig[];
   protocol?: TopologyProtocol;
+  phases?: TopologyPhase[];
+  lanes?: TopologyLane[];
 }
 
 export interface ResolvedTopology {
@@ -175,6 +201,8 @@ export interface TopologyRoleSummary {
   id: string;
   name: string;
   preset?: string;
+  phase?: string;
+  lane?: string;
   /** Resolved backend for this role — never the raw `"auto"` request. */
   execution?: TeamRoleExecution;
   /** Native per-child persona; only ever present on a `subagent` role. */
@@ -917,6 +945,88 @@ export const BUILTIN_TOPOLOGIES: TopologyConfig[] = [
       },
     },
   },
+  {
+    schemaVersion: 1,
+    id: "architect-dev",
+    name: "Architect Development",
+    description: "多阶段多车道架构规划与开发拓扑：按需懒加载 architect/planner 输出任务卡，由 implementer 推进实现，经 reviewer 验收闭环",
+    controller: { id: "driver", source: "caller" },
+    phases: [
+      { id: "planning", name: "Planning Phase", description: "Architecture exploration and task card breakdown" },
+      { id: "execution", name: "Execution Phase", description: "Implementation of task cards" },
+      { id: "verification", name: "Verification Phase", description: "Quality gate and review" },
+    ],
+    lanes: [
+      { id: "architecture", name: "Architecture Lane", phaseId: "planning", roles: ["architect"] },
+      { id: "main", name: "Main Implementation Lane", phaseId: "execution", roles: ["implementer"] },
+      { id: "review", name: "Review Lane", phaseId: "verification", roles: ["reviewer"] },
+    ],
+    roles: [
+      {
+        id: "architect",
+        name: "Architect",
+        preset: "orchestra-v04-architect-v1",
+        sandbox: "read-only",
+        phase: "planning",
+        lane: "architecture",
+        compositionTools: ["tool-fs", "tool-fs-search", "tool-bash"],
+        orchestraTools: ["orchestra_report"],
+        welcome:
+          "你作为 architect / planner：负责高熵任务的架构推演、接口拆解与微任务卡（Task Card）制定。\n1) 只读沙箱，不直接修改业务代码；唯一写通道是 orchestra_report。\n2) 针对复杂需求进行调研分析，把自包含 Task Card 的正文（context、changedFiles、acceptanceCriteria、verificationSteps）随调研报告一起经 orchestra_report 交回 driver；你是只读角色，唯一的写通道就是 orchestra_report（落盘在 orchestra/reports/ 下），需要把任务卡持久化到 orchestra/tasks/ 时由 driver 来做。\n3) 对 driver 的汇报经 a2a_reply；角色间交接用 a2a_send 直接投递。每个节点完成（交接/verdict/报告）后，向 driver 汇报一行进展；runtime 会自动通知 driver，你只需补充阻塞、风险或需要 driver 决策的信息。\n4) 不直接发起代码变更，由 driver 派发给后续执行角色。",
+      },
+      {
+        id: "implementer",
+        name: "Implementer",
+        preset: "orchestra-v04-implementer-v1",
+        sandbox: "workspace-write",
+        phase: "execution",
+        lane: "main",
+        compositionTools: ["tool-bash", "tool-fs", "tool-fs-search"],
+        orchestraTools: ["orchestra_report"],
+        welcome:
+          "你作为 implementer（实现者）：按 driver 派发的任务卡（Task Card）实现功能。\n1) 严格遵循 Task Card 约定的 scope 与边界，不扩大改动。\n2) 完成后用 orchestra_report 提交交付说明。\n3) 对 driver 的汇报经 a2a_reply；角色间交接用 a2a_send 直接投递。每个节点完成（交接/verdict/报告）后，向 driver 汇报一行进展；runtime 会自动通知 driver，你只需补充阻塞、风险或需要 driver 决策的信息。",
+      },
+      {
+        id: "reviewer",
+        name: "Reviewer",
+        preset: "orchestra-v04-reviewer-v1",
+        sandbox: "read-only",
+        phase: "verification",
+        lane: "review",
+        maxRounds: 2,
+        compositionTools: ["tool-fs", "tool-fs-search", "tool-bash"],
+        orchestraTools: ["orchestra_report"],
+        welcome:
+          "你作为 reviewer（评审者）：对 implementer 交付的成果进行客观验收评审。\n1) 只读沙箱，只审不修，最多两轮。\n2) 严格根据验收准则评估，结果写入 orchestra_report 并返回 PASS/FAIL 判定。\n3) 对 driver 的汇报经 a2a_reply；角色间交接用 a2a_send 直接投递。每个节点完成（交接/verdict/报告）后，向 driver 汇报一行进展；runtime 会自动通知 driver，你只需补充阻塞、风险或需要 driver 决策的信息。",
+      },
+    ],
+    protocol: {
+      ownership: {
+        scope: "driver",
+        architecture: "architect",
+        implementation: "implementer",
+        review_verdict: "reviewer",
+        closure: "driver",
+      },
+      phases: [
+        { id: "planning", name: "Planning Phase", description: "Architecture exploration and task card breakdown" },
+        { id: "execution", name: "Execution Phase", description: "Implementation of task cards" },
+        { id: "verification", name: "Verification Phase", description: "Quality gate and review" },
+      ],
+      lanes: [
+        { id: "architecture", name: "Architecture Lane", phaseId: "planning", roles: ["architect"] },
+        { id: "main", name: "Main Implementation Lane", phaseId: "execution", roles: ["implementer"] },
+        { id: "review", name: "Review Lane", phaseId: "verification", roles: ["reviewer"] },
+      ],
+      routes: [
+        { kind: "dispatch", from: "driver", to: ["architect", "implementer", "reviewer"] },
+        { kind: "task_card", from: "architect", to: ["driver"] },
+        { kind: "candidate", from: "implementer", to: ["reviewer"] },
+        { kind: "verdict", from: "reviewer", to: ["driver"] },
+      ],
+      completion: { owner: "driver", rule: "Review PASS and driver acceptance" },
+    },
+  },
 ];
 
 const TOPOLOGY_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -1006,9 +1116,11 @@ function subagentKnobProblems(role: RoleConfig): string[] {
   return problems;
 }
 
-function roleSummary(role: RoleConfig): TopologyRoleSummary {
+export function roleSummary(role: RoleConfig): TopologyRoleSummary {
   const summary: TopologyRoleSummary = { id: role.id, name: role.name ?? role.id };
   if (role.preset !== undefined && role.preset !== null) summary.preset = role.preset;
+  if (role.phase !== undefined) summary.phase = role.phase;
+  if (role.lane !== undefined) summary.lane = role.lane;
   if (role.execution !== undefined) summary.execution = resolveRoleExecution(role);
   if (role.persona !== undefined) summary.persona = role.persona;
   if (role.toolFilter !== undefined) {
@@ -1141,6 +1253,8 @@ export function validateTopology(config: unknown): string[] {
         problems.push(`role "${role.id}" runtime reasoningEffort requires provider and model`);
       }
     }
+    if (role.phase !== undefined && typeof role.phase !== "string") problems.push(`shape: role "${role.id}" phase must be a string`);
+    if (role.lane !== undefined && typeof role.lane !== "string") problems.push(`shape: role "${role.id}" lane must be a string`);
     if (role.execution !== undefined && role.execution !== "auto" && role.execution !== "session" && role.execution !== "subagent") {
       problems.push(`role "${role.id}" execution "${String(role.execution)}" is invalid (auto | session | subagent)`);
     } else if (resolveRoleExecution({ execution: role.execution, preset: role.preset }) === "subagent") {
@@ -1175,6 +1289,61 @@ export function validateTopology(config: unknown): string[] {
       }
     }
   }
+  if (config.phases !== undefined) {
+    if (!Array.isArray(config.phases)) {
+      problems.push("shape: topology phases must be an array");
+    } else {
+      for (const [index, p] of config.phases.entries()) {
+        if (!isRecord(p) || typeof p.id !== "string" || p.id === "") {
+          problems.push(`shape: topology phases[${index}] must be an object with non-empty id`);
+        }
+      }
+    }
+  }
+  if (config.lanes !== undefined) {
+    if (!Array.isArray(config.lanes)) {
+      problems.push("shape: topology lanes must be an array");
+    } else {
+      for (const [index, l] of config.lanes.entries()) {
+        if (!isRecord(l) || typeof l.id !== "string" || l.id === "") {
+          problems.push(`shape: topology lanes[${index}] must be an object with non-empty id`);
+        }
+      }
+    }
+  }
+
+  // A role's `phase` / `lane` is only meaningful if it names something the
+  // topology actually declares. Cross-check ONLY when that side declares
+  // entries at all: a topology that assigns a free-form label without declaring
+  // phases must keep working, but a declared catalogue with a dangling
+  // reference is a typo the author wants to hear about now, not when a draft
+  // card shows a phase nobody can find.
+  const declaredPhaseIds = new Set<string>();
+  for (const source of [config.phases, isRecord(config.protocol) ? config.protocol.phases : undefined]) {
+    if (!Array.isArray(source)) continue;
+    for (const entry of source) {
+      if (isRecord(entry) && typeof entry.id === "string" && entry.id !== "") declaredPhaseIds.add(entry.id);
+    }
+  }
+  const declaredLaneIds = new Set<string>();
+  for (const source of [config.lanes, isRecord(config.protocol) ? config.protocol.lanes : undefined]) {
+    if (!Array.isArray(source)) continue;
+    for (const entry of source) {
+      if (isRecord(entry) && typeof entry.id === "string" && entry.id !== "") declaredLaneIds.add(entry.id);
+    }
+  }
+  if (Array.isArray(config.roles)) {
+    for (const role of config.roles) {
+      if (!isRecord(role)) continue;
+      const roleId = typeof role.id === "string" ? role.id : "(unnamed)";
+      if (typeof role.phase === "string" && declaredPhaseIds.size > 0 && !declaredPhaseIds.has(role.phase)) {
+        problems.push(`role "${roleId}" phase "${role.phase}" is not declared in phases/ protocol.phases (declared: ${[...declaredPhaseIds].join(", ")})`);
+      }
+      if (typeof role.lane === "string" && declaredLaneIds.size > 0 && !declaredLaneIds.has(role.lane)) {
+        problems.push(`role "${roleId}" lane "${role.lane}" is not declared in lanes/ protocol.lanes (declared: ${[...declaredLaneIds].join(", ")})`);
+      }
+    }
+  }
   if (config.controller !== undefined && !isRecord(config.controller)) problems.push("shape: topology controller must be an object");
   if (isRecord(config.controller) && config.controller.id !== undefined && typeof config.controller.id !== "string") {
     problems.push("shape: topology controller.id must be a string");
@@ -1194,6 +1363,28 @@ export function validateTopology(config: unknown): string[] {
   // rather than an oversight. Reading it the other way would break every v0.3
   // template on disk to enforce a rule they predate.
   if (!isRecord(protocol)) return problems;
+  if (protocol.phases !== undefined) {
+    if (!Array.isArray(protocol.phases)) {
+      problems.push("shape: protocol.phases must be an array");
+    } else {
+      for (const [index, p] of protocol.phases.entries()) {
+        if (!isRecord(p) || typeof p.id !== "string" || p.id === "") {
+          problems.push(`shape: protocol.phases[${index}] must be an object with non-empty id`);
+        }
+      }
+    }
+  }
+  if (protocol.lanes !== undefined) {
+    if (!Array.isArray(protocol.lanes)) {
+      problems.push("shape: protocol.lanes must be an array");
+    } else {
+      for (const [index, l] of protocol.lanes.entries()) {
+        if (!isRecord(l) || typeof l.id !== "string" || l.id === "") {
+          problems.push(`shape: protocol.lanes[${index}] must be an object with non-empty id`);
+        }
+      }
+    }
+  }
   if (protocol.ownership !== undefined && !isRecord(protocol.ownership)) {
     problems.push("shape: protocol.ownership must be an object");
   } else if (isRecord(protocol.ownership)) {

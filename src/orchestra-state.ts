@@ -148,6 +148,29 @@ export interface TeamState {
    * Bounded by {@link NOTICE_FAILURE_LIMIT}; the oldest entries are dropped.
    */
   noticeFailures?: TeamNoticeFailure[];
+  /**
+   * Lanes grafted onto this Team AFTER it was created.
+   *
+   * A Team is dynamic by design (docs/alignment-v0.5.1-ux.md §1): a new
+   * objective is folded into the running graph as another lane instead of
+   * forcing a second Team. This is the audit trail for that operation — the
+   * charter was approved with the roles below NOT in it, so the record has to
+   * say so rather than letting the roster silently differ from the plan the
+   * user approved.
+   */
+  addedLanes?: {
+    roleId: string;
+    phase?: string;
+    lane?: string;
+    addedAt: number;
+    reason?: string;
+  }[];
+  /** Summary snapshot recorded when dismissed or handed off. */
+  handoffSummary?: {
+    reason?: string;
+    summary?: string;
+    pendingTasks?: Array<{ roleId: string; phase: string; reportCount: number }>;
+  };
 }
 
 /** One driver milestone notice that could not be delivered. */
@@ -278,6 +301,14 @@ export interface ActiveTeamWriteResult {
   snapshot?: ActiveTeamReady;
   /** Canonical path for user-facing tool output; callers do not resolve the state path themselves. */
   statePath: string;
+  /** Previous team state before this write was committed, if available. */
+  previousState?: TeamState;
+}
+
+export interface ActiveTeamMutateOptions extends ActiveTeamWriteOptions {
+  maxRetries?: number;
+  baseBackoffMs?: number;
+  maxBackoffMs?: number;
 }
 
 /** The narrow filesystem adapter needed by this module and its tests. */
@@ -300,6 +331,11 @@ export interface ActiveTeamStateStore {
   create(cwd: string, team: TeamState, options: ActiveTeamWriteOptions): Promise<ActiveTeamWriteResult>;
   replace(snapshot: ActiveTeamReady, team: TeamState, options: ActiveTeamWriteOptions): Promise<ActiveTeamWriteResult>;
   archive(snapshot: ActiveTeamReady, marker: ActiveTeamArchivedMarker, options: ActiveTeamWriteOptions): Promise<ActiveTeamWriteResult>;
+  mutate(
+    cwd: string,
+    updater: (team: TeamState) => TeamState,
+    options: ActiveTeamMutateOptions,
+  ): Promise<ActiveTeamWriteResult>;
 }
 
 const ACTIVE_STATE_PATH = "orchestra/state/team.json";
@@ -565,6 +601,10 @@ export function normalizeTeam(raw: unknown, cwd: string, options: { allowDismiss
     ...(asRecord(record.graphRuntime) ? { graphRuntime: record.graphRuntime as GraphRuntimeState } : {}),
     roles,
     reports: Array.isArray(record.reports) ? record.reports : [],
+    ...(record.handoffSummary !== undefined && typeof record.handoffSummary === "object"
+      ? { handoffSummary: record.handoffSummary as any }
+      : {}),
+    ...(Array.isArray(record.addedLanes) ? { addedLanes: record.addedLanes as any } : {}),
     // A malformed breadcrumb is DROPPED rather than fatal: this list exists to
     // explain a stalled run, and refusing to read the Team because one entry is
     // corrupt would destroy the very evidence a reader came for.
@@ -749,7 +789,11 @@ export function createActiveTeamStateStore(fs: ActiveTeamStateFileSystem): Activ
     if (version === undefined) {
       throw new ActiveTeamStateError("invalid_snapshot", "active team replacement received an unknown version token");
     }
-    return write(snapshot.cwd, team, { kind: "replaceIfVersion", version }, options);
+    const result = await write(snapshot.cwd, team, { kind: "replaceIfVersion", version }, options);
+    return {
+      ...result,
+      previousState: snapshot.team,
+    };
   }
 
   async function archive(
@@ -767,8 +811,113 @@ export function createActiveTeamStateStore(fs: ActiveTeamStateFileSystem): Activ
     if (version === undefined) {
       throw new ActiveTeamStateError("invalid_snapshot", "active team archive received an unknown version token");
     }
-    return write(snapshot.cwd, marker, { kind: "replaceIfVersion", version }, options);
+    const result = await write(snapshot.cwd, marker, { kind: "replaceIfVersion", version }, options);
+    return {
+      ...result,
+      previousState: snapshot.team,
+    };
   }
 
-  return { read, create, replace, archive };
+  async function mutate(
+    cwd: string,
+    updater: (team: TeamState) => TeamState,
+    options: ActiveTeamMutateOptions,
+  ): Promise<ActiveTeamWriteResult> {
+    const maxRetries = options.maxRetries ?? 5;
+    const baseBackoffMs = options.baseBackoffMs ?? 8;
+    const maxBackoffMs = options.maxBackoffMs ?? 128;
+
+    let attempt = 0;
+    while (true) {
+      if (options.signal?.aborted) {
+        throw new ActiveTeamStateError("write_failed", "mutate aborted by caller signal");
+      }
+
+      const snapshot = await read(cwd, { signal: options.signal });
+      if (snapshot.kind !== "ready") {
+        throw new ActiveTeamStateError(
+          "invalid_snapshot",
+          `cannot mutate active team: state is ${snapshot.kind}${snapshot.kind === "blocked" ? ` (${snapshot.diagnostic.message})` : ""}`,
+          snapshot.diagnostic.fsCode,
+        );
+      }
+
+      const inputFingerprint = JSON.stringify(snapshot.team);
+      const updatedTeam = updater(snapshot.team);
+      const afterFingerprint = JSON.stringify(snapshot.team);
+      if (inputFingerprint !== afterFingerprint) {
+        throw new ActiveTeamStateError("invalid_snapshot", "updater violated pure function contract: mutated input snapshot in place");
+      }
+
+      try {
+        return await replace(snapshot, updatedTeam, options);
+      } catch (error) {
+        if (error instanceof ActiveTeamStateError && error.code === "stale_write" && attempt < maxRetries) {
+          attempt++;
+          const cap = Math.min(maxBackoffMs, baseBackoffMs * (2 ** (attempt - 1)));
+          const sleepMs = Math.floor(Math.random() * cap);
+          if (sleepMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, sleepMs));
+          }
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+
+  return { read, create, replace, archive, mutate };
+}
+
+/**
+ * Transfer orchestration control to a new controller session.
+ *
+ * Atomically rebinds team.controllerSessionId and document.semanticWriterSessionId.
+ * For subagent roles (whose native DSH parent edge was bound to the old controller),
+ * resets phase to "reserved", rebinds parentSessionId to the new controller, and
+ * clears any previous welcome receipt so they materialize cleanly under the new controller.
+ */
+export function transferOrchestrationControl(
+  team: TeamState,
+  newControllerSessionId: string,
+  options: { reason?: string; timestamp?: number } = {},
+): TeamState {
+  const now = options.timestamp ?? Date.now();
+  const reason = options.reason ?? "takeover";
+  const oldController = team.controllerSessionId;
+
+  const controllerHistory = [
+    ...(team.controllerHistory ?? []),
+    ...(oldController !== "" && oldController !== newControllerSessionId
+      ? [{ sessionId: oldController, replacedAt: now, reason }]
+      : []),
+  ];
+
+  let document = team.document;
+  if (document !== undefined) {
+    document = {
+      ...document,
+      semanticWriterSessionId: newControllerSessionId,
+    };
+  }
+
+  const roles: TeamRole[] = team.roles.map((role) => {
+    if (role.execution === "subagent") {
+      return {
+        ...role,
+        phase: "reserved" as const,
+        parentSessionId: newControllerSessionId,
+        welcome: undefined,
+      };
+    }
+    return role;
+  });
+
+  return {
+    ...team,
+    controllerSessionId: newControllerSessionId,
+    controllerHistory,
+    ...(document === undefined ? {} : { document }),
+    roles,
+  };
 }

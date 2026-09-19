@@ -32,6 +32,7 @@ export type RolePresetRole =
   | "investigator"
   | "verifier"
   | "architect"
+  | "planner"
   | "researcher"
   | "hardening-auditor"
   | "oracle";
@@ -151,7 +152,10 @@ function rolePrompt(role: RolePresetRole, purpose: string, write: boolean, baseS
     "Do not claim another role's verdict, user approval or closure decision.",
     "Handoff payload fields: " + handoff.requiredPayloadFields.join(", ") + ".",
     "Required evidence kinds: " + handoff.requiredEvidenceKinds.join(", ") + ".",
-    "Use orchestra_report for durable evidence and a2a_send for typed handoffs to the next node.",
+    "Persist durable evidence with the orchestra_report TOOL — it is your write channel and it works even under a read-only sandbox. " +
+      "Do NOT use the generic write/edit tool for a report: under read-only it is denied, and retrying it raises a permission prompt that nobody answers in an unattended run, which hangs the whole team. " +
+      "If a report write is ever refused, say so in your reply instead of escalating.",
+    "Report back to the controller with a2a_reply before you end your turn: a turn that ends silently gets no reply and stalls the run.",
   ].join(" ");
 }
 
@@ -515,6 +519,54 @@ const V04_ROLE_PRESETS: RolePresetSpec[] = [
       deferred: ["release-readiness"],
     },
   }),
+  makeSpec({
+    id: "orchestra-v04-planner-v1",
+    status: "v04",
+    role: "planner",
+    name: "Orchestra v0.4 Planner",
+    purpose:
+      "Turn an approved objective into an executable task card (context, changed files, acceptance criteria, verification steps) for one lane. Decomposes; never implements, never verifies its own output.",
+    baseStrategy: "standard",
+    compositionTools: ["tool-fs", "tool-fs-search"],
+    orchestraTools: ["orchestra_report"],
+    sandbox: "read-only",
+    skills: true,
+    compaction: true,
+    optionalCapabilities: ["web"],
+    reportHandoff: {
+      requiredPayloadFields: ["taskCardPath", "context", "changedFiles", "acceptanceCriteria", "verificationSteps"],
+      requiredEvidenceKinds: ["report", "file"],
+    },
+    reuse: {
+      initial: ["feature-development", "refactor-and-migration", "architecture-decision"],
+      remediationOnly: ["bug-diagnosis-and-fix"],
+      deferred: ["release-readiness", "audit-and-hardening"],
+    },
+  }),
+  makeSpec({
+    id: "orchestra-v04-oracle-v1",
+    status: "v04",
+    role: "oracle",
+    name: "Orchestra v0.4 Oracle",
+    purpose:
+      "Answer one escalated uncertainty (a mission-interpretation conflict, an architectural dispute, a high-impact tradeoff) with a recommendation, its rationale, a confidence level and the implications of being wrong. Advisory only: it never issues a PASS/FAIL verdict, never owns closure, and never takes over a lane.",
+    baseStrategy: "standard",
+    compositionTools: ["tool-fs", "tool-fs-search"],
+    orchestraTools: ["orchestra_report"],
+    sandbox: "read-only",
+    skills: true,
+    compaction: true,
+    optionalCapabilities: ["web"],
+    reportHandoff: {
+      requiredPayloadFields: ["summary", "artifactRefs", "knownRisks"],
+      requiredEvidenceKinds: ["report", "message"],
+    },
+    reuse: {
+      initial: ["architecture-decision"],
+      remediationOnly: ["feature-development", "bug-diagnosis-and-fix", "refactor-and-migration"],
+      deferred: ["release-readiness", "audit-and-hardening"],
+    },
+  }),
 ];
 
 const LEGACY_IMPLEMENTER_PRESET_YML = "name: Orchestra Implementer\ndescription: Orchestra Implementer：实现者纪律（严格按派发任务 scope 实现、orchestra_report 交接、自包含回复）。\n";
@@ -749,6 +801,11 @@ function expectedRoleHandoff(role: RolePresetRole): RolePresetHandoffContract {
       return { requiredPayloadFields: ["command", "exit", "scope", "evidenceRefs", "unexecuted"], requiredEvidenceKinds: ["test", "diff", "report"] };
     case "architect":
       return { requiredPayloadFields: ["decisionQuestion", "alternatives", "recommendation", "tradeoffs", "constraints", "migrationImpact", "unknowns"], requiredEvidenceKinds: ["report", "file", "url"] };
+    case "planner":
+      // A task card is only actionable if it says where it lands, what "done"
+      // means, and what the next role must run to prove it. Anything shorter
+      // hands the hard part back to the implementer.
+      return { requiredPayloadFields: ["taskCardPath", "context", "changedFiles", "acceptanceCriteria", "verificationSteps"], requiredEvidenceKinds: ["report", "file"] };
     case "researcher":
       return { requiredPayloadFields: ["sourceRefs", "facts", "unknowns", "factInference", "nextQuestions"], requiredEvidenceKinds: ["url", "file", "report"] };
     case "hardening-auditor":

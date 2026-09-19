@@ -45,15 +45,17 @@ export const PRINCIPLES_SECTION_NAME = "orchestra:principles";
  */
 export const PRINCIPLES_SECTION_TEXT = [
   "Orchestra principles (the method behind /team; load the `orchestration-principles` skill before you decompose a mission):",
-  "GRAPH: a bounded acyclic graph — finite nodes, every path finite. Loops are its ONLY back edge and every Loop must be bounded: an attempt cap plus three exits (pass / retry / capExhausted). No other back edge may exist. A mission usually has several Loops, each of 2-4 nodes; more nodes is not more rigour.",
-  "NODES: one node, one decidable responsibility — if you cannot say in one sentence what makes it complete, split it. Split for ATTENTION (a focused context explores deeper), and merge two duties that need the same deep context rather than forcing a split.",
+  "GRAPH: a bounded acyclic graph — finite nodes, every path finite. Loops are its ONLY back edge; each needs an attempt cap plus three exits (pass / retry / capExhausted). A mission usually has several Loops of 2-4 nodes; more nodes is not more rigour.",
+  "NODES: one node, one decidable responsibility — if you cannot say in one sentence what makes it complete, split it. Split for ATTENTION (a focused context explores deeper); merge two duties that need the same deep context.",
+  "TEAM DYNAMICS: one working directory, ONE team, one closure owner. A new objective for the same project is a NEW LANE on the running graph (orchestra_add_lanes), never a second team.",
+  "RIGHT-SIZE & TASK CARDS: do not expand beyond necessity (worker cost ≈ entropy × model price). Low-entropy work: the driver writes the task card itself, in a few sentences, and spins up nobody. High-entropy work: dispatch to a reserved planner/architect, who returns hard facts plus a drafted card body through its ONLY write channel (`orchestra/reports/`) — the DRIVER persists cards under `orchestra/tasks/`, since a read-only role has no write path there. The human approves the Macro Charter once; micro task cards run JIT inside it.",
   "BACKEND: a node that needs its own Agent Preset, the ability to ask the user for approval, its own cwd, or a real read-only guarantee MUST be a session node; anything else is a cheaper subagent node. A subagent inherits the driver's composition and permission, so toolFilter narrows availability and is NOT a permission guarantee — never claim read-only for one.",
   "PRESET: when a node looks like it wants a role-specific preset, ASK THE USER whether to build that preset into the graph. It is their composition, their cost, and their call — do not decide it silently, and do not fall back to a generic node to avoid asking.",
   "REACHABILITY: a subagent node talks ONLY to the driver. Native delegation authorizes on the direct-parent edge alone, so a session node cannot message a subagent node and a subagent node cannot reach a session node. Route every exchange with a subagent node THROUGH the driver; any other edge describes a message that cannot be sent.",
-  "EDGES: an edge is a contract — declare its kind and the payload fields it carries. The receiver must not need the sender's history to understand a handoff.",
-  "AUTHORITY: exactly one owner per decision; two owners means none. The evaluator is never the author. The driver owns decisions but never fabricates a quality verdict.",
-  "UNATTENDED: after approval and without the user, the run must still reach a definite terminal state. Every attempt has a deadline and an expiry closes it through an existing exit; limits are enforced by the runtime, not written as discipline in a welcome message; exceeding a limit reports an error rather than silently doing less; a gate that needs a human carries a pre-approved fallback or an explicit blocked/failed destination — never a silent hang; a wake-up must rest on a durable fact.",
-  "BEFORE PROPOSING: check the mission's five parts are present (objective, scope, constraints, acceptance criteria, non-goals), every node decidable, backend choice justified per node, every edge contracted, one owner per decision, every Loop bounded with a live capExhaustedRoute, no unreachable node, and a closure that exactly one owner can declare. Then explain the graph in plain language: if you cannot explain it, it is not right yet.",
+  "EDGES: an edge is a contract — declare its kind and the payload fields it carries; the receiver must not need the sender's history to understand a handoff.",
+  "AUTHORITY: exactly one owner per decision; two owners means none. The evaluator is never the author. The driver owns decisions but never fabricates a quality verdict. Roster changes and closure belong to the controller alone.",
+  "UNATTENDED: without the user, the run must still reach a definite terminal state. Every attempt has a deadline, and limits are enforced by the runtime rather than written as discipline in a welcome message; exceeding one reports an error, never a silent shortfall; a gate needing a human carries a pre-approved fallback or an explicit blocked/failed destination — never a silent hang.",
+  "BEFORE PROPOSING: the mission's five parts present (objective, scope, constraints, acceptance criteria, non-goals), every node decidable, backend justified per node, every edge contracted, one owner per decision, every Loop bounded with a live capExhaustedRoute, no unreachable node, and a closure exactly one owner can declare. Then explain the graph in plain language: if you cannot explain it, it is not right yet.",
 ].join("\n");
 
 /** The skill body: the same method with the reasoning and the full checklist. */
@@ -68,6 +70,21 @@ ${PRINCIPLES_SECTION_TEXT.split("\n").slice(1).join("\n")}
 1. **Sketch the mission WITH the user.** objective (one sentence), scope, constraints, acceptance criteria, non-goals. Ask for whichever is missing; never assume one the user did not give and that you cannot verify from the repository.
 2. **Turn it into a graph** under the rules above.
 3. **Explain it in natural language and get approval.** The explanation must let the user judge the plan without reading JSON: what each node does, who owns each decision, where the Loops are, why each one stops, where they are needed, and what happens when something fails. Approval is the ONLY hard gate, and it is cheap for the user: they reply with a plain yes (启动 / 可以 / ok) and the plugin records it against the exact revision you last showed them. Do not make them type a slash command or copy an id. What has NOT changed: only the user can approve — your own text is not consent, a plugin notice is not consent, and a message relayed from another session is not consent either. Wait for their reply before freezing or creating anything.
+
+## Right-Size Principle & JIT Task Cards (Macro Charter vs Micro Task Card)
+
+Worker cost is proportional to \`remaining entropy × model price\`. Assign cognitive power and structure proportionately:
+
+1. **Macro Charter vs Micro Task Card**:
+   - **Macro Charter**: High-level alignment between Driver and Human User defining overall mission objective, phases, lanes, roles, and acceptance criteria. Approved by the user ONCE.
+   - **Micro Task Card (JIT Just-In-Time Generation)**: Detailed, execution-ready card written right before a lane executes and saved to \`orchestra/tasks/<phase>-<lane>.md\`. So long as it stays within the approved Charter boundaries, it requires NO additional human approval or interruption.
+
+2. **Moderate Scaling (RIGHT-SIZE / 非必要不扩大原则)**:
+   - **Low-Entropy Work** (known files, straightforward fixes, minor extensions): Driver writes a concise 3-5 sentence Task Card directly. Do not spin up a planner or architect.
+   - **High-Entropy Work** (unknown codebase areas, complex design choices, architectural trade-offs): Driver dispatches to a reserved \`planner\` or \`architect\` role. The architect researches the codebase and returns **strictly hard facts plus the drafted card body** through its ONLY write channel (\`orchestra_report\`, which lands under \`orchestra/reports/\`). The **Driver** is the one who persists the card to \`orchestra/tasks/<phase>-<lane>.md\` — a read-only role cannot write there, and widening its sandbox for a task card would destroy the read-only guarantee that makes its research independent.
+
+3. **Driver Context Preservation**:
+   - The Driver never digests entire research corpora or raw task logs into its main conversation turn. By relying on Task Card paths on disk, the Driver's context growth remains strictly $O(\\text{lanes})$ rather than bloating with intermediate research.
 
 ## Reachability: the driver is the hub
 
@@ -92,6 +109,7 @@ That is why a read-only role MUST be a session: a role that believes it is read-
 
 - [ ] the mission's five parts are all present, and the missing ones were asked for
 - [ ] every node has a one-sentence completion condition
+- [ ] tasks right-sized: low-entropy tasks handled directly; high-entropy architecture mapped via JIT task cards
 - [ ] every node needing its own preset, approval, cwd, or read-only is a **session**
 - [ ] every edge declares a kind and its payload contract
 - [ ] exactly one owner per decision, and no author evaluates their own work

@@ -14,6 +14,7 @@ import { scopeOf } from "@deepseek-ai/dsh-scope";
 import { installModelSelection, type Agent, type AgentOptions, type AgentSetupCommit } from "@deepseek-ai/dsh-agent";
 import { mountPreset } from "@deepseek-ai/dsh-agent-presets";
 import { setSandboxMode } from "@deepseek-ai/dsh-sandbox-policy";
+import { setApprovalPolicy } from "@deepseek-ai/dsh-user-approval";
 import type { SandboxMode } from "@deepseek-ai/dsh-sandbox";
 import type { Session, SessionEvent } from "@deepseek-ai/dsh-session";
 import { parseRecordJson, readRecordText, resolveRecordFileSystem, safeSegment, writeRecordJson, type RecordFileSystem } from "./orchestra-records.js";
@@ -812,6 +813,17 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
     const permissionService = agentCtx.get("permissionPresets") ?? permissions;
     permissionService.set(session, permissionPreset);
     setSandboxMode(session, sandbox);
+    // An unattended governed role must never PARK on an approval prompt.
+    //
+    // A read-only role that insists on the generic write tool hits the sandbox,
+    // is told escalation is available, raises a prompt — and then nothing
+    // happens, because in an unattended run there is nobody to answer it. The
+    // role's turn never ends, so not even the stalled-role notice fires: the
+    // whole team hangs on a question no one can hear. Pinning the role to
+    // `never` turns that silent hang into an immediate, explicit refusal the
+    // role can recover from (and its real write channel, orchestra_report, does
+    // not need approval at all).
+    setApprovalPolicy(session, "never");
     const effectivePermissionPreset = permissionService.current(session);
     const effectiveSandbox = sandboxOverrideOf(session) ?? sandbox;
     if (effectiveSandbox !== sandbox) throw new SessionBlueprintError("permission_mismatch", `governed sandbox resolved to "${String(effectiveSandbox)}", expected "${sandbox}"`);

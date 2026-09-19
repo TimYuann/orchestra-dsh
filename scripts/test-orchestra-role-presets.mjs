@@ -141,12 +141,12 @@ function blueprintRuntime(spec, missing = []) {
   };
 }
 
-test("catalog has seven versioned specs plus three explicit legacy specs", () => {
-  assert.equal(BUILTIN_ROLE_PRESETS.length, 7);
+test("catalog has nine versioned specs plus three explicit legacy specs", () => {
+  assert.equal(BUILTIN_ROLE_PRESETS.length, 9);
   assert.equal(LEGACY_BUILTIN_ROLE_PRESETS.length, 3);
-  assert.equal(ALL_BUILTIN_ROLE_PRESETS.length, 10);
+  assert.equal(ALL_BUILTIN_ROLE_PRESETS.length, 12);
   assert.deepEqual(validateAllRolePresetSpecs(), []);
-  assert.equal(new Set(BUILTIN_ROLE_PRESETS.map((spec) => spec.id)).size, 7);
+  assert.equal(new Set(BUILTIN_ROLE_PRESETS.map((spec) => spec.id)).size, 9);
   for (const spec of ALL_BUILTIN_ROLE_PRESETS) {
     const parsed = parseRolePresetComposition(spec.cordisYml);
     assert.ok(parsed.rowIds.includes("persona"), spec.id);
@@ -170,6 +170,8 @@ test("catalog has seven versioned specs plus three explicit legacy specs", () =>
     investigator: { requiredPayloadFields: ["symptom", "reproduction", "rootCause", "repairScope", "knownRisks"], requiredEvidenceKinds: ["report", "test", "message", "file"] },
     verifier: { requiredPayloadFields: ["command", "exit", "scope", "evidenceRefs", "unexecuted"], requiredEvidenceKinds: ["test", "diff", "report"] },
     architect: { requiredPayloadFields: ["decisionQuestion", "alternatives", "recommendation", "tradeoffs", "constraints", "migrationImpact", "unknowns"], requiredEvidenceKinds: ["report", "file", "url"] },
+    planner: { requiredPayloadFields: ["taskCardPath", "context", "changedFiles", "acceptanceCriteria", "verificationSteps"], requiredEvidenceKinds: ["report", "file"] },
+    oracle: { requiredPayloadFields: ["summary", "artifactRefs", "knownRisks"], requiredEvidenceKinds: ["report", "message"] },
     researcher: { requiredPayloadFields: ["sourceRefs", "facts", "unknowns", "factInference", "nextQuestions"], requiredEvidenceKinds: ["url", "file", "report"] },
     "hardening-auditor": {
       requiredPayloadFields: ["fingerprint", "asset", "location", "impact", "severity", "fix", "reproductionOrWhyNot"],
@@ -185,7 +187,7 @@ test("artifact installation is create-if-absent, idempotent, and preserves user 
   const root = await mkdtemp(join(tmpdir(), "orchestra-role-artifacts-"));
   try {
     const first = await ensureBuiltinRolePresetArtifacts(root);
-    assert.equal(first.length, 10);
+    assert.equal(first.length, 12);
     assert.equal(first.every((entry) => entry.status !== "failed"), true);
     const reviewer = BUILTIN_ROLE_PRESETS.find((spec) => spec.role === "reviewer");
     assert.ok(reviewer);

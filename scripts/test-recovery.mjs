@@ -365,6 +365,38 @@ test("activate three branches: live reused, missing replaced with history, persi
   });
 });
 
+test("activate leaves a RESERVED role reserved: no session is created for a lane nobody asked to start", async () => {
+  await withTempFs(async (fs) => {
+    await fs.seed(
+      "orchestra/archive/team-recovery-100-restore.json",
+      activateSnapshot({
+        roles: [
+          { id: "reviewer", name: "Reviewer", sessionId: "session-reviewer", sessionHistory: [], preset: "orchestra-reviewer", sandbox: "read-only", reportCount: 0, lastReport: null },
+          // A lane that was planned (an added lane, or a charter role never
+          // dispatched) and must stay a seat after reactivation.
+          { id: "wordsmith", name: "Wordsmith", sessionId: "session-wordsmith", sessionHistory: [], preset: "orchestra-implementer", sandbox: "workspace-write", reportCount: 0, lastReport: null, phase: "reserved" },
+        ],
+      }),
+    );
+    const activeStore = createActiveTeamStateStore(fs);
+    const archiveStore = createArchiveStore(fs);
+    const { ctx } = activateContext(fs, { persistedSessions: { "session-reviewer": { id: "session-reviewer" } } });
+    const events = [];
+    const result = await activateArchivedTeam(ctx, activeStore, archiveStore, { archiveId: "team-recovery-100-restore" }, exec, activateDeps(events));
+
+    const byRole = Object.fromEntries(result.roles.map((role) => [role.role_id, role]));
+    assert.equal(byRole.wordsmith.action, "kept-reserved", "a reserved lane must not be materialized by reactivation");
+    assert.equal(byRole.wordsmith.sessionId, "session-wordsmith", "the reserved seat keeps its pre-allocated identity");
+    assert.equal(events.some((entry) => String(entry).includes("session-wordsmith")), false, "no session may be created for a reserved lane");
+
+    const observation = await activeStore.read(cwd);
+    assert.equal(observation.kind, "ready");
+    const wordsmith = observation.team.roles.find((role) => role.id === "wordsmith");
+    assert.equal(wordsmith.phase, "reserved");
+    assert.deepEqual(wordsmith.sessionHistory, [], "a reserved lane is not a lost session and grows no replacement history");
+  });
+});
+
 test("activate live branch reuses the existing session and keeps its mapping", async () => {
   await withTempFs(async (fs) => {
     await fs.seed("orchestra/archive/team-recovery-100-restore.json", activateSnapshot());

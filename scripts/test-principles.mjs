@@ -42,8 +42,8 @@ test("the principles reach the driver on both surfaces", () => {
   assert.equal(section.text, PRINCIPLES_SECTION_TEXT);
   // The always-on half must stay small: it is paid for on every request of
   // every session, so it carries decisions rather than their reasoning.
-  assert.ok(section.text.length < 3000, `always-on principles section is ${section.text.length} chars`);
-  for (const rule of ["GRAPH", "NODES", "BACKEND", "EDGES", "AUTHORITY", "UNATTENDED"]) {
+  assert.ok(section.text.length < 3500, `always-on principles section is ${section.text.length} chars`);
+  for (const rule of ["GRAPH", "NODES", "RIGHT-SIZE", "BACKEND", "EDGES", "AUTHORITY", "UNATTENDED"]) {
     assert.ok(section.text.includes(rule), `the section must state the ${rule} rule`);
   }
   // The one rule whose violation is a safety bug rather than a style problem.

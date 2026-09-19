@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createActiveTeamStateStore, normalizeTeam } from "../lib/orchestra-state.js";
 import { blueprintStoreFor, parseGovernedBlueprint, prepareGovernedBlueprint } from "../lib/session-blueprint.js";
 import { charterRecordStoreFor } from "../lib/charter-store.js";
-import { assertUniqueGovernedSessionIds, createGovernedTeam, prepareGovernedRolePlan, provisionGovernedPlans, abbreviateMissionObjective, roleSessionTitle } from "../lib/orchestra.js";
+import { assertUniqueGovernedSessionIds, createGovernedTeam, dispatchRoleTask, prepareGovernedRolePlan, provisionGovernedPlans, abbreviateMissionObjective, roleSessionTitle } from "../lib/orchestra.js";
 import { preflightGovernedRequiredTools } from "../lib/session-blueprint.js";
 import { prepareApprovalEvent, prepareDraftEvent, prepareFreezeEvent } from "../lib/orchestration-charter.js";
 
@@ -581,22 +581,20 @@ test("actual orchestra_create preserves durable one-to-one mappings for a/b and 
   assert.equal(observed.team.document?.currentCharterRevision, 1);
   assert.equal(observed.team.graphRuntime?.charterRevision, 1);
   assert.equal(observed.team.graphRuntime?.runtimeRevision, 0);
-  assert.deepEqual(observed.team.roles.map((role) => role.phase), ["active", "active"]);
+  assert.deepEqual(observed.team.roles.map((role) => role.phase), ["reserved", "reserved"]);
   const mapping = new Map(observed.team.roles.map((role) => [role.id, role.sessionId]));
   assert.equal(mapping.size, 2);
   assert.notEqual(mapping.get("a/b"), mapping.get("a-b"));
   assert.deepEqual(result.roles.map((role) => [role.id, role.sessionId]), [...mapping.entries()]);
-  const phaseVectors = runtime.fs.stateSnapshots.map((snapshot) => snapshot.roles.map((role) => role.phase));
-  assert.equal(runtime.fs.stateSnapshots[0].document?.charterStatus, "frozen");
-  assert.equal(runtime.fs.stateSnapshots[0].graphRuntime?.runtimeRevision, 0);
-  assert.equal(phaseVectors[0].every((phase) => phase === "reserved"), true);
-  assert.equal(phaseVectors.some((phases) => phases.includes("provisioning")), true);
-  assert.equal(phaseVectors.at(-1).every((phase) => phase === "active"), true);
-  for (const snapshot of runtime.fs.stateSnapshots) {
-    assert.deepEqual(new Map(snapshot.roles.map((role) => [role.id, role.sessionId])), mapping);
-  }
   assert.ok(runtime.events.filter((entry) => entry === "state:createIfAbsent").length === 1);
-  assert.ok(runtime.events.filter((entry) => entry === "state:replaceIfVersion").length >= 5);
+
+  // Lazy materialization via orchestra_dispatch
+  await dispatchRoleTask(runtime.context, runtime.store, { agent: runtime.controller }, { roleId: "a/b", task: "do work a" });
+  await dispatchRoleTask(runtime.context, runtime.store, { agent: runtime.controller }, { roleId: "a-b", task: "do work b" });
+
+  const activeObserved = await runtime.store.read(cwd);
+  assert.equal(activeObserved.kind, "ready");
+  assert.deepEqual(activeObserved.team.roles.map((role) => role.phase), ["active", "active"]);
 });
 
 test("transaction reserves all mappings before create, flushes before active CAS, and cleans failed roles", async () => {
