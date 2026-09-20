@@ -60,8 +60,19 @@ export function installModelOverride(
 /** Cordis plugin name used by loader diagnostics. */
 export const name = "orchestra-a2a";
 
-/** Required services: live agent registry, in-memory session store, timer. */
-export const inject = ["agents", "sessions", "timer", "tools"];
+/**
+ * Required services: live agent registry, in-memory session store, timer, and the
+ * tool registry.
+ *
+ * `sandboxPolicy` is here because `sendRawA2A` resolves the escrow write policy
+ * from it (`ctx.sandboxPolicy.resolve({ session, mode: "workspace-write" })`) so a
+ * read-only role can still hand in a receipt. Reading a service that is not
+ * declared makes Cordis' context proxy throw `cannot get property "sandboxPolicy"
+ * without inject`, and `?.` does not swallow it — which is exactly the failure
+ * `docs/gate-round2-fixes.md` §5.2 registered as D4's first case. Declaring it is
+ * what makes the dependency visible instead of accidental.
+ */
+export const inject = ["agents", "sessions", "timer", "tools", "sandboxPolicy"];
 
 /** A preset resolved to a concrete composition file (spec §5.3). */
 export interface ResolvedPresetFile {
@@ -525,7 +536,11 @@ export async function readSessionText(
   return {
     sessionId,
     total_turns: totalTurns,
-    returned_turns: returnedTurns > 0 ? returnedTurns : undefined,
+    // Omit rather than set `undefined`: a literally-`undefined` field fails
+    // DSH's `snapshotJsonValue` round trip, which turns the whole `a2a_read`
+    // call into `value is not lossless JSON`. `returned_turns` is optional in
+    // the output schema, and its absence already means "nothing returned".
+    ...(returnedTurns > 0 ? { returned_turns: returnedTurns } : {}),
     messages: pickedMessages.map((entry) => ({
       role: entry.role,
       turn: entry.turn,
@@ -784,8 +799,16 @@ export async function listThreads(
       cwd: agent.session?.header?.cwd,
       status: statusStr,
       live: true,
-      lastActivityMs: lastTime,
-      lastActivity: lastTime !== undefined ? formatRelativeTime(Math.max(0, now - lastTime)) : undefined,
+      // Omit rather than set `undefined`. DSH runs `snapshotJsonValue` over every
+      // tool result before it is returned, and a field whose value is literally
+      // `undefined` fails the JSON round trip — `snapshotToolValue` then throws
+      // `value is not lossless JSON` and the model gets an error instead of data.
+      // Both keys are optional in `a2a_list`'s output schema, so omitting them is
+      // the declared shape. This is the same
+      // `...(x === undefined ? {} : { x })` idiom already used for
+      // `title` / `role` / `createdAt` below.
+      ...(lastTime === undefined ? {} : { lastActivityMs: lastTime }),
+      ...(lastTime === undefined ? {} : { lastActivity: formatRelativeTime(Math.max(0, now - lastTime)) }),
       ...(agentTitle !== undefined ? { title: agentTitle } : {}),
       ...(agentRole !== undefined ? { role: agentRole } : {}),
       ...(asTimestamp(agent.session?.header?.createdAt) === undefined

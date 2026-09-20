@@ -12,6 +12,7 @@ import {
   renderRolePresetComposition,
   resolveRolePresetFile,
   validateAllRolePresetSpecs,
+  validateRolePresetSpec,
 } from "../lib/orchestra-role-presets.js";
 import { blueprintStoreFor, prepareGovernedBlueprint, preflightGovernedRequiredTools, SessionBlueprintError } from "../lib/session-blueprint.js";
 import { prepareGovernedRolePlan } from "../lib/orchestra.js";
@@ -181,6 +182,35 @@ test("catalog has nine versioned specs plus three explicit legacy specs", () => 
     },
   };
   for (const spec of BUILTIN_ROLE_PRESETS) assert.deepEqual(spec.reportHandoff, expectedHandoffs[spec.role], spec.id);
+});
+
+// E4 (plan §1 E4 / `docs/plan-0.8.0-execution.md` §11 G-P0 ⑧, F9 + F12).
+// Zero implementation delta: `danger-full-access` was already never a legal role
+// default (`orchestra-role-presets.ts` `validateRolePresetSpec`), but no test
+// covered it. These two assertions are the missing coverage, not a new rule.
+// Applicable boundary: the ROLE PRESET validator only. This says nothing about
+// `orchestra_add_lanes`'s tool-surface validation (a different function, already
+// covered by scripts/test-add-lanes.mjs) — do not generalise it to "all specs".
+test("E4: role preset validator refuses danger-full-access and any non-workspace-write permission default", () => {
+  // A genuinely valid spec: `validateAllRolePresetSpecs()` is empty (asserted above),
+  // so each builtin is a clean baseline to mutate one field at a time.
+  const baseline = BUILTIN_ROLE_PRESETS.find((spec) => spec.role === "implementer");
+  assert.ok(baseline);
+  assert.deepEqual(validateRolePresetSpec({ ...baseline }), []);
+
+  const fullAccess = validateRolePresetSpec({ ...baseline, sandbox: "danger-full-access" });
+  assert.ok(
+    fullAccess.includes("danger-full-access is not a role default"),
+    "spec.sandbox === \"danger-full-access\" must raise invalid_spec, got: " + JSON.stringify(fullAccess),
+  );
+
+  for (const permissionPreset of ["read-only", "danger-full-access", ""]) {
+    const problems = validateRolePresetSpec({ ...baseline, permissionPreset });
+    assert.ok(
+      problems.includes("role default permission must be workspace-write"),
+      "spec.permissionPreset === " + JSON.stringify(permissionPreset) + " must raise invalid_spec, got: " + JSON.stringify(problems),
+    );
+  }
 });
 
 test("artifact installation is create-if-absent, idempotent, and preserves user bytes", async () => {
