@@ -27,7 +27,7 @@ import type {} from "@deepseek-ai/dsh-sandbox-policy";
 import type {} from "@deepseek-ai/dsh-permission-presets";
 import type {} from "@deepseek-ai/dsh-system-prompt";
 import type {} from "@deepseek-ai/dsh-commands";
-import { createSession, installModelOverride, deliverMessage, readDeliveryReceipt, transportStores } from "./a2a.js";
+import { buildRoleSession, createSession, installModelOverride, deliverMessage, readDeliveryReceipt, transportStores } from "./a2a.js";
 import { receiptStoreFor } from "./receipt-store.js";
 import { charterRecordStoreFor } from "./charter-store.js";
 import type { ResolvedPresetFile } from "./a2a.js";
@@ -2426,7 +2426,6 @@ export async function provisionGovernedPlans(
   const handles: AgentHandle[] = [];
   /** Native children this transaction materialized, released if a later step fails. */
   const subagentChildren: { parent: Agent; childId: string }[] = [];
-  const createRoleSession = dependencies.createSession ?? createSession;
   const deliverRoleWelcome = dependencies.sendRoleWelcome ?? sendRoleWelcome;
   const createRoleSubagent = dependencies.createSubagentNode ?? createSubagentNode;
   const releaseRoleSubagent = dependencies.releaseSubagentNode ?? releaseSubagentNodeDefault;
@@ -2495,12 +2494,13 @@ export async function provisionGovernedPlans(
         continue;
       }
 
-      const created = await createRoleSession(ctx, {
+      const created = await buildRoleSession(ctx, {
+        kind: "create",
         mode: "governed",
         sessionId: plan.sessionId,
         cwd,
         governedBlueprint: plan.blueprint,
-        currentSessionId: exec.agent?.id,
+        createdBySessionId: exec.agent?.id,
         returnHandle: true,
         signal: exec.signal,
       });
@@ -3066,25 +3066,32 @@ async function materializeRole(
     // again rather than permanently failing to materialize.
     let created: { sessionId: string };
     try {
-      created = await createSession(ctx, {
-        cwd,
+      created = await buildRoleSession(ctx, {
+        kind: "create",
         sessionId: role.sessionId,
-        currentSessionId: controller.id,
-        presetId: role.preset ?? undefined,
+        cwd,
+        createdBySessionId: controller.id,
+        // `...(x === undefined ? {} : {x})` rather than passing `undefined`:
+        // a literally-undefined option is a present key, so it defeats
+        // `createSession`'s own `options.provider !== undefined` checks and can
+        // flip the model-route branch. Same defect class D4's guard caught on
+        // tool RETURN values; here it is on the way IN.
+        ...(role.preset === null ? {} : { presetId: role.preset }),
         ...(presetFile !== undefined ? { presetFile } : {}),
         title: roleSessionTitle({ roleId: role.id, missionObjective: team.mission.objective, cwd }),
-        provider: role.model?.provider,
-        model: role.model?.model,
-        reasoningEffort: role.model?.reasoningEffort,
+        ...(role.model?.provider === undefined ? {} : { provider: role.model.provider }),
+        ...(role.model?.model === undefined ? {} : { model: role.model.model }),
+        ...(role.model?.reasoningEffort === undefined ? {} : { reasoningEffort: role.model.reasoningEffort }),
         signal: exec.signal,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (!/already exists/i.test(message)) throw error;
-      await ctx.agents.resume({
-        resumeSessionId: SID(role.sessionId),
+      await buildRoleSession(ctx, {
+        kind: "resume",
+        sessionId: role.sessionId,
         ...(role.model === undefined ? {} : { agentOptions: { provider: role.model.provider, model: role.model.model } }),
-      } as never);
+      });
       created = { sessionId: role.sessionId };
     }
 
@@ -3499,15 +3506,21 @@ export async function activateArchivedTeam(
   const results: ActivateRoleResult[] = [];
   let degraded = false;
   const activationNotice = "The team has been reactivated. You remain under your role discipline: stop/continue as instructed — wait for driver dispatch before starting new work.";
-  const createRoleSession = dependencies.createSession ?? createSession;
+  // Both seams are preserved (scripts/test-recovery.mjs injects them) but their
+  // DEFAULTS now route through `buildRoleSession`, so this path no longer owns a
+  // second way to build or resume a session. `resumeRoleSession` used to wrap
+  // `agentCtx.agents.resume(...)` inline; that call now lives in
+  // `buildRoleSession` alone, which is what S1's criterion 2 lands on.
+  const createRoleSession = dependencies.createSession ?? (async (agentCtx: Context, options: Parameters<typeof buildRoleSession>[1]) => buildRoleSession(agentCtx, options));
   const deliverRoleWelcome = dependencies.sendRoleWelcome ?? sendRoleWelcome;
-  const resumeRoleSession = dependencies.resumeAgent ?? (async (agentCtx: Context, options: ActivateResumeOptions): Promise<void> => {
-    await agentCtx.agents.resume({
-      resumeSessionId: options.resumeSessionId,
+  const resumeRoleSession = dependencies.resumeAgent ?? (async (agentCtx: Context, options: ActivateResumeOptions): Promise<unknown> => {
+    return buildRoleSession(agentCtx, {
+      kind: "resume",
+      sessionId: String(options.resumeSessionId),
       ...(options.agentOptions === undefined ? {} : { agentOptions: options.agentOptions }),
       ...(options.setup === undefined ? {} : { setup: options.setup }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
-    } as never);
+    });
   });
   for (const role of newTeam.roles) {
     // Step 5-0: a role that was never materialized stays that way.
@@ -3560,12 +3573,14 @@ export async function activateArchivedTeam(
           role.preset === null ? undefined : await resolvePresetFile(ctx, cwd, role.preset);
         const roleModel = role.model;
         const created = await createRoleSession(ctx, {
+          kind: "create",
+          sessionId: role.sessionId,
           cwd,
           ...(presetFile === undefined ? {} : { presetFile }),
           ...(roleModel === undefined || roleModel.provider === undefined || roleModel.model === undefined
             ? {}
             : { provider: roleModel.provider, model: roleModel.model, reasoningEffort: roleModel.reasoningEffort }),
-          currentSessionId: exec.agent.id,
+          createdBySessionId: exec.agent.id,
           title: roleSessionTitle({ roleId: role.id, missionObjective: newTeam.mission.objective, cwd }),
           signal: exec.signal,
         });

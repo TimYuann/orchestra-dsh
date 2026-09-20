@@ -56,6 +56,10 @@
 
 **E-1 的 G-S 回归**：`npm run typecheck` 0；`npm test` → **254 pass / 0 fail**（基线 248 + E4 1 + D4 5）。
 
+| E-3 | **S1a** | **P0-S1a** 三条建会话路径各自为政（首波带 blueprint / 懒加载无 blueprint 无 setup / 重激活 setup 仅当 presetFile 存在） | **已收口**：四条调用点（三条路径）全部经 `buildRoleSession`；`orchestra.ts` 零 `agents.resume`；`a2a.ts` 仅入口内一处 | `src/a2a.ts`、`src/orchestra.ts`、`scripts/test-role-session-single-path.mjs`；`docs/p0-report-s1a.md` |
+| E-3 | **S1a 关联缺陷** | **P0-S1a-2** 懒加载路径把 `provider`/`model`/`reasoningEffort`/`presetId` 以 `undefined` 值**当键**传给 `createSession` ⇒ 打不中下游 `!== undefined` 判据 | **已修**（改为按需展开）；**与 D4 是同一缺陷类**：D4 是返回值、这里是入参 | `src/orchestra.ts`；`docs/p0-report-s1a.md` §3 |
+| E-3 | **S1a 未达成项** | **P0-S1a-3** S1 判据 ①③（三路径 setup 同函数 / blueprint 记录字段集相同） | **未达成**——属 **S1b**（两个 `prepare*Blueprint` 收敛）；现在写断言会失败 | `docs/p0-report-s1a.md` §1 / §4 |
+
 ## 5. 批 1 的 G-P0 判定形态（driver 裁定，2026-09-20）
 
 **判据 ①②③⑤⑥⑦⑧⑨ 各自命中期望码；④ 显式延后（landing = 批 2 / G-P2）。**

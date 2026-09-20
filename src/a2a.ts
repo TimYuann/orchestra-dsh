@@ -299,6 +299,8 @@ export interface BuildRoleSessionSpec {
   /** Only for `kind: "resume"`: the setup to run, and the model options to apply. */
   setup?: (agentCtx: Context) => Promise<void>;
   agentOptions?: Record<string, unknown>;
+  /** Only the first-wave path needs this: it rolls back sessions it already started. */
+  returnHandle?: boolean;
   signal?: AbortSignal;
 }
 
@@ -306,6 +308,13 @@ export interface BuildRoleSessionResult {
   sessionId: string;
   /** Present only for `mode: "governed"` — the receipt the team record stores. */
   governedReceipt?: GovernedBlueprintReceipt;
+  /**
+   * Present only for `kind: "create"` on a path that asked for it. The first-wave
+   * path is the only caller that collects handles: it is the one that has to be
+   * able to roll back sessions it already started when a later lane fails, so the
+   * handle has to survive the move onto this entry point.
+   */
+  handle?: AgentHandle;
 }
 
 export async function buildRoleSession(ctx: Context, spec: BuildRoleSessionSpec): Promise<BuildRoleSessionResult> {
@@ -326,6 +335,7 @@ export async function buildRoleSession(ctx: Context, spec: BuildRoleSessionSpec)
           ...(spec.cwd === undefined ? {} : { cwd: spec.cwd }),
           governedBlueprint: spec.governedBlueprint,
           ...(spec.createdBySessionId === undefined ? {} : { currentSessionId: spec.createdBySessionId }),
+          ...(spec.returnHandle === true ? { returnHandle: true } : {}),
           ...(spec.signal === undefined ? {} : { signal: spec.signal }),
         })
       : await createSession(ctx, {
@@ -347,6 +357,7 @@ export async function buildRoleSession(ctx: Context, spec: BuildRoleSessionSpec)
   return {
     sessionId: created.sessionId,
     ...(created.governedBlueprint === undefined ? {} : { governedReceipt: created.governedBlueprint }),
+    ...(created.handle === undefined ? {} : { handle: created.handle }),
   };
 }
 

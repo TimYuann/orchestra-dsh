@@ -1,0 +1,206 @@
+/**
+ * S1: every role-session lifecycle path goes through ONE entry point.
+ *
+ * ## What this proves, and what it deliberately does not
+ *
+ * The plan's S1 criterion 2 has two halves, and they land at different times:
+ *
+ *  - **now**: all three role-session paths call `buildRoleSession`, and
+ *    `ctx.agents.resume(` exists in exactly one place — inside that function, in
+ *    `src/a2a.ts`. (`src/a2a-transport.ts` still owns its own `resume`; that is
+ *    S2's, and the全仓 form of this criterion only holds once S2 lands.)
+ *  - **after S2**: the repository-wide "only one call site" form.
+ *
+ * This file asserts the "now" form and labels it as such, so nobody can read it
+ * as the S2 form.
+ *
+ * ## Why it is built from two halves
+ *
+ * The three paths can only be driven for real inside a live DSH (they provision
+ * sessions, presets and approvals), so a purely behavioural test would need a
+ * fixture harness that would itself be the thing under test. Instead:
+ *
+ *  - **behaviourally**, `buildRoleSession` is driven through its three spec shapes
+ *    against a recording context, asserting which engine primitive each shape
+ *    reaches (`agents.create` vs `agents.resume`). This is what makes it the
+ *    single funnel: a path that bypassed it would reach the engine some other way.
+ *  - **structurally**, the three call sites in `src/orchestra.ts` are read and
+ *    asserted to spell `buildRoleSession(` rather than the primitives, and the
+ *    primitive count is asserted. Without this half the test would pass on a
+ *    tree where nothing calls the entry point at all.
+ */
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { buildRoleSession } from "../lib/a2a.js";
+
+const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+function session(id, cwd = "/role-workspace") {
+  return {
+    id,
+    header: { id, cwd, agentPreset: "preset" },
+    inheritedEventCount: 0,
+    events: [],
+    snapshotEvents() {
+      return this.events;
+    },
+    append(type, data) {
+      this.events.push({ type, data, seq: this.events.length, time: Date.now() });
+    },
+  };
+}
+
+/**
+ * A recording context. `calls` is the point of the whole file: it records WHICH
+ * engine primitive each spec shape reaches, so a shape that silently stopped
+ * going through the entry point would show up as a missing or misrouted call.
+ */
+function recordingContext() {
+  const calls = [];
+  const agents = new Map();
+  const sessions = new Map();
+  const ctx = {
+    calls,
+    agents: {
+      get: (id) => agents.get(String(id)),
+      list: () => [...agents.values()],
+      async create(options) {
+        calls.push({ primitive: "agents.create", options });
+        const target = session(String(options.sessionId));
+        sessions.set(target.id, target);
+        const agent = { id: target.id, session: target, status: "idle" };
+        agents.set(target.id, agent);
+        return { agent, async dispose() { agents.delete(target.id); } };
+      },
+      async resume(options) {
+        calls.push({ primitive: "agents.resume", options });
+        return {};
+      },
+    },
+    sessions: { get: (id) => sessions.get(String(id)) },
+    get: () => undefined,
+  };
+  return { ctx, calls };
+}
+
+// ---------------------------------------------------------------------------
+// Behavioural half: the entry point funnels on to the right engine primitive
+// ---------------------------------------------------------------------------
+
+test("S1: buildRoleSession routes each spec shape to the engine primitive it declares", async () => {
+  // `kind: "resume"` must reach `agents.resume` and only that.
+  {
+    const { ctx, calls } = recordingContext();
+    const result = await buildRoleSession(ctx, {
+      kind: "resume",
+      sessionId: "role-A",
+      agentOptions: { provider: "p", model: "m" },
+    });
+    assert.equal(result.sessionId, "role-A");
+    assert.deepEqual(calls.map((entry) => entry.primitive), ["agents.resume"]);
+    assert.equal(String(calls[0].options.resumeSessionId), "role-A");
+    assert.deepEqual(calls[0].options.agentOptions, { provider: "p", model: "m" });
+  }
+
+  // `kind: "create"` with `mode: "governed"` must reach `agents.create` carrying
+  // the prepared blueprint, and must surface the receipt AND the handle — the
+  // handle is what the first-wave rollback path needs.
+  {
+    const { ctx, calls } = recordingContext();
+    const blueprint = {
+      agentOptions: { provider: "p", model: "m" },
+      setup: async () => {},
+      receipt: { mode: "governed", sessionId: "role-B", agentPreset: "orchestra-v04-implementer-v1" },
+      meta: { cwd: "/role-workspace", agentPreset: "orchestra-v04-implementer-v1" },
+    };
+    const result = await buildRoleSession(ctx, {
+      kind: "create",
+      mode: "governed",
+      sessionId: "role-B",
+      cwd: "/role-workspace",
+      governedBlueprint: blueprint,
+      returnHandle: true,
+    });
+    assert.deepEqual(calls.map((entry) => entry.primitive), ["agents.create"]);
+    assert.equal(result.sessionId, "role-B");
+    assert.notEqual(result.governedReceipt, undefined, "the governed receipt must survive the funnel");
+    assert.notEqual(result.handle, undefined, "the first-wave handle must survive the funnel");
+  }
+
+  // Omitting `returnHandle` must NOT produce a handle: the lazy and reactivation
+  // paths do not collect one, and silently adding it would change their contract.
+  {
+    const { ctx } = recordingContext();
+    const result = await buildRoleSession(ctx, {
+      kind: "create",
+      mode: "governed",
+      sessionId: "role-C",
+      governedBlueprint: {
+        sessionId: "role-C",
+        agentOptions: {},
+        setup: async () => {},
+        receipt: { mode: "governed", sessionId: "role-C", agentPreset: "p" },
+        meta: { cwd: "/w", agentPreset: "p" },
+      },
+    });
+    assert.equal(result.handle, undefined);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Structural half: the S1 call sites, read from source
+// ---------------------------------------------------------------------------
+
+test("S1 (now-form): the three role-session paths call buildRoleSession, and orchestra.ts owns no resume", async () => {
+  const orchestra = await readFile(join(REPO, "src", "orchestra.ts"), "utf8");
+  const a2a = await readFile(join(REPO, "src", "a2a.ts"), "utf8");
+
+  // 1. `agents.resume(` is gone from orchestra.ts entirely: both the lazy-fallback
+  //    resume and the reactivation resume wrapper now funnel through the entry.
+  const orchestraResumes = orchestra.split("\n").filter((line) => /agents\.resume\(/.test(line) && !line.trimStart().startsWith("//"));
+  assert.deepEqual(orchestraResumes, [], "orchestra.ts must not call agents.resume directly");
+
+  // 2. In a2a.ts it appears exactly once as a CALL (the other hits are prose).
+  const a2aResumeCalls = a2a.split("\n").filter((line) => /^\s*await ctx\.agents\.resume\(/.test(line));
+  assert.equal(a2aResumeCalls.length, 1, "a2a.ts must call agents.resume exactly once, inside buildRoleSession");
+
+  // 3. All three paths spell the entry point. The first wave and the reactivation
+  //    replacement create governed sessions; the lazy fallback and the
+  //    reactivation resume use kind:"resume" / the plain create shape.
+  // FOUR call sites across the three paths, because the lazy path has two: the
+  // create attempt and the `already exists` resume fallback.
+  //   2497 first wave (governed create)      3069 lazy create
+  //   3090 lazy resume fallback              3575 reactivation replacement create
+  const orchestrasEntryPoints = orchestra.split("\n").filter((line) => /await (createRoleSession|buildRoleSession)\(ctx, \{/.test(line));
+  assert.equal(orchestrasEntryPoints.length, 4, `expected 4 role-session call sites, found ${orchestrasEntryPoints.length}`);
+  // No other way into a session may exist here.
+  assert.deepEqual(
+    orchestra.split("\n").filter((line) => /await createSession\(ctx, \{/.test(line)),
+    [],
+    "orchestra.ts must not call createSession directly — that would bypass the entry point",
+  );
+  // `createRoleSession` in orchestra.ts must itself be defined BY the entry point,
+  // never by `createSession` — that is the difference between "funnels" and "used to funnel".
+  const seam = orchestra.split("\n").find((line) => line.includes("const createRoleSession ="));
+  assert.notEqual(seam, undefined, "the reactivation seam must still exist for the recovery test");
+  assert.match(seam, /buildRoleSession/, "the reactivation seam must default to buildRoleSession, not createSession");
+
+  // 4. The first-wave path must request the handle (it is the rollback owner).
+  assert.ok(orchestra.includes("returnHandle: true"), "the first wave must still collect its rollback handle");
+});
+
+test("S1: the S2 boundary is stated, not silently assumed", async () => {
+  // This test exists so the "全仓 one call site" form cannot be read as already
+  // satisfied. When S2 lands, this assertion flips and the file gets updated.
+  const transport = await readFile(join(REPO, "src", "a2a-transport.ts"), "utf8");
+  const transportResumes = transport.split("\n").filter((line) => /await ctx\.agents\.resume\(/.test(line));
+  assert.equal(
+    transportResumes.length,
+    1,
+    "S2 has NOT landed: a2a-transport.ts still owns its own resume. The repo-wide 'exactly one call site' form of S1 criterion 2 is therefore NOT satisfied yet, and this test says so on purpose.",
+  );
+});
