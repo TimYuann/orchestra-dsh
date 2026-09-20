@@ -740,3 +740,51 @@ Ego space 30 **复用未新建、未 finish**；产品代码**未改**。
 **环路**：driver 设计测试 → verifier 取证 → verifier 把问题带回 driver → driver 定性并给修复方案 → implementer 修复 → 回到 driver。
 **所有边经 driver（星形）**；Owner 是传输层与最终决策者（范围/资源/放行）。
 **driver 第 1 任（本 session）退休**，交接以 handoff prompt 形式给出（状态、读链、方法学工具箱、现行口径、裁定 S、下一轮任务）。
+
+---
+
+## 23. 第 10 轮（N7 live 一次性 fixture）的 driver 复核与三条裁定（2026-09-21）
+
+**候选**：commit `17b200f`（**docs-only**：`docs/p0-report-n7-oneshot-fixture.md`，215 行；`git show --stat` 已核）。产品代码零改动（已核）。通道自报 = Ego lite space 31。
+
+### 接受的部分（driver 独立复核，不采信自述）
+| 项 | 它的读数 | driver 复核 |
+|---|---|---|
+| 硬前提 A（4600 换 HEAD 构建） | pack + sync + 等价性核验 | ✅ **我自己重核**：`~/.dsh/profiles/dev/node_modules/orchestra-dsh/lib/orchestra.js` 与仓库 `lib/orchestra.js` **sha256 同为 `c469b7245bf7b549…`**、`diff` 为空；§18 修复符号在位（`milestone: "materialization-failed"` ×1，旧 `reason: "materialization-failed"` ×0）。**本轮开始时我实测 profile 仍是 `03a374f1…`（旧构建）** ⇒ 它确实做了 pack+sync。 |
+| profile 完整性 | 三件套 | ✅ 我自己核：`@deepseek-ai/` 下只有 `cosmokit`/`schemastery`；`dsh-trinity` 行与 bundle 行**未动**（`package.json:9,10,16`）。 |
+| 硬前提 B（名册根） | 12/12 + 五行负对照 | 接受其读数（**driver 未重跑**，诚实边界：本轮我只核了它与 `--dump-config` 的一致性，未复跑探针）。 |
+| **段 A**（懒加载物化 + 角色用上组合工具） | 11 次 tool/call 全 ok | ✅ **driver 独立解码复核**（`scripts/check-session-readable.mjs` 的 `readStoredEvents`）：日志 `~/.dsh/sessions/--Users-yuantian-…-orchestra_N7--/orchestra-team-33be3b56-467d49e7-1312-482b-bf98-d69d158ba92f/session.v3.jsonl.zstd`，**103,259 B，mtime `Sep 21 04:30:10`**；`header.agentPreset = "orchestra-v04-reviewer-v1"`、`version 3`、`cwd` = fixture；事件 67；`tool/call 12` / `tool/result 11` / **`isError 0`**；调用名 = `read`×2 + `bash`×10。 |
+| fixture 团队与 E2E 未受损 | — | ✅ `team-33be3b56 status=active`、controller `session-b971f783…`、唯一角色 phase=active 且 sessionId 指向盘上确实存在的会话；`orchestra_E2E/orchestra/state/team.json` sha `5b8efdf9…`、mtime `Sep 19 15:18`（未动）。 |
+
+### ★ 驳回：它那条"盘上 log 被 GC／只有被 App 连续跟随的会话才落盘"的**阻断主张**（裁定 T）
+driver 实测（同一路径、普通 shell、只读）：四个会话的 `session.v3.jsonl.zstd` **全部在盘上**，且 mtime 不晚于其报告时点 ——
+`session-4289d06b…` **119,077 B @ 04:04:51**（**正是它声称"随后消失"的那个文件**）、`session-b971f783…` 413,424 B @ 04:23:14、reviewer 103,259 B @ 04:30:10、`session-5ec3a0c3…` 360 B @ 03:52:11；整个 slug 目录（`--Users-yuantian-…-orchestra_N7--`）也在。
+⇒ 它的"消失"**不可复现**，判为**探针/读法错误**（与它自己登记的 `_request`/`request` 误判同族），**不是存储层行为**。
+⇒ **段 B 并未被阻断**：同一个 fixture（团队、角色 sessionId、盘上日志都在）仍可跨重启取证。分层归因：**错在取证侧，不在产品侧**。
+⇒ **审查轮计数 +0**（E 类卡住里的错误读数，不是对契约的设计异议）；但教训固化见文末。
+
+### ★ driver 新发现（不在它的报告里：四条，全部带符号锚点）
+- **F-N7-1｜G-P0 ① 目前是"分支不覆盖"的绿灯。** `scripts/verify-role-identity.mjs` 的"记录的组合"cross-check 读 `role.blueprint?.compositionRowIds`，而 team 记录的 blueprint 形状是 `compositionTools` / `orchestraTools` / `tools` 三个 `{names, count}` 对象（`src/orchestra-state.ts` 的 `TeamRoleBlueprintFacts`）⇒ `recordedRows/recordedTools` **恒为 `undefined`**、`crossChecked` 恒 false ⇒ **该分支永远不会失败**，`(no recorded composition to cross-check)` 恒被打印（实测输出即如此）。**§4.7 步 4⑤（与插件写的"预期组合"逐项比对）当前没有任何东西在比对。**
+- **F-N7-2｜持久化的"预期组合"是空的 ⇒ D1 ③ 在记录上未兑现。** `src/orchestra.ts` 的 `reservedRole()` 在**预留时**就把 `roleBlueprintFacts(receipt)` 写进 team 记录，而三个 readiness 对象只在 `src/session-blueprint.ts` 的 setup `commit()` 里被填（`readiness.names = names` 等）⇒ 记录里恒为 `{names: [], count: 0}`；`materializeRole` 的成功分支写回的是 `{...r, phase: "active"}`，**不刷新 blueprint**。实测 N7 fixture `team.json` 的 role.blueprint：`compositionTools {names:[],count:0}` / `orchestraTools {names:[],count:0}` / `tools {names:[],count:0}`。⇒ **移交时那句"未做 = 只有 D1 的 live 半边"不准确，须更正**：D1 ③（"blueprint 记录写'预期组合'（行 id 集 + 工具名集）"）在**持久化记录**上未兑现，且它与 ① 的诚实性是同一件事的两半。
+- **F-N7-3｜`orchestra/blueprints/` 在两个 fixture 里都不存在**（N7 只有 `charter/`+`state/`；`orchestra_E2E` 只有 `archive/ charter/ reports/ state/ tasks/`）⇒ marker 文件（`BLUEPRINT_DIRECTORY = "orchestra/blueprints"`）的去向**未归因**。插件自己的注释说"无 `fs` 服务时 store 退化为进程内 ⇒ 冷恢复回退 header 的 preset 投影"，但 charter 记录能落盘、`resolveRecordFileSystem` 与 charter-store 同源（`ctx.get("fs")`）⇒ **不得写成"没写"，也不得写成"写了"**，需归因。
+- **F-N7-4｜现场物证：懒加载路径的回合真的悬挂了**（D2 的已知缺口，**不是新缺陷**，但是 D2-a 步骤 5"反例校准"的天然素材）。reviewer 日志 seq=2 `approval/policy: "ask"`（**未钉 `never`**）；最后一条 `tool/call`（seq 63, `bash`）**没有 result**，紧接 seq=64 `approval/asked`（`reason: "escalate sandbox to workspace-write: …"`）**没有 decided**；**整个会话没有 `turn/end`**，末两条是 `agent/inbox/spliced`。⇒ 只读角色为在 /tmp 造 fixture 提权 → 撞 `ask` → 无人应答 → 回合悬挂。
+
+### 裁定 T｜第 10 轮判定
+硬前提 A/B、名册层、挂载路径层（段 A）**接受**；**段 B 未取得但阻断理由被驳回**；**D1 仍未判定**（恢复路径层无证据）。审查轮计数 **+0**。
+
+### 裁定 U｜F-N7-1 / F-N7-2 是 B 类缺陷，且卡住 G-P0 ① 的诚实性
+① 必须按**分支覆盖**判：cross-check 失效时它只能算**部分绿**（弱 fixture 上的绿灯是假绿 —— §17 的形态在判据脚本自身上重演）。修法**不由执行者自选**：先做**只读归因 + 设计**（裁定 V），再交最小改动。
+
+### 裁定 V｜下一跳 = **analyzer**（该角色的第一个独占任务）
+理由：① F-N7-3 只能靠"读码 + 一手事实 + 可判实验判据"收敛；② S2 的教训（计划里的 API 假设被实测推翻一次：`sessionController.resume` 不存在）说明**改宿主耦合面之前必须先核一手事实**；③ `TeamRoleBlueprintFacts` 是 P0 判据的载体，归因未定时不许动；④ live 轮放在修复之后，可以**一趟同时取**"记录侧"与"恢复侧"，比"现在跑一趟 + 修完再跑一趟"少一轮。
+
+### 顺带固化的两条使用陷阱（后续 brief 必写）
+1. `verify-role-identity.mjs --repo` 必须是**被核工作区的根**（它决定会话存储的 slug），**不是插件源码仓**；driver 自己第一次就传错，而传错时输出的 `NOT_A_ROLE_SESSION` 与 §17 的真缺陷**形态相同**（可诊断，因为失败行里印出它解析到的目录）。
+2. 台账 §7 判据 ① 的具名命令**没有参数**；**可执行形态必须带 `<workspace> <team.json>`**。① 在 N7 fixture 上的实测：`--repo <fixture>` ⇒ `IDENTITY_OK … rows=11 tools=11 (no recorded composition to cross-check)`、**exit 0**；`--self-test` ⇒ 检出 `NOT_A_ROLE_SESSION`、exit 1。
+
+### 本轮 driver 侧执行记录（可复跑）
+```bash
+shasum -a 256 ~/.dsh/profiles/dev/node_modules/orchestra-dsh/lib/orchestra.js lib/orchestra.js   # 同为 c469b724…
+node /tmp/driver-probe-n7.mjs ; node /tmp/driver-probe-n7b.mjs                                    # 解码日志：段 A + 悬挂的 approval
+node scripts/verify-role-identity.mjs --repo ~/Documents/agentWorkspace/artifacts/projects/orchestra_N7 --team <同上>/orchestra/state/team.json  # exit 0
+```
