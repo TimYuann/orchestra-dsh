@@ -501,3 +501,33 @@ history 里的 `session-898f7481-…` 存在。⇒ 幽灵在 `role.sessionId`，
 - **(B) 组合读取**：**先试 (b)** —— 用**宿主 cordis 检查工具在 4600 实例内**读组合（即"用 dev 实例的 agent 去查 dev 实例"）；**(b) 不可行则退 (c)** —— 重启后对同一角色会话**重跑一次真实工具调用**（比 inventory 弱，但**仍能判掉 (c) 恢复路径没带 setup**）。**(a) 不允许**（改产品代码；本轮是取证轮）。
 
 **本轮执行（driver）**：`kill` 掉 4600 上的监听进程，确认端口空闲、4599 未受影响、dev profile 的 `dsh-trinity` 依赖行仍在（只加不改）。
+
+---
+
+## 19. Owner 的三条更正（2026-09-21，driver 记录）
+
+### ① `/team approve` 代敲 = **常规操作，无需声明**
+Owner 明确：**这本身就是无人值守的自动测试**，替用户敲 `/team approve` 是常规操作，**连主动声明都不必要**。
+⇒ **`docs/adr/0009` §3 的"后果"条（"任何替用户批准的动作必须在报告里主动声明"）在无人值守自动测试的语境下作废**；§3 的**授权本身仍然有效**（只在 dev/headless 测试实例上、绝不在 4599 上）。
+**欠账（U11）**：ADR-0009 §3 后果条与 §4 模型条的文字需更新（见下）。driver 不改 ADR（属开发平面编辑任务）。
+
+### ② Ego lite 的使用**无法确认**（driver 实测，不支持其自报）
+它自报 `{ spaceId: 29, label: 'p1', url: 'http://127.0.0.1:4600/' }`。实测：
+- `~/.ego-browser/state/` 里**没有 `space-29.json`**；现有记录最大为 `space-27`（Sep 20 11:59），**全部早于本轮**（已关闭的 space 文件可能被清理，故此项不能单独定论）。
+- 但 **`orchestra_E2E` 工作区确有 4 个会话在近 6 小时内被改动过** ⇒ **它确实在该文件夹里驱动过会话**。
+- Owner 侧的独立观察与此一致：**Ego lite 里看不到被 agent 控制的 space**。
+⇒ **结论：不能确认它用的是 Ego lite**。**下一轮起的硬要求**：测试报告必须给出**可核的 space 证据**（space id + 时间戳，且 Owner 在 Ego lite 里能看到该 space），否则不算无人测试协议已执行。
+
+### ③ 模型：**建议值已经是默认值**；driver 上一轮传了过期约定（driver 的错）
+`~/.dsh/settings.yaml` 实测：
+```yaml
+agent-default-model:
+  provider: step-plan
+  model: step-5-preview
+  reasoningEffort: high
+```
+⇒ Owner 建议的 `step 5 preview / stepfun step plan / 高思考强度` **就是当前默认**，无需额外配置。
+**而 `docs/adr/0009` §4 写的"E2E 模型统一：`provider: command`、`model: deepseek/deepseek-v4.1-flash`、effort `max`"是 2026-09-15 的旧约定、已过期** —— driver 在上一轮 prompt 里**照抄了这条过期约定**（未核 settings），**这是 driver 的错**。
+**欠账（U11）**：ADR-0009 §4 需改为"以 `agent-default-model`（`step-plan` / `step-5-preview` / `reasoningEffort: high`）为准"。
+
+**审查轮计数：+0。**
