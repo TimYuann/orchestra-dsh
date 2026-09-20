@@ -477,3 +477,27 @@ history 里的 `session-898f7481-…` 存在。⇒ 幽灵在 `role.sessionId`，
 无需再批准；工具面校准用的是既存 `standard` 会话。⇒ **ADR-0009 §3 的测试 seam 本轮未被使用**。
 
 **审查轮计数：+0。**
+
+---
+
+## 18. 第 6 轮（N7 live 取证）的 driver 裁定（2026-09-21）
+
+### Part A 归因：**接受，判为当前代码的真缺陷**
+它把 §17 的两条异常合成了一条，且更准：**幽灵在 `role.sessionId`**（`orchestra-team-f01da153-ec3b09cb-…` 磁盘上不存在），history 里那条 `session-898f7481-…` 反而存在。
+三条证据：①`git log -S'materialization-failed'` 只命中 `6bd8d9b`（= 当前 HEAD），此后无改动 ②时间线（三条 `replacedAt` = 2026-09-19T05:32/05:36Z）**就是 v0.5.1 交付当天** ⇒ 旧数据 + 当时的代码 = 当前代码 ③**缺陷不依赖数据即可推导**：失败分支里新会话已建成但**团队状态未前进**（`phase` 回 `reserved`、`sessionId` 未改）⇒ 重试会再建一个，而 `r.sessionId` 始终是同一旧值 ⇒ 同一 id 反复进 history（那两条字节相同、相隔 3 秒即循环指纹）。
+**真实后果**：`role.sessionId` 指向从未落盘的幽灵 ⇒ 按 sessionId 找该角色的路径全指向空；history 被写坏；`reason:"materialization-failed"` 记录了**未发生的事实**（"声明不实"同族）。
+**两条写入点**：写入点 2（重激活替换）**是正确的**（先前进后记旧 id）；**缺陷在写入点 1**（`materializeRole` 失败分支）。
+
+### 裁定 N｜Q3：这条缺陷**进批 1，且是 D1 的阻塞项**（不是"范围外登记"）
+理由不是"顺手修"，而是 **D1 自己的判据过不去**：N7 的验收形态是在**真实 fixture** 上让 `verify-role-identity.mjs` exit 0，而这条缺陷让该 fixture **必然 exit 1**（`# roles 6 ok 4 missing 2`）。弱 fixture 上的 exit 0 已证明是假绿。
+⇒ 它**必须在 D1 之前修掉**，否则 D1 无法被真实验收。
+
+### 裁定 O｜Q2 修法方向：**选 (a)** —— 失败分支**不写 `sessionHistory`**
+因为**没有发生替换**：history 的语义是"被替换掉的旧 id"，而失败分支里 `role.sessionId` 根本没前进。
+- 若确实要留痕"建了但不可用的那个会话"：**记进既有的 `noticeFailures` 字段**（team.json 里已有），**不得新增字段**（无 `fault_ref`）。**(b) 不采纳**——把一个 materialization **失败**的会话推进为角色的 sessionId，会把角色指向半成品。
+
+### 裁定 P｜Q1：进程控制交给你 + 组合读取先试 (b) 后退 (c)
+- **(A) 进程控制**：driver 已**停掉自己起的 4600**（见本轮执行）⇒ 4600 现在空闲。**由测试执行者以受管后台作业自己起**（`dsh --profile dev --port 4600`），这样它能自己停/拉，才叫无人测试。重启窗口不再依赖 Owner。**4599 未被波及。**
+- **(B) 组合读取**：**先试 (b)** —— 用**宿主 cordis 检查工具在 4600 实例内**读组合（即"用 dev 实例的 agent 去查 dev 实例"）；**(b) 不可行则退 (c)** —— 重启后对同一角色会话**重跑一次真实工具调用**（比 inventory 弱，但**仍能判掉 (c) 恢复路径没带 setup**）。**(a) 不允许**（改产品代码；本轮是取证轮）。
+
+**本轮执行（driver）**：`kill` 掉 4600 上的监听进程，确认端口空闲、4599 未受影响、dev profile 的 `dsh-trinity` 依赖行仍在（只加不改）。
