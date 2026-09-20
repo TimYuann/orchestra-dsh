@@ -125,6 +125,16 @@
 | **U7** | §0.2 新增假设 B-5 + §8 风险表 | **UA-7** `dsh-subagent` 新增进程级容量上限（0.1.5-rc.2 无此机制） | **已新增**（本轮唯一新增）：`ActivationPool` 满额抛 `ACTIVATION_LIMIT_REACHED`；默认 `maxDepth: 1` / `maxActiveSubagents: 8`，可由部署 `settings."subagent"` 覆盖；命中面 = `src/subagent-node.ts` 的 `subagents.startContinuable(...)`。**适用边界照抄**：**仅适用于"由 subagent child 承载的节点"**，可见会话承载的节点不受影响；**不得**普遍化为"所有节点都有并发上限"；**不得**因此新增任何机制（**无 `fault_ref`，属"知道即可"**）。风险行 R-18（`maxDepth: 1` 交互待核） | 同上 §0.2 B-5 / §8.1 R-15…R-18 |
 | **U8** | 收尾 | —— | **已记**（本节）；自检：`check-p0-preconditions.mjs` → **`# V1..V10 ok (10/10)`，exit 0**；`npm run typecheck` → **exit 0** | **commit `4e06cee`** —— `docs/plan-0.8.0-execution.md`（U1–U7）+ 本文件 §8（U8） |
 
+### 8.1 U9 · Owner 边界补正（开发期只动 dev，不动 web）
+
+| 项 | 阶段 | 问题 id | 结论 | 落定位置（commit + 文件 + 章节） |
+|---|---|---|---|---|
+| **U9** | 部署边界 | **UA-9** Owner 已裁定「**整个开发只动 dev，不动 web**；4599 是 Owner 的工作环境，开发期不得触碰」——该边界**原始 brief 漏写**（责任在 brief，不在编辑者），故 U1–U8 沿用了旧的"两个 profile"措辞 | **已改**（三处主改 + 四处连带）：①§7.1 文件清单**只保留 dev**，删 web 行、"两个文件"改"**只写 dev**"；②§7.2 **删「重启 web（4599）」整行**；③§0.2 B-2 的 U5 附带事实改为「**web 侧不做**，保持原状 `[]`，本次升级中曾被写入、**已回退**」。**连带**：§4.7 N7 步骤 2 改为**重启 dev 实例、不涉及 4599**；§5.1 `verify-role-presets-roster.mjs` 改为**只验 dev**；§8.1 **R-04** 保留"web 与 dev 都含 `dsh-web-app`"作为**事实描述**并写明**它不构成"两个实例都要改"的依据**；§8.1 **R-14**（4599 重启）标**本项作废、风险消除** | **commit `910985b`** —— `docs/plan-0.8.0-execution.md` §7.1 / §7.2 / §0.2 B-2 / §4.7 / §5.1 / §8.1 |
+
+**回退的可核事实（本机实测）**：`~/.dsh/profiles/web/cordis.patch.yml` 内容 = 模板原样 `[]`（217 B）；mtime `2026-09-20 22:13:24`，**晚于** `~/.dsh/profiles/dev/cordis.patch.yml` 的 `22:04:18`，与"web 曾被写入、随后回退"一致。**编辑者本轮的改动全部在仓库内**（`git show --stat 910985b` = 1 file），未触碰 `~/.dsh/` 下任何文件（沙箱亦不允许：`dsh --dump-config` 曾以 `EPERM ... ~/.dsh/profiles/*/cordis.yml` 失败）。
+
+**自检（U9 后复跑）**：`node scripts/check-p0-preconditions.mjs` → **`# V1..V10 ok (10/10)`，exit 0**（**脚本未改**，依据 = `git show --stat 910985b` 只含计划文件）。
+
 **本轮 commit**：`4e06cee` —— `docs(0.8.0 plan): adapt to DSH 0.1.6-alpha.2 (U1-U8)`（2 文件，+48/−15 于计划；`git show --stat 4e06cee` 可复跑）。
 
 **本轮产出的待核项（4 条，均已进 §8.1 风险表，不得写成现状）**：R-15 `patchReload` 新行为 · R-16 `dsh-bash-sandbox` 失败分类 · R-17 `git merge-base --is-ancestor` 本机可用性 · R-18 `maxDepth: 1` 与拓扑的交互。
