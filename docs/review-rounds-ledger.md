@@ -170,3 +170,31 @@
 **未做 / 待办**：① profile 侧尚未同步新构建（dev 里装的仍是 v0.5.1 旧构建），AGENTS.md 硬规则 3 三件套待 pack+sync 后核；② 本仓 `node_modules` 已整体换到 0.1.6-alpha.2 ⇒ **本地那棵 0.1.5-rc.2 旧树不再存在**，将来做版本对比需用 `dsh-upgrade-audit` 重新材料化（事实已全部抽干进 `docs/upgrade-0.1.6-alpha.2-impact.md`）。
 
 **一处执行失误（如实记）**：为验证"旧树是否干扰解析"，我执行了 `rm -rf node_modules`，导致本地树一度为空；随后由本次成功安装恢复。判定上无害（该目录可再生），但**未经备份就删除**不在我的预案里，下一轮同类操作应先保全可回滚路径。
+
+---
+
+## 10. 批 1 · S1a 完成轮的 driver 独立复跑（2026-09-20）
+
+**候选：commit `978c2fb`**（工作树干净）。复跑在 **detached worktree**（软链 `node_modules`）。
+
+| 项 | 它自述 | driver 复跑 | 判定 |
+|---|---|---|---|
+| `npm run typecheck` | 0 | **exit 0** | 命中 |
+| `npm test` | 257 pass / 0 fail | **exit 0；`# tests 257 / pass 257 / fail 0`**（254 + 新脚本 3） | 命中 |
+| 新脚本单独跑 | 3 pass | **exit 0；3 pass**（须先 build，见下） | 命中 |
+| `src/a2a.ts` 的 `await ctx.agents.resume(` | 1，在 `buildRoleSession` 内 | **1**（`src/a2a.ts:322`） | 命中 |
+| `src/orchestra.ts` 的 `agents.resume(` | 1（是注释） | **1**（`:3512` 注释） | 命中 |
+| `src/orchestra.ts` 的 `createSession(ctx, {` | 0 | **0** | 命中 |
+| `buildRoleSession(` 的出现处 | "四条调用点" | **实际 5 处**：`2497 / 3069 / 3090 / 3514 / 3517` | **实质成立；计数不精确（双方都是）** |
+
+**实质核验（读源码，不看计数）**：重激活的两条缝 `createRoleSession`（`:3514`）与 `resumeRoleSession`（`:3516`）**默认实现都路由到 `buildRoleSession`**（前者直调、后者构造 `{kind:"resume"}`）⇒ **三条路径确实全部经单一入口**。
+
+**driver 侧两处自我更正（如实记）**：
+1. **我用 `await buildRoleSession(ctx, {` 计数得 3，据此报"与自述 4 不符"——错的是我的模式**（`:3517` 写作 `return buildRoleSession(agentCtx, {`，变量名与关键字都不同）。**教训：锚点用 commit + 符号，不要用计数** —— 本项目已有此规则，这次是 driver 自己违反。
+2. **我一度把"单跑脚本 exit 1"当成缺陷**：真实原因是我的 worktree 只跑了 `tsc --noEmit`，**`lib/` 从未产出**（`ERR_MODULE_NOT_FOUND: lib/a2a.js`）。**先读失败原文再分类**才避免了假发现。规则：**验证脚本类产物前必须先 `npm run build`**。
+
+**对 driver 指令的一处偏离（判为接受）**：driver 原话要求"**删掉 `resumeRoleSession` 包装**"；实现保留它为**可注入的缝**（`dependencies.resumeAgent ?? 默认走 buildRoleSession`），因为 `scripts/test-recovery.mjs` 会注入它。**接受** —— 该指令的**目的**（`orchestra.ts` 不再拥有第二条 build/resume 实现）已达成，删除该缝会破坏既有测试。**属 driver 指令过于字面。**
+
+**它自查出的第三条同族缺陷（已核）**：懒加载路径把 `provider`/`model`/`reasoningEffort`/`presetId` **以 `undefined` 值当键**传给 `createSession`，打不中其自身的 `!== undefined` 分支判断 ⇒ 已用既有的 `...(x === undefined ? {} : {x})` 写法修掉，**且未建立全局机制**（正确避开 R-creep）。同一缺陷类第三次出现：D4 那次在**返回值**、这次在**入参**。
+
+**审查轮计数：+0**（检查不是轮次）。
