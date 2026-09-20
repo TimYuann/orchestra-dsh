@@ -160,3 +160,22 @@ $ npm run typecheck && npm test
 3. **E4 明文"零实现增量"**（`p0-scope-ruling.md` §5），任何时候做都一样。
 
 **边界**：这只调整了 **P0 内部两项（D4/E4）与 S 组之间的先后**，**没有**扩大 P0 范围，**没有**跳过任何 S 项——S1–S6 仍是 D1/D2/D3 的前置，仍未开工。
+
+---
+
+## 7. S 组开工前的引擎 API 核对（S2/S3 的硬依赖，先行实测）
+
+计划把 S2/S3 建立在两个引擎能力上。按"涉及部署或引擎行为的写法先做内存实测再落笔"（brief 硬要求），先核这两条。**结论：S2/S3 各缺一块前置。**
+
+| 计划假设 | 实测 | 结论 |
+|---|---|---|
+| **S2**：冷恢复改调 `ctx.sessionController.resume(sessionId)`、唤醒改 `ctx.sessionController.prompt({...})` | 服务**确实存在**：`dsh-api-session-controller` 导出 `SessionController`，方法签名 `async resume(sessionId, supplied)`（`lib/index.js:373`）与 `async prompt(request)`（`:736`）。**但**：① 它**不在本仓 `peerDependencies`**；② **本仓 `node_modules` 里没有这个包**（既无 `.d.ts` 也无运行时）⇒ `tsc` 与测试**都无法解析** | **S2 需先补 peer 依赖**（并按其 peer 集合做 dev 对齐）。这属**依赖面**改动，按 `AGENTS.md` 硬规则 1 只能进 `peerDependencies`；**需 Owner 确认后**再动 |
+| **S3**：`presets.resolve(id)` → `mountPreset(agentCtx, resolved.id)`，名册来源 `path === ""` | `@deepseek-ai/dsh-agent-presets` **已是 peer 且带 `.d.ts`**；导出含 `mountPreset`（`lib/types/index.d.ts:44`）。**但"名册"本身**（`roots` + `trust: system`）**要靠 §7 的 profile patch 才存在** —— S3 的前置是 §7（计划 §3 依赖表已写明） | **S3 仍卡在 §7**，与计划一致；**无新阻断** |
+
+**另一条实测（S1 相关，供下一轮直接用）**：`src/orchestra.ts` 里 `roles.map(...)` 的**手写出现处**与计划 §1 S6 所述一致（`updateTeamRole` 已存在但未被这些路径使用）；三条建会话路径的差别是**实测可核的**：
+
+- 首波：`orchestra.ts` 的 `createRoleSession({mode:"governed", governedBlueprint: plan.blueprint, ...})` —— **带 blueprint**（因此带 `setApprovalPolicy(session,"never")`）。
+- 懒加载：`createSession(...)`，失败落到 `ctx.agents.resume({ resumeSessionId })` —— **没有 blueprint，也没有 `setup`**（`session-blueprint.ts` 的 approval 钉死不经过这里）。
+- 重激活：`createRoleSession(...)` + `agentCtx.agents.resume({...})` —— `setup` **仅当 `presetFile` 存在**才挂。
+
+**这一节的用途**：把"S2/S3/S1 需要什么才算可开工"变成**已实测的事实**，避免下一轮再从推断开始。**本轮未做**：未加依赖、未改 patch、未写 S 组代码。
