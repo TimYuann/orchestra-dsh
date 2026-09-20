@@ -21,14 +21,14 @@ import { mountPreset } from "@deepseek-ai/dsh-agent-presets";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolExecutionInput } from "@deepseek-ai/dsh-tools";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
-import type { AgentHandle, AgentSetup } from "@deepseek-ai/dsh-agent";
+import type { Agent, AgentHandle, AgentSetup } from "@deepseek-ai/dsh-agent";
 import type { SessionId, AgentCancelCause } from "@deepseek-ai/dsh-session";
 import type {} from "@deepseek-ai/dsh-fs";
 import type {} from "@deepseek-ai/dsh-system-prompt";
 import { randomUUID } from "node:crypto";
 import { prepareLightweightBlueprint } from "./session-blueprint.js";
 import { createSubagentNode } from "./subagent-node.js";
-import type { GovernedBlueprintReceipt, PreparedGovernedBlueprint, LightweightBlueprintReceipt } from "./session-blueprint.js";
+import type { BlueprintPresetFile, GovernedBlueprintReceipt, PreparedGovernedBlueprint, LightweightBlueprintReceipt } from "./session-blueprint.js";
 import { deliverMessage, queryMessageStatus, readDeliveryReceipt } from "./a2a-transport.js";
 import { receiptStoreFor } from "./receipt-store.js";
 import { blueprintStoreFor } from "./session-blueprint.js";
@@ -242,6 +242,111 @@ export async function createLightweightSubagentNode(
     ...(provider === undefined ? {} : { provider }),
     ...(model === undefined ? {} : { model }),
     ...(args.reasoningEffort === undefined ? {} : { reasoningEffort: args.reasoningEffort }),
+  };
+}
+
+/**
+ * S1: the ONE entry point every role-session lifecycle path goes through.
+ *
+ * Before this existed there were three independent paths, and they did not agree:
+ *
+ *  1. **first wave** (`orchestra_create` materializing a lane before any
+ *     dispatch): `createSession({mode:"governed"})` with a prepared Governed
+ *     Blueprint — the only path that carried the blueprint, and therefore the
+ *     only one where `setApprovalPolicy(session,"never")` was pinned;
+ *  2. **lazy materialization** (`orchestra_dispatch` touching a reserved seat the
+ *     first time): `createSession(...)` with no blueprint at all, falling back to
+ *     a bare `agents.resume` with **no `setup`** — which DSH publishes as an
+ *     agent wearing an empty global layer, and only warns about;
+ *  3. **reactivation** (`orchestra_activate`): `createSession(...)` for a missing
+ *     session, or `agents.resume(...)` whose `setup` existed **only when a preset
+ *     file happened to resolve**.
+ *
+ * The three produced different Blueprint receipts and different permission state
+ * for the same logical operation, which is what D2 ("a turn must not hang") and
+ * the N7 identity check both depend on. Collapsing them here makes the
+ * differences explicit `spec` fields instead of accidents of which call site ran.
+ *
+ * `spec.mode` selects the path; `kind` selects creation vs resumption. The
+ * `kind: "resume"` arm is the only place in this module that calls
+ * `ctx.agents.resume`, and S1's exit criterion is exactly that: `agents.resume(`
+ * appears in one function, so S2 can replace that single call with the native
+ * cold-resume primitive without hunting for stragglers.
+ *
+ * @param ctx - host context carrying the agent registry and the optional services.
+ * @param spec - the complete, explicit description of the session to build.
+ * @returns the session id plus the governed receipt when one was produced.
+ */
+export interface BuildRoleSessionSpec {
+  kind?: "create" | "resume";
+  /** `mode` selects the blueprint plane. Governed sessions REQUIRE `governedBlueprint`. */
+  mode?: "lightweight" | "governed";
+  sessionId: string;
+  cwd?: string;
+  presetId?: string;
+  presetFile?: BlueprintPresetFile;
+  permissionPreset?: string;
+  provider?: string;
+  model?: string;
+  reasoningEffort?: string;
+  title?: string;
+  requiredTools?: string[];
+  /** Needed by `mode: "lightweight"`. */
+  caller?: Agent;
+  createdBySessionId?: string;
+  /** Needed by `mode: "governed"`: prepared by `prepareGovernedBlueprint`. */
+  governedBlueprint?: PreparedGovernedBlueprint;
+  /** Only for `kind: "resume"`: the setup to run, and the model options to apply. */
+  setup?: (agentCtx: Context) => Promise<void>;
+  agentOptions?: Record<string, unknown>;
+  signal?: AbortSignal;
+}
+
+export interface BuildRoleSessionResult {
+  sessionId: string;
+  /** Present only for `mode: "governed"` — the receipt the team record stores. */
+  governedReceipt?: GovernedBlueprintReceipt;
+}
+
+export async function buildRoleSession(ctx: Context, spec: BuildRoleSessionSpec): Promise<BuildRoleSessionResult> {
+  if (spec.kind === "resume") {
+    await ctx.agents.resume({
+      resumeSessionId: SID(spec.sessionId),
+      ...(spec.agentOptions === undefined ? {} : { agentOptions: spec.agentOptions }),
+      ...(spec.setup === undefined ? {} : { setup: spec.setup }),
+      ...(spec.signal === undefined ? {} : { signal: spec.signal }),
+    } as never);
+    return { sessionId: spec.sessionId };
+  }
+  const created =
+    spec.mode === "governed"
+      ? await createSession(ctx, {
+          mode: "governed",
+          sessionId: spec.sessionId,
+          ...(spec.cwd === undefined ? {} : { cwd: spec.cwd }),
+          governedBlueprint: spec.governedBlueprint,
+          ...(spec.createdBySessionId === undefined ? {} : { currentSessionId: spec.createdBySessionId }),
+          ...(spec.signal === undefined ? {} : { signal: spec.signal }),
+        })
+      : await createSession(ctx, {
+          ...(spec.mode === undefined ? {} : { mode: spec.mode }),
+          sessionId: spec.sessionId,
+          ...(spec.cwd === undefined ? {} : { cwd: spec.cwd }),
+          ...(spec.presetId === undefined ? {} : { presetId: spec.presetId }),
+          ...(spec.presetFile === undefined ? {} : { presetFile: spec.presetFile }),
+          ...(spec.permissionPreset === undefined ? {} : { permissionPreset: spec.permissionPreset }),
+          ...(spec.provider === undefined ? {} : { provider: spec.provider }),
+          ...(spec.model === undefined ? {} : { model: spec.model }),
+          ...(spec.reasoningEffort === undefined ? {} : { reasoningEffort: spec.reasoningEffort }),
+          ...(spec.title === undefined ? {} : { title: spec.title }),
+          ...(spec.requiredTools === undefined ? {} : { requiredTools: spec.requiredTools }),
+          ...(spec.caller === undefined ? {} : { callerAgent: spec.caller }),
+          ...(spec.createdBySessionId === undefined ? {} : { currentSessionId: spec.createdBySessionId }),
+          ...(spec.signal === undefined ? {} : { signal: spec.signal }),
+        });
+  return {
+    sessionId: created.sessionId,
+    ...(created.governedBlueprint === undefined ? {} : { governedReceipt: created.governedBlueprint }),
   };
 }
 
