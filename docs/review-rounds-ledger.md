@@ -203,3 +203,39 @@
 **它自查出的第三条同族缺陷（已核）**：懒加载路径把 `provider`/`model`/`reasoningEffort`/`presetId` **以 `undefined` 值当键**传给 `createSession`，打不中其自身的 `!== undefined` 分支判断 ⇒ 已用既有的 `...(x === undefined ? {} : {x})` 写法修掉，**且未建立全局机制**（正确避开 R-creep）。同一缺陷类第三次出现：D4 那次在**返回值**、这次在**入参**。
 
 **审查轮计数：+0**（检查不是轮次）。
+
+---
+
+## 11. 批 1 · S1b 轮的 driver 独立复跑与三条裁定（2026-09-20）
+
+**候选：commit `27445a2`**（detached worktree；**先 `npm run build` 再单跑脚本**——上一轮的教训已固化为步骤）。
+
+| 项 | 它自述 | driver 复跑 | 判定 |
+|---|---|---|---|
+| `npm run build` / `typecheck` | — / 0 | **exit 0 / exit 0** | 命中 |
+| `npm test` | 261 pass / 0 fail | **exit 0；261 / 261 / 0**（257 + 新脚本 4） | 命中 |
+| `test-role-blueprint-single-prepare.mjs` | 4 pass | **exit 0；4 pass** | 命中 |
+| `test-role-session-single-path.mjs` | 3 pass | **exit 0；3 pass** | 命中 |
+| `prepareRoleBlueprint(` 调用点 | `a2a.ts:401` · `orchestra.ts:869` | **两处，一致** | 命中 |
+| plane 函数直调消失 | 无输出 | **两文件内零直调** | 命中 |
+
+**driver 的 grep 第三次成为薄弱环节（记）**：我用 `export function prepare*Blueprint` 得到 0，据此一度怀疑函数被删；真相是它们是 **`export async function`**（`session-blueprint.ts:552` / `:786`），**仍在、仍被导出**。caller 计数三方各异（它说 13、我数 22 行、真实是 3 个测试文件：`test-session-blueprint.mjs` 10 · `test-orchestra-role-presets.mjs` 3 · `test-governed-provisioning.mjs` 3）。**结论：核这类声明一律读符号定义，不用计数** —— 这是本轮第二次由计数引发的误判。
+
+### 裁定 A｜`agentOptions` 双算法差异：**不合并**，先判可达性
+两条路径各自重算 `agentOptions`（"逐键独立回退" vs "整体配对回退"），同一"只给 provider"的输入会得到**不同模型路由**；两侧均有既有测试，**无法从代码判定哪一侧有意为之**。实现按"规则一"未合并、登记待裁 —— **处置正确**。
+**裁定**：**保持不合并**；补一步**可达性判定**（`role.model` 是否可能在真实输入上只给 provider 而不给 model）。不可达 ⇒ 记为潜在差异、零优先级；可达 ⇒ 升级为 **Owner 的产品语义裁定**（不是我可以按口味定的）。已登记进计划开项。
+
+### 裁定 B｜两个 plane 函数保留 + 新增派发器：**接受，但登记为对计划字面的偏离**
+计划 §1 S1 行的字面要求是"两个 `prepare*Blueprint` **收敛为一个**，差异由 `spec.mode` 参数化"；实际达成的是**单一派发点**（`prepareRoleBlueprint` 按 mode 分派到两个仍在的函数）。
+**接受依据（实证）**：3 个既有测试套直接引用这两个函数；其 `diff` 表明差异是**规则差异**而非重复，共用部分早已抽走 ⇒ 合并 body 不减少重复、只会让两套规则更难读，且要重写既有测试。
+**登记后果**：D2 落地、判据 ① 变得可写时，**"同一函数"的形态须先定**（单一 body vs 单一派发点）——否则届时会在判据上撞车。
+
+### 裁定 C｜下一轮做 **S3**，不是 D2
+计划的依赖表写着 **D2 ← S1 + S3 + S4**，而 **S3 与 S4 都未做** ⇒ **D2 现在不可用**（Implementer 给的二选一漏了这条）。S3 同时是 **D1 与 D2 的共同前置** ⇒ 它在关键路径上。S4 无前置、可与 S3 并行，仍须在 D2 之前。
+
+### 新发现｜**G-BUDGET 的输入在批 1 不存在**（与 O-5 的 ④ 同形态）
+计划 §11 说 `verify-agent-budget.mjs` 读「会话事件流 **+ 节点记录**」，§9.1 的判据是**逐节点逐轮**计数；而**节点记录是 P2-2 的产物**（`orchestra/nodes/` 在本仓不存在，`src/` 内零引用）。
+**默认裁定**：**G-BUDGET 标「延后（landing = 批 2 / P2-2 落地后）」**，与判据 ④ 同规；批 1 交付报告须在「未做/未验证」栏写明。
+**反转条件**：若实测表明"逐轮归集"只靠 `team.json` + 会话事件流即可得（不需要节点记录），则 G-BUDGET 留在批 1 —— 由实现者给出证据后翻案。
+
+**审查轮计数：+0**（检查不是轮次）。
