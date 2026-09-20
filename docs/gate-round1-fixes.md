@@ -349,3 +349,75 @@
 ### J.2 顺带自查（本轮新矛盾类型：同一数字/判据两处表述）
 
 R3-1 与 R3-5(a) 是同一类问题的两个实例（**同一件事两处表述**），所以顺手做了一次全文件扫描：除上述两处外，还发现 **§9.2 里残留了一份与 §9.1 几乎相同的判据代码块**——那是 H-5 与 P-8 两轮改动叠加的产物。已**删除该重复块**，§9.2 只保留"为什么必须逐项分开断言"的理由并指向 §9.1。**现在全文的判据定义各只有一处**：预算在 §9.1、恢复在 §4.2.1、档 0 谓词在 §0.4。
+
+---
+
+## §K 第 6 轮：V1–V10 编辑落地（依 `docs/ruling-d1-d5-oracle.md`）
+
+> **依据**：独立裁定 `docs/ruling-d1-d5-oracle.md`（基线 `810bf3a`，定稿）。裁定明确：**不需要第 5 轮审查**；未完成的是 §1 的 5 条 + §6 的 4 处**没有落进计划文件**——那是**编辑任务**。
+> **纪律**：**只做 V1–V10，不得顺手扩张、不得改闸判据、不得重写全文**。
+> **机械核对**：`node scripts/check-p0-preconditions.mjs`（新），末行 `# V1..V10 ok (10/10)`，退出码 0。
+
+| # | 改前 | 改后 | 落点（行号为改后） |
+|---|---|---|---|
+| **V1** | `:271`（旧）P0 方括号 = `D1 · D2 · D3 · D4 · E1 E2 E3 E4 · F1′`；G-P0 第 ⑧ 项要求"**E2/E3/E4/F1′ 的测试全绿**"；§10.5 把 **E2/E3 标 P0**（而 F1′ 标 P2 ⇒ **计划自相矛盾**） | 方括号改为 `D1 · D2 · D3 · D4 · E1 · E4`，并加**裁定脚注**（E1 = D2 的启动器；E4 = 零实现增量；**禁止误读为"E 组整组留 P0"**）。G-P0 ⑧ 改为"`test-orchestra-role-presets.mjs` 的 **E4** 两条断言全绿"并明文"**判据里不得再出现 E2/E3/F1′**"。§10.5 的 **E2 / E3 / F1′ 全部改标「未启用 / 后续」** | 计划 `:271`±3 / `:1138`（G-P0⑧）/ `:1069`（E2）/ `:1070`（E3）/ `:1072`（F1′） |
+| **V2** | `:52`（旧）B-4 写"`inject` 会让本插件**进入 waiting**（不静默降级）"⇒ 交付依赖缺席时**整个插件（含 A2A）一起停** | 改为"**交付依赖缺席 ⇒ 只拒绝交付动作，A2A 不随之失效**"：交付动作（验收执行 / 对账 / 合并门）**确定性拒绝**（`delivery_dependency_unavailable`），**不得静默降级为"无证据通过"**；但 `a2a_*` / `orchestra_*` 的编排、投递、名册查询**照常可用**。并注明**「A2A 不随之失效」是本条的可 grep 落点** | 计划 `:73`（B-4 行） |
+| **V3** | 档 0 的三组边界**未入本批回归** | 新增 **§11.0 G-PRE** 闸，S-PRE 清单 ① = `test-tier0-predicate.mjs`，并写明"**V3：档 0 的三组边界（两个纯聊天会话 / 一支要合并 / driver 标签两向）进本批回归**"；G-P0 ⑨ 同步 | 计划 `:1108`–`:1120` / `:1138` |
+| **V4** | 计划里 `grep "有限审查\|审查出口\|不清零"` **零命中**（该措辞只在 `p0-scope-ruling.md:27`） | 新增 **§0.1a「有限审查出口」**：**① 两轮上限**（同一问题 id 至多两轮门判，**两轮后交 Owner 指定的独立会话**裁定，且产出是**裁定**不是又一份缺陷清单）**② 独立裁定**（裁定者不得参与撰写与前两轮门判）**③ 换版本不清零**（计数对象是**问题 id**，不是文档 id）。并写入**两个平面的切分**（开发平面适用 / 产品平面不适用，附两条禁止）+ **本盘轮次台账** | 计划 `:43`–`:63` |
+| **V5** | §6 决策 schema **含 `refusalTest` 作为每条决策的字段**，`:686` 用例要求它 ⇒ **普遍义务** | 降为「**工具实现测试**」：写在**工具的测试**里（证明能力存在），**不再要求每条决策记录都带它**；并注明理由 = 把一条针对"写权限 ≠ 业务授权"的修正普遍化，**正是 fix-scope creep 的形态**（裁定 §3.1）。`test-decision-queue.mjs` 行同步（并注明 E2/E3 已退出 P0 ⇒ 该脚本为后续项） | 计划 `:791`（决策 schema）/ `:749`（脚本行） |
+| **V6** | `:223` / `:626` / `:630` / `:650` / `:695` 五处要求"**正文表格行数 == 用例条数**"作为覆盖判据（**形式代理**） | **取消行数相等**，保留**用例存在性**：改为"三处表驱动面（§4.2.1 / §0.4 / §9.1）**各自至少有一条对应用例**，且每条声明的 `caseId` 前缀**都能在 `verification/cases/` 里解析**"；`run-cases.mjs --check-coverage` 的输出改为 `# areas N tables T covered T cases C unresolved 0` | 计划 `:223` / `:738`（原 `:626`）/ `:742`（原 `:630`）/ `:762`（原 `:650`）/ `:807`（原 `:695`） |
+| **V7** | D4 写"读 `inputSchema`/`outputSchema`，用一个**形状生成器**造样本值喂给 JSON Schema 校验"⇒ **自己造样本验自己** | 改为"**真实调用 handler、校验实际返回值**"：用最小合法入参**真实调用每个注册工具的 handler**，把**实际返回值**拿去校验 `outputSchema`（DSH 自己就是这么校验的，正是本行开头引的 `orchestra_topologies` 事故形态），并断言 handler 闭包符号存在、调用不抛未类型化异常；不可调用/需外部环境的工具允许**注入最小 fake ctx** 驱动，但**仍必须走真实 handler** | 计划 `:186`（D4 行） |
+| **V8** | 四处自身文档未更正：① `gate-round2-fixes.md` §3 把"只复验六处"接成**整体 PASS**；② `explainer-delivery-layer.md:35` "**不消耗任何模型上下文**"；③ 散文版本绑定未补；④ "节点零实现量不构成浪费、配比归到根任务"未写 | ① §3 补 **"补丁复验 ≠ 整体执行资格"** 的教训段（并说明正确形态 = 门判只能说"这 6 处通过"）；② 删除该句，改写为"**模型的工作确实增加了；工具调用数不是全部摩擦**——它量不到返修重读、重新冻结这类开销"，并保留更正注；③ 计划新增 **§0.6(a)「散文亦有版本」**（任何实质改动绑定 commit + 变更记录；引用带**commit + 路径 + 版本标识/摘要**，**行号不作锚点**）；④ 计划新增 **§0.6(b)**（计划/契约节点零实现量不构成浪费、无需 `fault_ref`、成本归集到 `rootTask` 与实现节点合并计入 `ratio`） | `gate-round2-fixes.md` §3 / `explainer-delivery-layer.md` §三 / 计划 `:154`–`:161` |
+| **V9** | §4.2.1 的 **P2 启用门未登记** | §4.2.1 新增 **「V9 · P2 启用门」表**（4 条反例）：**① B5 的 `expectedNew` 反例**（第三值 + `candidateCommit` 是祖先 ⇒ 若判 `base_advanced` 就会重演已成功的 A）**② 祖先判定非二值**（命令失败/对象缺失**不得折成"否"或"是"**，两向都错 ⇒ 判不出即阻断）**③ 第三个值 ≠ 合法前进**（把"不同"读成"合法后继"会吞掉真账实不符）**④ 控制流自相矛盾**（同 attemptId 非成功终态被当"已完成" ⇒ 活锁）。入口条件：四条各有用例 ⇒ P2 可启用；**P0 不启用 P2，但本表现在登记** | 计划 `:476` 附近（§4.2.1） |
+| **V10** | 计划里 `grep "scout"` **零命中** ⇒ scout 方案只是口头授权 | 新增 **§0.5「scout 最小规范」**，含裁定 §1.2 的六行：**调用时机**（每 mission 一次 recon，勾勒队伍之前；每车道至多一次；不在回合循环里）/ **输入**（固定 prompt + 只读 mission 事实）/ **输出**（`normalizable` 判定 + 车道粗拆 + S/M/L 难度 + 未决项）/ **判据**（只写事实与估计，每条带依据指针；**禁止授权性结论**）/ **成本上限**（≤5 个 scout、1–2 轮、**不递归**、**只读**）/ **产出归属与边界**（结论是任务记录的一部分；**难度估计永远不能把交付型节点降成档 0**）。**实现落点 = DSH 原生 subagent**（`a2a_create(execution:"subagent")`），**零新增插件机制**，**不进 P0 代码范围** | 计划 `:139`–`:153` |
+
+### K.1 G-PRE 机械核对输出
+
+```
+$ node scripts/check-p0-preconditions.mjs
+V-OK    V1  P0 scope = D1/D2/D3 + D4 + E1 + E4; E2/E3/F1′ out of P0
+          bracket=true gpo8_clean=true E2_out=true E3_out=true  L315,L1138,L1069,L1070
+V-OK    V2  B-4: delivery dependency absent ⇒ refuse delivery actions, A2A still usable
+          hits=1 in_B4_row=true  L73
+V-OK    V3  tier-0 boundary groups in this batch's regression (G-PRE list)
+          gpre=1 script_refs=4 listed_in_gpre=true  L1108,L127,L757,L1114
+V-OK    V4  limited review exit: two-round cap + independent ruling + no reset across versions
+          cap=2 independent=true no_reset=2  L51,L59,L53,L62
+V-OK    V5  refusalTest is no longer a universal obligation
+          schema_demotes=true still_universal=false  L791
+V-OK    V6  row-count == case-count dropped as a coverage criterion
+          live_criteria=0 declared=true
+V-OK    V7  D4 calls the real handler and validates the actual return value
+          real_handler=1 old_form_present=false  L186
+V-OK    V8  four self-document corrections applied
+          gate2=true explainer=true prose_version=true zero_impl=true
+V-OK    V9  P2 enablement gate registered (B5 expectedNew counterexample + three more)
+          b5=1 non_binary=true third_value=true contradiction=true  L476
+V-OK    V10 scout minimal spec in plan §0.5 with all six rows
+          rows=6/6 native_subagent=true not_in_p0=true caps=true  L139
+
+# V1..V10 ok (10/10)
+# scope: mechanical presence check only; quality is NOT judged here (ruling §4.4)
+[exit: 0]
+```
+
+### K.2 裁定两条纪律的落地
+
+| 纪律 | 落点 |
+|---|---|
+| **"P0 不建节点 schema" ≠ "轮次计数可以不记"** | 新增 **`docs/review-rounds-ledger.md`**：轮次台账（计划门 1 = 23 条 / 门 2 = 6 条 / 门 3 = **12 条** / 门 4 = 5 条 / 第 5 轮 = V1–V10 编辑任务）+ **问题 id 级计数表**（按"换版本不清零"口径，V1 的问题记为**第 3 次提出**）。并在计划 §0.6 写明 **P2 落地时 `reviewRounds` 是必填字段** |
+| **保留字段名、写成"将产出"** | 计划 §0.6 保留 `rootTask` / `reviewScope` / `evidenceRefs` / `residuals` / `reviewRounds` / `artifactRef` 六个字段名，并明文"**它们目前都不存在**；P0 不建该 schema（节点记录是 P2 的工作项）" |
+
+### K.3 一处**超出 V1–V10 字面范围**的改动（主动申报，未静默扩张）
+
+V8② 要求删掉 `explainer-delivery-layer.md` 的"不消耗任何模型上下文"。改这一句时，**同一节里还有一处与计划定稿直接矛盾**的旧数字：该文件写"agent 侧真正新增的 **2–3 次**工具调用"，而计划 §9.1 在 R3-1 已定稿为 **`== 3 + decisions`**（典型 3、有真实请示 4）。
+
+**处理**：按 V8 的文档更正精神一并改齐（`2–3 次` → `3 次（典型；确有真实请示时第 4 次）`），并在文中标注这是随 V8 一并改的。**理由**：不修它就是**同一份文档里的两处自相矛盾**，而"同一件事两处表述"正是前四轮反复失分的形态；且它**不动任何闸判据、不动机制、不扩大范围**。
+
+**若裁定者认为这超出授权**：该处可单条回退，回退后 `explainer` 与 `plan §9.1` 的数字不一致（`check-p0-preconditions.mjs` 的 V8 项**不依赖**这个数字，因此回退不会影响 G-PRE 判定）。
+
+### K.4 未做（明确不扩张）
+
+- **未改任何闸判据**（G-P0 / G-P1 / G-P2 / G-P3 / G-P4 / G-RELEASE / G-BUDGET 的判据文本一律未动；只**新增**了 G-PRE 一节与 G-P0 的第 ⑨ 项——后者是 V3 要求）。
+- **未重写全文**：除 V1–V10 点名的落点外，其余段落保持原样。
+- **未新增机制**：V9 是登记项、V10 是口径（实现落点是 DSH 原生 subagent，零插件机制）、V4 是程序规则。
