@@ -142,3 +142,27 @@
 **未改动的权威文件**：`docs/plan-0.8.0-delivery-layer.md`（冻结契约）、`docs/ruling-d1-d5-oracle.md`、`docs/p0-scope-ruling.md`（只读）。
 
 **同步项（不在本轮范围，登记不动手）**：`package.json` 的 19 条 peer + 对应 devDependencies 与 `node_modules` 仍为 `0.1.5-rc.2`（本机实测）⇒ 依赖面同步是**独立工作项**（impact §5-1/2）。
+
+---
+
+## 9. 依赖面迁移执行记录（2026-09-20，driver 执行）
+
+**授权**：Owner（"动手吧"）。**锚点 = commit + 文件。**
+
+**改动**：42 条 `@deepseek-ai/*` 范围 `0.1.5-rc.2 → 0.1.6-alpha.2`（peer 19 条 + dev 23 条），**保持原有写法风格**——2 条精确锁（`dsh-user-approval`、`dsh-session-title`）仍为精确锁。另新增 `.npmrc`（见下）。
+
+**结果**：`npm install` exit 0；`npm run typecheck` **exit 0**；`npm test` **exit 0，254 pass / 0 fail**。**源码零改动即通过** ⇒ U1–U9 那份适配判断得到实测支撑。
+
+**排障过程（值得留痕，两次失败都不是我们的声明错）**：
+1. 首次 `npm install` **ERESOLVE**：`package-lock.json`（本地、未入库）钉着 251 处 `0.1.5-rc.2` ⇒ 删锁（已备份至 `/tmp/package-lock.json.0.1.5-rc.2.bak`）。
+2. 删锁后仍失败 ⇒ 再清空 `node_modules` 干净重装，**仍失败** ⇒ 证明与旧树无关。干净解析给出了唯一真因：
+   ```
+   peer @deepseek-ai/dsh-agent@"^0.1.1-rc.2" from @deepseek-ai/dsh-client-runtime@0.1.1-rc.2
+   ```
+   **`dsh-client-runtime` 整条线停在 `0.1.1-rc.x`**（dist-tag `next = 0.1.1-rc.2`，无 0.1.6 版本），它对 16 个包声明 `^0.1.1-rc.2` 的 peer，按预发布匹配规则**不可能**被 `0.1.6-alpha.2` 满足。
+3. **处置**：新增 `.npmrc` 置 `legacy-peer-deps=true`，并写明理由。这不是"绕过"：AGENTS.md 硬规则 4 规定**本仓 `node_modules` 只装 devDependencies**、peer 由宿主 profile 满足；这与 profile 侧 pnpm 的 `autoInstallPeers: false` **同旨**。我方对该包只有一处 **type-only** 用法（`src/client/index.tsx:14`）。
+4. **补偿证明（必须做，因为 npm 不再核 peer）**：逐条核 **19/19 peerDependencies 均被 0.1.6-alpha.2 宿主满足**，缺失 0、不满足 0（含两条精确锁）。
+
+**未做 / 待办**：① profile 侧尚未同步新构建（dev 里装的仍是 v0.5.1 旧构建），AGENTS.md 硬规则 3 三件套待 pack+sync 后核；② 本仓 `node_modules` 已整体换到 0.1.6-alpha.2 ⇒ **本地那棵 0.1.5-rc.2 旧树不再存在**，将来做版本对比需用 `dsh-upgrade-audit` 重新材料化（事实已全部抽干进 `docs/upgrade-0.1.6-alpha.2-impact.md`）。
+
+**一处执行失误（如实记）**：为验证"旧树是否干扰解析"，我执行了 `rm -rf node_modules`，导致本地树一度为空；随后由本次成功安装恢复。判定上无害（该目录可再生），但**未经备份就删除**不在我的预案里，下一轮同类操作应先保全可回滚路径。
