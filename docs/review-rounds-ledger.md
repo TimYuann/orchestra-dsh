@@ -65,6 +65,12 @@
 | E-4 | **待裁项** | **P0-S1b-3** 重激活路径与 `createSession` 各自重算 `agentOptions`，**逐键独立回退 vs 整体配对回退**（同一个"只给 provider"的输入会得到不同模型路由） | **未合并、两侧语义原样保留**；登记**待裁**（属产品语义，无法从代码判定哪一侧有意为之）。入口侧不变量已钉：`kind:"resume"` 原样透传 `agentOptions`、不引入第三份算法 | `docs/p0-report-s1b.md` §4 |
 | E-4 | **同类缺陷第四处扫描** | **P0-S1b-4** D4 发现的"`undefined` 当键"缺陷类是否还有第四处 | **未发现第四处**（三处候选逐一排除，理由在报告 §5）；**未为它建任何机制** | `docs/p0-report-s1b.md` §5 |
 
+| E-5 | **S3 · G-P0 ⑤** | **P0-S3-1** 名册是否真认插件私有根（§7 单跳 override 的合成结果）此前无闸 | **已建并绿**：`scripts/verify-role-presets-roster.mjs` → `# presets healthy=12/12 roots=1 default="standard" agent_presets_rows=1 warnings=0`，exit 0 | `scripts/verify-role-presets-roster.mjs`；`docs/p0-report-s3.md` §2.1 |
+| E-5 | **闸断言非恒真** | **P0-S3-2** 只跑 happy path 证明不了断言会拒 | **已证**：断言抽为**导出的纯函数** `rosterFailures()`，四种形态实测（happy `[]`；两跳 / 漏 `default` / trust 错 均被拒） | 同上 §2.2 |
+| E-5 | **计划文字与实测冲突** | **P0-S3-3** 计划 §1 S3 / §4.7 写"名册来源 `path === ""`"，而 `AgentPreset.path` 是**必需绝对路径**（`dsh-agent-presets/lib/types/preset.d.ts`），`""` 分支只是防御性代码 | **已登记待裁**：判据需改写为"**`path` 指向真实文件但不被 `mountRolePreset` 使用**"（行为断言）。**未自行落定**（属判据措辞变更） | `docs/p0-report-s3.md` §3.1 / §3.4 |
+| E-5 | **S3 待裁口径** | **P0-S3-4** `resolvePresetFile` 降级范围：只降级 `dsh`，还是 `builtin` 也走名册解析（§7 后 `builtin` 分支在优先级上**永远不可达** ⇒ 死分支） | **已登记待裁**（我倾向后者，理由已给；按规则一不自行选边） | `docs/p0-report-s3.md` §3.3 |
+| E-5 | **S3 未完成项** | **P0-S3-5** `mountRolePreset` 未实现；`resolvePresetFile` 未降级；`test-role-preset-roster.mjs` 未建；四处挂载调用点未改 | **未做**（落点已调查完，见报告 §3.2） | `docs/p0-report-s3.md` §3–§4 |
+
 ## 5. 批 1 的 G-P0 判定形态（driver 裁定，2026-09-20）
 
 **判据 ①②③⑤⑥⑦⑧⑨ 各自命中期望码；④ 显式延后（landing = 批 2 / G-P2）。**
