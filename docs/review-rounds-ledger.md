@@ -61,3 +61,47 @@
 **判据 ①②③⑤⑥⑦⑧⑨ 各自命中期望码；④ 显式延后（landing = 批 2 / G-P2）。**
 
 **依据**：计划 §10.7 自己的标题「延后项（**显式标注，不是漏掉**）」——删掉 ④ 就正是"漏掉"。编号**不重编号**（避免打断全部交叉引用）。
+
+---
+
+## 6. 批 1 第 1 轮的 driver 独立复跑与判定（2026-09-20）
+
+**候选：commit `3740981`**（工作树干净）。复跑在 **detached worktree** `/tmp/orch-verify-3740981`（软链 `node_modules`）——**恒不在在飞树上跑闸**（协议 §2.1）。
+
+| 项 | 它的自述 | driver 独立复跑 | 判定 |
+|---|---|---|---|
+| `npm run typecheck` | 0 | **exit 0** | 命中 |
+| `npm test` | 254 pass / 0 fail | **exit 0；`# tests 254 / pass 254 / fail 0 / cancelled 0`** | 命中（248 不回归 + 6 新增） |
+| D4 工具覆盖 | 18 全枚举 | 全仓 `defineTool(` = **18**；`test-tool-schemas.mjs:508` 显式列 `orchestra_wait`，`:432` 写明"没有第三种状态" | 命中 |
+| D4 守卫非恒真 | 假 ctx 只暴露 `inject` 内服务 + liveness 自测 | `:182` / `:607` / `:347`（两插件各用独立 ctx）属实 | 命中 |
+| 缺陷类"value is not lossless JSON" | DSH 对每个工具结果跑快照 | `dsh-tools/lib/index.js:2479-2482` **一字不差** | 命中 |
+| O-4 依赖落地 | peer+dev；tgz 无 `@deepseek-ai`；两 profile 干净 | `files` = `["lib","cordis.patch.yml","cordis.yml","README.md","LICENSE"]` ⇒ 不可能含 `@deepseek-ai`；web/dev 均只有 `cosmokit`+`schemastery` | 命中 |
+| **S2 API 更正（P0-F3）** | `sessionController.resume` 不存在 | 服务注册 `super(ctx,"sessionController",…)`；服务面有 `resolveAgent`（`dsh-api-session-controller/lib/index.js:2801`）与 `prompt(request,signal)`（`:2920`）；`resume`/`resumeObserved` 全在**内部类**（`:186`–`:426`） | **命中，且推翻计划 §3 一处前置假设** |
+| fault_ref 运行时抛错（P0-D4-3） | **未复现**（自己标注） | `cordis/lib/index.js:675-685`：错误对象**先建**，但 `fiber.store[prop]` 命中即 `return` ⇒ **未申报 ≠ 必抛**；其"未复现"的解释正确 | 判**如实**：只可记"欠账已补声明"，**不得**记"已修复线上故障" |
+
+**分类（协议 §2.2）**：A / B / C 类**均无**；D4/E4 = **F 类（机制命中）**；S 组未开工 = **E 类（明确停点 + 提问）**，非静默悬挂。
+**顺序偏离**（先做 D4/E4 而非 S 组）：已显式声明；两者与 S 组无依赖 ⇒ **接受，不回退**。
+**审查轮计数：+0**（检查不是轮次）。
+
+---
+
+## 7. 批 1 的 G-P0 可执行脚本清单（driver 按 V1 推导；**唯一形态**）
+
+计划 §11 的**具名脚本表**（9 个文件 / 11 条命令）与**判据 ①–⑨** 有三处不一致（P0-F1 + driver 新发现一处）：表里留着已被 V1 移出的 `test-decision-queue.mjs`(E2/E3)、`test-design-gate.mjs`(F1′)，**却漏了判据 ⑨ 要求的 `test-tier0-predicate.mjs`**。按 O-5(d) 的口径优先级（**V 条目 > 未同步的计划行**），批 1 的 G-P0 可执行形态是：
+
+| # | 命令 | 期望退出码 | 状态 |
+|---|---|---|---|
+| ① | `node scripts/verify-role-identity.mjs`（= N7） | **0** | 脚本未创建 |
+| ② | `node scripts/verify-role-identity.mjs --self-test` | **1**（校准） | 脚本未创建 |
+| ③ | `node scripts/verify-d2-approval.mjs`（须 `hanging 0 dangling 0`） | **0** | 脚本未创建 |
+| ④ | `node scripts/verify-d2-approval.mjs --self-test` | **1**（校准） | 脚本未创建 |
+| ⑤ | `node scripts/verify-role-presets-roster.mjs`（§7.3-a，期望 **12/12**） | **0** | 脚本未创建 |
+| ⑥ | `node scripts/test-orchestra-archive.mjs`（D3 扩展用例） | **0** | 已存在，待扩展 |
+| ⑦ | `node scripts/test-tool-schemas.mjs`（D4） | **0** | ✅ 已绿（E-1） |
+| ⑧ | `node scripts/test-orchestra-role-presets.mjs`（E4 两条断言） | **0** | ✅ 已绿（E-1） |
+| ⑨ | `node scripts/test-tier0-predicate.mjs`（V3 档 0 三组边界） | **0** | **脚本不存在，需创建** —— G-PRE 的 S-PRE 清单点了它的名，但当时只跑了 V1–V10 的 grep 断言就判绿 ⇒ **driver 侧核对的漏项**（同一失败形态：点了名但没验存在） |
+| — | `node scripts/verify-agent-budget.mjs`（**G-BUDGET**） | **0** | 脚本未创建 |
+
+**移出**：`test-decision-queue.mjs`（E2/E3 ⇒ 批 2）、`test-design-gate.mjs`（F1′ ⇒ 后续）、`verify-d2-decision.mjs`（④ 延后 ⇒ 批 2 / G-P2）。
+**合计：9 条具名命令 + 1 条 G-BUDGET；现已绿 2 条。**
+
