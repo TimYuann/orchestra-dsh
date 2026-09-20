@@ -441,3 +441,39 @@ IDENTITY_SKIP    difficulty-reviewer phase=reserved
 **方法论固化**：实现者上一轮**自己标注了盲区**（"fixture 两个角色 history 都是空数组 ⇒ 该分支未在真实数据上跑到"）——**一换到正确 fixture 就立刻炸出真异常**。⇒ **规则：判一个核对脚本"通过"之前，必须先确认它跑在"能覆盖其全部分支"的 fixture 上**；弱 fixture 上的绿灯是假绿。
 
 **审查轮计数：+0。**
+
+## 18. N7 live 取证轮：Part A 归因定型 + Part B 部分完成（2026-09-21）
+
+### ★ Part A 归因结论：**（i）当前代码的真缺陷**（不是遗留数据）
+
+**§17 的表述需修正为**：两条异常是**同一个缺陷的两个面**——`materializeRole` 的失败分支
+**记录了被抛弃的会话 id，却不推进团队状态**，于是 `role.sessionId` 钉在一个**从未落盘的幽灵 id** 上，
+且同一 id 被**反复写进 `sessionHistory`**。
+
+三条证据（`docs/p0-report-n7-live-forensics.md` §3）：
+1. **产生它的代码就是当前代码**：`git log -S'materialization-failed'` 与
+   `git log -L 3130,3145:src/orchestra.ts` **都只指向 `6bd8d9b`（当前 HEAD）**，此后无改动。
+2. **时间线不构成"旧构建"辩护**：三条 `replacedAt` = `2026-09-19T05:32:37Z / 05:36:42Z / 05:36:45Z`，
+   正是 v0.5.1（`6bd8d9b`）交付当天 ⇒ 旧数据 + 当时的代码 = 当前代码。
+3. **缺陷可推导**：失败分支里新会话**已建成功**（`created !== undefined`）但团队状态**未前进**；
+   数据里那两条**完全相同的 `session-898f7481-…`、相隔 3 秒**，正是重试循环的指纹。
+
+**磁盘核对**：`role.sessionId` = `orchestra-team-f01da153-ec3b09cb-…` **在磁盘上不存在**；
+history 里的 `session-898f7481-…` 存在。⇒ 幽灵在 `role.sessionId`，不在 history。
+
+**处置**：**登记为待办项，本轮不修**（P0 范围外）。修法方向（失败分支不写 history / 或推进团队状态）
+**两选一需 driver 裁**，执行者不自行选边。
+
+### Part B（N7 live 半边）：部分完成
+
+- ✅ **已证**：live 实例（4600）上 `orchestra_*` 工具面可用 —— 真实模型经 `page.fetch("/api/session/prompt",…)`
+  调用 `orchestra_team` 成功，读到 `team-f01da153 (trio, active)`；顺带读出该角色当前 **cold**。
+- ⬜ **未做（硬阻断）**：重启 4600 —— 无进程控制（`ps` 被沙箱禁；实例非我受管作业）。
+- ⬜ **未做**：`compositionInventory`「从实例内取」—— 该符号**在本插件产品代码里零命中**，
+  从工作区会话取不到；宿主检查工具跨不到 4600。
+- ⬜ **未做**：before/after 分层定位（无 before、无 after）。
+
+**替用户批准声明**：**本轮没有执行 `/team approve`** —— 既存 `team-f01da153` 已是 active，
+无需再批准；工具面校准用的是既存 `standard` 会话。⇒ **ADR-0009 §3 的测试 seam 本轮未被使用**。
+
+**审查轮计数：+0。**
