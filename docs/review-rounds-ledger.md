@@ -123,7 +123,9 @@
 | **U5** | §0.2 假设清单 B-1…B-4 + 其余假设 1–5 | **UA-5** 假设按新版本逐条重述 | **已改**：B-1/B-2/B-3 **已核未变、按原样保留**（各加"U5 复核"栏与核验方式）；**B-4 加"宿主事实已核未变 + 失败形态已改（V2）"**，并把 `dsh-bash-sandbox` 失败分类标**待核**（R-16）；其余假设 1–5 改为逐条复核表（1/2 已核未变、3/4 与版本无关、5 部分随版本 + `git merge-base --is-ancestor` 待核 ⇒ R-17） | 同上 §0.2 |
 | **U6** | §11 G-P0 三处欠账 | **UA-6**（= 执行期 **P0-F1 / P0-F2**）判据 ④ 的内容全在 E2/E3/P3-5（V1 已令其退出 P0）；D2-b 同源；具名脚本表与判据不一致 | **已改**：①判据 ④ 标 **「延后（landing = 批 2 / G-P2）」、编号不动**（依据 §10.7「延后项（显式标注，不是漏掉）」）；②**D2-b 归属**随 ④ 移出批 1、成为 G-P2 判据项（批 1 可交付 = **D2-a + D2-c**）；③具名脚本表校正：**补 `test-tier0-predicate.mjs`**、**移出** `verify-d2-decision.mjs` / `test-decision-queue.mjs` / `test-design-gate.mjs`（G-P0 = 8 文件 / 10 命令） | 同上 §4.8 D2-b / §11 G-P0 判据 ④ / §11 具名脚本表 |
 | **U7** | §0.2 新增假设 B-5 + §8 风险表 | **UA-7** `dsh-subagent` 新增进程级容量上限（0.1.5-rc.2 无此机制） | **已新增**（本轮唯一新增）：`ActivationPool` 满额抛 `ACTIVATION_LIMIT_REACHED`；默认 `maxDepth: 1` / `maxActiveSubagents: 8`，可由部署 `settings."subagent"` 覆盖；命中面 = `src/subagent-node.ts` 的 `subagents.startContinuable(...)`。**适用边界照抄**：**仅适用于"由 subagent child 承载的节点"**，可见会话承载的节点不受影响；**不得**普遍化为"所有节点都有并发上限"；**不得**因此新增任何机制（**无 `fault_ref`，属"知道即可"**）。风险行 R-18（`maxDepth: 1` 交互待核） | 同上 §0.2 B-5 / §8.1 R-15…R-18 |
-| **U8** | 收尾 | —— | **已记**（本节）；自检：`check-p0-preconditions.mjs` → **`# V1..V10 ok (10/10)`，exit 0**；`npm run typecheck` → **exit 0** | 本文件 §8；commit 见下 |
+| **U8** | 收尾 | —— | **已记**（本节）；自检：`check-p0-preconditions.mjs` → **`# V1..V10 ok (10/10)`，exit 0**；`npm run typecheck` → **exit 0** | **commit `4e06cee`** —— `docs/plan-0.8.0-execution.md`（U1–U7）+ 本文件 §8（U8） |
+
+**本轮 commit**：`4e06cee` —— `docs(0.8.0 plan): adapt to DSH 0.1.6-alpha.2 (U1-U8)`（2 文件，+48/−15 于计划；`git show --stat 4e06cee` 可复跑）。
 
 **本轮产出的待核项（4 条，均已进 §8.1 风险表，不得写成现状）**：R-15 `patchReload` 新行为 · R-16 `dsh-bash-sandbox` 失败分类 · R-17 `git merge-base --is-ancestor` 本机可用性 · R-18 `maxDepth: 1` 与拓扑的交互。
 
