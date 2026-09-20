@@ -17,7 +17,7 @@
 import type { Context } from "@deepseek-ai/cordis";
 import { ReasoningEffortId } from "@deepseek-ai/dsh-llm";
 import type { ContentBlock } from "@deepseek-ai/dsh-llm";
-import { mountPreset } from "@deepseek-ai/dsh-agent-presets";
+import { mountRolePreset } from "./role-preset-mount.js";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolExecutionInput } from "@deepseek-ai/dsh-tools";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
@@ -427,22 +427,25 @@ export async function createSession(ctx: Context, options: CreateSessionOptions 
     agentPreset = blueprint.receipt.agentPreset;
     governedReceipt = blueprint.receipt;
     governedMeta = blueprint.meta;
-  } else if (options.presetFile !== undefined) {
-    // Orchestra-resolved preset (project > global > builtin): mount the file
-    // directly — no DSH resolver root registration needed (spec §5.3).
+  } else if (options.presetFile !== undefined || (options.presetId !== undefined && options.presetId !== "")) {
+    // S3: ONE branch, because "which file vs which id" is a property of the
+    // preset's SOURCE, not of how the caller happens to describe it. An override
+    // file resolved from `project`/`global` has no roster id; a `dsh`/`builtin`
+    // preset must be mounted by id so the roster composes it and keeps an
+    // identity the resume path can find. `mountRolePreset` owns that decision;
+    // this call site only reports which API ran.
     const file = options.presetFile;
-    agentPreset = file.id;
+    const presets = options.presetId !== undefined && options.presetId !== "" ? ctx.get("agentPresets") : undefined;
+    if (file === undefined && presets === undefined) {
+      throw new Error(`a2a: agentPresets service is unavailable for preset "${options.presetId}"`);
+    }
+    agentPreset = file?.id ?? String(options.presetId);
     setup = async (agentCtx) => {
-      await mountPreset(agentCtx, { id: file.id, trust: file.trust, path: file.path });
-      installModelOverride(agentCtx, modelOverride, overrideProvider, overrideModel, options.reasoningEffort);
-    };
-  } else if (options.presetId !== undefined && options.presetId !== "") {
-    const presets = ctx.get("agentPresets");
-    if (presets === undefined) throw new Error(`a2a: agentPresets service is unavailable for preset "${options.presetId}"`);
-    const resolved = await presets.resolve(options.presetId);
-    agentPreset = resolved.id;
-    setup = async (agentCtx) => {
-      await presets.mount(agentCtx, resolved.id);
+      await mountRolePreset(agentCtx, {
+        presetId: agentPreset as string,
+        ...(presets === undefined ? {} : { roster: presets }),
+        ...(file === undefined ? {} : { overrideFile: { id: file.id, trust: file.trust, path: file.path } }),
+      });
       installModelOverride(agentCtx, modelOverride, overrideProvider, overrideModel, options.reasoningEffort);
     };
   } else {

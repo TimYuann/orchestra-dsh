@@ -135,7 +135,7 @@ import type { SubagentNodeSpec } from "./subagent-node.js";
 import { createTopologyCatalog, resolveRoleExecution, validateTopology } from "./orchestra-topology.js";
 import type { RoleConfig, TopologyCatalog, TopologyClosureDefinition, TopologyConfig, TopologyList, TopologyLoopContract, TopologyProtocol, TopologyResolution, TopologyRoleSummary } from "./orchestra-topology.js";
 export { validateTopology } from "./orchestra-topology.js";
-import { mountPreset } from "@deepseek-ai/dsh-agent-presets";
+import { mountRolePreset } from "./role-preset-mount.js";
 import { registerOrchestrationPrinciples } from "./orchestration-principles.js";
 import "./relay-types.js";
 import { basename, join } from "node:path";
@@ -3632,7 +3632,15 @@ export async function activateArchivedTeam(
       let setup: ((agentCtx: Context) => Promise<void>) | undefined;
       if (presetFile !== undefined) {
         setup = async (agentCtx) => {
-          await mountPreset(agentCtx, { id: presetFile.id, trust: presetFile.trust, path: presetFile.path });
+          // S3: a preset the roster knows is mounted BY ID. Mounting a roster
+          // preset by file bypassed discovery entirely, which is how a
+          // cold-resumed role came back without its composition.
+          await mountRolePreset(agentCtx, {
+            presetId: presetFile.id,
+            ...(presetFile.source === "project" || presetFile.source === "global"
+              ? { overrideFile: { id: presetFile.id, trust: presetFile.trust, path: presetFile.path } }
+              : {}),
+          });
           installModelOverride(agentCtx, true, roleModel?.provider, roleModel?.model, roleModel?.reasoningEffort);
         };
       } else if (roleModel !== undefined) {

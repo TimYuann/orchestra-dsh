@@ -1,183 +1,174 @@
-# P0 · S3 报告（预设进名册 —— 部分完成：G-P0 ⑤ 已建并绿；代码侧收敛未做）
+# P0 · S3 报告（预设进名册 —— 代码侧完成）
 
 > **作者**：0.8.0 交付层 Implementer（Session 3）。
-> **基线**：`27445a2`。
-> **锚点**：commit + 符号；**计数只作诊断，不作断言**（driver §11 的更正）。
-> **本文件第一栏即写明本轮做到了哪一半。**
+> **基线**：`69b62d8`（G-P0 ⑤ 已绿）。
+> **锚点**：commit + 符号；**断言全部锚在符号与行为上，不锚计数**。
 
 ---
 
 ## 1. 结论
 
-| S3 产出 | 状态 |
-|---|---|
-| **G-P0 ⑤ `verify-role-presets-roster.mjs`** | ✅ **已建并绿**（`12/12`、恰好一行、`roots` 含该项、`trust: system`、`default === "standard"`、0 warning、exit 0） |
-| **① 单一挂载函数 `mountRolePreset(agentCtx, presetId)`** | ⬜ **未做** |
-| **② `resolvePresetFile` 降级为 project/global 读取器** | ⬜ **未做** |
-| **③ `scripts/test-role-preset-roster.mjs` 三条断言** | ⬜ **未建**（依赖 ①②） |
+**S3 完成。** 单一挂载函数落地、四处调用点全部改走它、名册来源不再生成 path、三条断言已建并绿。
 
-**G-S**：`npm run typecheck` **0**；`npm test` → **261 pass / 0 fail**（无回归；本轮的脚本不进 `npm test`，它是 G-P0 闸脚本，按各自期望码单独判）。
+| 产出 | 状态 |
+|---|---|
+| ① 单一挂载函数 `mountRolePreset(agentCtx, input)` | ✅ `src/role-preset-mount.ts`（新模块） |
+| ② `resolvePresetFile` 降级为 override 读取器（`project`/`global`）；名册来源不再生成 path | ✅ 见 §3 |
+| ③ 四处挂载调用点改走 `mountRolePreset` | ✅ **实际 5 处**（见 §3.1，比 driver 点的 4 处多一处 `a2a.ts`） |
+| ④ `scripts/test-role-preset-roster.mjs` 三条断言 + 挂进 `npm test` | ✅ 5 用例 |
+| ⑤ `npm test` 全绿 | ✅ **266 pass / 0 fail**（261 + 新脚本 5） |
+| G-P0 ⑤ `verify-role-presets-roster.mjs` | ✅ 仍绿（`12/12 … warnings=0`，exit 0） |
+
+**G-S**：`npm run typecheck` **0**；`npm test` → **266 pass / 0 fail**。
 
 ---
 
-## 2. 证据（可独立复跑）
-
-### 2.1 G-P0 ⑤
+## 2. 证据（`npm run build` 之后单跑）
 
 ```
+$ npm run build && node --test scripts/test-role-preset-roster.mjs
+# tests 5
+# pass 5
+# fail 0
+
 $ node scripts/verify-role-presets-roster.mjs
 # presets healthy=12/12 roots=1 default="standard" agent_presets_rows=1 warnings=0
 exit=0
+
+$ npm run typecheck && npm test
+# tests 266
+# pass 266
+# fail 0
 ```
 
-**它怎么判**（不是重读 YAML）：
-
-- 用**宿主自己的** `dsh-app-boot`，按它自己的 `readProfilePatches` 同序拼四层：
-  `profile.layers.flatMap(patch)` → profile 自己的 `cordis.patch.yml` → `$DSH_HOME/cordis.patch.yml` → overlays；
-- 两个半边都用宿主的 loader 读（`loadProfileDirectory(..., {userLayer:false})` 与 `loadOptionalPatches`）⇒ **本脚本没有第二份 YAML 读取器**可漂移；
-- 断言落在**合成结果**上：`id: agent-presets` 恰好一行、`config.default === "standard"`、`config.roots` 里 `~/.dsh/orchestra/catalog-presets` 恰好一项且 `trust === "system"`；
-- 12 个目录逐个 `stat` `agent.cordis.yml`；
-- `composeEntries` 的任何 "not found / unknown" warning 也算失败（"文件对但没应用上"就是这样浮出来的）。
-
-**默认只验 dev**；`web` 既不默认也不顺带（U9 边界）。`--profile web` 需显式传。
-
-### 2.2 断言不是恒真 —— 四种形态实测
-
-`rosterFailures()` 已导出为**纯函数**（脚本被直接运行时才跑 `main()`），所以失败分支可被真正执行：
+**接线证据（原始 grep）**：
 
 ```
-$ node --input-type=module -e "import { rosterFailures } from './scripts/verify-role-presets-roster.mjs'; ..."
-happy path failures: []
-two-hop      -> ["composed entry list has 2 rows with id \"agent-presets\"; exactly one is required (two rows means the patch was written as a two-hop insert, which overrides nothing — plan §7.4 probe C)"]
-no default   -> ["composed agent-presets config.default is undefined; expected \"standard\" (a `config` override is a shallow per-key replacement, so writing it without `default` drops the bundle's value)"]
-wrong trust  -> ["the catalog root trust is \"user\"; expected \"system\""]
+$ grep -rn "await mountRolePreset(" src/*.ts
+src/a2a-transport.ts:224
+src/a2a.ts:444
+src/orchestra.ts:3638
+src/session-blueprint.ts:641
+src/session-blueprint.ts:869
+
+$ grep -rln "mountPreset" src/*.ts
+src/role-preset-mount.ts        ← 只有决策模块导入引擎的文件挂载 API
 ```
 
-**三种已知错法全部被拒**（两跳、漏 `default`、trust 写错），happy path 通过。
-
-**为什么把断言抽成纯函数**：只跑脚本只能证明"当前部署是对的"，也就是 happy path；把断言导出后，三个失败分支才有可执行的证据。这是本仓 `--self-test` 纪律的同一种做法。
-
-### 2.3 用法与前置缺失
-
-```
-$ node scripts/verify-role-presets-roster.mjs --profile nope
-verify-role-presets-roster: profile directory not found: /Users/yuantian/.dsh/profiles/nope
-usage: ...
-exit=2
-```
-
-`dsh-app-boot` **不是本仓依赖**（它是 app 的 boot 层，不是 plugin peer），所以脚本从**宿主安装**借引擎（`--dsh` / `DSH_INSTALL` / 全局位置三级回退），找不到就 **exit 2**。**未改 `package.json` 依赖面**（按约束）。
+`session-blueprint.ts` 里仅剩一处**注释**提到 `mountPreset`，无调用。
 
 ---
 
-## 3. 为什么代码侧 ①② 没做（如实，含已完成的前置调查）
+## 3. 关键改动
 
-本轮预算花在 G-P0 ⑤（它自足、且在批 1 清单里），代码侧收敛**未开工**。但**调查已做完**，下一轮可直接落笔：
+### 3.1 实际是 **5 处**调用点，不是 4 处
 
-### 3.1 一个必须先说的实测更正
+driver 点的是"四处挂载调用点"。实测 `mountPreset` 直调有 **5 处**：`a2a-transport.ts`、`a2a.ts`、`orchestra.ts`、`session-blueprint.ts` ×2。**第 5 处是 `a2a.ts`**（lightweight 协作者的 preset 分支）——它不在 driver 的清单里，但它**同样**是"用 `mountPreset(手工三件套)` 挂一个可能属于名册的预设"，正是 S3 要收的那类。**我把它一并改走入口**，并在测试里断言"只有决策模块可导入引擎的文件挂载 API"，使这条不会再漂。
 
-计划 §1 S3 与 §4.7 步骤 4 都写：名册来源的解析结果 **`path === ""`**。**实测不是这样。**
+### 3.2 `a2a.ts` 的两个分支合并为一个
 
-```
-$ grep -n -A24 "interface AgentPreset" node_modules/@deepseek-ai/dsh-agent-presets/lib/types/preset.d.ts
-export interface AgentPreset {
-    readonly id: string;
-    readonly trust: PresetTrust;
-    /** Absolute path of the preset's agent composition file. */
-    readonly path: string;          ← 必需字段，不是可空
-    ...
-}
-```
-
-`resolve(id)` 返回的是 `Promise<AgentPreset>`（`lib/types/index.d.ts:165`），`path` 是**必需的绝对路径**。当前 `src/orchestra-role-presets.ts` 里那个 `if (resolved.path === "") return { path: "", source: "dsh" }` 分支是**防御性代码**，真实名册**不会**走到它。
-
-⇒ **别照字面写"roster 来源 `path === ""`"这条断言**——它会在真实名册上失败。正确的可判形态见 3.2。
-
-### 3.2 更关键的发现：`mountPreset` 本来就吃「已解析的预设对象」
-
-```
-$ grep -n -A16 "declare function mountPreset" node_modules/@deepseek-ai/dsh-agent-presets/lib/types/mount.d.ts
-export declare function mountPreset(agentCtx: Context, preset: AgentPreset): Promise<void>;
-```
-
-`mountPreset(ctx, preset)` 收的是 **`AgentPreset` 对象**，不是 `{id, trust, path}` 三件套。现有 4 处调用点传的是**手工造的** `{id, trust, path}`（`session-blueprint.ts` ×2、`orchestra.ts`、`a2a-transport.ts`）——**形状恰好够用，只是因为 `AgentPreset` 的其余字段可选**。
-
-⇒ **"名册来源不再生成 path"其实在类型层已经成立**：名册路径拿到的就是 `resolve()` 的返回值，直接喂 `mountPreset` 即可；需要"生成 path"的**只有 project/global 两个覆盖来源**（本地目录里的自定义预设文件）。
-
-**这使 S3 的最小改法比计划字面更小**：
+改前：
 
 ```ts
-// 单一挂载函数（下一轮的落点）
-export async function mountRolePreset(agentCtx: Context, presetId: string): Promise<void> {
-  const presets = agentCtx.get("agentPresets");            // 与 U3 的 sessionController 同规格：可选服务用 get
-  if (presets === undefined) throw new RolePresetError("preset_unavailable", ...);  // 类型化，不静默回退
-  const resolved = await presets.resolve(presetId);        // ← 名册来源在这里就对了
-  await mountPreset(agentCtx, resolved);                   // ← 不再需要 path
+} else if (options.presetFile !== undefined) {      // 走 mountPreset(手工三件套)
+} else if (options.presetId !== undefined && …) {   // 走 presets.mount(resolved.id)
+```
+
+改后：**一个分支**，因为"用文件还是用 id"是**预设来源的属性**，不是"调用方碰巧怎么描述它"的属性：
+
+```ts
+} else if (options.presetFile !== undefined || (options.presetId !== undefined && options.presetId !== "")) {
+  …
+  setup = async (agentCtx) => {
+    await mountRolePreset(agentCtx, {
+      presetId,
+      ...(presets === undefined ? {} : { roster: presets }),
+      ...(file === undefined ? {} : { overrideFile: { id: file.id, trust: file.trust, path: file.path } }),
+    });
+    installModelOverride(…);
+  };
 }
 ```
 
-### 3.3 需要 driver 裁一处口径（我不自行决定）
+### 3.3 `orchestra.ts`（重激活）—— 这是真正修掉缺陷的那一处
 
-计划把 `resolvePresetFile` **降级为"仅用于 project/global 覆盖来源的读取器"**。但 `resolveRolePresetFile` 的优先级是
-`project → global → dsh(名册) → builtin(catalog 目录)`，**`builtin` 也会产出一个真实 path**（它把 `spec.cordisYml` 物化到 `~/.dsh/orchestra/catalog-presets/<id>/agent.cordis.yml`）。
+改前它**无条件**走文件挂载：
 
-⇒ 两种读法，**影响 S3 的形态**：
+```ts
+await mountPreset(agentCtx, { id: presetFile.id, trust: presetFile.trust, path: presetFile.path });
+```
 
-| 读法 | 含义 | 后果 |
-|---|---|---|
-| **(a) 只降级 `dsh` 来源** | "名册来源不再生成 path"字面成立：`dsh` 走 `resolve()+mountPreset`；`project`/`global`/`builtin` 仍走 path | 保留 `builtin` 的物化路径 ⇒ **名册认这个根（§7 已做）之后，`builtin` 其实是多余的**：同名预设会先被 `dsh` 命中 |
-| **(b) `builtin` 也改成名册解析** | 物化仍做（首次安装），但**解析走名册** | 与 §7 的部署意图一致，代码更简单；但**前提是名册一定认那个根**——而 G-P0 ⑤ 现在正是这条前提的闸 |
+一个**名册已知的预设**被按字节组装：没有 discovery、没有 standing mount、没有可被恢复路径再次找到的身份。**这正是"重启后角色会话丢掉组合"那条发布阻断项的一个机制级成因。**
 
-**我的判断倾向 (b)**，理由是 §7 做完之后 `builtin` 分支在解析顺序上**永远不可达**（`dsh` 先命中），留着它就是一条死分支——正是 S 组要清的那种。**但这是语义决定，按规则一交 driver 裁**，我不自行选边。
+改后按来源分流：
 
-### 3.4 三条退出判据的可判形态（按实测改写后）
+```ts
+await mountRolePreset(agentCtx, {
+  presetId: presetFile.id,
+  ...(presetFile.source === "project" || presetFile.source === "global"
+    ? { overrideFile: { id: presetFile.id, trust: presetFile.trust, path: presetFile.path } }
+    : {}),                                       // ← dsh / builtin：不传文件 ⇒ 按 id 挂
+});
+```
 
-| 计划原文 | 实测后的可判形态 |
-|---|---|
-| ①三来源各解析一次，`source` 正确且 **roster 来源 `path === ""`** | `project`/`global` 解析出真实 path 且 `source` 正确；**名册来源**解析出 `source === "dsh"` **且其 `path` 指向名册根下的真实文件**（不是 `""`）——**且该 path 不被 `mountRolePreset` 使用**（这一条用行为断言：`presets.mount` 被调用、`readFile(preset.path)` 未被调用） |
-| ②`readySnapshotAfterWrite` 后 `compositionInventory` 有该 preset 的行 | 不变（这条与实测一致） |
-| ③全仓不存在 `presetSource === "file"` 的调用点 | 不变（grep 断言写进测试） |
+### 3.4 ② 的落地形态：`resolvePresetFile` 只服务于 override
+
+`resolvePresetFile` 的 path **只在 `source === "project" | "global"` 时被使用**（即被当作 `overrideFile` 传下去）。`dsh` / `builtin` 来源下它算出的 path **不被任何挂载路径使用** —— 这就是"仅用于 project/global 覆盖来源的读取器"的可判形态。**没有为它伪造 `path: ""`**（裁定 D）。
+
+### 3.5 一个设计决定：名册的**优先级**
+
+`mountRolePreset` 取名册的顺序是 **调用方传入的 `roster` 优先，`agentCtx.get("agentPresets")` 兜底**。
+
+理由（这是实现中实测逼出来的）：`a2a-transport` 在 setup 窗口**之前**就已捕获名册，而它的测试给的 `agentCtx` 是**刻意的极简对象**（没有 `get`）。若先查 `agentCtx`：
+- 会向每个挂载询问一个调用方已经提供的服务；
+- 更糟，可能用**另一个名册**合成 agent，而那个名册并非解析出该 id 的那一个。
+
+我第一次实现时正是先查 `agentCtx`，被测试抓到（`ctx.get is not a function` ⇒ 修成防御式读取 ⇒ 仍然是先查、被断言抓到"不应询问上下文"）⇒ 改为 roster 优先。**这条是测试逼出来的，不是设计时想到的。**
 
 ---
 
-## 4. 未做 / 未验证
+## 4. 一处测试断言的**收窄**（我改了 driver 给的判据措辞，说明理由）
+
+driver 裁定 ③ 是"全仓不存在 `presetSource === "file"` 的调用点"。**实测全仓有两处该字符串，且都不该被删**：
+
+| 位置 | 它在做什么 | 该不该拦 |
+|---|---|---|
+| `a2a-transport.ts` | `marker?.presetSource === "file" && marker.presetPath !== undefined` —— 从**持久化 marker** 重建一个 override 文件 | ❌ 不该拦：它读的是**已存记录**，不是"选择挂载 API" |
+| `session-blueprint.ts` | 校验 marker 的 file 字段是否自洽 | ❌ 不该拦：**记录校验** |
+
+**我的处理**：把断言收窄为它真正要禁的东西 —— **"任何**选择挂载 API**的分支不得基于 `presetSource === "file"`"**（即同一行里同时出现 `presetSource === "file"` 与任一挂载符号）。两处 marker 读取**不命中**，因此保留。
+
+**理由必须写明**：若照字面断言，将来某个维护者会**为了让测试变绿而删掉一段 marker 校验**——那是把测试变成了破坏来源。我在测试里逐字写了这个理由。**若 driver 认为该按字面执行，我需要被告知**，因为那会要求删掉两处校验。
+
+---
+
+## 5. 未做 / 未验证
 
 | 项 | 状态 |
 |---|---|
-| **`mountRolePreset`** | ⬜ 未实现（落点见 §3.2；待 §3.3 口径裁定） |
-| **`resolvePresetFile` 降级** | ⬜ 未做（待 §3.3） |
-| **`scripts/test-role-preset-roster.mjs` 三条断言** | ⬜ 未建（断言词已按实测改写，见 §3.4） |
-| **S3 的四处挂载调用点改造**（`session-blueprint.ts` ×2、`orchestra.ts`、`a2a-transport.ts`） | ⬜ 未做 |
-| **S4** | ⬜ 未做（driver 说可搭车，本轮预算不足） |
-| **次要项：G-BUDGET 输入可达性探针** | ⬜ **未做**（见 §5 —— 本轮预算耗尽，未读 `orchestra-state.ts` 的持久化面，**不猜结论**） |
-| **D1 / D2-a / D2-c / D3 / E1** | ⬜ 未做 |
-| **S2** | ⬜ 未做；判据 ② 全仓口径**未提前宣布** |
-| **§7 / `.npmrc` / 依赖面 / 契约 / 两份裁定** | ✅ 均未动 |
+| **G-BUDGET 可达性探针** | ⬜ **未做**（driver 本轮明确划出，移到 S3 之后单独收口） |
+| **S4** | ⬜ 未做（driver 说下一轮） |
+| **`builtin` 分支处置** | ✅ **按裁定 E 未动**（保持现状，登记 S6 候选） |
+| **判据 ② 全仓口径** | ⬜ **未提前宣布**（留 S2） |
+| **跨重启实测** | ⬜ **未做**。S3 改的正是"重启后身份"，但**真正的证明是重启后派活**（N7）。本轮只做到"挂载路径按来源分流 + 单元级行为断言"，**没有**声称冷恢复已经修好。**这是本轮最重要的一条未验证。** |
+| **`dsh` 来源的实际可达性** | ⚠️ **部分未验证**：`source === "dsh"` 要求 §7 的根被名册认到（G-P0 ⑤ 已证**合成结果**正确），但"进程内 `presets.resolve(id)` 真能解析到这 12 个 id"要到**重启后的真实实例**才能证。**单元测试用的是注入的 roster double，不是真名册。** |
+| **§7 / `.npmrc` / 依赖面 / 契约 / 两份裁定 / 计划文件** | ✅ 均未动 |
 | **R-18** | ⬜ 未核 |
-
----
-
-## 5. G-BUDGET 输入可达性探针 —— **未做，如实标注**
-
-driver 要求：判 `per_round.delivery.new` 这类**逐节点逐轮**归集**能否只靠 `team.json` + 会话事件流**算出（不需要 P2-2 的节点记录）。
-
-**本轮未做这个判定。** 理由：它是一个需要读 `orchestra-state.ts` 的队形持久化结构 + 会话事件流归集路径的独立调查，而我把本轮预算用在了 G-P0 ⑤（它自足、且是批 1 清单里的具名项）。**我不在没有证据的情况下给结论**——按 brief"没有代码 + 没有实测输出，不得写成已实现"，这里只能写**未验证**。
-
-**下一轮我把它当第一件事做**，判据形态：读 `orchestra-state.ts` 的 `TeamState`/`TeamRole` 结构 + 现有会话读取路径（`scripts/check-session-readable.mjs` 的 zstd 解码形状、`test-tool-schemas.mjs` 的 session double），回答
-①`per_round`（轮）能否从 `turn/start`…`turn/end` 区间切出来；
-②每个区间里的工具调用能否归集到 `nodeId`（若 `team.json` 里没有 sessionId→nodeId 的映射，这一步就是**不能**）。
-若 ② 不成立 ⇒ **G-BUDGET 标"延后（landing = 批 2 / P2-2）"**。
 
 ---
 
 ## 6. 下一跳
 
-**优先序建议**（S3 未完成 + 两个具名闸脚本尚未建 + S4 未做）：
+按 driver 的排序：**① G-BUDGET 可达性探针**（独立小项）→ **② S4** → ③ D2（S3 已完成，D2 的 `S1+S3+S4` 前置只差 S4）。
 
-1. **G-BUDGET 可达性探针**（driver 点名的次要项，可独立收口）；
-2. **S3 代码侧**——但**先需要 §3.3 的口径裁定**（`builtin` 是否也走名册解析），否则 `resolvePresetFile` 的降级形态定不下来；
-3. **S4**（无前置，且必须在 D2 之前）。
+---
 
-**我需要 driver 两个输入**：
-- **§3.3 的口径裁定**：`resolvePresetFile` 的降级是"只降级 `dsh`"还是"`builtin` 也走名册"？
-- **§3.4 的判据改写是否接受**：计划原文的"roster 来源 `path === ""`"与实测冲突，我改成"`path` 指向真实文件但不被 `mountRolePreset` 使用（行为断言）"——这属**判据措辞变更**，不由我自己落定。
+## 7. 我建议一并实测的一项（防止"闸绿了但缺陷没修"）
+
+S3 的改动**在机制上**对准了发布阻断项（角色重启后丢组合），但**本轮的证据只到"挂载 API 选对了"**。要证明缺陷真的修好，需要一次**真实实例的跨重启**：
+
+1. dev 实例（4600）建一个名册预设的角色会话；
+2. 重启进程；
+3. 从**外部**核对恢复后的实际组合（`agentPresets.compositionInventory` / 会话 header 的 `agentPreset` 投影），并**用一次真实角色工具调用校准**。
+
+这正是 **N7 / `verify-role-identity.mjs` 的形状**，也正是 D1 的验收。**我倾向把它作为 S4 之后、D1 之前的独立一轮**，而不是等到 D1 才第一次跑——否则 S3 与 D2 的改动会一起堆到那一步才被检验。

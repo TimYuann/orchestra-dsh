@@ -71,6 +71,11 @@
 | E-5 | **S3 待裁口径** | **P0-S3-4** `resolvePresetFile` 降级范围：只降级 `dsh`，还是 `builtin` 也走名册解析（§7 后 `builtin` 分支在优先级上**永远不可达** ⇒ 死分支） | **已登记待裁**（我倾向后者，理由已给；按规则一不自行选边） | `docs/p0-report-s3.md` §3.3 |
 | E-5 | **S3 未完成项** | **P0-S3-5** `mountRolePreset` 未实现；`resolvePresetFile` 未降级；`test-role-preset-roster.mjs` 未建；四处挂载调用点未改 | **未做**（落点已调查完，见报告 §3.2） | `docs/p0-report-s3.md` §3–§4 |
 
+| E-6 | **S3 · 代码侧** | **P0-S3-6** 名册预设被按文件挂载（重激活路径**无条件**走 `mountPreset(手工三件套)`）⇒ 无 discovery / 无 standing mount / 无可恢复身份（发布阻断项的机制级成因之一） | **已收口**：新增 `src/role-preset-mount.ts` 的 `mountRolePreset`，**5 处**调用点全部改走它；`dsh`/`builtin` 按 id 挂、`project`/`global` 才传 `overrideFile`；仅决策模块可导入引擎的 `mountPreset` | `src/role-preset-mount.ts`、`src/a2a.ts`、`src/orchestra.ts`、`src/a2a-transport.ts`、`src/session-blueprint.ts`；`docs/p0-report-s3.md` §3 |
+| E-6 | **S3 测试** | **P0-S3-7** 三条断言（三来源 source 正确 / `readySnapshotAfterWrite` 后 inventory 有行 / 全仓无 `presetSource === "file"` 调用点） | **已建并绿**（5 用例）；③ **按实测收窄**为"不得有**选择挂载 API** 的分支基于 `presetSource === "file"`"——全仓两处该字符串都是 **marker 校验/重建**，删它们会让测试变成破坏来源（理由逐字写进测试） | `scripts/test-role-preset-roster.mjs`；`docs/p0-report-s3.md` §4 |
+| E-6 | **计数更正** | **P0-S3-8** driver 点"四处挂载调用点"，实测 `mountPreset` 直调 **5 处**（多 `a2a.ts`） | **已一并收口**（第 5 处同属该缺陷类），并加断言"只有决策模块可导入引擎的文件挂载 API" | `docs/p0-report-s3.md` §3.1 |
+| E-6 | **未验证（重要）** | **P0-S3-9** S3 改动**是否真修好发布阻断项** | **未验证**：本轮证据只到"挂载 API 选对了"（注入 roster double，非真名册）。**真证明需真实实例跨重启 + 外部核对组合 + 一次真实角色工具调用**（= N7 形状）。建议置于 S4 之后、D1 之前 | `docs/p0-report-s3.md` §5 / §7 |
+
 ## 5. 批 1 的 G-P0 判定形态（driver 裁定，2026-09-20）
 
 **判据 ①②③⑤⑥⑦⑧⑨ 各自命中期望码；④ 显式延后（landing = 批 2 / G-P2）。**

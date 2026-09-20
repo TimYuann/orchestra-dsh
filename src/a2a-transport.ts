@@ -9,7 +9,8 @@
 import type { Context } from "@deepseek-ai/cordis";
 import { createUserMessage, freezeMessage, MessageId, ReasoningEffortId } from "@deepseek-ai/dsh-llm";
 import type { ContentBlock, MessageSource } from "@deepseek-ai/dsh-llm";
-import { agentPresetProjectionDefinition, mountPreset } from "@deepseek-ai/dsh-agent-presets";
+import { agentPresetProjectionDefinition } from "@deepseek-ai/dsh-agent-presets";
+import { mountRolePreset } from "./role-preset-mount.js";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
 import type { Session, SessionEvent, SessionHeader } from "@deepseek-ai/dsh-session";
 import type { BlueprintStore } from "./session-blueprint.js";
@@ -214,12 +215,17 @@ async function tryResume(
     resumeSessionId: SID(sessionId),
     agentOptions: provider === undefined || modelId === undefined ? {} : { provider, model: modelId },
     setup: async (agentCtx) => {
-      if (presetFile === undefined) {
-        if (resolved === undefined) throw new Error(`a2a transport: preset ${presetId} was not resolved`);
-        await presets.mount(agentCtx, resolved.id);
-      } else {
-        await mountPreset(agentCtx, presetFile);
+      if (presetFile === undefined && resolved === undefined) {
+        throw new Error(`a2a transport: preset ${presetId} was not resolved`);
       }
+      // S3: one place decides how a preset is mounted. Passing the override file
+      // only when one actually shadows the id is what routes a roster preset
+      // through the roster's own `mount(id)` instead of composing it from bytes.
+      await mountRolePreset(agentCtx, {
+        presetId,
+        roster: presets,
+        ...(presetFile === undefined ? {} : { overrideFile: presetFile }),
+      });
       if (provider !== undefined && modelId !== undefined) {
         installModelSelection(agentCtx, {
           current: {

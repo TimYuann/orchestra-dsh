@@ -12,7 +12,7 @@ import type { Context } from "@deepseek-ai/cordis";
 import { ReasoningEffortId } from "@deepseek-ai/dsh-llm";
 import { scopeOf } from "@deepseek-ai/dsh-scope";
 import { installModelSelection, type Agent, type AgentOptions, type AgentSetupCommit } from "@deepseek-ai/dsh-agent";
-import { mountPreset } from "@deepseek-ai/dsh-agent-presets";
+import { mountRolePreset } from "./role-preset-mount.js";
 import { setSandboxMode } from "@deepseek-ai/dsh-sandbox-policy";
 import { setApprovalPolicy } from "@deepseek-ai/dsh-user-approval";
 import type { SandboxMode } from "@deepseek-ai/dsh-sandbox";
@@ -635,7 +635,13 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
     const agentPresets = agentCtx.get("agentPresets") ?? presets;
     if (presetStrategy === "file") {
       try {
-        await mountPreset(agentCtx, input.presetFile as BlueprintPresetFile);
+        // S3: reached only when the resolution layer is an override file
+        // (`project` / `global`). A roster or builtin preset takes the id branch
+        // below, where the roster composes it and the id stays resolvable.
+        await mountRolePreset(agentCtx, {
+          presetId: input.presetFile?.id as string,
+          overrideFile: input.presetFile as BlueprintPresetFile,
+        });
       } catch (error) {
         throw presetUnavailable(agentPreset, "file", "mounted", error, { path: input.presetFile?.path });
       }
@@ -857,7 +863,13 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
     const agentPresets = agentCtx.get("agentPresets") ?? presets;
     if (presetStrategy === "file") {
       try {
-        await mountPreset(agentCtx, input.presetFile as BlueprintPresetFile);
+        // S3: reached only when the resolution layer is an override file
+        // (`project` / `global`). A roster or builtin preset takes the id branch
+        // below, where the roster composes it and the id stays resolvable.
+        await mountRolePreset(agentCtx, {
+          presetId: input.presetFile?.id as string,
+          overrideFile: input.presetFile as BlueprintPresetFile,
+        });
       } catch (error) {
         throw presetUnavailable(agentPreset, "file", "mounted", error, { path: input.presetFile?.path, roleId: input.roleId });
       }
