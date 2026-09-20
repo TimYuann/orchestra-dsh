@@ -169,7 +169,7 @@ $ npm run typecheck && npm test
 
 | 计划假设 | 实测 | 结论 |
 |---|---|---|
-| **S2**：冷恢复改调 `ctx.sessionController.resume(sessionId)`、唤醒改 `ctx.sessionController.prompt({...})` | 服务**确实存在**：`dsh-api-session-controller` 导出 `SessionController`，方法签名 `async resume(sessionId, supplied)`（`lib/index.js:373`）与 `async prompt(request)`（`:736`）。**但**：① 它**不在本仓 `peerDependencies`**；② **本仓 `node_modules` 里没有这个包**（既无 `.d.ts` 也无运行时）⇒ `tsc` 与测试**都无法解析** | **S2 需先补 peer 依赖**（并按其 peer 集合做 dev 对齐）。这属**依赖面**改动，按 `AGENTS.md` 硬规则 1 只能进 `peerDependencies`；**需 Owner 确认后**再动 |
+| **S2**：冷恢复改调 `ctx.sessionController.resume(sessionId)`、唤醒改 `ctx.sessionController.prompt({...})` | 服务**确实存在**。**但两条都不成立**：① 它当时**不在本仓 `peerDependencies`**、**`node_modules` 里也没有** ⇒ `tsc` 与测试都无法解析；② **`SessionController` 不公开 `resume`**——`resume` / `resumeObserved` 是 `AgentService` 的**私有**方法，公开入口是 `resolveAgent(sessionId)` 与 `prompt(request, signal)` | ① **已由 driver 授权并落地**：peer+dev 各加一条 `^0.1.5-rc.2`（`package.json`，见 `docs/dsh-native-capabilities.md` §5 的实测三件套）；② **落点按实测更正**为 `resolveAgent` |
 | **S3**：`presets.resolve(id)` → `mountPreset(agentCtx, resolved.id)`，名册来源 `path === ""` | `@deepseek-ai/dsh-agent-presets` **已是 peer 且带 `.d.ts`**；导出含 `mountPreset`（`lib/types/index.d.ts:44`）。**但"名册"本身**（`roots` + `trust: system`）**要靠 §7 的 profile patch 才存在** —— S3 的前置是 §7（计划 §3 依赖表已写明） | **S3 仍卡在 §7**，与计划一致；**无新阻断** |
 
 **另一条实测（S1 相关，供下一轮直接用）**：`src/orchestra.ts` 里 `roles.map(...)` 的**手写出现处**与计划 §1 S6 所述一致（`updateTeamRole` 已存在但未被这些路径使用）；三条建会话路径的差别是**实测可核的**：
