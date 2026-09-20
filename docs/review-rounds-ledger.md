@@ -412,3 +412,32 @@
 **未建**：**③④** `verify-d2-approval.mjs`(+`--self-test`)（等 D2）· **⑥** `test-orchestra-archive.mjs` 扩展（等 D3）· **⑨** `test-tier0-predicate.mjs`（独立，搭 D3 轮）· **G-BUDGET** `verify-agent-budget.mjs`（等 P2-2；反转条件见 §11）。
 
 **审查轮计数：+0**。
+
+---
+
+## 17. ★ fixture 更正 + N7 静态半边在**正确** fixture 上不通过（2026-09-21，driver 自查）
+
+### driver 的错误（如实记）
+上一轮（§16）我把 `verify-role-identity.mjs` 跑在 **`~/Documents/agentWorkspace/orchestra-e2e`**（2 角色、`sessionHistory` 全空）上，得到 exit 0 并据此判定 G-P0 ① 通过。
+**正确的 fixture 是 `~/Documents/agentWorkspace/artifacts/projects/orchestra_E2E`**（**两个大写 E**，在 Owner 指定的侧边栏工作区内；`docs/adr/0009` 与 `UPDATE-v0.5.1.md:97` 都有记载）。我上一轮既没找对路径，也没先读 `adr/0009` 就裁定了"必须 Owner 本人批准"——后者被 ADR-0009 §3 的**测试 seam** 直接推翻（**测试实例授权 agent 代敲 `/team approve`**，产品路径不变）。
+
+### 正确 fixture 的形状
+`team-f01da153` · `status: active` · `rootCwd = …/orchestra_E2E` · **6 角色 / 4 预设**：
+`implementer`(orchestra-implementer) · `reviewer`(orchestra-reviewer) · `difficulty-architect`(v04-planner-v1) · `difficulty-implementer`(orchestra-implementer，会话 id 是 `session-*` 形态) · `difficulty-reviewer`(**reserved**) · `e2e-verifier`(v04-verifier-v1)；且有 `activatedFromArchiveId`（**经历过重激活**）与 `addedLanes`（**懒加载形态**）⇒ **天然覆盖 §4.7 步 1 的三种角色形态**。
+
+### ★ 结果：`exit 1`，抓出两条真实数据异常
+```
+IDENTITY_MISSING difficulty-implementer session-898f7481-… 
+      sessionHistory lists the CURRENT session id as a replaced one
+IDENTITY_MISSING difficulty-implementer (history) orchestra-team-f01da153-ec3b09cb-…
+      NOT_A_ROLE_SESSION: no session directory for orchestra-team-f01da153-ec3b09cb-… under …/orchestra_E2E--
+IDENTITY_SKIP    difficulty-reviewer phase=reserved
+# roles 6 ok 4 missing 2
+```
+两条异常：**① `sessionHistory` 把"当前"会话 id 记成了"被替换过的"**（同一条因此出现两次）**② history 里有一个磁盘上不存在的会话目录**。
+
+**归因未定（不得写成"已定位缺陷"）**：该工作区是 **v0.5.1 时代（9-18/19）的遗留数据**，异常可能来自旧构建，也可能是当前 `sessionHistory` 写入逻辑的真实缺陷。**下一步第一件事就是归因**。
+
+**方法论固化**：实现者上一轮**自己标注了盲区**（"fixture 两个角色 history 都是空数组 ⇒ 该分支未在真实数据上跑到"）——**一换到正确 fixture 就立刻炸出真异常**。⇒ **规则：判一个核对脚本"通过"之前，必须先确认它跑在"能覆盖其全部分支"的 fixture 上**；弱 fixture 上的绿灯是假绿。
+
+**审查轮计数：+0。**
