@@ -3131,12 +3131,41 @@ async function materializeRole(
                   ...r,
                   phase: "reserved" as const,
                   diagnostic: { code: "provisioning_failed", message },
+                  // NO `sessionHistory` entry here. history means "the session id
+                  // this role USED TO have, after being replaced" — and in this
+                  // branch nothing was replaced: `r.sessionId` has not moved, so
+                  // recording it would assert a replacement that never happened.
+                  // Doing that also fed a loop: the retry builds ANOTHER session
+                  // while `r.sessionId` still holds the same value, so the same id
+                  // was appended again on every failure (observed: two
+                  // byte-identical entries three seconds apart in
+                  // team-f01da153's difficulty-implementer).
+                  //
+                  // The abandoned attempt is still worth a breadcrumb, so it goes
+                  // to the existing `noticeFailures` list — no new field, and
+                  // deliberately no `replacedAt`, because "replaced" is exactly the
+                  // false claim being removed.
+                  //
+                  // KNOWN LIMIT, recorded rather than fixed: this breadcrumb names
+                  // `r.sessionId`, and `created` is a liveness probe on THAT id —
+                  // not on the session this attempt created. When an attempt
+                  // registers a session and then fails, the two are different
+                  // values, so the breadcrumb does not point at the abandoned
+                  // session. Naming it correctly needs `created.sessionId` from the
+                  // try block, i.e. widening this catch's scope, which is more than
+                  // a minimal repair. See
+                  // docs/p0-report-materialization-failure-fix.md §5.
                   ...(created
                     ? {
-                        sessionHistory: [
-                          ...r.sessionHistory,
-                          { sessionId: r.sessionId, replacedAt: Date.now(), reason: "materialization-failed" },
-                        ],
+                        noticeFailures: [
+                          ...(t.noticeFailures ?? []),
+                          {
+                            milestone: "materialization-failed",
+                            targetSessionId: r.sessionId,
+                            failedAt: Date.now(),
+                            reason: message,
+                          },
+                        ].slice(-NOTICE_FAILURE_LIMIT),
                       }
                     : {}),
                 }

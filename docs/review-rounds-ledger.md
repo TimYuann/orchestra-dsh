@@ -531,3 +531,38 @@ agent-default-model:
 **欠账（U11）**：ADR-0009 §4 需改为"以 `agent-default-model`（`step-plan` / `step-5-preview` / `reasoningEffort: high`）为准"。
 
 **审查轮计数：+0。**
+
+## 19. 修 §18 缺陷：物化失败分支不再写 `sessionHistory`（2026-09-21，裁定 O）
+
+**修法 = (a)**（按裁定 O）。改动只有一处：`src/orchestra.ts` · `materializeRole` 的 catch 分支。
+
+| 项 | 结果 |
+|---|---|
+| 失败分支**不写 `sessionHistory`** | ✅ 因为**没有替换发生**（`r.sessionId` 从未前进） |
+| 留痕改记**既有的 `noticeFailures`** | ✅ **不新增字段** ⇒ 不需要 `fault_ref`；受 `NOTICE_FAILURE_LIMIT` 约束；**刻意不带 `replacedAt`**（那正是被移除的错误主张） |
+| 写入点 2（重激活替换）**不动** + **钉进测试** | ✅ 用例 3 断源码级**顺序**：`role.sessionId = created.sessionId` 必须**先于**记录 `oldSessionId` |
+| 不采纳 (b) | ✅ 未采纳 |
+
+**测试**：`scripts/test-materialization-failure-history.mjs`（3 用例，已挂进 `npm test`）
+①history 不变 ②`sessionId` 不变 ③`phase` 回 `reserved` ④`noticeFailures` 条目**不带 `replacedAt` 语义**
+＋ **回归**：**连续两次失败** ⇒ history 仍不变（原缺陷的循环指纹，含防恒真断言）。
+
+**变异测试（证明非恒真）**：把失败分支改回原实现 ⇒ 用例 1 与用例 2 **各自独立命中**
+（`sessionHistory must not change on a failed materialization` /
+`the original defect appended the same id once per failed attempt`）。改回修复后 3/3 通过。
+
+**G-S**：`npm run typecheck` 0；`npm test` → **269 pass / 0 fail**（266 + 3，既有 266 项 0 回归）。
+
+**N7 对照仍 exit 1（预期）**：本轮修的是**写入逻辑**，不回头修**已写坏的数据**。
+⇒ `team-f01da153` 的历史损伤是**既成事实**，**不得声称 N7 通过**。
+
+**本轮未使用 `/team approve`**（未用 Ego lite、未驱动任何会话）⇒ ADR-0009 §3 测试 seam 未被使用。
+
+### 登记一条遗留（本轮不修）
+`noticeFailures` 那条留痕记的是 **`r.sessionId`**，而 `created` 是**对该 id 的存活探测**、
+**不是**本次尝试建出来的那个会话 ⇒ 在"新会话已建、团队状态未前进"的形状下，两者**不是同一个值**，
+留痕**没指向被抛弃的会话**。修正需要把 `created.sessionId` 提到 catch 可见的作用域（超出最小修复）。
+已**写进代码注释**并在 `docs/p0-report-materialization-failure-fix.md` §5 登记。
+
+**审查轮计数：+0。**
+
