@@ -68,13 +68,50 @@
 | # | 退回的原文要求 | 为什么不可机械判定 | 改成什么（本计划采用的形态） | 记录为 |
 |---|---|---|---|---|
 | **R-1** | 契约 §1.3 的"**无法证明不受影响**"判据 | 判据是"可核验的输入绑定 + **路径交集**"。而验收清单声明的"输入"是**角色写的自然语言**——插件手上只有路径字符串，没有"这条验收读了哪些文件"这一事实。**要算出来就必须自建依赖分析器**，而契约 §1.4 与 §3-P1"不做"清单**两次明令不做** | **默认整树失效**（§1.4 的第一顺位，本来就是默认）。只有验收声明了**机械可比对的形式**（`inputs[]`：路径 + `sha256` + `source`）才开放细粒度复用；**`inputs: []`（空数组）一律视为"未声明"**（F1），**没有 `inputs[]` 的验收一律判"受影响"**，逐条重跑。**变更路径由插件用 `git diff` 自算**（F1），**不取自角色**。**四条限定（F20）**：①属冻结验收协议，改它 = `generation + 1`；②审查者审的是"**这个声明是否正确**"，**不是**"这次复用是否安全"；③复用时**必须标注"基于声明输入集、完备性未证"**并**计入体检报告 §1.9⑤**；④**必须覆盖非 git 跟踪的输入**（夹具 / env 文件按 sha256 绑定，`source: "non-git"`） | `degraded`（诚实边界 `capability-boundaries.md` **#6**）；**不阻塞** |
-| **R-2** | 需求 §2.A6"同一候选树 + 同命令 + 等价条件即可**引用**既有读数" | "等价条件"里包含**环境**；环境是一个开放集合（PATH、locale、env 变量数以百计），插件只采集**声明过的**那几个。声明外的差异**不可判** | 复用判据取**闭集**，**逐项相等 ⇒ 可复用**：`(candidateTree, inputsDigest, checkId, commandDigest, cwd, envDigest, mode, externalDeclaration)` **八项**（**F2**：原来只有五项，漏了**模式**与**外呼宣言**——那正是 P2-4 用例③"历史外呼读数不得证明本次真链"要拦的东西；**F21**：加 `inputsDigest` 以绑定 `inputs[]` 声明）。`envDigest` 只覆盖**声明过的** `env[]`。全部落进 `evidence.reuseScope` 随证据一起落盘。**F22：这八项是"必须比对的下界"，不是"只看这些"的上界**——插件已采集的**其它**身份字段（解释器版本、工具链版本、依赖目录摘要）若不同 ⇒ **至少 `warning` + 计入体检报告 §1.9⑤**，**不得静默放行** | `degraded`（`capability-boundaries.md` **#6**"只保证判定所依赖的条件逐项可比"） |
+| **R-2** | 需求 §2.A6"同一候选树 + 同命令 + 等价条件即可**引用**既有读数" | "等价条件"里包含**环境**；环境是一个开放集合（PATH、locale、env 变量数以百计），插件只采集**声明过的**那几个。声明外的差异**不可判** | 复用判据取**闭集**，**逐项相等 ⇒ 可复用**：`(candidateTree, inputsDigest, checkId, commandDigest, cwd, envDigest, mode, externalDeclaration)` **八项**（**F2**：原来只有五项，漏了**模式**与**外呼宣言**——那正是 P2-4 用例③"历史外呼读数不得证明本次真链"要拦的东西；**F21**：加 `inputsDigest` 以绑定 `inputs[]` 声明）。`envDigest` 只覆盖**声明过的** `env[]`。全部落进 `evidence.reuseScope` 随证据一起落盘。
+
+**P-2（撤回 F22 的宽松读法，回到契约 §1.4 原文"未知依赖一律不复用"）**：
+
+| 情形 | 判定 |
+|---|---|
+| 八项里**任何一项**不同 | **该条重跑**（`fresh`） |
+| 八项全同，且**插件已采集到的、与验收相关的**其它运行条件**任何一项**不同（解释器 / 工具链 / 依赖目录摘要……） | **该条重跑**（`fresh`）。**不是"告警 + 复用"** |
+| 其它已采集字段不同，**但该字段在冻结协议里被显式声明为与本验收无关**（`irrelevantConditions[]`） | 才允许复用；**必须 `warning` + 计入 §1.9⑤** |
+| 未经采集的条件（无法比对） | **视为未知依赖** ⇒ **不复用**（契约 §1.4 原文） |
+
+**"下界非上界"的正确读法**（Pro 纠正的正是这一句）：八项是**必须比对的最小集合**；`reuseScope` 之外**已采集**的条件若不同 ⇒ **前者更严（重跑）**；**只有被显式声明为无关的字段**才降级为告警。**"告警 + 计入证据质量"不得用于任何与验收相关的已采集条件**——那是降标，不是满足 §1.4 | `degraded`（`capability-boundaries.md` **#6**"只保证判定所依赖的条件逐项可比"） |
 | **R-3** | 需求 §2.A7"失败的**位置/类型**"作为硬判据 | "位置"只对**能给出结构化输出的运行器**存在。通用仓库可能是任意语言、任意框架，插件不做运行器适配层（需求 §4.4 保持通用 + §4.8 机制准入） | **两档**：能解析则必须给出 `{name, location, type, reason}`；**解析不出** ⇒ 该验收判 `unqualified`（契约 §1.4 与 `alignment-0.5-position.md` A7 已写"给不出可解析输出 → `unqualified`"）。**"名字相同即无新增"在任何一档都不被接受**。**F3：`unqualified` 不是终点 ⇒ 必须给出收束出口**，见 §4.3.1（活锁是这条原来最大的缺陷） | 硬判据保留（`unqualified` 是可判定的），只是**不是"位置一定要有"** |
 | **R-4** | 需求 §2.B2"强制摄入……**不允许空列表直接通过**" | **不是"不可判定"**（F4 更正）：`dispositions.length === 0 ⇒ 拒` 完全可机械判定。真正的问题是**字面执行会退化成填表 / 活锁**——一个确实没有相关缺陷的节点被迫造一条处置；而"有相关缺陷却空列表"是一种**语义**上的漏表态 | 拒绝条件写成**机械谓词**：`relevantDefects.length > 0 ∧ dispositions.length < relevantDefects.length` ⇒ 拒绝，原因码 `defect_disposition_incomplete`。**候选集为空 ⇒ 过**（这不是"漏表态"，是"确实不相关"）。**时机回到「准备阶段（prepared）」**（F5 + F19，见 §9.1） | 硬判据（**语义澄清**，非收窄判定能力） |
 
 > **F5 的状态（时机移位）**：本计划**原来**把强制摄入的时机从需求的「准备阶段」移到了 freeze，并**未标注**该移位（计划门 F5 指出）。**该移位已取消**：按 round-8 裁定改回 **prepared**（F19）。所以现在**没有**"不申报候选的节点永不摄入"这个缺口，**也没有未标注的移位**。§9.1 的预算随之重算（F23）。
 
-**另有一条不退回但必须写明的边界**：契约 §1.2 档 0 的机械谓词里"**依赖边 = 0**"与"**合并/发布/可复用 PASS 动作全部禁用**"——本计划把它实现为**准入时的声明 + 插件重算**（§2 节点记录字段 `tier` / `deliverable`），**不承诺插件能发现"角色偷偷依赖了别人"**。这落在 `capability-boundaries.md` #7（不能拦任意文件写入）之内。
+**另有一条不退回但必须写明的边界**：契约 §1.2 档 0 的机械谓词——本计划把它实现为**准入时的声明 + 插件重算**（§2 节点记录字段 `tier` / `deliverable`），**不承诺插件能发现"角色偷偷依赖了别人"**。这落在 `capability-boundaries.md` #7（不能拦任意文件写入）之内。
+
+### 0.4 P-1：档 0 谓词的实现口径（**本节的规范定义，取代契约 §1.2 档 0 行**）
+
+**Pro 二审指出的缺陷**：契约 §1.2 档 0 行原文把谓词写成"**执行会话 = 1**"。后果是**两个纯聊天的执行会话进不了档 0**，而轻量档仍有四项底座 ⇒ 与需求 §2"**扩展必须可选；未声明新字段的既有拓扑行为不变**"**不一致**。**这是弹性问题，不是文字问题**：小的用法（不交付任何东西）必须**零成本**。
+
+契约已随之升到 **v1.2.1**（§1.2 档 0 行收紧 + 澄清）。落到实现就是下面五条：
+
+| # | 口径 | 说明 |
+|---|---|---|
+| **①** | **档 0 不限制聊天会话数** | 谓词里**没有**"执行会话 = 1"这一项。N 个纯聊天会话（N ≥ 1）都可以是档 0 |
+| **②** | **交接 / 依赖只统计"交付型"** | **交付型会话 / 交付型节点**才计入 `交接 = 0` 与 `依赖边 = 0`。纯聊天会话之间的消息、以及聊天会话对别人的依赖，**都不构成交付**，不计入 |
+| **③** | **对全部交付动作的硬禁保留** | 合并 / 发布 / 可复用 PASS——**任何一个发生就不是档 0**。这一条没有放松 |
+| **④** | **标准档默认只作用于「已准入的交付节点」** | 反向说：**没有交付动作的会话不进交付层**，不产生节点记录、不摄入、不建胶囊、不建租约。档 0 是"准入的**结果**"，不是"申请来的豁免" |
+| **⑤** | **准入判定只看插件可见的事实** | 只看三样：**插件可见的交付动作**（git/验收/合并/发布/记账这些插件拥有的动作）、**产物引用**（commit / tree / 报告路径 / 证据指针）、**依赖**（其他交付节点）。**不采信 driver 的"不交付"标签** —— 与 §0 约束二一致（会话写意图，插件写事实）。若某个交付动作发生在插件之外（宿主外自主写文件 / 手动合并），**插件不阻止但也不认它**：它**不得被包装成已治理交付**（`capability-boundaries.md` #7） |
+
+**P3-6 的消息指针纪律只管交付消息**（P-1 的连带项，**R3-2 与之同步**）：`test-pointer-messages.mjs` 的判据改成"**交付语境下的协作消息**（涉及 nodeId / decisionId / 证据 / 合并 / 释放的那些）只带指针与原因码"；**纯聊天消息不受该纪律约束**——否则档 0 的零成本就被一条消息格式规则吃掉了。**§1 P3-6 行与本节同源**：那条纪律的"消息"一律读作"交付消息"；而"**任何正确性条件不得依赖消息成功送达**"是**全局**的，对纯聊天消息同样成立。
+
+**判定**（`scripts/test-tier0-predicate.mjs`，新增；P-1 的核心回归）：
+
+1. **两个纯聊天执行会话**（互发若干消息、有依赖式对话、不产生任何交付动作）⇒ 两者**都判档 0**，且**零**节点记录 / 零摄入 / 零胶囊 / 零租约。
+2. 同上，但其中一条会话**要求合并** ⇒ 该条 **不再是档 0**，进**重新准入**；另**一条仍是档 0**（谓词按会话/节点判，不是全局开关）。
+3. **档 0 首次申请任一交付动作 ⇒ 重新准入，且不追认此前产出的 PASS**；**原有权限与外呼审批不随豁免关闭**（契约 §1.2 原文，未改）。
+4. **driver 声称"本节点不交付"但插件看到交付动作**（例如它调了验收执行或写了产物引用）⇒ 仍按**交付型**处理（⑤ 的"不采信标签"）。
+5. **驱动侧的反向用例**：driver 声明"这是交付节点"而插件**看不到任何**交付动作、产物引用或依赖 ⇒ 判**档 0**（**不能靠标签把成本加回来**）。
+
+**为什么这不新增机制**：五条里**没有一条**引入新的检测手段——① ② 是**把统计口径从"全部会话"收窄到"交付型"**（统计口径不是机制）；③④ 是**保留**契约原文；⑤ 是**已经写在本计划 §0 约束二里**的同一条原则（事实由插件写、意图由会话写）在准入上的直接推论。
 
 ---
 
@@ -125,10 +162,10 @@
 | **P2-1** worktree 与租约 | 新 `src/delivery-worktree.ts`、`src/write-lease.ts` | 需求 §7.2-3/-4；契约 §1.6 | ①`git worktree add` 创建/回收，路径确定性（`nodeId → .worktrees/<node-id>`），可重入，dirty 不自动删②租约锚 = **可枚举写面（路径前缀集）**；不可枚举 ⇒ 退化为仓库级独占；**绝不用 `index.lock`**③准入硬拦：写面重叠的节点不得同时开工/冻结 | `scripts/test-write-lease.mjs`：①重叠 ⇒ `lease_conflict` 类型化拒绝②不可枚举 ⇒ 仓库级独占③**全仓不存在 `index.lock` 字样**（grep 断言） |
 | **P2-2** 节点记录 | 新 `src/node-record.ts` | 契约 §3-P2；需求 §7.2-11 | 插件写、不进 git、非插件可读；`<主 worktree>/orchestra/nodes/<node-id>.json` + `schemaVersion` + 纯 JSON（§6） | `scripts/test-node-record.mjs`：①写→读往返②`schemaVersion` 错 ⇒ `unsupported_schema`③**用 `JSON.parse` 裸读**（同 `tests` 里一个"外部读者"函数，不用插件代码）能读懂全部事实字段 |
 | **P2-3** 候选身份与复审 | 新 `src/candidate.ts` | 契约 §1.3；需求 §2.1-1 | 候选 = `{commit, tree, acceptanceManifest, decisionSnapshotHash, generation}`；冻结点 = **门运行之前**；失效的是"新候选的放行资格"：不交新改动 ⇒ 仍交旧候选；必须交 ⇒ 补审差异 + 重新确认证据适用性 + **只重跑无法证明不受影响的验收**（R-1 形态） | **N1**（§4.1） |
-| **P2-4** 证据复用 | 同 P1-1 + `src/candidate.ts` | 契约 §1.4；**R-2 + F2 + F21 + F22** | **八项闭集是"必须比对的下界"**（F22）：`(candidateTree, inputsDigest, checkId, commandDigest, cwd, envDigest, mode, externalDeclaration)` 逐项相等 ⇒ 可复用；未知依赖一律不复用；**不自建依赖分析器**。**复用时的标注义务（F20③）**：证据带 `reuseBasis: "declared-inputs-only"` + `completeness: "unproven"`，并计入体检报告 §1.9⑤ | `scripts/test-evidence-reuse.mjs`：①八项全等 ⇒ `reused` 且带 `reuseBasis`②任一不等 ⇒ `fresh`③历史外呼读数**不得**证明本次真链（构造"上一次观测到真链、本次声明需要真链但未观测" ⇒ `unqualified`）④**`externalDeclaration` 不同（上次 required / 本次 forbidden）⇒ `fresh`**（F2 的直接用例）⑤**`mode` 不同（read-only / workspace-write）⇒ `fresh`**（F2）⑥**八项全等但已采集的其它身份字段不同（工具链版本）⇒ `reused` + `warning: other_identity_mismatch` 且计入⑤节，不得静默**（F22） |
+| **P2-4** 证据复用 | 同 P1-1 + `src/candidate.ts` | 契约 §1.4；**R-2 + F2 + F21 + F22 + P-2 + P-3** | **八项闭集是"必须比对的下界"**：`(candidateTree, inputsDigest, checkId, commandDigest, cwd, envDigest, mode, externalDeclaration)` 逐项相等 ⇒ 才可能复用。**P-2：任何一项已采集的运行条件不同 ⇒ 重跑**（含 `otherIdentity{}` 里的解释器 / 工具链 / 依赖摘要）；**只有在冻结协议里显式声明为无关的字段**（`irrelevantConditions[]`）才降级为告警。**未经采集的条件 = 未知依赖 ⇒ 不复用**。**P-3：复用的默认姿态是"例外"不是"允许"**——带 `reused_unverified_inputs` 类型化标记 + 计入 §1.9⑤ + **在报告里单列计数**。**不自建依赖分析器** | `scripts/test-evidence-reuse.mjs`：①八项全等 ⇒ `reused`②任一不等 ⇒ `fresh`③历史外呼读数**不得**证明本次真链 ⇒ `unqualified`④`externalDeclaration` 不同 ⇒ `fresh`（F2）⑤`mode` 不同 ⇒ `fresh`（F2）⑥**八项全等但 `otherIdentity.toolchain` 不同 ⇒ `fresh`（P-2 的核心回归；上一版这里写的是 `reused+warning`，已撤回）**⑦**同 ⑥ 但该字段在 `irrelevantConditions[]` 里 ⇒ `reused` + `warning` + 计入⑤节**⑧**未采集任何条件的验收 ⇒ 不复用**（未知依赖）⑨复用证据带 `reused_unverified_inputs` 标记，且 §1.9⑤ 的 `unverifiedInputReuseCount` 计数 ≥ 1（P-3） |
 | **P2-5** 合并门 + CAS | 新 `src/merge-gate.ts` | 契约 §1.7③；需求 §7.2-2；**F17** | `git merge-tree --write-tree` 预演 → **先落 `mergeIntent{expectedOld, expectedNew, previewedTree}`** → **`git update-ref <ref> <expectedNew> <expectedOld>` 原子更新** → 合并后 `git rev-parse HEAD^{tree}` 比对 `previewedTree` → 写 `mergeAttempts[]` → "ref 已推进、记账前崩溃"的**四段幂等恢复**（§4.2 步 6） | **N2**（§4.2）+ `scripts/test-merge-cas.mjs` 的崩溃注入用例（§4.2） |
 | **P2-6** 豁免集 | 新 `src/exemptions.ts` | 契约 §1.6；需求 §2.1-3 | 显式声明在配置里；每条带**理由 + 加入人 + 加入时间**（缺理由即校验失败）；**每次对账报告必须打印当次全量豁免集**；写入 `.git/info/exclude` | `scripts/test-exemptions.mjs`：①缺理由 ⇒ 校验失败②对账报告输出里**含全部**豁免条目（逐条比对）③`.git/info/exclude` 含三者 |
-| **P2-7** 收工对账 | 新 `src/reconciliation.ts` | 契约 §1.6；需求 §7.2-2 | 读 **git 自己的** `status --porcelain`（不遍历文件）→ 与节点声明写入面比对 → 范围外**点名**（不阻塞）→ **唯一例外**：越界触及他人**活跃租约** ⇒ **阻断冻结/合并**，且**豁免不能取消这个冲突** | `scripts/test-reconciliation.mjs`：①范围外改动 ⇒ `named[]` 且 `blocked=false`②越界命中他人活跃租约 ⇒ `blocked=true` + `lease_intrusion`③**把该路径加进豁免集后仍 `blocked=true`**（豁免不取消冲突） |
+| **P2-7** 收工对账 | 新 `src/reconciliation.ts` | 契约 §1.6；需求 §7.2-2；**P-5** | **P-5：不能只看 `git status`**——`status --porcelain` 反映的是**工作区相对 HEAD** 的差异，**已经提交的越界改动在 `status` 里是干净的**，会被整条漏掉。因此判定必须做**基线 → 候选的差集**：<br>**① 已提交部分**：`git diff --name-only <baselineRef> <candidateCommit>`（**基线取节点准入时记录的 `baseCommit`**，由宿主在准入时 `rev-parse` 得到）<br>**② 未提交部分**：`git status --porcelain --untracked-files=all`（相对候选 worktree）<br>**③ 合并去重**后与节点声明写入面比对 ⇒ 范围外**点名**（`named[]`，不阻塞）<br>**④ 唯一例外**：越界触及他人**活跃租约** ⇒ **阻断冻结/合并**，且**豁免不能取消这个冲突**<br>两边都只用 git 自己的输出，**不遍历文件** | `scripts/test-reconciliation.mjs`：①范围外改动 ⇒ `named[]` 且 `blocked=false`②越界命中他人活跃租约 ⇒ `blocked=true` + `lease_intrusion`③**把该路径加进豁免集后仍 `blocked=true`**（豁免不取消冲突）④**越界改动已 commit 进候选分支 ⇒ 仍必须被点出**（P-5 的核心回归：这条在只用 `status` 时是**假通过**）⑤未提交的越界改动同样被点出⑥`baselineRef` 缺失 ⇒ **拒绝判定**（`baseline_unknown`），不猜 |
 | **P2-8** 决策队列 | 同 E2/E3 | 契约 §1.5、§1.9③ | 见 E2/E3 | 同 E2/E3 |
 
 ### P3 · 治理层
@@ -140,14 +177,14 @@
 | **P3-3** 所有权与事务声明 | 同 P3-1 + `src/write-lease.ts` | 需求 §2.B3；**收窄出处**（F13）：`alignment-0.5-position.md` §4 的 **B3 行**把这一条**拆成两件事**（①硬拒 ②只登记），**契约 §3-P3 行**已照此写入"**写者冲突硬拒；声明完备性只登记**"。所以②"只登记、不阻断"**不是我方的静默收窄，是契约 §3-P3 与 `alignment-0.5-position.md` B3 行已经写定的口径** | ①同写面第二个活跃写者且无裁定 ⇒ **硬拒**（= N5，复用 P2-1）②`canonical owner` 未定这类**声明完备性** ⇒ **只登记不阻断**，close 时作为 residual 出现 | **N5**（§4.5）+ `scripts/test-ownership-declaration.mjs`：断言②**不阻断开工**（同场景下开工成功、close 时 residual 列表含该条） |
 | **P3-4** 胶囊 | 新 `src/capsule.ts` | 需求 §2.C1/C2；契约 §3-P3 | 骨架机械生成；`required` **只留机器推不出来的三项**：下一步 / 已知失败 / 不可重复的外部动作；缺失标 `incomplete` **不阻塞** | **N6**（§4.6） |
 | **P3-5** `do_not_repeat` | 同 P3-4 | 契约 §1.5-4；需求 §2.1-3 | 未知必须**停**（`unknown` / `attempted` ⇒ **阻断**，不是告警）；解除**只能由人节点作出并留痕** | `scripts/test-do-not-repeat.mjs`：①`unknown` ⇒ 阻断②解除记录缺 `resolvedBy`（人节点）⇒ 拒绝③解除后阻断解除 |
-| **P3-6** 消息只带指针 | `src/a2a.ts`、`src/orchestra.ts` 的角色话术 | 需求 §2.C4 | 协作消息只承载指针与唤醒（node/decision id + 原因码）；**任何正确性条件不得依赖消息成功送达** | `scripts/test-pointer-messages.mjs`：①构造消息投递失败 ⇒ 判定路径仍能跑（读记录即可）②消息文本里出现"验收通过/失败判定"类字样 ⇒ 断言失败（防止把判据塞进消息） |
+| **P3-6** 消息只带指针 | `src/a2a.ts`、`src/orchestra.ts` 的角色话术 | 需求 §2.C4；**R3-2** | **适用范围（R3-2 明确）**：**交付语境下的协作消息**只承载指针与唤醒（node/decision id + 原因码）；**任何正确性条件不得依赖消息成功送达**（这一句对**所有**消息成立，与上下文无关）。**纯聊天消息不承担指针纪律**——但"正确性不得依赖送达"仍然管它们（它们本来就不承载正确性条件） | `scripts/test-pointer-messages.mjs`：①构造消息投递失败 ⇒ 判定路径仍能跑（读记录即可）②**交付消息**文本里出现"验收通过/失败判定"类字样 ⇒ 断言失败（防止把判据塞进消息）③**纯聊天消息**含自由文本 ⇒ **不失败**（R3-2 的边界用例：纪律只判交付消息） |
 
 ### P4 · 收尾
 
 | 项 | 负责面 | 产出 | 退出判据 |
 |---|---|---|---|
 | **P4-1** C3 上下文可观察 | `src/orchestra.ts` | **先查 DSH 有无现成**（`docs/dsh-native-capabilities.md` 第 3 节判据）；有 ⇒ 复用，无 ⇒ 记录"DSH 不具备，故自建"并写明代价。只有观测，**不设配额、不强制轮换** | 观测读数出现在体检报告③节 |
-| **P4-2** 每周机制复查上线 | 新 `src/weekly-review.ts` + 体检报告 ④ 节 | §1.8 三条判据 + **留痕（含"本周无候选"）** + **"比率已连续两窗报警 + 复查连续 N 周无候选"本身成为告警** | `scripts/test-weekly-review.mjs`：①无候选 ⇒ 仍写一条 review 记录②"两窗报警 + 两窗无候选" ⇒ 产出独立告警条目③删除动作必须绑定 `executor` 字段 |
+| **P4-2** 每周机制复查上线 | 新 `src/weekly-review.ts` + 体检报告 ④ 节 | §1.8 三条判据 + **留痕（含"本周无候选"）** + **"比率已连续两窗报警 + 复查连续 N 周无候选"本身成为告警**。<br>**P-11：让删除规则真能执行**——目前它只能报警。每条**按机制**记录五样：**实际成本** / **独有拦截证据**（拿掉它会丢哪些独有拦截，逐条列举）/ **等强替代测试**（替代它的是什么，附可执行断言）/ **执行人 + 截止窗** / **实际停用结果**。<br>**四条硬规则**：①**缺覆盖证据 ⇒ 写 `pending_verification`**，**不算作"无候选"**（否则"没查"会被记成"没问题"）②**到期未执行 ⇒ 不得记复查完成**（状态停 `overdue`）③**没有等强替代 ⇒ 保留**（不得以"最近没出事"为删除理由——契约 §1.8 原文）④**停用结果必须回填**，回填为空 ⇒ 该机制仍在册 | `scripts/test-weekly-review.mjs`：①无候选 ⇒ 仍写一条 review 记录②"两窗报警 + 两窗无候选" ⇒ 产出独立告警条目③删除动作必须绑定 `executor` 字段④**`pending_verification` 不被计成"无候选"**（P-11①）⑤**到期未执行 ⇒ `overdue`，该周不算"复查完成"**（P-11②）⑥**无"等强替代测试"的候选 ⇒ 不产出删除建议**（P-11③）⑦**停用结果未回填 ⇒ 该机制仍在册**（P-11④） |
 | **P4-3** 体检报告 | 新 `src/health-report.ts` | **五节 + 立即阻断清单**；缺任一节即报告无效；④节含复查结论；⑤节**必须与①分开** | `scripts/test-health-report.mjs`：①删任一节 ⇒ `report_invalid`②①⑤合并 ⇒ `report_invalid`③立即阻断清单两项非零 ⇒ 报告带 `blocking` 标记 |
 | **P4-4** 文档面同步 | `STATE.md`、`UPDATE-v0.8.0.md`、`AGENTS.md`、`docs/plan-0.8.0-delivery-layer.md` 的状态行 | 只写已实现项（需求 §4 约束 7「未验证的不要写成现状」） | `scripts/check-docs-status.mjs`：文档里出现"已实现/已完成"字样的行，其指向的符号必须在 `lib/` 里存在 |
 
@@ -181,6 +218,10 @@
 | `src/health-report.ts` | 五节 + 立即阻断清单 | §1.9 独立验收断言 | §1.9 |
 | `src/weekly-review.ts` | 每周复查 + 留痕 + "报警无动作"告警 | §1.8 | 元规则二 |
 | `scripts/verify-role-identity.mjs` | **外部**核对角色身份（N7） | D1 唯一验收 | D1 / N7 |
+| **`verification/manifest.json`** | 闸与脚本的**唯一**结构化清单（`{gate, script, args[], cwd, env[], expectedExitCode, asserts[], dependsOn[]}`）；§5.1/§11 的表由它生成 | **P-10**：消灭手写表带来的"16 vs 17"那类矛盾 | 判据 3 |
+| **`verification/schemas/*.schema.json`** | 十份记录的 JSON Schema（含 `schemaVersion`）；§6 字段表由它生成，**插件写侧用同一份校验** | **P-10**：写侧与文档侧同一真相源 | §6 |
+| **`verification/cases/{merge-recovery,tier0-predicate,agent-budget}.cases.json`** | **表驱动用例**：三处表（§4.2.1 / §0.4 / §9.1）的行与用例一一对应，行数不匹配即失败 | **P-10**：行为正确性由用例证明，不由 grep 证明 | P-7 / P-1 / P-8 |
+| `scripts/run-cases.mjs` / `scripts/gen-verification-docs.mjs` / `scripts/verify-all.mjs` | 用例驱动 / 文档生成校验 / 全量按期望码核对 | **P-10 + P-12** | 判据 3 |
 | `scripts/verify-delivery-e2e.mjs` | 端到端无人介入（§3.1） | 总判据 | §3.1 |
 | `scripts/test-*.mjs`（§1 各表末列点名的） | 每项工作项的退出判据 | 每阶段闸要机器可判 | 全部 |
 
@@ -256,7 +297,7 @@
 | P1-1..P1-4 | P0 全段 | 证据要绑到"冻结快照"，而冻结快照由候选身份产出；候选身份在 P2 —— **注意**：P1 只做**执行与采集**，`candidateId` 字段此时由 P1 自己签发一个占位并标 `provisional: true`，P2 接上后改为真候选。**这个临时状态必须落盘标记，不许假装已绑定** |
 | P2-3（候选身份） | P1-3（冻结快照） | 候选身份的核心是"快照 + 清单 + 决策集" |
 | P2-5（合并门） | P2-3 + P2-1 | 合并的对象是候选；租约决定谁能冻结 |
-| P2-7（对账） | P2-1 + P2-6 | 越界例外要拿活跃租约与豁免集比对 |
+| P2-7（对账） | P2-1 + P2-6 + **准入时记下 `baseCommit`** | 越界例外要拿活跃租约与豁免集比对；**P-5 的基线→候选差集需要准入时的 `baseCommit`**（所以准入要 `rev-parse` 并存进节点记录） |
 | P3-2（强制摄入） | P3-1 + P2-3（候选身份） | 摄入结果要进**候选身份的决策快照**（F19），所以候选身份得先有；载体是节点记录，候选缺陷来自登记 |
 | P3-4（胶囊） | P2-2 | 胶囊骨架从节点记录机械生成 |
 | **D2-a/b/c 的编排** | **S4 先落地** | D2 的"回合不悬挂"要靠 `turn-stopping` 收束（§0.1 的实现顺序已把 S4 排在 D2 之前） |
@@ -311,6 +352,14 @@
 | 6′ | **只重跑"无法证明不受影响"的验收**。R-1 的精确形态（**F1**）：<br>· 清单里**没有** `inputs[]`、或 `inputs` 是**空数组** ⇒ 视为**未声明** ⇒ **一律判"受影响"、逐条重跑**（空数组不得被读成"声明了零个输入"）<br>· 有非空 `inputs[]` 的 ⇒ 变更路径**由插件用 `git diff <C1> <C2> --name-only` 自算**（**不取自角色**），与该 `inputs[].path` 求交集：**交集为空** ⇒ 标记 `reused`；**非空** ⇒ 重跑 | 证据里 `reused` 的**必须**带 `reuseScope`（R-2 的**八项**闭集）+ `reuseBasis: "declared-inputs-only"` + `completeness: "unproven"`（F20③）；**空 `inputs[]` 不得出现在任何 `reused` 证据里**（F1 的核心断言） |
 | 7′ | 再走合并门 | 通过；`git rev-parse` 前进；`update-ref` 的 `expected-old` 与预演时的旧值一致 |
 
+**P-6：另补两个用例（§1.3 的"不交新改动 ⇒ 仍交旧候选"原来只写在正文，没有可执行用例）**
+
+| 用例 | 注入 | 期望 |
+|---|---|---|
+| **P6-a 未申报新 commit ⇒ 仍交旧候选** | 分支上**存在**新 commit，但节点**没有**申报（不调 freeze） | 冻结的候选**仍是 `C1`**；合并门只认 `C1`；新 commit **不参与判定**、也不触发重新审查。**不得**静默把"分支 HEAD"当成新候选 |
+| **P6-b 已声明新 commit ⇒ 才要求新审查** | 节点**显式**申报 `C2`（调 freeze，`inputs[]`/清单随之冻结） | `generation + 1`；旧审查结论**失效**（`stale_candidate_review`）；需要新审查 + 只重跑"无法证明不受影响"的验收 |
+| **P6-c 未申报但分支出现新 commit 的处置**（措辞写清） | 同 P6-a，但该新 commit **改了冻结清单里某些验收的 `inputs[]` 路径** | **插件的判定仍以 `C1` 的冻结清单为准**；P6-a 不变。同时：**收工对账（P-5）会把该新 commit 的路径纳入基线→候选差集** ⇒ 若它越界，按 P2-7 点名/阻断。**两条路径各管各的，不互相冒充** |
+
 **硬线断言（契约 §1.3）**：把 `C1` 的验收清单改一个字（改断言文本）而不改 commit ⇒ 脚本必须拒绝把旧 PASS 复用，原因码 `acceptance_manifest_changed`。**"改断言或改决策语义不得换版本号继续用"** 由这条覆盖。
 
 ### 4.2 N2 · 预检后集成分支前进 ⇒ 重新预演或拒
@@ -324,24 +373,69 @@
 | 3 | A 继续合并 | **两条合法路径之一，且必须是确定的一条**：`git update-ref` 用 `expected-old = <old-sha>` ⇒ **原子失败**；插件捕获后 `git rev-parse` 发现 ref 已推进 ⇒ **重新预演**（`merge-tree` 对 `<new-sha>` 重算）⇒ 若仍可合并则合、否则拒。**不允许**沿用旧预演直接合 |
 | 4 | 记录 | `mergeAttempts[]` 追加 `{code: "base_advanced_retried"}` 或 `{code: "base_advanced_conflict"}`；两种情况下 **`git rev-parse` 的最终值必须是"重演后成立"或"未推进"**，脚本对此做断言 |
 
-#### 4.2.1 F17 恢复判定表（**有序、穷尽**）
+#### 4.2.1 F17 恢复判定表（**两段式、有序、穷尽**）
 
-**两处 F17 的缺口已补**：(a) `ref == expectedOld` **且** `mergeAttempts[]` 已有同 `attemptId` 时，原四段表里的 ② 与 ④ **冲突且无优先级**；(b) `intent` **落盘中途崩溃 / 截断**全文没有规则。下面把这两件事一次收口。
+**Pro 二审对上一版的四条修正（P-7）**：
 
-**判定顺序就是下表的行序**——先判 ①，命中即返回；不命中再往下。**表是穷尽的**：最后一行是"其它一切"，所以不存在落到表外的输入。
+1. **先判 `intent` 的存在 / 损坏 / 合法，再读它的字段**。上一版把"⑤ 不可解析"排在表末，却在①②③④ 里**先读** `intent.expectedNew` / `expectedOld`——等于"先用无效输入，最后才处理无效输入"。现在**阶段 A 只回答 intent 是什么**，**阶段 B 才读字段**。
+2. **修掉"同 `attemptId` 有任意条目即完成"**。上一版第 ① 行只要看到同 `attemptId` 的条目就判"已完成"，**不区分它是不是成功终态记录**。现在要识别**成功终态记录**与**合法后继**，**判不明即阻断**。
+3. **补组合用例「A 崩溃 + B 合法推进」**（不能只每行各测一次）。
+4. **⑤⑥ 的措辞与表内容一致**：⑥ 只写"**不存在**"，不再声称"末行是其它一切"。
 
-| 序 | 先决条件（按序判，命中即停） | 判定 | 动作 |
+##### 阶段 A：`intent` 的形态（**先判这个，命中即停**）
+
+| 序 | 条件 | 判定 | 动作 |
 |---|---|---|---|
-| **①** | `mergeAttempts[]` 里**已有**同 `attemptId` 的条目 | **已完成**（无论 ref 现在是什么值） | 删 `intent`；**不做任何 ref 动作**；若 `ref` 与 `attempt.expectedNew` 不符 ⇒ 记 `ledger_ref_mismatch` 进**立即阻断清单**（§1.9）。**这一行优先于 ②④，是冲突的裁决者** |
-| **②** | `ref == intent.expectedNew` | **ref 已推进、记账未完成** | 补写 `mergeAttempts[]` + `state = "merged"`；**不再 `update-ref`**（这是"重复合并导致 ref 二次前进"的唯一防线） |
-| **③** | `ref == intent.expectedOld` | **`update-ref` 没发生** | 按 `intent` **重做一次**（CAS 仍带 `expectedOld`） |
-| **④** | `ref` 是**第三个值**（既非 expectedOld 也非 expectedNew） | **他人已推进 ref** | 判 `base_advanced` ⇒ **回到预演**（§4.2 步 3），**不得**按 intent 重做 |
-| **⑤** | `intent` **不可解析**（读到临时文件 / 截断 / JSON 坏 / 缺字段） | **视为无 intent** | 回落到"无 intent"的既定分支：**只读 `ref` 与会话记录**，按 ②③④ 的语义重新判定一次但不复用 intent 里的值；判不了 ⇒ `recovery_indeterminate`（类型化）+ 进**立即阻断清单**，**不猜** |
-| **⑥** | `intent` **不存在**（从未写过，或已被 ① 删除） | **无在途合并** | 什么都不做（正常路径） |
+| **A1** | `orchestra/nodes/<node-id>.intent.json` **不存在** | **无在途合并** | **什么都不做**（正常路径）。**本行只覆盖"不存在"** |
+| **A2** | 文件存在但**不可解析**（读到临时文件残留 / 截断 / JSON 坏 / **缺必填字段**） | **视为无 intent** | **不得按半份内容继续**。回落到**阶段 B 的"无 intent"分支**；该分支判不了 ⇒ `recovery_indeterminate`（类型化）+ 进**立即阻断清单**，**不猜** |
+| **A3** | 存在、可解析、`attemptId` / `expectedOld` / `expectedNew` / `previewedTree` **齐备** | **合法 intent** | 进**阶段 B** |
 
-**写入原子性（H-2）**：`intent` 用 **临时文件 + 原子 `rename` 写入 `orchestra/nodes/<node-id>.intent.json`**（写 `<name>.intent.json.tmp.<pid>` → `fsync` → `rename`）。这样 ⑤ 里那几种"半份文件"只可能出现在 `rename` 之前，而 `rename` 之前的文件**不叫** `intent.json`，所以 §6 的落点只会看到完整内容。**解析失败一律按"无 intent"处理（⑤），绝不按"半份内容"继续**——猜测崩溃点的语义正是 0.3 要禁的东西。
+> **为什么 A2 与 A3 之间没有第三种形态**：写入是**临时文件 + 原子 `rename`**（见下），所以落地后的 `intent.json` 只可能是"完整"或"根本没这个名字"；`A2` 覆盖的是"`rename` 之前被中止、而残留物恰好被读到"这一种，**它明确不猜**。
 
-**判定脚本**：`scripts/test-merge-cas.mjs` 必须覆盖**六行各一个用例**，其中三行是 F17 的缺口：①与③同时满足（`ref == expectedOld` **且**已有同 attemptId）⇒ **必须走 ①**（记 `ledger_ref_mismatch`、不动 ref），**不得**走 ③ 重做；⑤ 截断的 `intent.json` ⇒ 走 ⑤ 而不是崩；⑥ 正常路径 ⇒ 无动作。另断言源码里存在 `rename` 调用（`grep` 断言，防止有人改成直接 `writeFile`）。
+##### 阶段 B：账本与 ref 的比对（**读字段只会发生在 A3 之后**）
+
+**核心事实**：**`mergeAttempts[]` 是首次记账之后的权威**。所以"已完成"的判据不是"有同 attemptId 的条目"，而是"**有一条该 attemptId 的成功终态记录**（`result: "merged"` 且带 `expectedNew`）"。
+
+| 序 | 条件（按序判，命中即停） | 判定 | 动作 |
+|---|---|---|---|
+| **B1** | `mergeAttempts[]` 里**有同 `attemptId` 且 `result == "merged"`** 的记录 `R` | **该次合并已完成** | 删 `intent`。**再核账实**：<br>· `ref == R.expectedNew` ⇒ **正常**（无人在其后推进）<br>· `ref != R.expectedNew` ⇒ 判 `ref` **是否为 `R.expectedNew` 的后继**（`git merge-base --is-ancestor R.expectedNew ref`）：**是** ⇒ **合法后继**（他人推进），**不报账实不符**，什么也不做；**否** ⇒ **真账实不符** ⇒ 记 `ledger_ref_mismatch` 进**立即阻断清单**<br>· **判不出** ⇒ **阻断**（不得假定合法） |
+| **B2** | `mergeAttempts[]` 里**有同 `attemptId` 但 `result != "merged"`**（失败 / 拒绝 / 进行中） | **不是成功终态** | 按阶段 A 的 `expectedNew` / `expectedOld` 继续判 B3–B5。**这一行是 P-7(ii) 的关键**：上一版会把这种记录也当"已完成"，从而**永远不再尝试合并**（活锁） |
+| **B3** | `ref == intent.expectedNew` | **ref 已推进、记账未完成** | 补写 `mergeAttempts[]`（`result: "merged"`，带 `expectedNew`）+ `state = "merged"`；**不再 `update-ref`**（这是"重复合并导致 ref 二次前进"的唯一防线） |
+| **B4** | `ref == intent.expectedOld` | **`update-ref` 没发生** | 按 `intent` **重做一次**（CAS 仍带 `expectedOld`） |
+| **B5** | `ref` 是**第三个值**（既非 `expectedOld` 也非 `expectedNew`），**且 `ref` 是 `intent.candidateCommit` 的后继**（`git merge-base --is-ancestor intent.candidateCommit ref`） | **A 已成功、且其后有人在 A 之后推进了 ref** | 补写 `mergeAttempts[]`（`result: "merged"`，**`expectedNew` 记 `ref` 当时的实际值**，并另记 `supersededBy: ref`）+ `state = "merged"`；**不 `update-ref`**。**不得**判 `base_advanced`——那会把 A 重演一遍（重复合并） |
+| **B5'** | `ref` 是第三个值，**且 `candidateCommit` 不是 `ref` 的祖先** | **A 的合并没进 ref，另有他人推进** | 判 `base_advanced` ⇒ **回到预演**（§4.2 步 3）。**不得**按 intent 重做 |
+| **B6** | **无合法 intent**（来自 A1 或 A2） | 无在途合并或不可判 | 只读 `ref` 与**账本**重新判定：与账本自洽 ⇒ 无动作；**不自洽或判不出** ⇒ `recovery_indeterminate` + 进**立即阻断清单**，**不猜** |
+
+> **表是穷尽的**：阶段 A 的三行覆盖 `intent` 的全部形态（不存在 / 不可解析 / 合法）。阶段 B 在 A3 之下按 `ref` 取值分成 B3/B4/B5/B5' 四类（互斥且穷尽"已知 `expectedOld` / `expectedNew` 前提下 `ref` 的一切可能"：等于哪个、或不等于任何一个而 `candidateCommit` 是否为 `ref` 的祖先二选一），B1/B2 按**账本状态**先做终态判别，**B6 是 A1/A2 的出口**。**没有任何输入落到表外**。
+
+##### P-7(ii) 的原始故障（写下来，便于复判）
+
+| 场景 | 上一版会怎么错 |
+|---|---|
+| **A 已 `update-ref` 成功但**记账前崩溃；此时 **B 合法推进了集成分支** | 上一版落 **④**（第三个值）⇒ 判 `base_advanced` ⇒ **回到预演并把 A 重演一遍** = **重复合并**（A 的提交进来两次，或 ref 二次前进） |
+| **A 已记账成功**；随后 **B 合法推进** | 上一版第 ① 行命中"同 attemptId 已存在" ⇒ 判"已完成" ⇒ 但它接着比 `ref` 与 `expectedNew` ⇒ **不相等** ⇒ **误报账实不符** |
+
+两处都是"**只按单条记录的字面命中**"造成的。现在的 **B1 的三种子情形**（相等 / 合法后继 / 非后继）与 **B2 的"非成功终态继续判"** 分别堵住它们。
+
+##### 写入原子性（H-2，沿用）
+
+`intent` 用 **临时文件 + 原子 `rename`** 写入 `orchestra/nodes/<node-id>.intent.json`（写 `<name>.intent.json.tmp.<pid>` → `fsync` → `rename`）。因此 A2 覆盖的"半份文件"**只可能出现在 `rename` 之前**，而它**不叫** `intent.json`。**解析失败一律按"无 intent"处理（A2 → B6），绝不按"半份内容"继续**——猜测崩溃点的语义正是 0.3 要禁的东西。
+
+##### 判定脚本
+
+`scripts/test-merge-cas.mjs` **必须覆盖两张表的每一行，外加 Pro 要求的组合用例**（**P-10：以下每条都要有对应的表驱动用例**）：
+
+| 用例 | 断言 |
+|---|---|
+| A1 / A2（截断 intent）/ A3 | A1 无动作；A2 ⇒ 走 B6、**不崩**、**不按半份内容继续**；A3 ⇒ 进阶段 B |
+| B1-相等 / B1-合法后继 / B1-非后继 / B1-判不出 | 后两者分别 ⇒ 正常 / **什么也不做、不报账实不符** / `ledger_ref_mismatch` 进阻断清单 / **阻断** |
+| **B2（非成功终态）** | 同 attemptId 但 `result: "rejected"` ⇒ **不得**判"已完成"，须继续走 B3–B5 |
+| B3 / B4 | 补记账且**不再 update-ref**（`reflog` 只前进一次）/ 按 intent 重做 |
+| **B5 / B5′** | `ref` 是第三值且 `candidateCommit` 是其后继 ⇒ **补记账、不重演**（`reflog` 只前进一次）；不是后继 ⇒ `base_advanced` 回预演 |
+| B6 | 判不出 ⇒ `recovery_indeterminate` + 进阻断清单 |
+| **组合用例 1：A 崩溃（未记账）+ B 合法推进**（P-7(iii)，**最关键的一条**） | ①A `update-ref` 成功、记账前被杀；②B 合法推进 ref；③恢复 ⇒ 走 **B5**（`candidateCommit` 仍是 ref 的祖先）⇒ **补 A 的记账**，**不是**重演、**不是**报 `base_advanced`；④`git reflog <ref>` 里 **A 只前进一步、B 只前进一步**（**合计 2 条**——⚠️ **这是双节点语境**：A 一步 + B 一步；**§4.2 步 7 的"条目数 = 1"是单节点语境**（只有 A）。两个数字都对，各管各的语境） |
+| **组合用例 2：A 已记账 + B 合法推进** | ①A 完成（已记账，`result: "merged"`）；②B 合法推进 ref；③恢复 ⇒ 走 **B1** ⇒ 认出 `ref` 是 `expectedNew` 的**合法后继** ⇒ **不报账实不符、无动作**；④再断言**不会**补出第二条 `mergeAttempts[]` |
+| 另加 | 源码里存在 `rename` 调用的 **grep 断言**（H-2；但见 P-10：grep 只防"改回直接 writeFile"，**不证明行为正确**，行为由上面的表驱动用例证明） |
 
 **同时必须跑的崩溃幂等用例（契约 §1.7③）**：
 
@@ -349,7 +443,7 @@
 |---|---|---|
 | 5 | 在 `update-ref` **成功之后、写 `mergeAttempts[]` 之前**注入进程终止（测试形态：把两者之间的写入点换成一个测试钩子，钩子抛错） | ref 已前进；节点记录里**没有**合并记录 |
 | 6 | 重启/重跑恢复 | **幂等恢复：有序判定表，见下方 §4.2.1**（落点是 §6 的 `mergeIntent` 文件，**F17**）。**判定必须按表里的序号顺序**，第 ① 行先于其余各行 |
-| 7 | 断言 | 整个用例后 `git rev-parse <ref>` **只前进过一次**（`git reflog <ref>` 的条目数 = 1，这是"ref 已推进、记账前崩溃"的**可机器判定**形态） |
+| 7 | 断言（**单节点语境**） | **只有 A 一个节点**在操作该 ref 时：整个用例后 `git rev-parse <ref>` **只前进过一次**（`git reflog <ref>` 的**条目数 = 1**，这是"ref 已推进、记账前崩溃"的可机器判定形态）。⚠️ **这是 §4.2 崩溃用例的语境**（只有 A），与 §4.2.1 组合用例 1 的"**合计 2 条**"（A 一步 + **B 一步**）**不是同一件事**，两个数字都正确、不可互相套用 |
 
 ### 4.3 N3 · 错误 worktree / 错误 PYTHONPATH ⇒ 证据不合格
 
@@ -393,6 +487,19 @@
 | 非 git 跟踪的输入（`source: "non-git"`） | **必须**在 `inputs[]` 里声明且带 `reason`（F20④）。夹具 / env 文件 / 生成物都属于这一类 |
 | 未声明的参与输入 | `unbound_input` ⇒ `unqualified`（P1-3 用例①）。**"未声明"与"声明了但变了"是两个不同的原因码**，不可合并 |
 | 哈希算法 | `sha256`，十六进制小写，**对文件内容**（不对路径、不对 mtime） |
+
+**P-4：跑前哈希只证明"读到的与声明一致"，不证明"跑的就是那一份"** —— 验收与哈希之间存在 **TOCTOU**（哈希算完到验收执行之间，文件仍可被改；这与 `reports/review-v0.5.1-6bd8d9b-R1.md` 记的那类守卫/事务时间差同族）。
+
+**收口：执行必须从「绑定副本」读取，不从主 worktree 的活路径读。**
+
+| 步 | 何时 | 做什么 |
+|---|---|---|
+| **① 物化绑定副本** | **freeze 时**（不是每次执行时） | 宿主把每条 `inputs[]` 的**内容**复制到 **`orchestra/nodes/<node-id>.inputs/<check-id>/<相对路径>`**（`source:"git"` 的从冻结快照的 worktree 取；`source:"non-git"` 的从声明路径取），**复制时算 sha256 并写入 `frozen.json`**。副本区**只读**（宿主以只读语义使用；插件不改写它） |
+| **② 每次执行前复核** | **每次**验收执行之前 | 对**副本区**逐项重算 sha256，与 `frozen.json` 比对：不一致 ⇒ `input_digest_mismatch` ⇒ `unqualified`（F18 的规则不变，只是**算的对象变成副本**） |
+| **③ 验收读副本** | 执行时 | `cwd` 仍是节点 worktree（契约 §1 已定），但每条验收**声明的 `inputs[]` 一律从副本区读取**：`source:"git"` 的按 git 跟踪路径映射到副本；`source:"non-git"` 的（夹具 / env 文件）通过在 `env[]` 里注入副本路径（如 `FIXTURE_ROOT=<副本目录>`）或按声明路径替换的方式供给。**具体映射方式必须由 `inputs[].materializedAt` 字段显式记录**，不得靠约定 |
+| **④ 主 worktree 的活路径** | —— | **不再作为验收的输入来源**。它变了不影响已冻结副本（这正是要的：副本=声明的那一份），但它变了**会影响正在实现的代码**——那属于"候选变了"，由 A1 的 generation 机制管，**不在这里管** |
+
+**收益与边界**：这闭掉了"跑前哈希通过、执行时读的却是另一份"的缝。**它不保证**被测程序内部不再去读别的东西（`capability-boundaries.md` **#4**：威胁模型之外）。**证据里要写明**：`inputsReadFrom: "bound-copy"`，且副本目录的路径随证据一起落盘（可复核）。
 
 ### 4.4 N4 · 合并后检查失败 ⇒ 终态，不许改回进行中
 
@@ -504,6 +611,47 @@
 
 ## 5. 验收脚本
 
+### 5.0 P-10：可验证面必须是**机器可读的单一真相源**
+
+**Pro 的判据**：这套东西会失控。而且它纠正了一个我原来接受的说法——"失分全是旧文本、语义缺口只有 F17/F18"**不成立**：**F17/F18 是语义缺口**，且**文字层面的完备不等于行为正确**。一句 `grep rename` 命中、或"符号存在"，**都不能证明行为正确**。
+
+**因此本计划的"可验证面"不再散落在正文各处**，改为**三个机器可读源 + 一个生成器**。
+
+> **R3-5 的措辞纪律**：下表三样**目前都不存在**——它们是**本计划将产出的交付物**（见 §2.1 的"新增文件"）。所以下面一律读作"**将产出 / 将作为**"，**不得读成"已存在"**（需求 §4 约束 7：未验证的不要写成现状）。落地前，§5.1 / §11 / §6 的表**仍是手写的**，它们同时是生成器的**输入规格**。
+
+| 源 | 文件（**将产出**） | 内容 | 谁读它 |
+|---|---|---|---|
+| **① 闸与脚本** | **`verification/manifest.json`**（**将产出**） | **唯一的**结构化清单：`{gate, script, args[], cwd, env[], expectedExitCode, asserts[], dependsOn[]}`。**§5.1 的表与 §11 的闸表由它生成**，不再手写（手写正是"16 vs 17"那类矛盾的成因） | **运行器**（`scripts/verify-all.mjs` 按它逐个跑、逐个核对期望退出码）+ 文档生成器 |
+| **② 记录 schema** | **`verification/schemas/<record>.schema.json`**（**将产出**） | 每份记录（节点 / 冻结清单 / 证据 / 决策 / 租约 / 胶囊 / intent / 体检报告 / 基线 / 门 / 豁免集）的 **JSON Schema**，`schemaVersion` 写在 schema 里 | **§6 的字段表由它生成**；插件写入前用同一份 schema 校验（**写侧与文档侧同一真相源**） |
+| **③ 行为用例** | **`verification/cases/<area>.cases.json`**（**将产出**） | **表驱动**：每条用例 = `{caseId, given[], when, then[], refs[]}`。**恢复表（§4.2.1）、分档谓词（§0.4）、预算（§9.1）三处必须表驱动**——它们的行就是用例的行，一一对应 | 由 `scripts/run-cases.mjs` 驱动；**行数不匹配即失败**（表里有一行、用例里没有 ⇒ 红） |
+
+**计划正文只留四样**：**顺序** / **理由** / **边界** / **测试引用**。所以：
+
+- §4.2.1、§0.4、§9.1 的每张表**必须**在 `verification/cases/` 里有等行数的表驱动用例；正文表格后加一行指向 `caseId` 前缀。
+- §5.1 与 §11 的表**改为生成产物**（生成命令与产物路径写进正文；`scripts/check-docs-status.mjs` 扩展为**比对生成产物与磁盘上的表**，不一致即红）。**P-10 落地前**，本文的这两张表是手写的，作为生成器的输入规格。
+- **"grep 到符号" 只保留一条用途**：防止**回归**（例如有人把 `rename` 改回 `writeFile`）。**行为正确性一律由 ③ 的表驱动用例证明**，不得由 grep 证明。
+
+**P-10 的 grep 断言普查**（本文共 6 处 grep 断言，逐条定性——把"结构性守卫"与"行为证明"分开，不许用前者冒充后者）：
+
+| # | grep 断言 | 定性 | 与之配对的行为用例 |
+|---|---|---|---|
+| 1 | §4.2.1：源码存在 `rename` 调用 | **回归守卫** | ✅ `merge-recovery.cases.json` 的 `MR-A2`（截断 intent ⇒ 回落 B6、不按半份内容继续）——**行为由用例证明，grep 只防改回 `writeFile`** |
+| 2 | S3：全仓不存在 `presetSource === "file"` 的调用点 | **结构性** | ✅ `test-native-delivery.mjs` 的"roster 来源解析后 `path === ""`"（行为） |
+| 3 | S6：`agents.resume(` 只剩 2 处 / `roles.map(` ≤ 1 | **结构性（纯计数）** | ❌ **无行为配对，且不假装有**：它只证明"没有第二份实现"，**不证明行为正确**。行为由 N7（身份完整）+ G-P0 的 D2 用例覆盖 |
+| 4 | §10.6：`src/` 下不存在遍历工作区的 `readdir` 实现 | **结构性（不做清单守卫）** | ❌ 同上：防的是"有人把 git 的输出换回自己遍历文件"；**行为由 P-5 的对账用例（基线→候选差集）证明** |
+| 5 | §10.6：不存在 `index.lock` 字样 | **结构性（不做清单守卫）** | ❌ 同上：行为由 `test-write-lease.mjs` 的 `lease_conflict` / 仓库级独占用例证明 |
+| 6 | §10.6：不存在"依赖分析器"实现 | **结构性（不做清单守卫）** | ❌ 同上：行为由 P-2 的复用判据用例（任何已采集条件不同 ⇒ `fresh`）证明 |
+
+**结论**：**6 处里 2 处有行为配对，4 处是纯结构性守卫**。后 4 处**明确标注为「结构性守卫，不承担行为证明」**（不许再被读成"有 grep 就安全了"），并各自指名了承担行为证明的那条用例。
+
+**将产出的文件**（P-10）：`verification/manifest.json`、`verification/schemas/*.schema.json`、`verification/cases/*.cases.json`、`scripts/verify-all.mjs`、`scripts/run-cases.mjs`、`scripts/gen-verification-docs.mjs`。**当前一个都不在磁盘上**。
+
+**新增退出判据**（进 §11 的 G-P0）：
+- `scripts/run-cases.mjs --check-coverage`：**正文表格行数 == 用例条数**（三处表驱动面各一），不一致 ⇒ 退出 1；
+- `scripts/gen-verification-docs.mjs --check`：`manifest.json` 生成的表 == 文档里的表，不一致 ⇒ 退出 1；
+- `scripts/verify-all.mjs`：按 `manifest.json` 跑全部脚本并**逐项核对期望退出码**（这也顺势解决了 P-12 的"自测期望 1 vs 任一非 0 即失败"）。
+
+
 **共同约定**（每个脚本的 `--help` 必须自述这些）：
 
 | 约定 | 值 |
@@ -535,7 +683,7 @@ run-preconditions: tree=<git rev-parse HEAD> env=<sha256 of sorted declared env>
 | `test-node-stall.mjs`（重写） | 同上 | 仓库根 | 0 | S4 三条断言 | TAP |
 | `test-orchestra-preferences.mjs`（改写） | 同上 | 仓库根 | 0 | S5 `legacy_tiers_ignored` + `unknown_argument` | TAP |
 | `test-v05-slimming.mjs`（扩展） | 同上 | 仓库根 | 0 | S6 两条 grep 断言 | TAP |
-| `test-decision-queue.mjs` | 同上 | 仓库根 | 0 | E2/E3 六个用例 | TAP |
+| `test-decision-queue.mjs` | 同上 | 仓库根 | 0 | E2/E3 六个用例 + **P-9 四项**（撤销可执行 / `costCap` 越界即停 / `downstreamMark` 出现在依赖产物上 / `refusalTest` 通过） | TAP |
 | `test-design-gate.mjs` | 同上 | 仓库根 | 0 | F1′ 三个用例 | TAP |
 | `test-runtime-preconditions.mjs` | 同上 | 仓库根 | 0 | 四象限 + `unknown` + 三例外 = 8 用例 | TAP |
 | `test-evidence-runner.mjs` / `test-frozen-snapshot.mjs` / `test-baseline-diff.mjs` / `test-evidence-reuse.mjs` | 同上 | 仓库根 | 0 | P1 各表末列 | TAP |
@@ -543,6 +691,10 @@ run-preconditions: tree=<git rev-parse HEAD> env=<sha256 of sorted declared env>
 | `test-defect-registry.mjs` / `test-defect-intake.mjs` / `test-ownership-declaration.mjs` / `test-do-not-repeat.mjs` / `test-pointer-messages.mjs` | 同上 | 仓库根 | 0 | P3 各表末列 | TAP |
 | `test-orchestra-archive.mjs`（扩展） | 同上 | 仓库根 | 0 | D3 的三条新用例（重入归档两次都通知 / 终态旧队清活跃前通知 / archived marker 后 `orchestra_team` 返回空队 + archive 列表） | TAP `# fail 0`（**G-P0 第 ⑥ 项点名它**，F12） |
 | `test-unqualified-exit.mjs` | 同上 | 仓库根 | 0 | §4.3.1 的四个用例（F3 的收束出口） | TAP |
+| `test-tier0-predicate.mjs`（**P-1**） | 同上 | 仓库根 | 0 | §0.4 的五条口径 + 五个用例（驱动 `verification/cases/tier0-predicate.cases.json`） | TAP |
+| `run-cases.mjs`（**P-10**） | `node scripts/run-cases.mjs --check-coverage [--area <name>]` | 仓库根 | 0（正文表格行数 == 用例条数）/ 1（不匹配）/ 2 | 末行 `# areas N tables T rows R cases R matched yes` | **三处表驱动面各一行**（`merge-recovery` / `tier0-predicate` / `agent-budget`）；行数不一致即退出 1 |
+| `gen-verification-docs.mjs`（**P-10**） | `node scripts/gen-verification-docs.mjs --check` | 仓库根 | 0（生成表 == 文档表）/ 1 / 2 | 末行 `# manifest entries E tables N in_sync yes` | 读 `verification/manifest.json` 生成 §5.1/§11 的表并与文档比对 |
+| `verify-all.mjs`（**P-10 / P-12**） | `node scripts/verify-all.mjs [--gate <id>]` | 仓库根 | 0（**每项命中各自期望退出码**）/ 1 / 2 | 末行 `# checks N ok N mismatched 0` | **按 `manifest.json` 逐项核对期望码**（校准模式期望 1）——这就是 P-12 的机械保证 |
 | `test-weekly-review.mjs` / `test-health-report.mjs` / `check-docs-status.mjs` | 同上 | 仓库根 | 0 | P4 各表末列 | TAP |
 | **`verify-role-identity.mjs`** | `node scripts/verify-role-identity.mjs --repo <abs> --team <abs>` | 任意（路径全显式） | **0**（身份完整）/ **1**（有角色不合）/ **2**（用法或前置缺失） | 每个角色一行 `IDENTITY_OK|IDENTITY_MISSING <roleId> <sessionId> preset=<id> rows=<n> tools=<n>`；末行 `# roles 3 ok 3 missing 0` | 逐行解析：`preset=` 必须是名册可解析 id；`rows/tools` 与节点记录比对 |
 | `verify-role-identity.mjs --self-test` | 同上 | 任意 | **1**（必须检出被换的 id） | 末行 `# self-test detected=yes` | `detected=yes` 且退出码 1 ⇒ 校准通过 |
@@ -554,7 +706,7 @@ run-preconditions: tree=<git rev-parse HEAD> env=<sha256 of sorted declared env>
 | `verify-d2-approval.mjs --self-test` | 同上 + 把一条路径的 approval 改回 `ask` | 任意 | **1**（必须检不出 `turn/end`） | 末行 `# self-test detected=yes` | `detected=yes` 且退出码 1 ⇒ 校准通过（证明第 4 步不是恒真） |
 | **`verify-d2-decision.mjs`** | `node scripts/verify-d2-decision.mjs --repo <abs>` | 任意 | 0（§4.8 D2-b 六用例全部按期望）/ 1 / 2 | 末行 `# cases 6 ok 6 default_applied=<n> blocked=<n> late_answers=<n>` | 逐用例断言；`default_outside_authority` 与 `do_not_repeat` 阻断两例必须有 |
 | **`verify-role-presets-roster.mjs`** | `node scripts/verify-role-presets-roster.mjs --profile web [--profile dev]` | 任意 | 0 / 1 / 2 | 末行 `# presets healthy=12/12 roots=1 default=standard` | §7.3-a：按 `applyEntryPatches` 的**浅替换**语义离线合成 patch 后断言 |
-| **`verify-agent-budget.mjs`**（F23 / H-5） | `node scripts/verify-agent-budget.mjs --repo <abs> --team <abs>` | 任意 | 0（逐项断言全过）/ 1（任一项不过）/ 2 | 每节点一行 `BUDGET node=<id> role=<roleId> new=<n> total=<n>`；末行 `# nodes N delivery_new_max <n> delivery_over 0 review_new 0 review_total_ok yes` | **逐项分开断言**（H-5）：`delivery.new ≤ 3`（有真实请示时 ≤ 4）且 `delivery.new == delivery.total`；**`review.new == 0`**；`review.total == 1`；`driver.new == 0`；`tier0.total == 0`。**逐项断言是本脚本的全部判据**（单一上界判据对"审查型合计 1"恒真通过，判不出 `review.new == 0`）。计数来源 = 会话事件流按 `sessionId → nodeId` 归集（**不采信角色自报**，§9.4） |
+| **`verify-agent-budget.mjs`**（F23 / H-5 / R3-1） | `node scripts/verify-agent-budget.mjs --repo <abs> --team <abs>` | 任意 | 0（逐项断言全过）/ 1（任一项不过）/ 2 | 每节点每轮一行 `BUDGET node=<id> role=<roleId> round=<k> new=<n> total=<n> decisions=<d>`；末行 `# nodes N per_round_ok yes review_new 0 review_total_ok yes lifecycle_sum <n>` | **逐项分开断言**（H-5）。**判据的唯一定义在 §9.1**（R3-1：`per_round.delivery.new == 3 + decisions`，且 `== per_round.delivery.total`；下面只是本脚本要核的项，不是第二处定义）；`per_round.review.new == 0`；`per_round.review.total == 1`；`driver.new == 0`；`tier0.total == 0`；`lifecycle.delivery.new == Σ(per_round.delivery.new)`；`extra_slots.every(d => d.decisionId != null)`。**全文不存在 `≤3 / ≤4` 的上界写法**（那与 `== 3 + decisions` 在 `decisions ≥ 2` 时矛盾）。计数来源 = 会话事件流按 `sessionId → nodeId` 归集（**不采信角色自报**，§9.4） |
 | **`verify-health-report.mjs`** | `node scripts/verify-health-report.mjs --window <id> --team <abs>` | 任意 | 0（五节齐全且①⑤分开）/ 1 / 2 | `# sections 5 present 5 separated=yes blocking=<bool>` | `present 5` 与 `separated=yes` 都是硬判据 |
 
 **为什么负例脚本"通过时退出 0"而不是"退出 1"**：CI 语义是"期望的结果发生了 ⇒ 成功"。注入被拒 = 期望结果。所以 `verify-negative-*.mjs` 的**期望退出码是 0**，而"没被拒"才返回 1。这一点写进脚本 `--help`，避免读者误判。
@@ -567,13 +719,13 @@ run-preconditions: tree=<git rev-parse HEAD> env=<sha256 of sorted declared env>
 
 | 记录 | 路径（相对主 worktree） | 版本常量 | 关键字段 |
 |---|---|---|---|
-| 节点记录 | `orchestra/nodes/<node-id>.json` | `NODE_RECORD_SCHEMA_VERSION = 1` | `nodeId` `teamId` `charterRevision` `state` `tier`(`"standard"｜"lightweight"｜"off"`) `tierReason`(轻量档必填，缺即校验失败) `writeSurface[]` `leaseId` `worktree` `candidate{candidateId,commit,tree,generation,frozenAt}` `acceptanceManifestRef` `decisionSnapshotHash` `designerSessionId` `designerModel` `reviewerSessionId` `reviewerModel` `deliverable{merge,publish,reusablePass}` `faultRefs[]` `ratio{plan,implement,verify}` `residuals[]` `mergeAttempts[]` `updatedAt` |
+| 节点记录 | `orchestra/nodes/<node-id>.json` | `NODE_RECORD_SCHEMA_VERSION = 1` | `nodeId` `teamId` `charterRevision` `state` `tier`(`"standard"｜"lightweight"｜"off"`) `tierReason`(轻量档必填，缺即校验失败) `writeSurface[]` `leaseId` `worktree` `baseCommit`（**准入时 `rev-parse` 得到；P-5 的差集基线**）`candidate{candidateId,commit,tree,generation,frozenAt}` `acceptanceManifestRef` `decisionSnapshotHash` `designerSessionId` `designerModel` `reviewerSessionId` `reviewerModel` `deliverable{merge,publish,reusablePass}` `faultRefs[]` `ratio{plan,implement,verify}` `residuals[]` `mergeAttempts[]{attemptId, at, result: "merged"｜"rejected"｜"failed", expectedOld, expectedNew, supersededBy?}` `updatedAt` |
 | 胶囊 | `orchestra/capsules/<node-id>.json` | `CAPSULE_SCHEMA_VERSION = 1` | 机械字段：`lastConfirmedEffect{commit,tree,externalCallIds[]}` `workspace{worktree,dirty}` `resources{processes[],ports[],leases[]}` `evidencePointers[]`；`required` 三项（**只留机器推不出来的**）：`nextStep` `knownFailures[]` `doNotRepeat[]`；`state: "complete"｜"incomplete"`（缺 required ⇒ `incomplete`，**不阻塞**） |
-| 证据 | `orchestra/nodes/<node-id>.evidence/<check-id>.json` | `EVIDENCE_SCHEMA_VERSION = 1` | `checkId` `candidateId` `commandDigest` `cwd` `treeIdentity{expected,actual}` `env{declared,observed,digest}` `mode` `external{mode,observed,observation:"observed"｜"unknown"}` `exitCode` `signal` `verdict:"pass"｜"fail"｜"unqualified"` `reasonCode` `summary` `failures[{name,location,type,reason}]` `baselineRef` `reuseScope{candidateTree, inputsDigest, checkId, commandDigest, cwd, envDigest, mode, externalDeclaration}` `otherIdentity{interpreter?, toolchain?, depsDigest?}` `otherIdentityMismatch?: true` `reuseBasis:"declared-inputs-only"` `completeness:"unproven"` `preconditionClass:"I"｜"II"`（§4.3.1 的收束出口分类）`reusedFrom` `collectedAt` |
-| **合并意图（F17）** | `orchestra/nodes/<node-id>.intent.json`（**独立文件，不是节点记录的一部分**：它必须在 `update-ref` **之前**落盘，而节点记录是**原子替换**的——把意图塞进节点记录里，写它就会把"合并前"的整份记录一起改写，崩溃语义会变模糊） | `MERGE_INTENT_SCHEMA_VERSION = 1` | `attemptId` `expectedOld`（预演时读到的 ref 值）`expectedNew`（将要写入的新 commit）`previewedTree`（`merge-tree` 算出的组合树）`candidateId` `at`；**写入顺序 = 先落 intent → 再 `update-ref <ref> <expectedNew> <expectedOld>` → 再写节点记录的 `mergeAttempts[]`**。恢复只读它 |
-| 冻结清单 | `orchestra/nodes/<node-id>.frozen.json` | `FROZEN_MANIFEST_SCHEMA_VERSION = 1` | `snapshotCommit` `snapshotTree` `checks[{checkId, command, args[], cwd, env[]:{key,value,source}, timeoutMs, externalMode, testsNoExternalCall?, inputs[]}]` `frozenAt`；**`inputs[]` 是唯一的输入声明字段**（F21）：每项 `{path, sha256, source: "git"｜"non-git", reason?}`，`source:"non-git"` 必带 `reason`。**没有 `extraInputs`**。**注意是 per-check 的 `inputs[]`**（每个验收各自声明它的输入）；清单根级没有"全清单输入"这种第二处口径。**改 `inputs[]` = 改验收协议 = `generation + 1`**（F20①，与 `command` 同级） |
+| 证据 | `orchestra/nodes/<node-id>.evidence/<check-id>.json` | `EVIDENCE_SCHEMA_VERSION = 1` | `checkId` `candidateId` `commandDigest` `cwd` `treeIdentity{expected,actual}` `env{declared,observed,digest}` `mode` `external{mode,observed,observation:"observed"｜"unknown"}` `exitCode` `signal` `verdict:"pass"｜"fail"｜"unqualified"` `reasonCode` `summary` `failures[{name,location,type,reason}]` `baselineRef` `reuseScope{candidateTree, inputsDigest, checkId, commandDigest, cwd, envDigest, mode, externalDeclaration}` `otherIdentity{interpreter?, toolchain?, depsDigest?}`（**P-2：其中任何一项不同 ⇒ `fresh`**）`irrelevantConditions[]`（冻结协议里**显式声明为与本验收无关**的字段名）`irrelevantConditionMismatch?: true`（仅在命中 `irrelevantConditions[]` 时出现，属**告警**）`reuseBasis:"declared-inputs-only"` `completeness:"unproven"` `preconditionClass:"I"｜"II"`（§4.3.1 的收束出口分类）`reuseKind:"exact"｜"reused_unverified_inputs"`（**P-3**：后者是**例外**，不是常规复用）`reusedFrom` `collectedAt` |
+| **合并意图（F17）** | `orchestra/nodes/<node-id>.intent.json`（**独立文件，不是节点记录的一部分**：它必须在 `update-ref` **之前**落盘，而节点记录是**原子替换**的——把意图塞进节点记录里，写它就会把"合并前"的整份记录一起改写，崩溃语义会变模糊） | `MERGE_INTENT_SCHEMA_VERSION = 1` | `attemptId` `expectedOld`（预演时读到的 ref 值）`expectedNew`（将要写入的新 commit）`previewedTree`（`merge-tree` 算出的组合树）`candidateId` **`candidateCommit`**（B5/B5′ 的祖先判定要用它）`at`；**写入顺序 = 先落 intent → 再 `update-ref <ref> <expectedNew> <expectedOld>` → 再写节点记录的 `mergeAttempts[]`**。恢复按 §4.2.1 的两段表读它 |
+| 冻结清单 | `orchestra/nodes/<node-id>.frozen.json` | `FROZEN_MANIFEST_SCHEMA_VERSION = 1` | `snapshotCommit` `snapshotTree` `checks[{checkId, command, args[], cwd, env[]:{key,value,source}, timeoutMs, externalMode, testsNoExternalCall?, inputs[]}]` `frozenAt`；**`inputs[]` 是唯一的输入声明字段**（F21）：每项 `{path, sha256, source: "git"｜"non-git", reason?, materializedAt}`（**R3-3**：`materializedAt` = 该输入在**绑定副本**里的落点路径，由 **P-4** 在 freeze 物化时写入；`source:"non-git"` 必带 `reason`）。**没有 `extraInputs`**。**注意是 per-check 的 `inputs[]`**（每个验收各自声明它的输入）；清单根级没有"全清单输入"这种第二处口径。**改 `inputs[]` = 改验收协议 = `generation + 1`**（F20①，与 `command` 同级） |
 | 候选 | 内嵌在节点记录 `candidate` | `CANDIDATE_SCHEMA_VERSION = 1` | `candidateId` `commit` `tree` `acceptanceManifestRef` `decisionSnapshotHash` `generation` `frozenAt` `frozenBy` |
-| 决策队列 | `orchestra/decisions/<decision-id>.json` | `DECISION_SCHEMA_VERSION = 1` | `decisionId` `question` `default{action,authorityRef}` `deadlineAt` `blocks[]:nodeId` `state:"open"｜"default_applied"｜"resolved"｜"blocked"` `owner` `resolvedBy` `safetyClass:"defaultable"｜"non_defaultable"` `history[]` |
+| 决策队列 | `orchestra/decisions/<decision-id>.json` | `DECISION_SCHEMA_VERSION = 2`（**P-9 加四项 ⇒ 版本递增**） | `decisionId` `question` `default{action,authorityRef}` `deadlineAt` `blocks[]:nodeId` `state:"open"｜"default_applied"｜"resolved"｜"blocked"` `owner` `resolvedBy` `safetyClass:"defaultable"｜"non_defaultable"` `history[]` **＋ P-9 四项**：<br>**① `revocation{how, by, at?}`** —— **撤销方式**（谁、按什么手段撤回已应用的默认值；不能只有"可撤销"这三个字）<br>**② `costCap{unit, limit}`** —— 继续范围的**成本上限**（契约 §1.5-2 要求"可撤销 + 有明确成本上限"）<br>**③ `downstreamMark`** —— 传给下游的**"尚未批准"标记**：依赖该默认值的产物 / 审批 / 交接**必须**带 `provisional: true`，**不得**当"已批准事实"（契约 §1.5-2 后半句）<br>**④ `refusalTest`** —— **对应的拒绝测试**：一条可执行的断言，证明"该默认值不会在无授权时被应用"（把"写权限 ≠ 业务授权"变成可判定的回归） |
 | 租约 | `orchestra/leases/<lease-id>.json` | `LEASE_SCHEMA_VERSION = 1` | `leaseId` `nodeId` `writeSurface[]`（路径前缀，可枚举；不可枚举 ⇒ `enumerable:false` 且按仓库级独占）`state:"active"｜"released"` `acquiredAt` `releasedAt` |
 | 豁免集 | `orchestra/exemptions.json` | `EXEMPTION_SCHEMA_VERSION = 1` | `entries[{path,reason,addedBy,addedAt}]`（**缺任一项即校验失败**）；对账报告必须打印**当次全量** |
 | 设计门 | `orchestra/gates/<node-id>.design.json` | `DESIGN_GATE_SCHEMA_VERSION = 1` | `state:"satisfied"｜"degraded"｜"gate_not_run"` `designer{sessionId,model}` `reviewer{sessionId,model}` `participants[]`（**只允许 `phase === "active"` 的角色进入**）`modelPoolSize` `reason` |
@@ -715,7 +867,31 @@ run-preconditions: tree=<git rev-parse HEAD> env=<sha256 of sorted declared env>
 | **收工 / 交接** | `orchestra_capsule_submit`（**只填 required 三项**：nextStep / knownFailures / doNotRepeat） | **1** | 机械字段（commit/tree/dirty/进程/端口/租约/证据指针）由胶囊生成器从节点记录与 git 推导 |
 | **合计（交付型节点）** | —— | **3（无请示）/ 4（有请示）** | —— |
 
-**最终数字（F23 的答案）**：**典型 3 次，上界 4 次**。
+**P-8：预算的计量单位改为「单轮」，并把返修另计**
+
+Pro 指出原口径把"成功路径"当成了全部：**返修后重新冻结（无请示）会出现第 4 次；多次请示会超 4**。所以口径改成：
+
+| 计量 | 定义 | 数字 |
+|---|---|---|
+| **单轮新增** | **一轮**（一次 candidate 生命周期：prepared → freeze → capsule）内新增的 agent 动作 | **`3 + 请示数`**（摄入 1 + 冻结 1 + 胶囊 1，加每一**真实请示** 1） |
+| **生命周期新增** | 该节点**从开工到关闭**的全部轮次之和，**含返修** | **按轮次累加**，**另计**——不再声称"≤4" |
+| **额外槽的绑定** | 第 4 个及以后（`decision_open`）**必须绑定一条真实决策记录** | 且**"记录存在"不证明"请示必要"**（记录可被滥用为走流程的凭据）⇒ 必要性由**每周机制复查**（P-11）抽样判，不在这里自我认证 |
+| **`total` 的边界** | 要么**含** §4.1 已在基线里存在的报告与通信动作，要么**明确声明不计入并给理由** | 本计划取**前者**：`total` = 该节点本轮**全部** agent 动作（含基线已有的 `orchestra_report` / 通信），因此审查型 `total == 1`、交付型 `total == new`（交付型的三/四次全是新增） |
+
+**因此 G-BUDGET 的判据随之改写**。**下面这个代码块是全文唯一的预算判据定义**，§5.1 与 §11 只是引用它（`≤4` 这种上界不再作为生命周期判据）：
+
+```
+per_round.delivery.new   == 3 + decisions       # decisions = 本轮真实请示数
+per_round.delivery.new   == per_round.delivery.total
+per_round.review.new     == 0
+per_round.review.total   == 1
+driver.new               == 0
+tier0.total              == 0
+lifecycle.delivery.new   == Σ(per_round.delivery.new)   # 含返修，只累加、不设上界
+extra_slots.every(d => d.decisionId != null)            # 额外槽必须绑定决策记录
+```
+
+**原来的"典型 3 次，上界 4 次"作为单轮数字仍然成立**（`decisions ≤ 1` 的典型轮），但**不再被当作生命周期上界**。
 
 - **为什么是 3 而不是 2**：摄入回到 prepared 之后，`defect_disposition` 与 `node_freeze` 是**两个不同时点**的动作（前者影响"怎么动手"，后者在动手之后申报候选），无法再合并成一次调用。若强行合并到 freeze，就又违反 F19。
 - **为什么典型是 3 而不是 4**：`decision_open` 只在**确有请示**的节点上出现。E2 的三类去向里"技术分叉 → oracle"走**既有** `a2a_send`（不新增动作），"范围/依赖/资源 → driver"走**既有** `orchestra_send`。所以多数节点的这一格是 **0**。
@@ -756,17 +932,9 @@ run-preconditions: tree=<git rev-parse HEAD> env=<sha256 of sorted declared env>
 | **driver** | **0** | **0 新增动作** | 任务卡、派发、合并触发都走既有工具 |
 | **档 0（查询型）** | **0** | **0** | 交付层整体关闭 |
 
-**因此 §11 的 G-BUDGET 必须分开断言**（原写法只有 `expect<=4`，**判不出"审查型 0 新增"**——审查型合计 1 ≤ 4 会恒真通过）：
-```
-delivery.new   <= 3      # 典型；确有真实请示时允许 4
-delivery.new   == delivery.total
-review.new     == 0      # H-5 的硬断言：不受 delivery 的上界影响
-review.total   == 1
-driver.new     == 0
-tier0.total    == 0
-```
+**因此 §11 的 G-BUDGET 必须分开断言**（原写法只有 `expect<=4`，**判不出"审查型 0 新增"**——审查型合计 1 ≤ 4 会恒真通过）。
 
-**为什么必须分开**：原来的单一判据 `expect<=4` 对"审查型合计 1"**恒真通过**——`1 <= 4`，所以它**永远判不出**"审查型 0 新增"这条真正要守的线。`review.new == 0` 是唯一能判它的断言。
+**R3-1：预算判据的唯一定义在 §9.1 的那一个代码块，本节不再复述**（同一份计划里出现两处判据正是 R3-1 指出的矛盾来源）。本节只说明**为什么必须逐项分开**：原来的单一判据 `expect<=4` 对"审查型合计 1"**恒真通过**（`1 <= 4`），所以它**永远判不出** `review.new == 0` 这条真正要守的线。
 
 ### 9.3 为什么这些动作不能由宿主承担
 
@@ -894,12 +1062,12 @@ tier0.total    == 0
 | 闸 | 退出判据 | 判定命令 |
 |---|---|---|
 | **G-S（减法）** | `npm run typecheck` 0；`npm test` 全绿且**既有 248 项不回归**；S1–S6 的六个新/改测试全绿；（N7 在 G-P0 判） | `npm run typecheck && npm test` |
-| **G-P0（事实层）** | ①`verify-role-identity.mjs` 退出 0（= N7）②`verify-role-identity.mjs --self-test` 退出 **1**（校准通过；**同一脚本的校准模式，不另计一个脚本**）③`verify-d2-approval.mjs` 退出 0 且 `hanging 0 dangling 0`（D2-a + D2-c），其 `--self-test` 退出 **1**（校准通过；**同一脚本的校准模式**）④`verify-d2-decision.mjs` 退出 0（D2-b 六用例）⑤`verify-role-presets-roster.mjs` 退出 0（§7.3-a，名册真认这个根）⑥`test-orchestra-archive.mjs` 扩展用例全绿（D3）⑦`test-tool-schemas.mjs` 全工具覆盖（D4）⑧E2/E3/E4/F1′ 的测试全绿 | 上述脚本逐个；**任一非 0 即不进 P1** |
-| **G-P1（证据层）** | ①`verify-negative-N3.mjs` 退出 0（六个变体全被按期望判）②`test-baseline-diff.mjs` 的人工对账样例一致③`test-frozen-snapshot.mjs` 的"未跟踪夹具不会让证据冒充输入绑定"用例通过 | 三个脚本 |
+| **G-P0（事实层）** | **退出码口径（P-12）**：本闸的"通过" = **每个脚本的每个模式各自命中它自己的期望退出码**（正常模式 **0**、校准模式 **1**），**不是**"所有命令都返回 0"。凡标 `--self-test` 的项，**期望 1 即为通过**。逐项：<br>①`verify-role-identity.mjs` 退出 0（= N7）②`verify-role-identity.mjs --self-test` 退出 **1**（校准通过；**同一脚本的校准模式，不另计一个脚本**）③`verify-d2-approval.mjs` 退出 0 且 `hanging 0 dangling 0`（D2-a + D2-c），其 `--self-test` 退出 **1**（校准通过；**同一脚本的校准模式**）④`verify-d2-decision.mjs` 退出 0（D2-b 六用例）⑤`verify-role-presets-roster.mjs` 退出 0（§7.3-a，名册真认这个根）⑥`test-orchestra-archive.mjs` 扩展用例全绿（D3）⑦`test-tool-schemas.mjs` 全工具覆盖（D4）⑧E2/E3/E4/F1′ 的测试全绿 | 上述脚本逐个、**按各自期望码**判定；**任一项未命中其期望码即不进 P1**（**校准模式的期望码是 1**，见上） |
+| **G-P1（证据层）** | ①`verify-negative-N3.mjs` 退出 0（六个变体全被按期望判）②`test-baseline-diff.mjs` 的人工对账样例一致③`test-frozen-snapshot.mjs` 的"未跟踪夹具不会让证据冒充输入绑定"用例通过④**`test-frozen-snapshot.mjs` 的「绑定副本」用例通过**（P-4：副本与活路径内容被改成不同时，验收读到的必须是副本） | 三个脚本 |
 | **G-P2（交付层）** | ①`verify-delivery-e2e.mjs` 退出 0 且 `human_interventions=0`（§3.1）②`verify-negative-N1.mjs` / `verify-negative-N2.mjs` / `verify-negative-N4.mjs` / `verify-negative-N5.mjs` **逐个**退出 0（不为缩写单列一行） ③`test-merge-cas.mjs` 的崩溃幂等用例通过（`reflog` 只前进一次）④§1.7 的两项早期信号可被观测（体检报告⑤节的 `unknownPreconditionPasses` 与 `crossBoundaryCount` 字段有值） | 六个脚本 |
 | **G-P3（治理层）** | ①`verify-negative-N6.mjs` + `verify-capsule-resume.mjs` 退出 0 ②`test-defect-intake.mjs` 的 R-4 谓词两向用例通过（非空未表态 ⇒ 拒；为空 ⇒ 过）③`test-ownership-declaration.mjs` 断言②**不阻断开工** | 三个脚本 |
 | **G-P4（收尾）** | ①`verify-health-report.mjs` 退出 0（五节 + ①⑤分列 + 立即阻断清单）②`test-weekly-review.mjs` 的"无候选也留痕"与"报警无动作告警"用例通过③`check-docs-status.mjs` 退出 0 | 三个脚本 |
-| **G-BUDGET（随 G-P0 一起核，F23 / H-5）** | **两个口径分开判**（字段名与脚本输出一致，见 §9.1）：`delivery.new ≤ 3`（典型）/ `≤ 4`（**仅确有真实请示**，门第 2 轮裁定已接受）且 `delivery.new == delivery.total`；**`review.new == 0`**（硬断言）；`review.total == 1`；`driver.new == 0`；`tier0.total == 0`。计数来源是宿主持有的会话事件流（按 `sessionId → nodeId` 归集），**不采信角色自报**（§9.4） | `scripts/verify-agent-budget.mjs`（读会话事件流 + 节点记录；末行 `# nodes N delivery_new_max <n> delivery_over 0 review_new 0 review_total_ok yes`）。**只写 `expect<=4` 判不出"0 新增"**，所以逐项分开断言 |
+| **G-BUDGET（随 G-P0 一起核，F23 / H-5 / R3-1）** | **唯一判据见 §9.1 的代码块**（ `per_round.delivery.new == 3 + decisions`，且 `== total`；**此处只引用，不另立定义**）；**两个口径分开判**（字段名与脚本输出一致，见 §9.1）：`per_round.review.new == 0`（硬断言）；`per_round.review.total == 1`；`driver.new == 0`；`tier0.total == 0`；`lifecycle.delivery.new == Σ(per_round.delivery.new)`；`extra_slots.every(d => d.decisionId != null)`。计数来源是宿主持有的会话事件流（按 `sessionId → nodeId` 归集），**不采信角色自报**（§9.4） | `scripts/verify-agent-budget.mjs`（读会话事件流 + 节点记录；末行 `# nodes N per_round_ok yes review_new 0 review_total_ok yes`）。**全文不得再出现 `≤3 / ≤4` 这类上界**——它与 `== 3 + decisions` 在 `decisions ≥ 2` 时直接矛盾 |
 | **G-RELEASE（bump 0.8.0）** | 契约 §7 三条同时成立：N1–N7 全部按期望被拒绝/被处理 **+** §3.1 端到端无人介入跑通 **+** §1.9 五节 + 立即阻断清单有效。外加 `AGENTS.md` 硬规则 2/3 的两步 | `npm pack --cache /tmp/dsh-npm-cache` → 按 `DSH-INTEGRATION.md`「更新流程」同步 profile → 核 profile 无 `@deepseek-ai` 实体副本 + `require.resolve` 从 lib 视角指向 host 路径 + health 200 → **新会话**实测 |
 | **G-CLIENT（条件闸）** | 若本轮**确有** client 改动：必须真开浏览器验证（`ego-browser` 打开 `http://127.0.0.1:4600/?token=…`），`tsc` 全绿不算数 | `AGENTS.md` 硬规则 3。**本计划不含 client 改动**，若执行期新增了 client 改动则该闸启用 |
 
