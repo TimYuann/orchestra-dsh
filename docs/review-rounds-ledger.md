@@ -81,6 +81,11 @@
 | E-7 | **新发现（推论，非实测）** | **P0-F8** 真实组合标记里 `approval: "ask"`，而受治理会话被 `setApprovalPolicy(session,"never")` 钉死 ⇒ **标记记的是「预设声明值」，不是「会话实际值」** | **登记为机制推论，未实测**：冷恢复若不重新钉 `never` 就会回到记录声明的 `ask`（正是 D2-a 要判的）。**不得写成"已定位缺陷"** | 同上 §2.3 |
 | E-7 | **未完成** | **P0-F9** 跨重启第 2–4 步（建会话 / 重启 / 外部核对） | **未做**，阻断点可判定：`orchestra_create` 需 `frozenRef` ⇒ 需用户 `/team approve`（模型侧无等价工具） | 同上 §2.4 |
 
+| E-8 | **G-P0 ① / N7** | **P0-F10** 缺 `verify-role-identity.mjs`（发布阻断项判据） | **已建成并双向验证**：正常 exit 0（`# roles 2 ok 2 missing 0`）；`--self-test` 检出真实非角色会话并 exit 1（`NOT_A_ROLE_SESSION`）；另三条检出路径（A 预设不一致 / B 名册不存在 / C 根缺失）均 exit 1；前置缺失 exit 2 | `scripts/verify-role-identity.mjs`；`docs/p0-report-verify-role-identity.md` §2 |
+| E-8 | **脚本自查更正** | **P0-F11** 首版 `rows=0 tools=0` 是**空转输出**（读的字段 fixture 里没有） | **已修**：改经宿主 `readComposition` + 插件自己的 `parseRolePresetComposition` 取真实行数（现为 5/5）。**未自造第三份解析器** | 同上 §3.1 |
+| E-8 | **脚本自查更正** | **P0-F12** 首版 `--self-test` 挑到"目录存在但无日志"的会话 ⇒ 只证明"缺会话报缺"，**证不了"真实非角色会话会被拒"** | **已修**：只挑确实有日志的会话；并显式写 `NOT_A_ROLE_SESSION` | 同上 §3.2 |
+| E-8 | **证据上限（必须写清）** | **P0-F13** 本脚本读的是**预设文件声明的**行/工具数，**不是恢复实例实际挂载的工具面**（后者要 `compositionInventory`，需活代理上下文） | **已声明为上限**：脚本证明"记录与名册现在一致"，**不证明**"重启后身份完整"。后者仍需 live 会话（裁定 I 明确拆出） | 同上 §4 |
+
 ## 5. 批 1 的 G-P0 判定形态（driver 裁定，2026-09-20）
 
 **判据 ①②③⑤⑥⑦⑧⑨ 各自命中期望码；④ 显式延后（landing = 批 2 / G-P2）。**
