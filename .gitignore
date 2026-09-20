@@ -37,3 +37,5 @@ reports/
 .env.*
 probe.txt
 .probe-mkdtemp.txt
+# 升级审计（npm 模式）的材料化目录：a/ + b/ 两棵依赖闭包，可达数百 MB，不入库
+tmp/
