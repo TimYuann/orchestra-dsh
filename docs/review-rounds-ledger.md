@@ -379,3 +379,36 @@
 **更彻底一条**：裁定 I 的脚本**直接读 `~/.dsh/sessions/` 的文件**，走的是文件系统而**不是 a2a** ⇒ **红线在验证这一步根本不适用**。禁止的仍然只有：`a2a_send`、任何 resume/`resolveAgent`、以及会触发 resume 的投递。
 
 **审查轮计数：+0**。
+
+---
+
+## 16. 第 5 轮（G-P0 ① / N7 脚本）的 driver 复核与两条裁定（2026-09-21）
+
+**候选：commit `77116ef`。** driver 独立复跑（先 `npm run build`）：
+
+| 模式 | 期望 | 复跑 | 判定 |
+|---|---|---|---|
+| 正常 | 0 | **exit 0**；`IDENTITY_OK` ×2；`# roles 2 ok 2 missing 0` | 命中 |
+| `--self-test` | 1 | **exit 1**；在**真实非角色会话**上检出 `NOT_A_ROLE_SESSION`；`# self-test detected=yes` | 命中 |
+| 无参数 / team 不存在 | 2 | **exit 2 / exit 2** | 命中 |
+| 无第二份解析器 | 只 import 宿主与既有脚本 | **import 面确认**：`readStoredEvents` 来自 `./check-session-readable.mjs`，其余来自宿主包 | 命中 |
+
+**它的两处自我更正都核过且都写进了报告**：① 首版 `rows=0 tools=0` 是读了 fixture 没有的 `blueprint.compositionRowIds` ⇒ 那行"看起来在报数、其实零信息"，已改为读预设真实组合（现为真的 5/5），并在角色没记预期组合时显式打 `(no recorded composition to cross-check)`；② 首版 `--self-test` 挑到"目录在但无日志"的会话 ⇒ 只证了"缺会话报缺"，**证不了"真实非角色会话会被拒"**，已改为只挑有日志的会话。
+
+### 裁定 L｜Q1：**本轮做 S4**（不是它建议的 ⑥/⑨）
+批 1 剩余的真实分布是：**S4**（D2 的前置）· **D2-a/D2-c + ③④**（发布阻断项，但要等 S4）· **D1/N7 的 live 半边**（发布阻断项）· **D3 + ⑥**（独立 P0 项）· **⑨ / G-BUDGET**（闸项，挡不住任何东西）。
+⇒ **S4 在通往 D2 的关键路径上**，先做它。**⑨ 与 G-BUDGET 搭到 D3 那一轮**（D3 本来就要扩 ⑥，同轮多建 $9 更便宜）。**本轮不搭车**（轮粒度太粗是本项目已认定的问题）。
+
+### 裁定 M｜Q2：**不接受"只做静态半边"作为 D1 的最终验收**
+脚本自己的证据上限写得对：它读的是**预设文件声明的**行/工具数，**不是恢复实例实际挂载的工具面**（后者要 `agentPresets.compositionInventory()`，需要活代理上下文，而脚本是纯读盘）。
+⇒ **静态半边证明"记录与名册现在一致"，不证明"重启后角色身份完整"。** N7 的名字就是后者，而 D1 是发布阻断项 ⇒ **live 半边必须做**，只是排在 S4 之后。
+**live 半边的三段（归属已划清）**：
+1. **Owner 本人**在 4600 上批准一个最小宪章 —— `orchestra_create` 的 `frozenRef` 只能来自 `/team approve`，是**用户命令**，模型侧无等价工具；**且"代批"违反平台权限公理，不得由 agent 代做**。
+2. 在 4600 上用 `ego-browser` 驱动建三角色 / 重激活（agent 可做；**不要用 browser-use**）。
+3. 重启后**从实例内**取 `compositionInventory` + 一次**真实角色工具调用**（agent 可做）。
+
+### 批 1 · G-P0 现状（复核后）
+**已绿 4 条**：**①**（本脚本 + 校准）· **⑤**（`verify-role-presets-roster.mjs`）· **⑦**（`test-tool-schemas.mjs`）· **⑧**（`test-orchestra-role-presets.mjs`）。
+**未建**：**③④** `verify-d2-approval.mjs`(+`--self-test`)（等 D2）· **⑥** `test-orchestra-archive.mjs` 扩展（等 D3）· **⑨** `test-tier0-predicate.mjs`（独立，搭 D3 轮）· **G-BUDGET** `verify-agent-budget.mjs`（等 P2-2；反转条件见 §11）。
+
+**审查轮计数：+0**。
