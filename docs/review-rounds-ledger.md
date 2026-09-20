@@ -316,3 +316,26 @@
 **预登记的合法结局**：若 **(c)** 命中，那是**已知的（S2 未做）**，**不是新缺陷**，更不是本轮失败。届时结论形态是"S1/S3 正确，瓶颈在 S2"，并据此把 S2 提到前面。
 
 **审查轮计数：+0**。
+
+---
+
+## 14. §7-dev 部署 + DSH 0.1.6-alpha.2 首次同步（2026-09-21，driver 执行）
+
+**授权**：Owner 直接提权（本会话 file policy = `danger-full-access`，无需 escalation）。
+**执行**（按 `DSH-INTEGRATION.md`「更新流程」，**目标按 Owner 边界改为 `profiles/dev`**）：
+
+1. `npm pack --cache /tmp/dsh-npm-cache` → `orchestra-dsh-0.5.1.tgz`，**79 文件**；`@deepseek-ai` 条目 **0**、`src/`+`scripts/` **0**；`dependencies` 仅 `js-yaml`；19 条 peer 全在 `0.1.6-alpha.2`。
+2. dev profile 同步：`rm -rf node_modules/orchestra-dsh` + 删 `.modules.yaml` / `.pnpm-workspace-state-v1.json` / `.pnpm/lock.yaml` → `pnpm install`（1.6s，123 包）。
+3. **三件套（AGENTS.md 硬规则 3）**：①`@deepseek-ai/` 下仅 `cosmokit`/`schemastery` ⇒ **无实体副本** ✓ ②插件副本 `dependencies` 无 `@deepseek-ai` ✓ ③`require.resolve('@deepseek-ai/dsh-tools', {paths:[<profile>/node_modules/orchestra-dsh/lib]})` → **host 路径** ✓
+4. **新代码确已落地**：`lib/role-preset-mount.js` + `.d.ts` 存在，mtime `Sep 21 00:18:07`（本次 pack 产物）。
+5. **★ §7 的真实组合证据**（`dsh --profile dev --dump-config`，exit 0，634 行）：`id: agent-presets` **恰好一行**、`default: standard` 在、`roots: [{path: ~/.dsh/orchestra/catalog-presets, trust: system}]` 在；插件三行 `orchestra-bundle` / `orchestra-a2a` / `orchestra-manager` 均在。
+6. **实例启动**：`dsh --profile dev --port 4600` ⇒ 4600 LISTEN，**零插件加载失败**；4599 未受影响。
+
+**仍未验证（= N7 形状的下一单元，是本轮"取证轮"的真正内容）**：
+- 真实会话里 `presets.resolve(id)` 能否解析到那 **12 个 id** —— **§7 目前只证到"根在组合里"，未证到"发现过程认它"**（假设 (b) 的另一半）；
+- 角色会话身份**跨重启**是否完整（建角色 → 重启 → 外部核对 compositionInventory / header 投影）；
+- 新会话里**插件工具是否可调**（验证清单第 5 条）。启动日志里**没有 orchestra 的 init 行**（dsh-trinity 有）—— 不等于失败，但工具面仍未证。
+
+**driver 侧两处 shell 自误（记，防后人误读）**：`timeout` 在 macOS 不存在（`exit 127`，与 dsh 无关）；`curl /` 得 **401** 是未带 token 的正常拒绝、带 token 得 **303** 是正常重定向 —— **两者都不是失败信号**。
+
+**未做**：S4、D2、D1、G-BUDGET 探针、`test-tier0-predicate.mjs` 等 5 条批 1 脚本。**未动**：`.npmrc`、依赖面、契约、两份裁定、计划文件。
