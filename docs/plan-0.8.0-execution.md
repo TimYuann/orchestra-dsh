@@ -38,7 +38,11 @@
 | 需求 | `docs/2026-09-20-repo-delivery-requirements.md`（A–F 六组 / N1–N7 / §4 十一条约束） |
 | 基线代码 | `6bd8d9b`（v0.5.1，已提交、未发布） |
 | 基线测试 | `npm test` → **248 pass / 0 fail**（2026-09-20 本机复跑实测，非转述） |
-| 宿主 | DSH `0.1.5-rc.2`；两个 profile 都已装 `orchestra-dsh` 0.5.1 |
+| 宿主 | DSH **`0.1.6-alpha.2`**（**U4**：原写 `0.1.5-rc.2`）；两个 profile 都已装 `orchestra-dsh` 0.5.1 |
+
+**U4 · 依赖范围事实（写入本节，勿再论证）**：`^0.1.5-rc.2` **不覆盖** `0.1.6-alpha.2` —— semver 7.8.5 实测：`0.1.6-alpha.2 satisfies ^0.1.5-rc.2 ? false`，**连 `>=0.1.5-rc.2` 都不满足**（预发布匹配规则要求范围内存在同 `major.minor.patch` 且有预发布后缀的比较器）。⇒ 本仓 **19 条 `@deepseek-ai/*` peer + 对应 devDependencies 必须同步到 `^0.1.6-alpha.2`**，其中 **2 条原为精确锁**（`@deepseek-ai/dsh-user-approval`、`@deepseek-ai/dsh-session-title`）同样改为该范围。**风险已降级**：两个 profile 的 `pnpm-workspace.yaml` 均为 `autoInstallPeers: false` ⇒ 未满足的 peer **不触发自动安装**、不产生实体副本，**不踩 2026-08-16 的双实例事故线**（`AGENTS.md` 硬规则 1 仍然有效：`@deepseek-ai/*` 只进 peer + dev、**严禁进 `dependencies`**）。证据锚点：`docs/upgrade-0.1.6-alpha.2-impact.md` §2-A-2 / §4 / §5-1（审计 commit `926434c` 的上游文档）。
+
+> **锚点纪律**：本节引用的行号只作辅助；**权威锚点 = commit + 文件 + 章节号**（本仓已实测行号会漂）。
 
 ### 0.1a 有限审查出口（**V4**）
 
@@ -63,16 +67,36 @@
 
 ### 0.2 开工前必须落定的四件事（假设清单，含两条硬依赖）
 
+> **U5 · 0.1.6-alpha.2 下的重述结论**（逐条核，**不凭直觉改**）：B-1 / B-2 / B-3 **已核未变，按原样保留**；**B-4 加了"宿主事实已核未变 + 失败形态已改（V2）"与一处待核项**。下表每条的"U5 复核"栏给出该条的核验方式与结论。**证据锚点**：`docs/upgrade-0.1.6-alpha.2-impact.md` §3（确认未变）/ §4（边界签名表）/ §C（负面清单），审计 commit `926434c`；本机实测宿主版本 = `@deepseek-ai/dsh@0.1.6-alpha.2`（`~/.nvm/.../dsh/package.json`）。
+
 这四件事**没有一条是设计问题**，全部是实现期一小时量级的机械核对；但**第三条和第四条不做，计划的部分任务就没有合法落点**。因此它们是本计划的**前置依赖**，写在最前面。
 
 | # | 事项 | 我在本文中的假设 | 如果核对结果不同 |
 |---|---|---|---|
-| **B-1** | **槽位已占用** | `~/.dsh/orchestra/catalog-presets/` **已存在**为插件私有预设根，现有 **12 个**预设目录（**F8 实测更正**：原文写 13，`find . -maxdepth 1 -mindepth 1 -type d | wc -l` → 12）＝ **9 个 v0.4 规格目录**（`orchestra-v04-{implementer,reviewer,investigator,verifier,architect,planner,researcher,hardening-auditor,oracle}-v1`，逐一对应 `rolePresetSpec` 的 9 个 role）+ **3 个 legacy 目录**（`orchestra-implementer` / `orchestra-reviewer` / `orchestra-oracle`，是 v0.4 前身的 `legacyIds` 落点），每个目录含 `agent.cordis.yml` + `preset.yml`（v0.4 目录）——即 **S3 需要的物化已经发生**，S3 只改"按名册 id 解析"的代码，不搬迁文件 | 若目录内容缺失：§7 部署步骤加一步"先跑一次 `ensureBuiltinRolePresetArtifacts` 生成物化"，S3 前置依赖改为该步 |
-| **B-2** | **契约 §1.1 的"直接改已有行"在本部署不成立** | 部署里 **没有** `id: agent-presets` 这一行可改：它由 `@deepseek-ai/dsh-web-app` 的 bundle 层 `cordis.patch.yml`（第 481 行）`insert` 而来，两个 profile 自己的 `cordis.patch.yml` 都是空数组 `[]`。因此"直接改该行"等于改 **bundle 内部文件**，会被升级覆盖 | **改为在 profile patch 层做「单跳 override」**（`- id: agent-presets` + `config` 自带 `default`；§7.1 给正文、§7.4 给内存实测、§8.1-R-02 给回退写法）。这是**实现落点**的偏离，不是口径偏离；契约 §1.1 的**四个实质要求**（私有根 / `trust: system` / `~` 写法 / 三条激活路径都能解析）**全部保留** |
-| **B-3** | **`trust: system` 的根不被名册视为可写根 ⇒ 插件不能通过名册写它** | 契约 §1.1 已声明这个前提（"不被视为可写根 ⇒ 插件是唯一所有者"）。因此：**建会话时绝不要求名册写入**；预设的物化仍走插件自己的 `ensureBuiltinRolePresetArtifacts`（`flag: "wx"`，不覆盖用户文件） | 若插件确实需要名册写入（例如将来的"用户自建角色"）：**不在本计划范围**，登记为延后项（§10 尾部） |
-| **B-4** | **`ctx.shell` 可用，且以宿主身份运行** | **要声明的包是 `@deepseek-ai/dsh-shell`**（`lib/types/index.d.ts:24-25` 在那里 `declare module '@deepseek-ai/cordis'` 并加 `Context.shell`）——**"服务定义在 `dsh-shell`、提供者是 `dsh-bash-sandbox`"**，两者不是一回事，见 §2.2 的说明。契约类型：`resolve()` → `ShellExecSpec`，`run()` → `ShellRunResult{exitCode, signal, timedOut, aborted, stdout, stderr, sandbox}`；`bash-sandbox` 行的默认 `timeoutMs: 60000`。P1/P2 的 git 与验收执行**全部走它** | ①**交付依赖缺席 ⇒ 只拒绝交付动作，A2A 不随之失效**（**V2**）：`shell` / git 等**交付依赖**在部署里缺席时，插件的**交付动作**（验收执行、对账、合并门）**必须确定性拒绝**（类型化 `delivery_dependency_unavailable`），**不得静默降级为"无证据通过"**；但 **A2A 与编排语义不因此失效** —— `a2a_*` / `orchestra_*` 的会话编排、投递、名册查询**照常可用**。理由：`inject` 一旦把整个插件挂进 waiting，**A2A 也被一起拖停** —— 那是把"交付依赖缺席"放大成"插件不可用"。（**「A2A 不随之失效」是本条的可 grep 落点**）②**若它不以宿主身份运行（例如继承了某个会话的沙箱策略）⇒ P1 的全部证据不合法**——"宿主采集"的前提就没了，此时**必须停下**，不得产出证据（`capability-boundaries.md` #4）。③若插件需要 `dsh-bash-sandbox` 的**具体配置面**（本计划不需要，只用 `resolve/run`）：把它也加进 dev/peer |
+| **B-1** | **槽位已占用**<br>**U5 复核：已核未变**（impact §3 末段"预设发现"：`PresetRoot{path,trust}` / `trust:'system'\|'user'` / 每目录扫 `agent.cordis.yml` / `PRESET_ID` / `COMPOSITION_FILE` / Config schema / `expandHomePath` / `mountPreset` / `presets.resolve(id)` / `defaultId` **全部未变**；本机实测 `find -maxdepth 1 -mindepth 1 -type d \| wc -l` → **12**；`dsh-agent-presets/lib/types/preset.d.ts` 与旧树 `cmp` 通过）⇒ **12 个目录不会变非法** | `~/.dsh/orchestra/catalog-presets/` **已存在**为插件私有预设根，现有 **12 个**预设目录（**F8 实测更正**：原文写 13，`find . -maxdepth 1 -mindepth 1 -type d | wc -l` → 12）＝ **9 个 v0.4 规格目录**（`orchestra-v04-{implementer,reviewer,investigator,verifier,architect,planner,researcher,hardening-auditor,oracle}-v1`，逐一对应 `rolePresetSpec` 的 9 个 role）+ **3 个 legacy 目录**（`orchestra-implementer` / `orchestra-reviewer` / `orchestra-oracle`，是 v0.4 前身的 `legacyIds` 落点），每个目录含 `agent.cordis.yml` + `preset.yml`（v0.4 目录）——即 **S3 需要的物化已经发生**，S3 只改"按名册 id 解析"的代码，不搬迁文件 | 若目录内容缺失：§7 部署步骤加一步"先跑一次 `ensureBuiltinRolePresetArtifacts` 生成物化"，S3 前置依赖改为该步 |
+| **B-2** | **契约 §1.1 的"直接改已有行"在本部署不成立**<br>**U5 复核：已核未变**（live 0.1.6-alpha.2 实测：`dsh-web-app/cordis.patch.yml` **仍在** `- insert:` 下 `id: agent-presets`；`composeEntries` **仍是导出函数**（`require('dsh-app-boot').composeEntries` → `function`）；`applyEntryPatches` 的**按键浅替换语义未变**——本机内存探针复核："单跳 + 自带 `default`" ⇒ **恰好一行且 config 正确**、"单跳但漏 `default`" ⇒ `config` 被顶成只剩 roots）⇒ **§7.1 的三条写法纪律仍然有效**。<br>**U5 附带新事实**：`~/.dsh/profiles/dev/cordis.patch.yml` **已经**是 §7.1 要求的单跳 override 形态（`- id: agent-presets` + `config: {default: standard, roots: [...]}`）⇒ **dev 侧已就位**；`~/.dsh/profiles/web/cordis.patch.yml` 仍为 `[]` ⇒ **web 侧待落**（按 §7.2：验收 N7 之前、用户在场时做） | 部署里 **没有** `id: agent-presets` 这一行可改：它由 `@deepseek-ai/dsh-web-app` 的 bundle 层 `cordis.patch.yml`（第 481 行）`insert` 而来，两个 profile 自己的 `cordis.patch.yml` 都是空数组 `[]`。因此"直接改该行"等于改 **bundle 内部文件**，会被升级覆盖 | **改为在 profile patch 层做「单跳 override」**（`- id: agent-presets` + `config` 自带 `default`；§7.1 给正文、§7.4 给内存实测、§8.1-R-02 给回退写法）。这是**实现落点**的偏离，不是口径偏离；契约 §1.1 的**四个实质要求**（私有根 / `trust: system` / `~` 写法 / 三条激活路径都能解析）**全部保留** |
+| **B-3** | **`trust: system` 的根不被名册视为可写根 ⇒ 插件不能通过名册写它**<br>**U5 复核：已核未变**（`dsh-agent-presets` 的 `authoring` / `metadata` / `specifier` 等文件与旧树**逐字节相同**，见 impact §3；"只把 `trust==='user'` 当可写根"这一语义未变） | 契约 §1.1 已声明这个前提（"不被视为可写根 ⇒ 插件是唯一所有者"）。因此：**建会话时绝不要求名册写入**；预设的物化仍走插件自己的 `ensureBuiltinRolePresetArtifacts`（`flag: "wx"`，不覆盖用户文件） | 若插件确实需要名册写入（例如将来的"用户自建角色"）：**不在本计划范围**，登记为延后项（§10 尾部） |
+| **B-4** | **`ctx.shell` 可用，且以宿主身份运行** | **要声明的包是 `@deepseek-ai/dsh-shell`**（`lib/types/index.d.ts:24-25` 在那里 `declare module '@deepseek-ai/cordis'` 并加 `Context.shell`）——**"服务定义在 `dsh-shell`、提供者是 `dsh-bash-sandbox`"**，两者不是一回事，见 §2.2 的说明。契约类型：`resolve()` → `ShellExecSpec`，`run()` → `ShellRunResult{exitCode, signal, timedOut, aborted, stdout, stderr, sandbox}`；`bash-sandbox` 行的默认 `timeoutMs: 60000`。P1/P2 的 git 与验收执行**全部走它** | ①**交付依赖缺席 ⇒ 只拒绝交付动作，A2A 不随之失效**（**V2**）：`shell` / git 等**交付依赖**在部署里缺席时，插件的**交付动作**（验收执行、对账、合并门）**必须确定性拒绝**（类型化 `delivery_dependency_unavailable`），**不得静默降级为"无证据通过"**；但 **A2A 与编排语义不因此失效** —— `a2a_*` / `orchestra_*` 的会话编排、投递、名册查询**照常可用**。理由：`inject` 一旦把整个插件挂进 waiting，**A2A 也被一起拖停** —— 那是把"交付依赖缺席"放大成"插件不可用"。（**「A2A 不随之失效」是本条的可 grep 落点**）<br>**U5 复核：宿主事实已核未变 + 失败形态已改**。①**已核未变**：live 0.1.6-alpha.2 的 `dsh-shell/lib/types/index.d.ts` 仍有 `declare module '@deepseek-ai/cordis' { interface Context { shell: ShellExecutor } }`（服务定义位置不变）；`dsh-bash-sandbox` 仍是 `super(ctx, config)` 形态的提供者；`SandboxMode` 取值集合与 `setSandboxMode` 签名未变。②**变更（本计划已改，即 V2）**：原写"服务缺席 ⇒ 整个插件 waiting"，现改为"**只拒绝交付动作、A2A 不随之失效**"。③**未覆盖 ⇒ 标待核**：`dsh-bash-sandbox` 的**失败分类** before→after 在证据中列为 UNKNOWN（旧树无该族包可比对）——见 §8.1 R-16。②**若它不以宿主身份运行（例如继承了某个会话的沙箱策略）⇒ P1 的全部证据不合法**——"宿主采集"的前提就没了，此时**必须停下**，不得产出证据（`capability-boundaries.md` #4）。③若插件需要 `dsh-bash-sandbox` 的**具体配置面**（本计划不需要，只用 `resolve/run`）：把它也加进 dev/peer |
 
-**其余假设（不阻塞开工，但实现时若证伪要报告）**：
+**U7 · 新增假设 B-5（唯一的新增条目）**
+
+| # | 事项 | 我在本文中的假设 | 如果核对结果不同 |
+|---|---|---|---|
+| **B-5** | **`dsh-subagent` 在本版新增了进程级容量上限**（0.1.5-rc.2 **没有**这个机制） | `ActivationPool.reserve(capacity)` 在 `slots.size >= capacity` 时抛 `SubagentError(code="ACTIVATION_LIMIT_REACHED")`，文案 `` `subagent limit reached (active child limit: ${capacity}); wait for an existing child to finish or complete this work with the current agents` ``。默认 `Config { maxDepth: 1, maxActiveSubagents: 8 }`，**可由部署的 `settings` 段 `"subagent"` 覆盖**。**命中面 = `src/subagent-node.ts` 的 `subagents.startContinuable(...)`**（另有 `sendMessage` / `listChildren` / `drainContinuableChildren`；**四者的存在与签名均未变**） | 部署侧 `settings.subagent.maxActiveSubagents` 需要提高时，**本插件无法自行设置** ⇒ 记为**部署前提**。另：`maxDepth: 1` 与本插件拓扑的交互**未实测 ⇒ 待核**（见 §8.1 R-18） |
+
+> **R-creep 适用边界（必须照此读，不得普遍化）**：本项**仅适用于"由 subagent child 承载的节点"**；**由可见会话承载的节点不受影响**（它们不是 subagent child，不进这个池）。**不得**把本条读成"所有节点都有并发上限"。**不得**因此新增任何机制——**本项没有 `fault_ref`，属"知道即可"**（`docs/upgrade-0.1.6-alpha.2-writer-brief.md` §B-1）。
+
+**其余假设（不阻塞开工，但实现时若证伪要报告）——U5 复核：逐条给结论**：
+
+| # | 假设 | U5 复核 |
+|---|---|---|
+| 1 | 会话日志落点 `~/.dsh/sessions/<slug>/<sessionId>/session.v3.jsonl.zstd`，`slug` 由 cwd 推导；`scripts/check-session-readable.mjs` 的"用宿主自己的 `validateStoredEvents` 判可读性"这条路可行 | **已核未变**：本机 `~/.dsh/sessions/--Users-yuantian-Developer-orchestra-dsh--` 形状未变；`SESSION_FORMAT_VERSION` **两树皆 3**；"新增的投影强校验只针对 `image/offload`（旧树 0 命中）⇒ 旧会话文件读取不受影响"（impact §3） |
+| 2 | `agentPresets.compositionInventory(presetId)` 可在**无 agent** 的宿主侧上下文读取一个预设实际挂载的行与工具 | **已核未变**：live `dsh-agent-presets/lib/types/index.d.ts` 仍含 `compositionInventory`；`composition-inventory` 相关文件与旧树逐字节相同（impact §3） |
+| 3 | 集成分支 deliverable = 节点分支 + worktree；合并动作 = `git update-ref refs/heads/<integration> <new> <expected-old>` | **与 DSH 版本无关**（纯 git 操作，插件调外部 git plumbing）；升级审计对本条无覆盖、也无需覆盖 |
+| 4 | `orchestra/` 与 `.worktrees/` 通过 `.git/info/exclude` 排除；对账读 git 自己的 `status --porcelain` | **与 DSH 版本无关**（本仓自建状态区 + git 输出）；同上 |
+| 5 | N1–N7 的注入与判定可在真实 git 仓库上以脚本完成，不需要 fixture | **部分随版本**：与 DSH 引擎事实相关的部分（D4 工具边界 / D2 审批）**已核未变**（impact §3）；其余为**本插件自己的脚本**，与版本无关。**待核**：§4.2.1 的恢复判定新依赖 `git merge-base --is-ancestor`，该命令的**本机可用性未在本次审计中复核** ⇒ 见 §8.1 R-17 |
+
+**下列 5 条原假设的正文原样保留**（内容一字未改；其版本结论以上表为准）：
 
 1. 会话日志落点 `~/.dsh/sessions/<slug>/<sessionId>/session.v3.jsonl.zstd`，`slug` 由 cwd 推导（实测目录名形如 `--Users-yuantian-Developer-orchestra-dsh--`）；`scripts/check-session-readable.mjs` 已证明"用宿主自己的 `validateStoredEvents` 判其可读性"这条路可行，N7 的外部核对**复用这个形状**。
 2. `agentPresets.compositionInventory(presetId)` 可在**无 agent** 的宿主侧上下文中读取一个预设实际挂载的行与工具（`docs/dsh-native-capabilities.md` 第 1 节表格第 3 行）。N7 的"实际挂载的组合"由此获得。
@@ -168,7 +192,9 @@
 | 项 | 负责面 | 输入 | 产出 | 退出判据（机器可判） |
 |---|---|---|---|---|
 | **S1** 统一建会话路径 | `src/session-blueprint.ts`、`src/a2a.ts`、`src/orchestra.ts` | 现有三条路径：①P0 首波 `orchestra.ts:2498 createRoleSession({mode:"governed"})` ②懒加载 `orchestra.ts:3069 createSession(...)` + 兜底 `:3084 agents.resume`（**无 setup**）③重激活 `orchestra.ts:3562 createRoleSession` + `:3644 resumeRoleSession`（setup 仅当 presetFile 存在才有） | **单一入口** `buildRoleSession(ctx, spec)`（`spec: {cwd, sessionId, rolePresetId, permissionPreset, model, title, caller}`）。三条路径都调它；`session-blueprint.ts` 的两个 `prepare*Blueprint` 收敛为一个 `prepareRoleBlueprint`，差异由 `spec.mode` 参数化 | `scripts/test-role-session-single-path.mjs`：三路径各建一次，断言 ①三者的 setup 执行的是同一函数（导出符号比对）②`agents.resume` 在全仓只剩 S2 那一处调用 ③三条路径产出的 blueprint 记录字段集完全相同 |
-| **S2** 投递 / 冷恢复换原生 | `src/a2a.ts`、`src/a2a-transport.ts` | `tryResume`（`a2a-transport.ts:177-235`，自建 resume + 自建 preset 解析）、`deliverMessage`（自建投递） | **冷恢复**改调 `ctx.sessionController.resume(sessionId)`（DSH 原生：`composeAgent` + `presetForObservation` + `agents.resume({setup})`，见假设 B-4 与 `dsh-api-session-controller/lib/index.js:391-407`）；**唤醒**改调 `ctx.sessionController.prompt({sessionId, content})` 或 `ctx.agents.get(id)?.send/steer`。**保留**：`deliverMessage` 的"消息生命周期"（`accepted/claimed/answered`，`src/receipt-store.ts`）与 `agent/inbox/*` 折叠 | `scripts/test-v05-slimming.mjs` 扩展 + 新增 `test-native-delivery.mjs`：`sessionController` 缺席时**类型化失败**（不静默回退到自建）；`deliverMessage` 仍写 receipt；`receipt-store` 的 4 个用例不回归 |
+| **S2** 投递 / 冷恢复换原生 | `src/a2a.ts`、`src/a2a-transport.ts` | `tryResume`（`a2a-transport.ts:177-235`，自建 resume + 自建 preset 解析）、`deliverMessage`（自建投递） | **冷恢复**改调 **`ctx.sessionController.resolveAgent(sessionId)`**（**U3 / P0-F3 更正**：服务面的公开入口是 `resolveAgent(sessionId)`，**不是** `resume(...)` —— `resume` / `resumeObserved` 是内部类 `ApiSessionAgentController` 的 **`private` 成员，不在服务面上**；`resolveAgent` 返回 `Promise<{agent}|{error}>`，失败联合本版仅新增 `session/writer-held`，签名与返回形状未变）；**唤醒**改调 **`ctx.sessionController.prompt(request, signal)`** 或 `ctx.agents.get(id)?.send/steer`（`prompt` 逐字不变）。
+
+**依赖写法（U3 / O-4，硬约束）**：`sessionController` **默认用 `ctx.get("sessionController")` 取**，**不写进 `inject`**；缺席 ⇒ 在**调用点抛类型化错误**（`session_controller_unavailable`）、**不静默回退到自建**。理由：写进 `inject` = **硬依赖** ⇒ 服务一旦缺席，**整个 a2a 插件进入 waiting、`a2a_*` 全套工具消失**（与 B-4 的 V2 同一条失败形态：不得把"一个服务的缺席"放大成"插件不可用"）。**保留**：`deliverMessage` 的"消息生命周期"（`accepted/claimed/answered`，`src/receipt-store.ts`）与 `agent/inbox/*` 折叠 | `scripts/test-v05-slimming.mjs` 扩展 + 新增 `test-native-delivery.mjs`：`sessionController` 缺席时**类型化失败**（不静默回退到自建）；`deliverMessage` 仍写 receipt；`receipt-store` 的 4 个用例不回归 |
 | **S3** 预设进名册 | `src/orchestra-role-presets.ts`、`src/orchestra.ts`、`src/session-blueprint.ts`、`src/a2a-transport.ts` | 现有的**按文件路径挂载**：`mountPreset(agentCtx, {id, trust, path})`（`session-blueprint.ts:574` / `:801` / `orchestra.ts:3619` / `a2a-transport.ts:221`）；`resolvePresetFile`（`orchestra.ts:433`）把预设解析成"文件路径 + trust" | 新增 **单一挂载函数** `mountRolePreset(agentCtx, presetId)`：内部只调 `presets.resolve(id)` → `presets.mount(agentCtx, resolved.id)`。`resolvePresetFile` **降级**为"仅用于 `project`/`global` 覆盖来源的读取器"（保留 `project > global` 优先级），名册来源（`dsh`/roster）**不再生成 path** | `scripts/test-role-preset-roster.mjs`：①project / global / roster 三种来源各解析一次，断言 `source` 正确且 **roster 来源的解析结果 `path === ""`**（因为 `session-blueprint.ts:1014` 已有这个分支）②`readySnapshotAfterWrite` 后 `compositionInventory` 有该 preset 的行 ③**全仓不存在 `presetSource === "file"` 的调用点**（grep 断言写进测试） |
 | **S4** 停摆兜底换第一手信号 | `src/orchestra.ts`（`ctx.on("agent/status")` 段，`src/orchestra.ts:5180-5226`） | 现状：`agent/status` 的 `running → idle` 推断（`dsh-native-capabilities.md` 禁忌 5） | ①订阅 `agent/turn-stopping`（`Promise|void` 形态、`@mode serial`、回合关闭前被 await 派发，`dsh-agent/lib/types/runtime-types.d.ts:396-400`）：目标角色的回合即将关闭且未交报告、未回 driver ⇒ 用 `agent.steer()` **续一步**要求补交；②订阅 `approval/asked`，维护 `{id, sessionId, askedAt}` 悬空表，收 `approval/decided` 时销账；③**`agent/status` 的推断路径删除**，只在 `turn-stopping` 与 `approval` 两条第一手信号上工作 | `scripts/test-node-stall.mjs` 重写：①构造"回合关闭前无报告"⇒ 断言 `steer` 被调用一次且**只一次**（同回合去重）②构造 `asked` 无 `decided` ⇒ 断言看门狗记账并通知 driver ③断言 `agent/status` 上**不再有本插件的监听器** |
 | **S5** 删悬空能力 | `src/orchestra.ts`（`OrchestraDispatchArgs`，2735-2741）、`src/orchestra-preferences.ts`、`src/orchestra.ts:2047-2050` | 实测：`orchestra_dispatch` 的 `preset` / `timeoutMs` **两个字段零消费点**（`grep 'args.preset\|args.timeoutMs'` 无命中；`timeoutMs` 的 4384 行属 `orchestra_wait`）；三档偏好阶梯 `writePreferences` **无任何调用点**（仅导出与测试引用），且 `orchestra.ts:2049` 还在向模型描述"ask them ONCE then persist it" | ①从 `OrchestraDispatchArgs` 与工具 schema 删除 `preset` / `timeoutMs`，调用方传了即**类型化拒绝** `unknown_argument`（不静默忽略）②**删除 `tiers` 三档阶梯**：`orchestra-preferences.ts` 只保留 `roleMapping`（角色 → 模型）读取；`orchestra.ts:2049` 的措辞改为"未声明即继承 driver"③`readPreferences` 仍读旧文件，读到 `tiers` 即**告警并忽略**（不静默，也不崩） | `scripts/test-orchestra-preferences.mjs` 改写：断言 `tiers` 字段在类型层与校验层都不存在；旧文件（含 `tiers`）读取 ⇒ 返回 `roleMapping` + `diagnostic.code === "legacy_tiers_ignored"`；`orchestra_dispatch` 传 `preset` ⇒ 抛 `unknown_argument` |
@@ -276,7 +302,7 @@
 | `src/session-blueprint.ts` | ①两个 `prepare*Blueprint` 收敛为 `prepareRoleBlueprint(spec)`，`buildRoleSession` 成为唯一入口（S1）②`mountPreset(agentCtx, {path})` 全部换成 `mountRolePreset(agentCtx, presetId)`（S3）③`setApprovalPolicy(session,"never")` 从 governed 分支**上提到公共段**，并补 lightweight 分支（D2）④blueprint 记录补"预期组合"字段 | S1/S3/D2/D1 | D1 / D2 |
 | `src/orchestra.ts` | ①三条建会话路径改调 `buildRoleSession`；`:3084` 的**无 setup `agents.resume` 兜底删除**（改走 `resumeViaNative`）②`resolvePresetFile` 降级为 project/global 读取器③`ctx.on("agent/status")` 停摆段删除，改 `turn-stopping` + `approval/*`（S4）④删除 `OrchestraDispatchArgs.preset/timeoutMs`（S5）⑤`updateTeamRole` 收敛（S6）⑥接入 P1–P4 的工具/命令面 | S1–S6 + P0–P4 | D1–D4 / A1–A7 |
 | `src/a2a.ts` | ①`createSession` 的 `presetFile` 参数删除，改 `presetId`（S3）②`createSession` 内部改调 `buildRoleSession`③`OrchestraDispatch` 侧沿用 | S1 / S3 | D1 |
-| `src/a2a-transport.ts` | `tryResume` 改调 `sessionController.resume`；删除自建 preset 解析（`presets.resolve` 那段） | S2 / S3 | D1 |
+| `src/a2a-transport.ts` | `tryResume` 改调 **`sessionController.resolveAgent(sessionId)`**（冷恢复；**U3 / P0-F3**：服务面公开入口，非 `resume`）；删除自建 preset 解析（`presets.resolve` 那段） | S2 / S3 | D1 |
 | `src/orchestra-role-presets.ts` | ①`resolveRolePresetFile` 的返回值不再携带 `path`（roster 来源）②`mountRolePreset` 的 id 校验与错误码③`danger-full-access` 回归断言（E4） | S3 / E4 | D1 / E4 |
 | `src/orchestra-archive.ts` | 归档事务重排 + 幂等重入 | D3 | D3 |
 | `src/orchestra-state.ts` | `updateTeamRole` 复用点；team 记录补 `tier` 字段（§1.2 分级必须显式声明在节点记录里，team 侧只留投影） | S6 / §1.2 | §1.2 |
@@ -294,7 +320,7 @@
 |---|---|---|
 | `src/orchestra-preferences.ts` 的 `IntelligenceTier` / `ModelPreferenceConfig.tiers` / `resolveModelForRole` 的档位分支 | S5：三档阶梯被 Owner 取消，且**没有写入口**（悬空能力） | Owner 决定 3 / 需求 §6 建议 6 |
 | `src/orchestra.ts` 的 `agent/status` 停摆监听段（5180-5226） | S4：`running→idle` 是事后推断，被 `turn-stopping`（回合关闭前被 await）取代 | 需求 §2.D2 / `dsh-native-capabilities.md` 禁忌 5 |
-| `src/a2a-transport.ts` 的 `tryResume` 全程 | S2：DSH 原生 `sessionController.resume` 已覆盖 | 需求 §4.1（优先减法） |
+| `src/a2a-transport.ts` 的 `tryResume` 全程 | S2：DSH 原生 **`sessionController.resolveAgent`** 已覆盖（**U3 / P0-F3**） | 需求 §4.1（优先减法） |
 | `src/orchestra.ts:3084` 的裸 `agents.resume`（无 setup） | D1 的直接成因之一；`dsh-native-capabilities.md` 禁忌 1 | D1 / N7 |
 | `OrchestraDispatchArgs.preset` / `.timeoutMs` 及其工具 schema 行 | S5：零消费点 | 需求 §6 建议 6 |
 | `src/orchestra-role-presets.ts` 的 `LEGACY_*_CORDIS_YML`（若 S3 全绿后仍无引用） | S6：死分支。**删除前必须确认 roster 已能解析这些 legacy id** | S6 |
@@ -627,13 +653,15 @@
 |---|---|---|
 | 1 | 建一个 `read-only` 的角色会话（**三种路径各一次**：首波 / 懒加载 / 重激活） | blueprint 记录的 `approval === "never"` |
 | 2 | **注入**：给该角色派一个必然触发沙箱写入的动作（例如让它 `write` 一个仓库外文件，或带 `sandbox_permissions` 调 `bash`） | 工具调用返回**确定性拒绝**（不是"等待中"） |
-| 3 | 观测会话日志 | `approval/asked` 与 `approval/decided(outcome="rejected")` **成对出现**；对每一条 `asked`，同一个 `turn/start`…`turn/end` 区间内必有同 `id` 的 `decided` |
+| 3 | 观测会话日志 | `approval/asked` 与 `approval/decided` **成对出现**；对每一条 `asked`，同一个 `turn/start`…`turn/end` 区间内必有同 `id` 的 `decided`。**`outcome` 断言为集合 `outcome ∈ {allowed-once, rejected, cancelled, unavailable}`**（**不得断言 `never` 必为 `"rejected"`**：`decide()` 里 `if (signal?.aborted) return "cancelled";` **位于** `if (effectivePolicy === "never") return "rejected";` **之前** ⇒ **「已中止 + never」返回 `cancelled`**，断言 `rejected` 会在**预中止信号**上假失败。本条与 §4.8 **D2-c 步骤 1** 同一写法） |
 | 4 | 观测回合收束 | 该回合**正常 `turn/end`**（存在 `turn/end` 事件），且 `turn/end` 在 `decided` 之后 |
 | 5 | **反例校准（必须有）** | 把某一条路径的 `approval` 改回 `ask` 并重跑：`turn/end` **不出现**（回合悬挂）⇒ 校准通过。这一步证明第 4 步不是恒真 |
 
 **判定脚本**：`scripts/verify-d2-approval.mjs`，输入 = 会话日志目录 + 期望的 `approval` 值。退出码 0 = 全部路径通过；1 = 有路径悬挂或 `asked/decided` 不成对。
 
 **D2-b · 走路由必须带截止时间、到点按申报默认值收束（不可默认类 ⇒ 停在原地）**
+
+> **U6② 归属更正：D2-b 移出批 1（P0），成为批 2 / G-P2 的判据项。** 依据 = 本节下一段自己写的口径："这里的'路由'是**本插件的决策队列**（E2/E3）" —— 而 **V1 已令 E2/E3 退出 P0**，所以 D2-b 的六个用例**随判据 ④ 一并延后**（landing = 批 2 / G-P2），**批 1 不判它**。**批 1 可交付的 D2 部分 = D2-a + D2-c**（依据：`docs/review-rounds-ledger.md` §4 的 E-2 行 / §5）。**本节内容一字不改，只标归属。**
 
 **注意口径**：这里的"路由"是**本插件的决策队列**（E2/E3），**不是** DSH 的审批受理者链——因为 E1 已把提权改成"派发期钉死 + 运行期确定性拒绝"，**没有任何东西走审批路由**（`alignment-2026-09-20-next-round.md` §2.1："受理者三选一已由 E 组取代，不再是待决项"）。
 
@@ -849,7 +877,7 @@ run-preconditions: tree=<git rev-parse HEAD> env=<sha256 of sorted declared env>
 | 动作 | 时机 | 生效条件 |
 |---|---|---|
 | 改 `cordis.patch.yml` | S3 代码改完之后、跑 S3 测试之前 | **新增根需重启实例**（契约 §1.1 已写明） |
-| 重启 dev（4600） | 立即 | `patchReload: "live"` 让 patch 文件本身热重载，但**新增根**要重启；`scripts/dev-instance.sh` 前台 Ctrl-C 后重跑即可 |
+| 重启 dev（4600） | 立即 | **新增根**要重启；`scripts/dev-instance.sh` 前台 Ctrl-C 后重跑即可。**⚠️ 原来这里写的 `patchReload: "live"`（"patch 文件本身热重载"）的依据已失效**：`PATCH_RELOAD` / `patchReload` 在 DSH `0.1.6-alpha.2` 的 `dsh-app-boot` **整个 `lib/` 零命中**（0.1.5-rc.2 有 `lib/index.js` 两处 + `types/index.d.ts` + `types/profile.d.ts` 六处）；新树另增 `types/profile-resolution/` 与 `lib/worker/`。**新行为 = 待核**（见 §8.1 R-15）——**实测前不写"改 patch 文件需要/不需要重启"的任何断言**；本计划对重启的要求一律以"**新增根要重启**"为唯一依据（该依据来自 `dsh-agent-presets` 的发现过程语义，本次审计确认未变） |
 | 重启 web（4599） | **验收 N7 之前**，且要用户在场（这是用户自己的实例） | 同上 |
 | 往已在扫描的根里放/改文件 | 随时 | **即时可见**（发现过程不做记忆化）——所以占位目录/文件改动不需要再重启 |
 
@@ -887,7 +915,7 @@ run-preconditions: tree=<git rev-parse HEAD> env=<sha256 of sorted declared env>
 | R-01 | §7 patch 写法 | patch 未匹配 ⇒ **静默跳过**（`dsh-app-boot` 只 warn `patch: entry %C not found`）；名册少一个根 ⇒ S3 与 N7 全失败，但**没有明显报错** | 用 §7.3-a 的模拟脚本先离线验证；回退 = 把文件恢复成 `[]` 并重启 | ✅ 完全可回退 |
 | R-02 | **单跳的层序风险**（取代原"找不到两跳写法"） | §7.4 探针 B 已证明：单跳覆盖成立的前提是 **profile 层在 bundle 层之后应用**。若 DSH 改了 `allPatches` 的层序，单跳退化为"warn `entry not found` + 静默不生效"——**N7 会失败，但 S3 的单元测试不会** | §7.3-a 的脚本**必须**直接调宿主 `composeEntries`（不是自己模拟一份顺序）⇒ 层序一变它立刻红。回退 = 改 `~/.dsh/profiles/*/node_modules/@deepseek-ai/dsh-web-app/cordis.patch.yml:481` 的 `config`（**会被下次升级覆盖**，故必须写进 `DSH-INTEGRATION.md`） | ⚠️ 可回退，但退法易被升级冲掉 |
 | R-03 | S1 统一建会话路径 | 三条路径合并后某一类角色的行为变了（预设/权限/模型任一） | S1 单独一个 commit；出问题 `git revert` 该 commit。**注意**：S1 之后 `session-blueprint.ts` 的两个 `prepare*` 被删，revert 会把 D2 的"公共段上提"一起退掉 ⇒ 所以 **S1 的 commit 里不含 D2 的改动**（顺序纪律） | ✅ |
-| R-04 | S2 换 `sessionController` | web 与 dev 都含 `dsh-web-app`，所以两个实例都有该服务；**但测试环境（`npm test`，无 profile）没有** ⇒ 测试会因为服务缺失而失败 | 在 `a2a.ts` 里把 `sessionController` 设为**可选依赖**：存在 ⇒ 走原生；不存在 ⇒ **类型化失败** `session_controller_unavailable`（**不回退到自建**，否则 S2 变成死代码）。测试用 fake ctx 提供该服务 | ✅ |
+| R-04 | S2 换 `sessionController`（落点 = **`resolveAgent(sessionId)`**，**U3 / P0-F3**） | web 与 dev 都含 `dsh-web-app`，所以两个实例都有该服务；**但测试环境（`npm test`，无 profile）没有** ⇒ 测试会因为服务缺失而失败 | **用 `ctx.get("sessionController")` + 调用点类型化错误，不写进 `inject`**（**U3 / O-4**；写 `inject` = 硬依赖 ⇒ 服务缺席会让**整个 a2a 插件** waiting、`a2a_*` 工具全消失）。存在 ⇒ 走原生；不存在 ⇒ **类型化失败** `session_controller_unavailable`（**不回退到自建**，否则 S2 变成死代码）。测试用 fake ctx 提供该服务 | ✅ |
 | R-05 | S2 的 `deliverMessage` 保留边界 | 若把"消息生命周期"也一起换成原生的，会丢掉 receipt（插件独有价值） | 明确边界写进代码注释与测试（`receipt-store` 用例不回归） | ✅ |
 | R-06 | S3 名册解析 | 若名册解析出的 id 与 team.json 里记的 id 不一致 ⇒ 报错。实测 12 个目录的 id 与 `rolePresetSpec` 派生 id 一致（9 个 v0.4 id 一一对应 + 3 个 legacy id）（`orchestra-v04-*-v1` 目录名 == id），但**必须在 S3 测试里断言** | 断言失败 ⇒ 以名册 id 为准，同步 `rolePresetSpec` 与 `team.json`；**不做兼容映射**（Owner：不留兼容残留） | ✅ |
 | R-07 | S4 `turn-stopping` 的 `steer` | 若 `steer` 在回合关闭边界不生效，停摆兜底退回"什么都不做"（比 `running→idle` 更差） | S4 测试里断言 `steer` 被调用**且回合确实多走了一步**（不是只断言调用）；不成立则保留 `turn-stopping` 的**事件记账**部分（至少比事后推断第一手），并把"续一步"标 `degraded` 进体检报告①节 | ✅（降级可回退） |
@@ -898,6 +926,10 @@ run-preconditions: tree=<git rev-parse HEAD> env=<sha256 of sorted declared env>
 | R-12 | P4-4 文档同步 | 把未实现的写成"已" | `scripts/check-docs-status.mjs` 做机械检查（§2.1） | ✅ |
 | R-13 | 分批交付 | 两次交付之间 `lib/` 与 `docs/` 可能不一致 | 每次交付的最后一步固定跑 §11 的闸 + `check-docs-status.mjs` | ✅ |
 | R-14 | 4599 重启 | 用户自己的实例要重启才生效 | **不主动重启**；在 §7.2 写明"验收 N7 之前要用户在场" | ✅ |
+| **R-15** | §7.2 的 `patchReload` 依据失效（**U1**） | 原写"patch 文件本身热重载"的机制在 0.1.6-alpha.2 的 `dsh-app-boot` **全 `lib/` 零命中**。**若实际行为已变成"改 patch 文件也需要重启"**，而实现者仍按"热重载"操作 ⇒ **改了 patch 却以为已生效**（静默不生效，与 H-6 那类"声明不实"同族） | **实测前不写任何断言**（§7.2 已改为以"**新增根要重启**"为唯一依据）；**待核实测项**：改一处 patch 文件后，不重启实例，观察该行是否生效。**权威锚点**：`docs/upgrade-0.1.6-alpha.2-impact.md` §A-1 | ⚠️ 待核 |
+| **R-16** | `dsh-bash-sandbox` 的**失败分类** before→after 未知（**U5 / B-4③**） | 证据把他列为 UNKNOWN（旧树无该族包可比对）。若失败分类变了，B-4 里"交付依赖缺席 ⇒ 拒绝交付动作"的**判定依据**（哪些失败算"依赖不可用"）可能对不上实际抛出的形状 | 证据未覆盖 ⇒ **标待核**；实现 P1 时若发现失败形状与假设不符，按 §0.2 B-4 的"如果核对结果不同"栏处置（**不猜**）。**权威锚点**：`docs/upgrade-0.1.6-alpha.2-impact.md` §7 UNKNOWN 第 3 条 | ⚠️ 待核 |
+| **R-17** | §4.2.1 的恢复判定依赖 `git merge-base --is-ancestor`（**U5 / 假设 5**） | 该命令用于 B1 的"合法后继"判定与 B5 / B5′ 的祖先二分。**它的本机可用性未在本次升级审计中复核**；若不可用或行为不同，恢复表的二分判据落不了地 | 证据未覆盖 ⇒ **标待核**；P2 启用门（§4.2.1 的 V9 表）已要求"祖先判定非二值 ⇒ 判不出即阻断"，因此**命令失败不会被折成"是/否"**——这一点已由 V9 覆盖，本条只补"命令本身是否存在" | ⚠️ 待核 |
+| **R-18** | `dsh-subagent` 的 `maxDepth: 1` 与本插件拓扑的交互（**U7 / B-5**） | `maxDepth: 1` 对本插件的拓扑是否有约束**未实测**。若我们的角色会话（`ctx.agents` 的一等会话）也被计入 subagent 父链深度，可能影响嵌套派发 | 证据未覆盖 ⇒ **标待核**；B-5 的适用边界已限定"**仅适用于由 subagent child 承载的节点**"，可见会话承载的节点不受影响。**权威锚点**：`docs/upgrade-0.1.6-alpha.2-impact.md` §2-A-1 待验证项 | ⚠️ 待核 |
 
 ### 8.2 不可回退清单（写清楚，不许事后"再改改"）
 
@@ -1120,13 +1152,14 @@ extra_slots.every(d => d.decisionId != null)            # 额外槽必须绑定�
 
 | 闸 | 脚本文件（逐个列出） | `node` 命令数 |
 |---|---|---|
-| **G-P0** | `verify-role-identity.mjs`（+ `--self-test`）· `verify-d2-approval.mjs`（+ `--self-test`）· `verify-d2-decision.mjs` · `verify-role-presets-roster.mjs` · `test-orchestra-archive.mjs` · `test-tool-schemas.mjs` · `test-decision-queue.mjs` · `test-design-gate.mjs` · `test-orchestra-role-presets.mjs` | 11（9 个文件 + 2 个校准模式） |
+| **G-P0**（**批 1 形态；U6③ 已按 V1 与判据 ⑨ 对齐**） | `verify-role-identity.mjs`（+ `--self-test`）· `verify-d2-approval.mjs`（+ `--self-test`）· `test-orchestra-archive.mjs` · `test-tool-schemas.mjs` · `test-orchestra-role-presets.mjs` · **`test-tier0-predicate.mjs`**（**U6③ 补入**：判据 ⑨ 点了它的名，原表漏列） | **10**（6 个文件 + 2 个校准模式 + 1 个 V3 补入 = 8 个文件口径见下） |
+| **G-P0 · 移出（U6③）** | **`verify-d2-decision.mjs`**（判据 ④ 延后 ⇒ **批 2 / G-P2**）· **`test-decision-queue.mjs`**（E2/E3 ⇒ 批 2）· **`test-design-gate.mjs`**（F1′ ⇒ 后续） | 0（批 1 不判） |
 | **G-P1** | `verify-negative-N3.mjs` · `test-baseline-diff.mjs` · `test-frozen-snapshot.mjs` | 3 |
 | **G-P2** | `verify-delivery-e2e.mjs` · `verify-negative-N1.mjs` · `verify-negative-N2.mjs` · `verify-negative-N4.mjs` · `verify-negative-N5.mjs` · `test-merge-cas.mjs` | 6 |
 | **G-P3** | `verify-negative-N6.mjs` · `verify-capsule-resume.mjs` · `test-defect-intake.mjs` · `test-ownership-declaration.mjs` | 4 |
 | **G-P4** | `verify-health-report.mjs` · `test-weekly-review.mjs` · `check-docs-status.mjs` | 3 |
 | **G-BUDGET** | `verify-agent-budget.mjs` | 1 |
-| **合计** | **26 个脚本文件**（去重后：上表 20 个具名文件 + `verify-negative-N1/N2/N3/N4/N5/N6` 共 6 个） | **28** |
+| **合计** | **26 个脚本文件**（去重后：上表 20 个具名文件 + `verify-negative-N1/N2/N3/N4/N5/N6` 共 6 个）。**U6③ 说明**：G-P0 那一行的文件组成已按 V1 + 判据 ⑨ 校正（补 `test-tier0-predicate.mjs`、移出 3 个），**合计不变**——因为被移出的三个仍在 G-P1–G-P4 或后续批次里，属"换闸"不是"删脚本" | **28**（G-P0 自身：**8 个文件 / 10 条命令**） |
 
 **说明**：上表是"闸**点名**的脚本"。§5.1 的交付清单更长（还包含 P1–P3 其余工作项的退出判据脚本，它们由各自工作项的退出判据约束，不由阶段闸点名）。**26 个点名脚本 100% 在 §5.1 清单里**（用跨全文收集 → 与 §5.1 求差集的方式机械核对，差集为空）。
 
@@ -1136,7 +1169,7 @@ extra_slots.every(d => d.decisionId != null)            # 额外槽必须绑定�
 | 闸 | 退出判据 | 判定命令 |
 |---|---|---|
 | **G-S（减法）** | `npm run typecheck` 0；`npm test` 全绿且**既有 248 项不回归**；S1–S6 的六个新/改测试全绿；（N7 在 G-P0 判） | `npm run typecheck && npm test` |
-| **G-P0（事实层）** | **退出码口径（P-12）**：本闸的"通过" = **每个脚本的每个模式各自命中它自己的期望退出码**（正常模式 **0**、校准模式 **1**），**不是**"所有命令都返回 0"。凡标 `--self-test` 的项，**期望 1 即为通过**。逐项：<br>①`verify-role-identity.mjs` 退出 0（= N7）②`verify-role-identity.mjs --self-test` 退出 **1**（校准通过；**同一脚本的校准模式，不另计一个脚本**）③`verify-d2-approval.mjs` 退出 0 且 `hanging 0 dangling 0`（D2-a + D2-c），其 `--self-test` 退出 **1**（校准通过；**同一脚本的校准模式**）④`verify-d2-decision.mjs` 退出 0（D2-b 六用例）⑤`verify-role-presets-roster.mjs` 退出 0（§7.3-a，名册真认这个根）⑥`test-orchestra-archive.mjs` 扩展用例全绿（D3）⑦`test-tool-schemas.mjs` 全工具覆盖（D4）⑧`test-orchestra-role-presets.mjs` 的 E4 两条断言全绿（**V1**：本条**只留 `E4`**；`E2` / `E3` / `F1′` 已退出 P0，**判据里不得再出现它们**）⑨`test-tier0-predicate.mjs` 退出 0（**V3**：档 0 三组边界进本批回归） | 上述脚本逐个、**按各自期望码**判定；**任一项未命中其期望码即不进 P1**（**校准模式的期望码是 1**，见上） |
+| **G-P0（事实层）** | **退出码口径（P-12）**：本闸的"通过" = **每个脚本的每个模式各自命中它自己的期望退出码**（正常模式 **0**、校准模式 **1**），**不是**"所有命令都返回 0"。凡标 `--self-test` 的项，**期望 1 即为通过**。逐项：<br>①`verify-role-identity.mjs` 退出 0（= N7）②`verify-role-identity.mjs --self-test` 退出 **1**（校准通过；**同一脚本的校准模式，不另计一个脚本**）③`verify-d2-approval.mjs` 退出 0 且 `hanging 0 dangling 0`（D2-a + D2-c），其 `--self-test` 退出 **1**（校准通过；**同一脚本的校准模式**）④`verify-d2-decision.mjs` 退出 0（D2-b 六用例）——**延后（U6①，landing = 批 2 / G-P2）**：该六用例的内容**全部落在 E2 / E3 / P3-5**，而 **V1 已令这三项退出 P0**（见 §10.5 的"未启用 / 后续"）⇒ 批 1 不判它。**编号不动、不删除**（依据：§10.7 自己的标题「延后项（显式标注，不是漏掉）」——删掉它才正是"漏掉"；重编号会打断全部交叉引用）。<br>**批 1 的 G-P0 可执行形态 = 判据 ①②③⑤⑥⑦⑧⑨ 各自命中期望码 + ④ 显式延后**（完整清单与逐条期望退出码见 `docs/review-rounds-ledger.md` §7）⑤`verify-role-presets-roster.mjs` 退出 0（§7.3-a，名册真认这个根）⑥`test-orchestra-archive.mjs` 扩展用例全绿（D3）⑦`test-tool-schemas.mjs` 全工具覆盖（D4）⑧`test-orchestra-role-presets.mjs` 的 E4 两条断言全绿（**V1**：本条**只留 `E4`**；`E2` / `E3` / `F1′` 已退出 P0，**判据里不得再出现它们**）⑨`test-tier0-predicate.mjs` 退出 0（**V3**：档 0 三组边界进本批回归） | 上述脚本逐个、**按各自期望码**判定；**任一项未命中其期望码即不进 P1**（**校准模式的期望码是 1**，见上） |
 | **G-P1（证据层）** | ①`verify-negative-N3.mjs` 退出 0（六个变体全被按期望判）②`test-baseline-diff.mjs` 的人工对账样例一致③`test-frozen-snapshot.mjs` 的"未跟踪夹具不会让证据冒充输入绑定"用例通过④**`test-frozen-snapshot.mjs` 的「绑定副本」用例通过**（P-4：副本与活路径内容被改成不同时，验收读到的必须是副本） | 三个脚本 |
 | **G-P2（交付层）** | ①`verify-delivery-e2e.mjs` 退出 0 且 `human_interventions=0`（§3.1）②`verify-negative-N1.mjs` / `verify-negative-N2.mjs` / `verify-negative-N4.mjs` / `verify-negative-N5.mjs` **逐个**退出 0（不为缩写单列一行） ③`test-merge-cas.mjs` 的崩溃幂等用例通过（`reflog` 只前进一次）④§1.7 的两项早期信号可被观测（体检报告⑤节的 `unknownPreconditionPasses` 与 `crossBoundaryCount` 字段有值） | 六个脚本 |
 | **G-P3（治理层）** | ①`verify-negative-N6.mjs` + `verify-capsule-resume.mjs` 退出 0 ②`test-defect-intake.mjs` 的 R-4 谓词两向用例通过（非空未表态 ⇒ 拒；为空 ⇒ 过）③`test-ownership-declaration.mjs` 断言②**不阻断开工** | 三个脚本 |
