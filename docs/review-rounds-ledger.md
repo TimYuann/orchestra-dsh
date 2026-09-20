@@ -344,3 +344,33 @@
 **driver 侧两处 shell 自误（记，防后人误读）**：`timeout` 在 macOS 不存在（`exit 127`，与 dsh 无关）；`curl /` 得 **401** 是未带 token 的正常拒绝、带 token 得 **303** 是正常重定向 —— **两者都不是失败信号**。
 
 **未做**：S4、D2、D1、G-BUDGET 探针、`test-tier0-predicate.mjs` 等 5 条批 1 脚本。**未动**：`.npmrc`、依赖面、契约、两份裁定、计划文件。
+
+---
+
+## 15. 取证轮（第 4 轮）的 driver 复核与 Q1–Q3 裁定（2026-09-21）
+
+### 复核：第 1 步探针（**绿**，假设 (b) 排除）
+`node scripts/probe-preset-roster.mjs` → **exit 0，# probe ids=12 ok=12 fail=0**，12 个 `orchestra-*` 全部 `RESOLVE_OK trust=system from_catalog=true`，另有 4 个 shipped 作对照。
+⇒ **§7 的根不仅进了组合，发现过程也认它**。driver 复跑一致。
+
+**★ 方法论留痕（本轮最值得记的一条）**：它第一版探针把 12 个预设 + 4 个 shipped **全判 BROKEN（Invalid URL）**——因为它把**文件系统路径**当 `harnessBase`，而引擎要的是**目录 URL**。抓住它的是**对照组**：shipped 也坏 ⇒ 不可能是产品缺陷。**没有对照组，本轮会报出一个完全可信的假缺陷（"12 个预设全坏"）。** 这与我方"负例校准"是同一条纪律，**固化为规则：任何新探针必须自带一个已知应当通过的对照项**。
+
+### ★ fixture 发现：N7 需要的既存团队**已经在磁盘上**，不需要 Owner 新建批准
+- `~/Documents/agentWorkspace/orchestra-e2e/orchestra/state/team.json` ⇒ `team-a594dc8e`，**2 个 `phase: active` 角色**：`implementer`(preset `orchestra-implementer`) · `reviewer`(preset `orchestra-reviewer`)。
+- 两个角色会话**真实存在于磁盘**：`~/.dsh/sessions/--Users-yuantian-Documents-agentWorkspace-orchestra-e2e--/<sessionId>/`。
+- ⇒ 实现者报告的"障碍 1（`orchestra_create` 需 `/team approve`、要 Owner 点一次）"**在本轮任务里不需要**。
+
+### 裁定 I｜Q1：**先写 `verify-role-identity.mjs` 并用既存 fixture 自测**（不是它提议的 A/B 二选一）
+依据 §4.7 步 3–5 的原文：核对是**从 `~/.dsh/sessions/.../session.v3.jsonl.zstd` 解 header + events**，即**静态读盘**，**不驱动实例、不碰 a2a、不涉红线**。它列的三条障碍**只对 live 的两步（建三角色 + 重启）成立**。
+⇒ 序：**① 写脚本 + 用 e2e fixture 自测（含步 5 的 `--self-test` 负例）→ ② 再做 live 的建角色/重启**。①就是 **G-P0 ①**（发布阻断项），且零批准、零 GUI。
+它的 (B) 离线 `mount` 探针**降为可选**（(B) 证的只是"按 id 能挂载"，而脚本证的是"恢复后的身份可外部核"——后者才是 N7）。
+
+### 裁定 J｜Q2：approval 记录值 ≠ 会话实际值 ⇒ **归 D2-a，不新立条目**
+依据计划 §1 D2 行原文："**「永不询问」钉到所有建会话/恢复路径**"——**恢复路径本来就在 D2 的范围内**，该发现提供的是**机制依据**而非新范围。
+**追加要求**：D2-a 的判据必须 ①显式覆盖**恢复路径也要钉 `never`**；②断言读**会话实际钉住的有效值**，**不是** marker 里记录的那个（marker 记的是*预设声明*的 approval，而部署把 `workspace-write` 配成 `ask`）。
+
+### 裁定 K｜Q3：**只读安全，且脚本根本不经过 a2a**
+`DSH-INTEGRATION.md` 明写："headless 测试会话在进程退出后为 cold，从主实例**读取（`a2a_read`）安全**，发送/resume 不建议"。红线针对的是**写/恢复**（双进程写同一日志）。
+**更彻底一条**：裁定 I 的脚本**直接读 `~/.dsh/sessions/` 的文件**，走的是文件系统而**不是 a2a** ⇒ **红线在验证这一步根本不适用**。禁止的仍然只有：`a2a_send`、任何 resume/`resolveAgent`、以及会触发 resume 的投递。
+
+**审查轮计数：+0**。
