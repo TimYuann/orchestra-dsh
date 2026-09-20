@@ -15,7 +15,7 @@
 | 组合挂载 | DSH 自己的会话激活路径**自动** `resolve + mount` | 手写 setup；⚠️ 有一处 `agents.resume` **不带 setup** → 空壳（DSH 有官方告警） | **替换 + 全路径核对** |
 | 组合核对 | 行/插件名：`agentPresets.compositionInventory()`；工具名：`standingKeyFor(id)` + `tools.schemas/get`（无需 agent）；会话侧：`sessionProjections.stateOf(session,'agentPreset')` | 仅治理路径上有 `composedPreset` 校验 | **补齐**：所有建会话/恢复路径都要核对 |
 | 投递与唤醒 | `sessionController.prompt({sessionId, mode})`（任意会话、自动 resume）、`agents.get(id)` + `Agent.send/steer` | 自建 `deliverMessage` + `tryResume` | **机制替换，语义保留** |
-| 冷恢复 | `agents.resume({resumeSessionId})`、`sessionController.prompt` | 自建 `tryResume` | 同上 |
+| 冷恢复 | `sessionController.resolveAgent(sessionId)`（**公开**）；⚠️ **`resume` / `resumeObserved` 是 `AgentService` 的私有方法，`SessionController` 不公开它们** | 自建 `tryResume` | **改用 `resolveAgent`**——计划 §1 S2 / §3 写的 `sessionController.resume(...)` **在本版 API 上不存在**，详见 §5 |
 | 投递回执 | 只有 `accepted` + inbox 事件（`agent/inbox/inserted/claimed/discarded`） | 自建"已认领 / 已回答"生命周期 | **保留**——这是插件独有价值 |
 | 模型侧的跨会话通信 | ⚠️ 原生模型工具**只能沿直连父子边** | 自建 A2A（跨目录、任意会话） | **保留模型面**。注意：正因为原生模型工具被限制在父子边，这层不能整体删除 |
 | 审批（提权） | 策略只有 `ask` / `never` + 一条"受理者"链；⚠️ **整条链没有超时**，唯一寿命控制是取消信号 | 仅在治理路径上钉 `never` | 钉死要**覆盖所有创建路径**；受理者方案见 `docs/alignment-2026-09-20-next-round.md` §2.1 |
@@ -60,3 +60,26 @@
 - **投递/恢复**：`dsh-api-session-controller/lib/types/index.d.ts:138`；`dsh-agent/lib/types/runtime-types.d.ts:176-209`
 
 > 完整调研过程与"证据 → 结论"的推导见 `reports/dsh-native-capability-findings.md`。
+
+---
+
+## 5. API 层耦合（S2 的落点依赖，2026-09-20 driver 授权记录）
+
+**事实**：`@deepseek-ai/dsh-api-session-controller@0.1.5-rc.2` 属 **API 层**（Web API 的会话控制器），**不是**底座能力包。本仓已把它加进 `peerDependencies` + `devDependencies`（`^0.1.5-rc.2`，与其余 18 个 `@deepseek-ai/*` 同规格）。
+
+**为什么要记这一条**：**插件因此耦合到 API 层**。S2 要的正是"原生冷恢复"，所以这不是错；但**该服务若被上游移动或改名，S2 的落点随之失效**——而失效形态是"冷恢复退回自建"，不是崩溃，所以**不会自己报警**。下一轮动 S2 时先复核本行。
+
+**同一份实测里另有一条更硬的限制（必须与计划 §1 S2 / §3 的字面对齐）**：
+`SessionController` **不公开 `resume` / `resumeObserved`**——它们是 `AgentService` 的私有方法（`lib/types/agent.d.ts` 的 `private resume` / `private resumeObserved`）。公开的冷恢复入口是：
+
+```
+resolveAgent(sessionId: SessionId): Promise<ApiSessionAgentResult>   // index.d.ts
+prompt(request: SessionPromptRequest, signal: AbortSignal): Promise<SessionPromptValue>  // index.d.ts
+```
+
+⇒ **实现 S2 时按 `resolveAgent` 写，不按计划字面的 `sessionController.resume(...)` 写**（driver 裁定：与实测冲突时以实测为准）。
+
+**依赖面实测（本次硬规则 3 的那一条判据）**：
+- `npm pack --cache /tmp/dsh-npm-cache` → 76 文件，**tgz 内 `@deepseek-ai` 条目 0 个**，`dependencies` 仍只有 `js-yaml`，peer 19 个。
+- `~/.dsh/profiles/{web,dev}/node_modules/@deepseek-ai/` → **只有 `cosmokit` 与 `schemastery`**，**无新增目录** ⇒ 未触碰 2026-08-16 双实例事故线。
+- 安装这个 dev 依赖需要 `--legacy-peer-deps`：该包自身 peer 面近 30 个包，其中若干与本仓 dev 面版本不同源，npm 的默认严格解析会 ERESOLVE 报错。这是**外部插件包的常规情况**，不是本仓依赖面的缺陷。
