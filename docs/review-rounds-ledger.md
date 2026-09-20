@@ -245,3 +245,33 @@
 **反转条件**：若实测表明"逐轮归集"只靠 `team.json` + 会话事件流即可得（不需要节点记录），则 G-BUDGET 留在批 1 —— 由实现者给出证据后翻案。
 
 **审查轮计数：+0**（检查不是轮次）。
+
+---
+
+## 12. 批 1 · S3 部分轮（G-P0 ⑤）的 driver 独立复跑与两条裁定（2026-09-20）
+
+**候选：commit `69b62d8`**（3 文件：`docs/p0-report-s3.md` +228 脚本 + 台账）。
+
+| 项 | 它自述 | driver 复跑 | 判定 |
+|---|---|---|---|
+| `node scripts/verify-role-presets-roster.mjs` | `healthy=12/12 roots=1 default="standard" agent_presets_rows=1 warnings=0`，exit 0 | **逐字一致，exit 0** | 命中 |
+| 纯函数 `rosterFailures(composed)` 非恒真 | 四形态实测 | **按签名重建五形态**：happy `[]`；两跳 / 漏 `default` / trust 错 / 无 roots 各自报出对应原因 | 命中 |
+| `npm run build` / `typecheck` / `npm test` | 0 / 0 / 261 | **0 / 0 / 261 pass / 0 fail**（本轮无代码改动，数字不变正确） | 命中 |
+| 禁改面（依赖 / `.npmrc` / 契约 / 裁定） | 未动 | **未动**；闸脚本未被误挂进 `npm test` | 命中 |
+
+**driver 的 grep/探针第四次出错（记）**：我第一次调 `rosterFailures` 传的是自造对象 `{rows,default,trust,healthy}`，四形态全抛 `composed.filter is not a function`。真实签名是 **`rosterFailures(composed)`**——收**合成后的 entries 数组**。**规则固化：探针必须先读签名再构造输入**（这是同一毛病第四次；前三次分别是 `export async function`、`await buildRoleSession(ctx, {` 的计数、以及没 build 就单跑脚本）。
+
+### 裁定 D｜S3 判据"roster 来源 `path === \"\"`"**与实测冲突 ⇒ 改用行为形态**
+计划 §1 S3 行要求断言"roster 来源的解析结果 `path === ""`"。实测：**`AgentPreset.path` 是必需绝对路径**（`dsh-agent-presets/lib/types/preset.d.ts`），`resolve(id)` 返回真实路径；`path === ""` 是**防御性代码，真实名册走不到**。
+**裁定（按 O-5(d)：实测 > 计划原文）**：判据改为**行为形态** —— ①名册来源经 `presets.mount(agentCtx, resolved.id)` 挂载（断言 `presets.mount` 被调）②`mountRolePreset` **不读 `preset.path`**（断言 `readFile(preset.path)` 未被调）③名册路径上 `presetSource === "file"` 的调用点为零。
+**计划文本欠账 +1（U10）**：§1 S3 行该处措辞需按上述改写。
+
+### 裁定 E｜`builtin` 来源**本轮不动**，登记为 S6 候选
+优先级 `project → global → dsh(名册) → builtin`；§7 应用后 `builtin` 在优先级上**永远不可达**（我们的 builtin 物化在 catalog 根里，而该根现在是名册根 ⇒ `dsh` 先命中）。
+**裁定**：**不在 S3 里改它**。它是**死分支**，归属 **S6（死分支与重复实现）**，登记为 S6 候选并写明**不可达性的前提是 §7 已应用**。理由：把"把 builtin 并进名册解析"塞进 S3 会扩大 S3 的语义面，而删除死分支是 S6 的既定职责——**这是防 creep 的一侧**。
+**接受它的附带实测**：`mountPreset(agentCtx, preset)` 收的是**已解析的 `AgentPreset` 对象**，故名册来源**本就不需要产 path**，需要产 path 的只有 project/global ⇒ **这是 S3 工作量的净减少，采纳**。
+
+### 结构性观察（driver 侧，记）
+四轮里有**两轮**（S1a、S3）只交付了分配范围的一部分。**原因在 driver 的轮粒度，不在实现者**。自本轮起：每轮 brief **显式写出"本轮不做什么"**，并把可独立收口的次要项移出该轮。
+
+**审查轮计数：+0**。
