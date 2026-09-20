@@ -31,7 +31,7 @@ import { buildRoleSession, createSession, installModelOverride, deliverMessage, 
 import { receiptStoreFor } from "./receipt-store.js";
 import { charterRecordStoreFor } from "./charter-store.js";
 import type { ResolvedPresetFile } from "./a2a.js";
-import { hostToolNamesForPreflight, prepareGovernedBlueprint, preflightGovernedRequiredTools, resolveDraftRoleModel, SessionBlueprintError, REMOVED_ORCHESTRA_TOOLS } from "./session-blueprint.js";
+import { hostToolNamesForPreflight, prepareRoleBlueprint, preflightGovernedRequiredTools, resolveDraftRoleModel, SessionBlueprintError, REMOVED_ORCHESTRA_TOOLS } from "./session-blueprint.js";
 import type { GovernedBlueprintReceipt, PreparedGovernedBlueprint } from "./session-blueprint.js";
 import {
   ensureBuiltinRolePresetArtifacts,
@@ -866,7 +866,8 @@ export async function prepareGovernedRolePlan(
     hostToolNames: hostToolNamesForPreflight(ctx),
   });
   const presetInput = presetFile.source === "dsh" ? { presetId } : { presetFile };
-  const blueprint = await prepareGovernedBlueprint(ctx, {
+  const blueprint = await prepareRoleBlueprint(ctx, {
+    mode: "governed",
     sessionId,
     teamId: options.teamId,
     roleId: options.role.id,

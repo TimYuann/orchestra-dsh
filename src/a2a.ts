@@ -26,7 +26,7 @@ import type { SessionId, AgentCancelCause } from "@deepseek-ai/dsh-session";
 import type {} from "@deepseek-ai/dsh-fs";
 import type {} from "@deepseek-ai/dsh-system-prompt";
 import { randomUUID } from "node:crypto";
-import { prepareLightweightBlueprint } from "./session-blueprint.js";
+import { prepareRoleBlueprint } from "./session-blueprint.js";
 import { createSubagentNode } from "./subagent-node.js";
 import type { BlueprintPresetFile, GovernedBlueprintReceipt, PreparedGovernedBlueprint, LightweightBlueprintReceipt } from "./session-blueprint.js";
 import { deliverMessage, queryMessageStatus, readDeliveryReceipt } from "./a2a-transport.js";
@@ -398,7 +398,8 @@ export async function createSession(ctx: Context, options: CreateSessionOptions 
           : { provider: selection.provider, model: selection.model };
   }
   if (lightweight) {
-    const blueprint = await prepareLightweightBlueprint(ctx, {
+    const blueprint = await prepareRoleBlueprint(ctx, {
+      mode: "lightweight",
       sessionId,
       caller: options.callerAgent,
       createdBySessionId: options.currentSessionId ?? options.callerAgent?.id,

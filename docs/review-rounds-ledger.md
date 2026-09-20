@@ -60,6 +60,11 @@
 | E-3 | **S1a 关联缺陷** | **P0-S1a-2** 懒加载路径把 `provider`/`model`/`reasoningEffort`/`presetId` 以 `undefined` 值**当键**传给 `createSession` ⇒ 打不中下游 `!== undefined` 判据 | **已修**（改为按需展开）；**与 D4 是同一缺陷类**：D4 是返回值、这里是入参 | `src/orchestra.ts`；`docs/p0-report-s1a.md` §3 |
 | E-3 | **S1a 未达成项** | **P0-S1a-3** S1 判据 ①③（三路径 setup 同函数 / blueprint 记录字段集相同） | **未达成**——属 **S1b**（两个 `prepare*Blueprint` 收敛）；现在写断言会失败 | `docs/p0-report-s1a.md` §1 / §4 |
 
+| E-4 | **S1b** | **P0-S1b** `prepare*Blueprint` 两个名字、两个演化路径，三条建会话路径无单一名准备入口 | **已收敛**：新增 `PreparedRoleBlueprint`（判别式联合）+ `prepareRoleBlueprint(ctx, input)`（按 `mode` 派发、重载签名收窄返回类型）；两处调用点（`a2a.ts` / `orchestra.ts`）均只拼写派发器，源码零 plane 函数直调 | `src/session-blueprint.ts`、`src/a2a.ts`、`src/orchestra.ts`；`docs/p0-report-s1b.md` §2 |
+| E-4 | **判据 ①③** | **P0-S1b-2** S1 判据 ①（三路径 setup 同函数）与 ③（blueprint 记录字段集相同）**在 S1b 无法转绿** | **实测挡住**：只有首波产出 blueprint；懒加载与重激活 replacement 不产出 receipt ⇒ 没有 setup 与记录可比。**给那两条路径补 blueprint 是 D2 的活** ⇒ ①③ **留到 D2**；测试已留 tripwire（"恰好一条 spec 带 `governedBlueprint`"，D2 落地即翻） | `docs/p0-report-s1b.md` §3 |
+| E-4 | **待裁项** | **P0-S1b-3** 重激活路径与 `createSession` 各自重算 `agentOptions`，**逐键独立回退 vs 整体配对回退**（同一个"只给 provider"的输入会得到不同模型路由） | **未合并、两侧语义原样保留**；登记**待裁**（属产品语义，无法从代码判定哪一侧有意为之）。入口侧不变量已钉：`kind:"resume"` 原样透传 `agentOptions`、不引入第三份算法 | `docs/p0-report-s1b.md` §4 |
+| E-4 | **同类缺陷第四处扫描** | **P0-S1b-4** D4 发现的"`undefined` 当键"缺陷类是否还有第四处 | **未发现第四处**（三处候选逐一排除，理由在报告 §5）；**未为它建任何机制** | `docs/p0-report-s1b.md` §5 |
+
 ## 5. 批 1 的 G-P0 判定形态（driver 裁定，2026-09-20）
 
 **判据 ①②③⑤⑥⑦⑧⑨ 各自命中期望码；④ 显式延后（landing = 批 2 / G-P2）。**

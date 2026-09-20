@@ -201,6 +201,70 @@ export interface PreparedGovernedBlueprint {
   readonly setup: (agentCtx: Context, agent: Agent) => Promise<AgentSetupCommit>;
 }
 
+/**
+ * S1b: the single prepared-blueprint type and the single entry point.
+ *
+ * The two planes have DIFFERENT, legitimate shapes and they stay different:
+ * a governed receipt names the role's place in the team and the permission state
+ * the blueprint pins (`teamId` / `roleId` / `controllerSessionId` /
+ * `topologyId` / `topologySource` / `approval` / `effectivePermissionPreset` /
+ * `sandbox` / `compositionTools` / `orchestraTools` / `optionalCapabilities`),
+ * while a lightweight receipt has no team to name. Inventing empty values for
+ * those eleven fields so the two records would "match" would be fabricating
+ * facts, which is the opposite of what a record is for.
+ *
+ * What IS shared, and what this type makes explicit rather than accidental:
+ *  - `agentOptions` — the model route;
+ *  - `setup` — the composition-window callback, and this is the one S1's
+ *    criterion 1 is about: all three role-session paths must execute THE SAME
+ *    function here, not three lookalikes;
+ *  - `meta` — what the session is published with (`agentPreset`, and `cwd` when
+ *    the caller named one).
+ *
+ * The `mode` discriminant is what callers switch on; the plane-specific receipt
+ * stays reachable through it, so no caller loses information.
+ */
+export type PreparedRoleBlueprint = PreparedLightweightBlueprint | PreparedGovernedBlueprint;
+
+export interface RoleBlueprintInput {
+  readonly mode: "lightweight" | "governed";
+}
+
+/**
+ * S1b: ONE entry point for preparing a role blueprint, with the plane selected by
+ * `input.mode`.
+ *
+ * This replaces the shape S1 found — two independently evolved `prepare*`
+ * functions reached from different call sites — with one name every path uses.
+ * The plane-specific bodies remain (their validation genuinely differs: governed
+ * refuses preset inheritance and requires an explicit preset, governed resolves a
+ * permission SPEC and refuses a missing approval policy, governed validates that
+ * the preset file carries an id). Folding those into `if (mode === ...)` branches
+ * inside one function body would not have reduced any duplication — the shared
+ * part is already factored out — it would only have made the two rule sets harder
+ * to read and easier to blur.
+ *
+ * @param ctx - host context carrying the preset / permission / tool registries.
+ * @param input - the plane-specific prepared input, discriminated by `mode`.
+ * @returns the prepared blueprint for that plane.
+ */
+export function prepareRoleBlueprint(
+  ctx: Context,
+  input: LightweightBlueprintInput & RoleBlueprintInput & { mode: "lightweight" },
+): Promise<PreparedLightweightBlueprint>;
+export function prepareRoleBlueprint(
+  ctx: Context,
+  input: GovernedBlueprintInput & RoleBlueprintInput & { mode: "governed" },
+): Promise<PreparedGovernedBlueprint>;
+export async function prepareRoleBlueprint(
+  ctx: Context,
+  input: (LightweightBlueprintInput | GovernedBlueprintInput) & RoleBlueprintInput,
+): Promise<PreparedRoleBlueprint> {
+  return input.mode === "governed"
+    ? prepareGovernedBlueprint(ctx, input as GovernedBlueprintInput)
+    : prepareLightweightBlueprint(ctx, input as LightweightBlueprintInput);
+}
+
 export type BlueprintErrorCode =
   | "invalid_input"
   | "preset_unavailable"
