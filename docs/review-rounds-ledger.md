@@ -566,3 +566,27 @@ agent-default-model:
 
 **审查轮计数：+0。**
 
+
+---
+
+## 20. 第 7 轮（修 §18 缺陷）的 driver 复核与裁定 Q（2026-09-21）
+
+**候选：commit `5e9c068`**（`src/orchestra.ts` +37/−5、新脚本 311 行、报告 154 行、`package.json` 仅 `test` 接线）。
+
+| 项 | 它自述 | driver 复跑 | 判定 |
+|---|---|---|---|
+| `build` / `typecheck` | — / 0 | **0 / 0** | 命中 |
+| `test-materialization-failure-history.mjs` | 3 pass | **exit 0；3 pass** | 命中 |
+| `npm test` | 269 pass / 0 fail | **exit 0；269 / 269 / 0** | 命中 |
+| 修法 = 裁定 O (a) | 失败分支不写 history、改记 `noticeFailures`、不带 `replacedAt` | **diff 逐字对应**；`sessionHistory` 追加被删 | 命中 |
+| 断言非恒真 | 变异测试双向命中 | driver **结构性核验**：`assert.deepEqual(after.sessionHistory, before.sessionHistory)` 在旧实现下必然失败；防恒真 `writeCount() >= 2` 在 | 命中（**变异未由 driver 重跑**） |
+
+**driver 的诚实边界**：变异测试我只做了结构性核验（读断言 + 读被删除的代码），**没有自己重跑变异**。它的变异输出点名了两条断言及其原文，且与代码结构一致。
+
+### 裁定 Q｜它登记的 KNOWN LIMIT：**不是新条目，是裁定 O 第 2 条的未完成部分** ⇒ 完成它，排在 live 轮之后
+事实：`noticeFailures` 的留痕记的是 **`r.sessionId`**，而 `created` 是**对该 id 的存活探测**，不是本次尝试建出来的那个会话；在"新会话已建、团队状态未前进"的形状下两者**不是同一个值** ⇒ **留痕没有指向被抛弃的会话**。
+**裁定**：**我裁定 O 第 2 条说的就是"记'建了但不可用的那个会话'"，实现记的是另一个 id ⇒ 属未完成，不是范围外**。修法（把 `created.sessionId` 提到 catch 可见作用域，即 try 之前先声明）是**局部改动**，不构成"超出最小修"。
+**排期**：**live 轮之后**（live 轮是发布阻断项，不让它让路）。**live 轮不得顺手改它。**
+**认可它的处置方式**：把 KNOWN LIMIT 逐字写进**代码注释**并在报告 §5 登记 —— 这正是"已登记但未修"该有的样子。
+
+**审查轮计数：+0。**
