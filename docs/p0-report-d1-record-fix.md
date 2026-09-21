@@ -295,7 +295,7 @@ not ok 20 - a reserved role records the EXPECTED composition row ids, and no obs
 # 跟修（裁定 Z）· cross-check 从"比条数"改成"集合比对"
 
 > **driver 判定**：第 1 任实现已过（typecheck 0 / build 0 / `npm test` 272 / 判据矩阵 6/6），但留下**一条 B 类缺陷**：cross-check 只比条数（`recordedRows.length !== composition.rowIds.length`），driver 的反例是"11 条、内容全错"仍 `IDENTITY_OK`、exit 0。判据原文（`docs/plan-0.8.0-execution.md` §4.7 步 4⑤）= "与节点记录里插件写的'预期组合'**逐项比对**"。
-> **实现 commit**：`<见本节末尾 git log>`（只改 `scripts/verify-role-identity.mjs` 一个文件）。
+> **实现 commit**：`1f8659c`（只改 `scripts/verify-role-identity.mjs` 一个文件；`git show --stat` 可核，工作树干净。driver 的独立复跑台账在 `674aa80` 之后的 `afb72cb` = `docs/review-rounds-ledger.md` §25）。
 > **边界（如实声明）**：未碰 `src/`、未碰两个 fixture、未起实例、未改台账 / ADR / 计划 / 契约；`/tmp` 与 `/private/tmp` 只写 team.json 副本与脚本变异副本（可弃）。
 
 ## ① 结论（一句话，可判真假）
