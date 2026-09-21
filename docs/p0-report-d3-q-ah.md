@@ -2,7 +2,7 @@
 
 > **作者**：repair（第 3 任，只按 driver 方案实现）。
 > **任务书**：`docs/review-rounds-ledger.md` §29（测试文件夹纪律）+ §30（裁定 AG/AH/AI）+ `docs/plan-0.8.0-execution.md` §1 的 **D3 行**、§4.6 N6、§4.7；裁定 Q 原文 = `docs/p0-report-materialization-failure-fix.md` §5。
-> **实现 commit**：`d58c817`（`git show --stat` 可核，工作树干净）。
+> **实现 commit**：`d58c817`（本报告与其后两条 docs 提交 `0f6fb9d` / `11acd80`；`git show --stat` 可核，工作树干净）。
 > **锚点纪律**：全部用 **commit + 符号**，不用行号。
 > **本轮边界（如实声明）**：**不产生任何 fixture**（§29 纪律：测试一律落在 `orchestra_E2E/` 或其子目录，本轮三项全是进程内单测，无 fixture 需求）；未起 4600 / 未碰 4599 / 未做任何活体；未改 ADR / 计划 / 契约 / 台账；未向 Owner 提问。
 
