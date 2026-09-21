@@ -788,3 +788,46 @@ shasum -a 256 ~/.dsh/profiles/dev/node_modules/orchestra-dsh/lib/orchestra.js li
 node /tmp/driver-probe-n7.mjs ; node /tmp/driver-probe-n7b.mjs                                    # 解码日志：段 A + 悬挂的 approval
 node scripts/verify-role-identity.mjs --repo ~/Documents/agentWorkspace/artifacts/projects/orchestra_N7 --team <同上>/orchestra/state/team.json  # exit 0
 ```
+
+---
+
+## 24. 第 11 轮（analyzer 归因轮）的 driver 复核与三条裁定（2026-09-21）
+
+**候选**：commit `a7b6c89`（**docs-only**：`docs/p0-analysis-d1-composition-record.md`，544 行；`git show --stat` 已核；工作树干净）。产品代码零改动（已核）；未起实例、未动 fixture 与 `~/.dsh/`（其自述 + 我的抽查一致）。
+
+### 接受的归因（driver 独立复核，逐条）
+| 它的主张 | driver 复核 |
+|---|---|
+| 写入链本身是通的（控制项） | ✅ `~/Documents/agentWorkspace/orchestra/blueprints/` 实有 2 份 marker（`orchestra-team-4b21c7ee-…`，`Sep 16 19:59`） |
+| **首波 provisioning（唯一写 marker 的那段）在产品里不可达** | ✅ `grep -rn provisionGovernedPlans src/ scripts/`：**`src/` 内只有 `src/orchestra.ts` 的定义，零调用点**；调用点全在 `scripts/test-governed-provisioning.mjs`（测试直接调它） |
+| "未经 governed setup"的签名有效 | ✅ governed setup 里的顺序实测为 `setSandboxMode(session, sandbox)` → `setApprovalPolicy(session, "never")` → `session.append("session/title")`（`src/session-blueprint.ts`），而 N7 的 reviewer 日志是 `approval/policy: "ask"` + read-only 落在 title **之后**；**我另抽检了 E2E 的两个角色会话**（`orchestra-team-f01da153-6d44a378…` 与 `session-898f7481…`）：同样是 `approval/policy: "ask"`、never 从不出现、read-only 从不在 title 前 ⇒ 抽样与"六个角色一个都没走过 setup"一致 |
+| cross-check 恒不触发有两条独立恒假守卫 | ✅ 读码确认（`compositionRowIds` 不在 `TeamRoleBlueprintFacts`；`orchestraTools` 是对象、过不了 `Array.isArray`），并**自己跑了一遍反证**：把 N7 team.json 复制到 `/tmp`、给 `compositionRowIds` 填 2 条 → `recorded composition has 2 row(s), the resolved preset declares 11`、**exit 1** ⇒ "分支没坏，是没被喂到"成立 |
+| `--self-test` 检出时 exit 1 | ✅ 实测 exit **1**、`detected=yes`（我 §23 里那条读数是隔着管道取的，本轮补成直接取值） |
+| **`--self-test` 未检出时 exit 0** | ✅ 读码确认：`return detected ? 1 : 0`（与其 docstring "1 = … or the calibration detected nothing" 矛盾）⇒ **B 类缺陷**，其复现输出与代码一致 |
+| 行 id 集今天就能派生且三路径一致 | ✅ `resolvePresetFile` 已映射 `compositionRowIds`（符号在位）；行数 11 由我自己跑 `verify-role-identity.mjs` 的 `rows=11` 独立确认 |
+
+### 对 §23 两处表述的更正（采纳它的建议，保留原文不改写）
+- **F-N7-3 更正**：不是"未归因"，而是 **"写入从未被调用"** —— N7 / E2E / `orchestra-e2e` 三个 fixture 的角色会话都**没有走过 governed setup**（判据版本无关），因此 marker 从未写出；写入链本身有真实运行的控制项（v0.5.0 的两份 marker）。**真正未定的是读侧**：a2a 插件 ctx 上 `ctx.get("fs")` 的运行期结果只能由 **R-6 的活体实验**判定。
+- **F-N7-2 更正**：`materializeRole` 成功分支**不刷新** blueprint，在当前形状下是**正确的**（预留时刻才是"批准的那一份组合"被钉住的时刻）；缺的是记录里的行 id 字段（R-2）。**但**：正因如此，① 的 cross-check 在旧记录上永远无料可喂 —— 这一点不变。
+
+### 裁定 W｜修复批次的范围（越界 = C 类，默认回退）
+**IN**：**R-1 + R-4（合并）**、**R-2**、**R-3**，外加两处注释（`materializeRole` 不刷新是刻意的；三个 readiness"预留时不可得"）与报告里的诚实栏。
+**OUT**：**R-5 延后**（F-D1-5 = 候选缺陷，`fault_ref` = analyzer 报告 §4.4 + 符号 `orchestra_activate` step 5c / `createSession` 的 `overrideFile` 无条件展开；**landing = 批 2 或下次动 a2a 时**；理由：从未在 fixture 上观测到、且改共享点会牵连 lightweight 路径，属无 `fault_ref` 的范围增长）；**R-6 → live 轮**；**R-7 → D2 之后**。
+
+### 裁定 X｜判据脚本的口径（**driver 覆盖 R-1/R-4 的建议值**）
+1. `--self-test` **检出 ⇒ exit 1**（保持 G-P0 ② 的期望码不变）。
+2. **未检出 ⇒ exit 2**（**不得**是 0，**也不得**是 1）：若盲校准也返回 1，② 就会被一个"什么都没检出的脚本"骗过 —— 那正是这个自检存在的理由。
+3. `--self-test` 必须**再加一次记录侧扰动**（内存里去掉一条 `compositionRowIds`），要求 cross-check 命中；**两次扰动任一未命中 ⇒ exit 2**。
+4. 角色**有 blueprint 但缺 `compositionRowIds`** ⇒ **记为问题**（`recorded composition is absent`），**不得**静默跳过 —— 根治"弱 fixture 上的假绿"。
+5. **后果（必须写进报告，不得含糊）**：旧记录（N7 / E2E）上 ① 将变为 **exit 1**，这是诚实结果；**G-P0 ① 只有在修复后新物化的 fixture 上才可能真的绿**（live 轮），在此之前 ① **由"假绿"转为"诚实红"**。
+
+### 裁定 Y｜R-2 的形态（driver 定）
+- `TeamRoleBlueprintFacts` 加 **一个**可选字段 `compositionRowIds?: string[]`；值来自**预留时**的解析（`resolvePresetFile` → `resolveRolePresetFile` 的 `composition.rowIds`），**不得**在写记录时重新解析或编造。
+- 经 `GovernedRolePlan` 显式传递（**不让** `roleBlueprintFacts` 收 `presetFile`：解析层类型不 leak 进记录层）。
+- **不填** `compositionTools` / `orchestraTools` / `tools`（填了 = 用预期冒充实际）。
+- **D1 ③ 的"工具名集"半边本轮不兑现**，必须进"未做/未验证"栏（理由：语义冲突 + 只在 setup 窗口可得），landing = R-7 / D2。
+
+**审查轮计数 +0**（分析轮；其发现是缺陷与候选登记，不是对契约的设计异议）。
+
+### 下一跳
+**repair**（R-1+R-4 / R-2 / R-3）→ 之后 **一趟 live 轮**：新 fixture（`orchestra_N7b/`）create + 懒加载物化（验 R-2 的端到端：记录带行 id）→ 重启 → 唤醒（段 B）→ **R-6**（marker 读侧判定，写在 N7 上、取证封存后做）。
