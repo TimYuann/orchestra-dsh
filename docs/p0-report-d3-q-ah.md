@@ -163,12 +163,14 @@ $ ls -d ~/Documents/agentWorkspace/artifacts/projects/orchestra_N7* 2>/dev/null 
 (none — nothing to clean up)
 ```
 
-**`npm test` 前后对 `~/.dsh/orchestra` + `~/.dsh/sessions` + `orchestra_E2E` 的全量 `find -exec stat` 比对**（各 911 个文件）：
+**`npm test` 前后对 `~/.dsh/orchestra` + `~/.dsh/sessions` + `orchestra_E2E` 的全量 `find -exec stat` 比对**（各 911 个文件）：唯一变动的是**本 session 自己的对话日志**（`~/.dsh/sessions/--Users-yuantian-Developer-orchestra-dsh--/session-8305930f-…/session.v3.jsonl.zstd`，mtime 随我这一轮工作增长 —— 宿主写的，不是插件产物）。排除该 slug 后：
 
 ```
-$ diff <before> <after> && echo "NO CHANGE ..."
-NO CHANGE to ~/.dsh/{orchestra,sessions} or orchestra_E2E across a full npm test
+$ diff <before> <after> && echo "NO CHANGE outside this session's own log"
+NO CHANGE outside this session's own log
 ```
+
+即 `~/.dsh/orchestra`、其余全部会话日志、`orchestra_E2E` 三个范围**零变化**（各 792 个受比文件）。
 
 **实例**：4600 `000`（未运行，本轮未起）；4599 `401`（在跑、未被登录使用，与 §27/§30 的取证口径一致）。**未向 4599 发过任何业务请求。**
 
