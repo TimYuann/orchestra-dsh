@@ -873,3 +873,39 @@ node scripts/verify-role-identity.mjs --repo ~/Documents/agentWorkspace/artifact
 ### 下一跳
 1. **小跟修**（裁定 Z，同一 repair session，一条消息即可）→ driver 复跑矩阵（含新的 (a)/(b) 对照项）。
 2. 之后 **live 轮**（test runner）：新 fixture `orchestra_N7b/` create → 懒加载物化（① 期望真绿）→ 重启 → 唤醒（段 B，判据 = 宿主 `agent/created` 的 preset warning + 角色实际 tool/call）→ **R-6**（marker 读侧）。
+
+---
+
+## 26. 第 13 轮（repair 跟修轮 · 裁定 Z 收口）的 driver 独立复跑（2026-09-21）
+
+**候选**：`1f8659c`（实现）+ `2d362bc`（报告补 hash）。范围已核：**只有** `scripts/verify-role-identity.mjs` 与 `docs/p0-report-d1-record-fix.md`；`src/`、两个 fixture、`~/.dsh/` 零接触；主仓树干净。
+
+### driver 独立复跑（detached worktree `/tmp/orch-verify-1f8659c` @ `1f8659c`，软链 `node_modules`）
+`typecheck` **0** · `build` **0** · `npm test` **272 tests / 272 pass / 0 fail**。
+
+判据矩阵（**输入全部由 driver 自造**；行 id 由我从名册预设 YAML 独立解析出 11 条）——**8/8 命中**：
+
+| 用例 | 期望 | 实测 |
+|---|---|---|
+| (a) 11 条、内容全错 | exit 1 且点名 | **exit 1**：`… is missing row "agent-instructions" … (and 10 more)` + `… has an extra row "bogus-1" … (and 10 more)` |
+| (b) **同集乱序**（11 条反转） | exit 0（防脆弱） | **exit 0** |
+| (b2) **同集乱序 + `--self-test`** | exit 1（扰动仍被检出） | **exit 1**，扰动印 `row "tool-result-pruner" -> …--self-test-calibration` ⇒ **它自查的"字母序第一"解耦缺陷，我用这条独立验证了修法有效**（乱序下被扰动的 id 不是排序后的第一条差异，旧检测会漏） |
+| (c1) N7 旧记录 | exit 1 + `absent` | **exit 1**，逐字 |
+| (c2) correct 11 | exit 0 | **exit 0** |
+| (c3) stale 10 | exit 1（条数行 + 点名行） | **exit 1**，两行都在 |
+| (c4) empty 0 | exit 1 | **exit 1** |
+| (c5) blindspot + `--self-test` | exit 2 | **exit 2** |
+| (c6) N7 + `--self-test` | exit 1 | **exit 1** |
+
+**driver 变异（我自己做的）**：把 `missing`/`extra` 两个 `problems.push` 关掉（退回条数比对）⇒ (a) 立刻回到 `IDENTITY_OK` / **exit 0**；还原后 exit 1 ⇒ **集合比对是负载而非装饰**。变异在 scratch worktree 内完成并 `git checkout` 还原。
+
+**裁定 Z：收口**（① 的三条恒假守卫已消除：字段缺失报 `absent`、条数不比内容的问题已修、未检出的校准返回 2）。
+
+### 本轮登记两条
+- **候选（它自述的边界）**：该脚本的负例校准结构上依赖真实 session store（要挑真实非角色会话 + 名册解析），因此不能直接写成 `npm test` 用例；durable 化形态 = "自带 fixture 工作区 + 会话日志夹具"。`fault_ref` = `docs/p0-report-d1-record-fix.md` §③；**landing = 批 2 之后 / 下次改动该脚本时**。
+- **环境事实（避免下一轮误认）**：`~/Documents/agentWorkspace/artifacts/projects/orchestra_serial/` 是 **Sep 19 15:11 创建的空目录**、全仓零引用 ⇒ 历史遗留，**不是 fixture**，live 轮不得动它。
+
+### live 轮前置（driver 实测，写进 brief）
+dev profile 副本仍是**旧构建** `c469b7245bf7b549…`，仓库 HEAD 的 `lib/orchestra.js` 已是 `50c5d6b9125539d9…` ⇒ **live 轮必须重新 pack + sync + 等价性核验**（"证据绑 HEAD"的唯一凭据），否则记录里不会有 `compositionRowIds`，① 不可能真绿。
+
+**审查轮计数 +0。**
