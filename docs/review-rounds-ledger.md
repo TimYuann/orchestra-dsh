@@ -1100,3 +1100,33 @@ driver 实测两条：
 **显式延后（各带 landing）**：计划 §11 判据 ④（批 2 / G-P2）· ⑨ 档 0 谓词（批 2 / G-P2）· G-BUDGET（P2-2 + E2/E3 之后）。
 **live 遗留**：D2-a **步骤 3**（新鲜数据上的 `asked`/`decided` 成对；上一轮 `asked=0` 未喂到）—— **必须在批 1 交付报告之前闭合**；机会项：S4 steer 实证、R-6 修正配方。
 **下一跳**：一趟 live（**一个结果 = 批 1 的 live 遗留清零**，每小项只跑一次、取不到就记下继续），落点 `orchestra_E2E/test-a/`，收尾按 §29 文件级清理。
+
+---
+
+## 32. 第 18 轮（批 1 live 遗留清零）的 driver 独立复核与两条裁定（2026-09-21）
+
+**候选**：`6b2d0a8`（**docs-only**：`docs/p0-report-live-leftovers.md`，354 行）。**通道** = Ego lite space 35。
+
+### 接受（driver 逐条复跑）
+| 项 | 期望 | driver 实测 |
+|---|---|---|
+| 硬前提 | profile == 仓库 lib | ✅ 两侧 sha256 同为 **`af224fe05471cc79b5a0…`**；4600 已停、4599 未碰 |
+| **D2-a 步骤 3（必做项）** | 真实提权 ⇒ 成对 + 即时拒绝 + 回合收束 | ✅ **我自己解码会话**：`approval/policy@0 = never`（仅 1 条）；`#86 approval/asked{id:85a03f50-…, toolName:write}` 与 `#87 approval/decided{同 id, outcome:"rejected"}` **成对**、同属 **turn 2**（`turn/start@73` … `turn/end@109`）；`#88` 工具结果 `Error: the user rejected escalating this operation to "workspace-write"`、`isError:true` ⇒ **即时确定性拒绝**；全 5 个回合都有 `turn/end` |
+| ③ | 0 | ✅ **exit 0**、`APPROVAL_OK … hanging 0 dangling 0`；**该会话确有 `asked=1` ⇒ 成对断言这次不是空转** |
+| ④ | 1 | ✅ exit 1、`dangling=detected` |
+| **R-6（结论翻转）** | — | ✅ **我在 driver 日志里核到三次 `a2a_send` 及其结果**：`#261 accepted`（基线，无 marker）→ `#283 failed to mount: config file not found: /nonexistent/ro…`（**合法 marker + 不存在路径 ⇒ 只有读到 marker 才可能报这条**）→ `#304 accepted`（阳性对照，真实路径）。**读侧有 `fs`**，marker 会被消费并按 `presetSource:"file"` 发起 by-file mount |
+| 善后（§29） | 起始/终态 `ls` + 文件级清理 | ✅ 我实测 `orchestra_E2E/` 下只剩 `artifacts` 与 `orchestra`；`test-a/` 已删 |
+| 成本偏离 | brief 约 15 次回合 | 实测 18（driver 13 + 角色 5）：**接受**（逐条登记、无重复尝试） |
+
+### 裁定 AL｜§27 裁定 AC **更正**：R-6 = **读侧有 `fs`**（不是 memory store）
+上一轮结论作废的原因（marker 形状非法被 `parseGovernedBlueprint` 拒 → 与"memory store"观测同形）**已由本轮消除**（它自检 `PARSE_VALID=true`），且失败信息**逐字点名 marker 的 `presetPath`** ⇒ 只能来自"读到了 marker"。
+**连带**：`src/session-blueprint.ts` 里 `blueprintStoreFor` 的注释（"无 `fs` 服务时退化为进程内 store"）描述的是**回退分支**，**不是本部署的行为** —— 该注释保留但不得被当作现状引用。
+**连带（对 R-5/F-D1-5 的意义）**：by-file mount 在**声明了 file 源**时确实会发生（这是覆盖预设的设计路径）；**不构成** R-5 升级的证据。R-5 仍是候选（landing = 批 2 / 下次动 a2a）。
+**一条未解释的观察（登记为开放问题，不作缺陷）**：阳性对照下 marker 挂载成功，但角色**未**表现出改用 marker 预设（仍以 Reviewer 行事）⇒ 可能 header 投影在行为层优先，或 by-file 挂载只影响部分面。**归因需读码 + 可判实验**，本轮不判。
+
+### 裁定 AM｜批 1 的 **live 遗留清零**
+· 必做项（D2-a 步骤 3）**闭合**；机会项 1（steer）**未触发**（两回合均以 handoff 收束，`STEER_TEXT_HITS=0`）—— **如实记为"未取得实证"**，不为此另造场景（S4 的判据形态本就是单测，已绿）。
+· 一处与 brief 字面序列的偏离（**重启 3 次**而非 1 次）：**接受** —— marker 只在冷恢复被读，基线会把角色热起来使后续两步失效；每步之前各重启一次是"让每条设计好的测量有效"，**不是换路子重试**。它主动登记该偏离，做法正确。
+· ⇒ **批 1 的 live 侧无遗留**；批 1 交付报告由 driver 出具（见 `docs/p0-batch1-delivery-report.md`）。
+
+**审查轮计数 +0。**
