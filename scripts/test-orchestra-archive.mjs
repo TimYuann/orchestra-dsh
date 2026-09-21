@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { ActiveTeamStateError, createActiveTeamStateStore } from "../lib/orchestra-state.js";
 import { ArchiveStoreError, createArchiveStore } from "../lib/orchestra-archive.js";
-import { archiveListForTeamTool } from "../lib/orchestra.js";
+import { apply as applyOrchestra, archiveListForTeamTool, dismissGovernedTeam, handleTeamCommandInvocation } from "../lib/orchestra.js";
 
 const cwd = "/archive-test-workspace";
 
@@ -17,11 +17,13 @@ class FsTestError extends Error {
 }
 
 class TemporaryArchiveFs {
-  constructor(root) {
+  constructor(root, events = []) {
     this.root = root;
     this.lastExpected = undefined;
     this.failList = undefined;
     this.failEntry = undefined;
+    /** Ordered log of every write, so a test can prove one step preceded another. */
+    this.events = events;
   }
 
   absolute(path) {
@@ -71,6 +73,7 @@ class TemporaryArchiveFs {
 
   async writeText(target, content, expected) {
     this.lastExpected = expected;
+    this.events.push(`fs:write:${target.displayPath}`);
     await mkdir(dirname(target.displayPath), { recursive: true });
     const current = await this.stat(target);
     if (expected?.kind === "createIfAbsent" && current !== undefined) {
@@ -146,6 +149,57 @@ async function withTempFs(callback) {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+}
+
+/**
+ * A dismiss harness over the SAME fs the stores use, plus an agent registry whose
+ * members record what was done to them, in order.
+ *
+ * The notices are observed through `inject`, which is where the transport puts a
+ * `wake: false` message for a live agent — the same channel a real role's log
+ * would show it in. Sharing the fs matters: the ordering assertions compare a
+ * notice against the fs writes, so a second fs would silently record nothing.
+ */
+function dismissHarness(fs) {
+  const events = fs.events;
+  const agents = new Map();
+  const controller = {
+    id: "session-driver",
+    session: { header: { cwd }, snapshotEvents: () => [], append() {} },
+    status: "idle",
+    inbox: { hasPending: false, clear() {} },
+    followup() {},
+    inject() {},
+    steer() {},
+    cancel() {},
+  };
+  agents.set(controller.id, controller);
+  const register = (id) => {
+    const agent = {
+      id,
+      session: { header: { cwd }, snapshotEvents: () => [], append() {} },
+      status: "running",
+      inbox: { hasPending: false, clear() {} },
+      followup() { events.push(`followup:${id}`); },
+      inject() { events.push(`notice:${id}`); },
+      steer() { events.push(`steer:${id}`); },
+      cancel(_cause, _options) { events.push(`cancel:${id}`); },
+    };
+    agents.set(id, agent);
+    return agent;
+  };
+  const ctx = {
+    fs,
+    sandboxPolicy: { resolve: () => ({}) },
+    agents: { get: (id) => agents.get(String(id)) },
+    sessions: { get: () => undefined },
+    get(name) {
+      if (name === "agents") return ctx.agents;
+      return undefined;
+    },
+  };
+  const exec = { agent: controller, signal: undefined };
+  return { events, fs, ctx, exec, agents, register, controller };
 }
 
 test("archive list treats a missing directory as empty", async () => {
@@ -365,3 +419,116 @@ test("ready archive restores through inactive marker and rejects competing activ
     assert.equal((await archiveStore.read(cwd, dismissed.archived.summary.archiveId)).kind, "ready");
   });
 });
+
+// ---------------------------------------------------------------------------
+// D3: the archive transaction is STOP → TELL → RECORD, and every step survives a
+// repeat. The three cases below are the plan's exit criteria for D3.
+// ---------------------------------------------------------------------------
+
+test("D3 1: dismissing twice notifies both times and the second call reports already_archived", async () => {
+  await withTempFs(async (fs) => {
+    const harness = dismissHarness(fs);
+    const activeStore = createActiveTeamStateStore(fs);
+    const archiveStore = createArchiveStore(fs, { dismissalId: () => "first" });
+    const role = { ...team().roles[0], execution: "session", sessionHistory: [] };
+    const current = team({ roles: [role] });
+    await activeStore.create(cwd, current, { policy: {} });
+    harness.register(role.sessionId);
+
+    const first = await dismissGovernedTeam(harness.ctx, activeStore, archiveStore, harness.exec, { reason: "done" });
+    assert.equal(first.status, "dismissed");
+    assert.match(first.archive_id, /^team-team-archive-test-\d+-first$/, "the archive id is derived from the team and the dismissal id");
+    // STOP before TELL: the role was cancelled, and then told.
+    assert.deepEqual(harness.events.filter((entry) => entry.startsWith("cancel:")), [`cancel:${role.sessionId}`]);
+    assert.deepEqual(harness.events.filter((entry) => entry.startsWith("notice:")), [`notice:${role.sessionId}`]);
+    assert.ok(
+      harness.events.indexOf(`cancel:${role.sessionId}`) < harness.events.indexOf(`notice:${role.sessionId}`),
+      "the role is stopped before it is told",
+    );
+    // TELL before RECORD: the notice precedes every state/archive write.
+    const markerWrite = harness.events.lastIndexOf(`fs:write:${await statePathOf(fs)}`);
+    assert.ok(markerWrite > 0, "the archived marker was written");
+    assert.ok(harness.events.indexOf(`notice:${role.sessionId}`) < markerWrite, "the notice precedes the record");
+
+    // Re-entry: the marker is already there. Nothing is archived again, but the
+    // role is told once more — a marker on disk says nothing to a session that
+    // still believes it belongs to a live team.
+    harness.events.length = 0;
+    const second = await dismissGovernedTeam(harness.ctx, activeStore, archiveStore, harness.exec, { reason: "again" });
+    assert.equal(second.status, "already_archived");
+    assert.equal(second.archive_id, first.archive_id, "the re-entry names the archive that already exists");
+    assert.equal(second.archive_path, first.archive_path);
+    assert.deepEqual(harness.events.filter((entry) => entry.startsWith("notice:")), [`notice:${role.sessionId}`]);
+    // No second snapshot: the archive directory still holds exactly one file.
+    const listing = await archiveStore.list(cwd);
+    assert.equal(listing.ready.length, 1, "a re-entry does not archive a second snapshot");
+  });
+});
+
+test("D3 2: a terminal team's roles are told before the active slot is cleared", async () => {
+  await withTempFs(async (fs) => {
+    const harness = dismissHarness(fs);
+    const activeStore = createActiveTeamStateStore(fs);
+    const archiveStore = createArchiveStore(fs, { dismissalId: () => "terminal" });
+    const role = { ...team().roles[0], execution: "session", sessionHistory: [] };
+    await activeStore.create(cwd, team({ roles: [role] }), { policy: {} });
+    harness.register(role.sessionId);
+    await activeStore.mutate(cwd, (t) => ({ ...t, status: "completed" }), { policy: {} });
+
+    const outcome = await handleTeamCommandInvocation(harness.ctx, activeStore, archiveStore, {
+      rawInput: "/team start fresh",
+      commandId: "command-terminal",
+      agent: harness.controller,
+    });
+    assert.equal(outcome.kind, "success");
+
+    // The notice happened, and it happened BEFORE the active state was cleared.
+    assert.deepEqual(harness.events.filter((entry) => entry.startsWith("notice:")), [`notice:${role.sessionId}`]);
+    const stateWrite = harness.events.lastIndexOf(`fs:write:${await statePathOf(fs)}`);
+    assert.ok(stateWrite > 0, "the active state was written (cleared into the archived marker)");
+    assert.ok(
+      harness.events.indexOf(`notice:${role.sessionId}`) < stateWrite,
+      "a terminal team's roles are told before the active slot is cleared",
+    );
+    assert.equal((await activeStore.read(cwd)).kind, "inactive");
+  });
+});
+
+test("D3 3: after the marker lands, orchestra_team reports no team and lists the archive", async () => {
+  await withTempFs(async (fs) => {
+    const harness = dismissHarness(fs);
+    const activeStore = createActiveTeamStateStore(fs);
+    const archiveStore = createArchiveStore(fs, { dismissalId: () => "listed" });
+    const role = { ...team().roles[0], execution: "session", sessionHistory: [] };
+    await activeStore.create(cwd, team({ roles: [role] }), { policy: {} });
+    const dismissed = await dismissGovernedTeam(harness.ctx, activeStore, archiveStore, harness.exec, {});
+
+    // Drive the REAL tool: the marker makes the read non-ready, which is exactly
+    // the branch that returns {team: null, archives}.
+    const registered = [];
+    const previousHome = process.env.DSH_HOME;
+    process.env.DSH_HOME = await mkdtemp(join(tmpdir(), "orchestra-archive-apply-"));
+    try {
+      applyOrchestra({
+        ...harness.ctx,
+        tools: { register: (tool) => registered.push(tool) },
+        effect: () => () => {},
+        on: () => () => {},
+      });
+    } finally {
+      if (previousHome === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = previousHome;
+    }
+    const teamTool = registered.find((tool) => tool.name === "orchestra_team");
+    assert.notEqual(teamTool, undefined, "orchestra_team is registered by the plugin");
+    const output = await teamTool.execute({}, { ...harness.exec, name: "orchestra_team", callId: "call-team", arguments: {} });
+    assert.equal(output.team, null, "an archived marker is not a team");
+    assert.equal(output.archives.length, 1);
+    assert.equal(output.archives[0].archive_id, dismissed.archive_id);
+  });
+});
+
+/** The state file path this fs writes, for the ordering assertions. */
+async function statePathOf(fs) {
+  return fs.absolute("orchestra/state/team.json");
+}

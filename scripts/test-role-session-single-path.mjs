@@ -36,6 +36,9 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { buildRoleSession } from "../lib/a2a.js";
+import { createActiveTeamStateStore } from "../lib/orchestra-state.js";
+import { PINNED_APPROVAL } from "../lib/session-blueprint.js";
+import { addLanesToTeam } from "../lib/orchestra.js";
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -281,7 +284,7 @@ function publishingContext() {
       if (name === "permissionPresets") {
         return { defaultPreset: "workspace", resolve: () => ({ sandbox: "workspace-write", approval: "ask" }), set: () => {}, current: () => "workspace" };
       }
-      if (name === "tools") return { schemas: () => [] };
+      if (name === "tools") return { schemas: () => ["read", "write", "bash", "glob", "grep", "orchestra_report"].map((tool) => ({ name: tool, description: tool, parameters: {} })) };
       if (name === "agentDefaultModel") return { currentSelection: () => ({ provider: "p", model: "m" }) };
       return undefined;
     },
@@ -348,4 +351,101 @@ test("D2-a: every build path pins approval to never, and the governed path pins 
     await buildRoleSession(ctx, { kind: "create", mode: "governed", sessionId: "role-governed", cwd: "/role-workspace", governedBlueprint: blueprint });
     assert.deepEqual(policies("role-governed"), ["never"], "exactly one policy event, not two");
   }
+});
+// ---------------------------------------------------------------------------
+// 裁定 AH: the record DECLARES the approval policy every path pins, without
+// overwriting the permission preset's own declared value.
+// ---------------------------------------------------------------------------
+
+/** A minimal in-memory fs port: enough of the contract for the team store. */
+function memoryFs() {
+  const files = new Map();
+  return {
+    files,
+    async resolve(path, options = {}) {
+      return { key: `${options.cwd ?? ""}:${path}`, displayPath: `${options.cwd ?? ""}/${path}` };
+    },
+    processPath: (target) => target.displayPath,
+    async stat(target) {
+      const file = files.get(target.key);
+      return file === undefined ? undefined : { type: "file", size: file.content.length, version: file.version };
+    },
+    async readText(target) {
+      const file = files.get(target.key);
+      if (file === undefined) throw Object.assign(new Error("missing"), { code: "FS_NOT_FOUND" });
+      return file.content;
+    },
+    async writeText(target, content, expected) {
+      const current = files.get(target.key);
+      if (expected?.kind === "createIfAbsent" && current !== undefined) {
+        throw Object.assign(new Error("exists"), { code: "FS_NOT_OBSERVED" });
+      }
+      if (expected?.kind === "replaceIfVersion" && (current === undefined || current.version !== expected.version)) {
+        throw Object.assign(new Error("stale"), { code: "FS_STALE_VERSION" });
+      }
+      const version = `v${files.size + 1}`;
+      files.set(target.key, { content, version });
+      return { operation: current === undefined ? "create" : "update", version, before: current?.content ?? null, after: content };
+    },
+  };
+}
+
+test("裁定 AH: a reserved record declares the pinned approval without overwriting the preset's declared value", async () => {
+  const { ctx, policies } = publishingContext();
+  ctx.fs = memoryFs();
+  ctx.sandboxPolicy = { resolve: () => ({}) };
+  const store = createActiveTeamStateStore(ctx.fs);
+  const controller = { id: "driver", session: { header: { cwd: "/role-workspace" } }, options: {} };
+  await store.create(
+    "/role-workspace",
+    {
+      schemaVersion: 1,
+      teamId: "team-pinned",
+      status: "active",
+      rootCwd: "/role-workspace",
+      controllerSessionId: "driver",
+      controllerHistory: [],
+      topologyRef: { id: "duo", source: "bundled" },
+      mission: { objective: "o", scope: [], constraints: [], acceptanceCriteria: [], nonGoals: [], context: "" },
+      createdAt: 1,
+      activatedFromArchiveId: null,
+      // A team with no role at all is not a recoverable team, so the store blocks
+      // it; the lane under test is added on top of one live seat.
+      roles: [{ id: "worker", name: "Worker", sessionId: "session-worker", phase: "active", execution: "session", sessionHistory: [], preset: "orchestra-v04-reviewer-v1", sandbox: "read-only", reportCount: 1, lastReport: null }],
+      reports: [],
+    },
+    { policy: {} },
+  );
+
+  const added = await addLanesToTeam(ctx, store, { agent: controller }, {
+    roles: [{ roleId: "reviewer", preset: "orchestra-v04-reviewer-v1", sandbox: "read-only" }],
+    confirm: true,
+  });
+  assert.equal(added.status, "added");
+
+  const observed = await store.read("/role-workspace");
+  assert.equal(observed.kind, "ready");
+  const record = observed.team.roles.find((role) => role.id === "reviewer").blueprint;
+  assert.notEqual(record, undefined, "a session role's reservation carries a blueprint record");
+
+  // Two different facts, both preserved: the permission preset declares `ask`,
+  // and the plugin declares that it pins the session to `never`. Overwriting one
+  // with the other is what made §4.8 D2-a step 1 / E1's literal criterion miss.
+  assert.equal(record.approval, "ask", "the permission preset's declared value survives untouched");
+  assert.equal(record.pinnedApproval, PINNED_APPROVAL, "the record declares what the plugin pins");
+  assert.notEqual(record.pinnedApproval, record.approval, "the declaration and the preset value are distinct facts");
+
+  // And the declaration is not decorative: every build path pins exactly it.
+  const shapes = [
+    { name: "governed", spec: { kind: "create", mode: "governed", sessionId: "pinned-governed", cwd: "/role-workspace", governedBlueprint: { sessionId: "pinned-governed", agentOptions: {}, meta: { cwd: "/role-workspace", agentPreset: "orchestra-v04-reviewer-v1" }, receipt: { mode: "governed", sessionId: "pinned-governed", agentPreset: "orchestra-v04-reviewer-v1" }, setup: async () => ({ commit() {} }) } } },
+    { name: "lazy", spec: { kind: "create", sessionId: "pinned-lazy", cwd: "/role-workspace", presetId: "orchestra-v04-reviewer-v1" } },
+    { name: "lightweight", spec: { kind: "create", mode: "lightweight", sessionId: "pinned-light", cwd: "/role-workspace", presetId: "orchestra-v04-reviewer-v1", caller: { id: "driver", ctx: {}, options: {} } } },
+    { name: "resume", spec: { kind: "resume", sessionId: "pinned-resume" } },
+  ];
+  for (const shape of shapes) {
+    const built = publishingContext();
+    await buildRoleSession(built.ctx, shape.spec);
+    assert.deepEqual(built.policies(shape.spec.sessionId), [PINNED_APPROVAL], `${shape.name} pins the declared policy`);
+  }
+  void policies;
 });

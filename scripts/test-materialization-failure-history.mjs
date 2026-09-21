@@ -309,3 +309,116 @@ test("the reactivation replacement path keeps advancing sessionId BEFORE recordi
     "reactivation must record the id it moved OFF, not the new one",
   );
 });
+
+// ---------------------------------------------------------------------------
+// 裁定 Q: the abandoned-attempt breadcrumb names the session the attempt
+// actually created, not the seat id team.json reserved.
+// ---------------------------------------------------------------------------
+
+/**
+ * A harness for the shape where the two ids DIVERGE: a `subagent` role whose
+ * provider materializes a child under its own id, after which the state write
+ * that would publish the role fails.
+ *
+ * That is the shape the KNOWN LIMIT was written for. The seat id
+ * (`role.sessionId`) is what team.json reserved; the child id comes back from
+ * `startContinuable` and appears nowhere else. A breadcrumb naming the seat
+ * therefore points at a session that was never built.
+ */
+function subagentDivergenceHarness() {
+  const fs = new MemoryFs();
+  const agents = new Map();
+  const sessions = new Map();
+  const controllerSession = sessionFor("driver-1");
+  sessions.set("driver-1", controllerSession);
+  agents.set("driver-1", { id: "driver-1", session: controllerSession, status: "idle" });
+  const CHILD_ID = "native-child-9f8e7d6c";
+  const started = [];
+  const context = {
+    fs,
+    sandboxPolicy: { resolve: () => ({ kind: "policy" }) },
+    get(name) {
+      if (name === "fs") return fs;
+      if (name === "subagents") {
+        return {
+          async startContinuable(options) {
+            started.push(String(options.childId));
+            // The provider owns the child id: it echoes the REQUESTED id in
+            // `childId` only as a hint, and returns the id it actually made.
+            return { childId: CHILD_ID, messageId: "msg-native-1" };
+          },
+        };
+      }
+      return undefined;
+    },
+    sessions: { get: (id) => sessions.get(String(id)) },
+    agents: { get: (id) => agents.get(String(id)) },
+  };
+  const exec = { agent: agents.get("driver-1"), signal: undefined };
+  return { fs, context, store: createActiveTeamStateStore(fs), exec, started, CHILD_ID, agents, sessions };
+}
+
+/** The team record with one `subagent` seat on the reserved id. */
+function subagentTeamRecord() {
+  return {
+    ...teamRecord(),
+    roles: [{ ...teamRecord().roles[0], execution: "subagent", parentSessionId: "driver-1" }],
+  };
+}
+
+/**
+ * Make the SECOND write to the team state file fail — the one that would publish
+ * the role — so the attempt reaches the failure branch with whatever it already
+ * materialized. The first write is the `provisioning` marker.
+ */
+function failPublishWrite(fs, stateKey) {
+  const realWrite = fs.writeText.bind(fs);
+  let writes = 0;
+  fs.writeText = async (target, content, expected) => {
+    if (target.key === stateKey) {
+      writes += 1;
+      if (writes === 2) throw Object.assign(new Error("probe: the publish write failed"), { code: "FS_IO_ERROR" });
+    }
+    return realWrite(target, content, expected);
+  };
+}
+
+test("裁定 Q: the abandoned-attempt breadcrumb names the session the attempt created", async () => {
+  const harness = subagentDivergenceHarness();
+  await harness.store.create(cwd, subagentTeamRecord(), { policy: { kind: "policy" }, signal: undefined });
+  // Fail the state write that would publish the role, so the attempt lands in the
+  // failure branch with the child already materialized. Writes to team.json once
+  // the hook is in, in order: provisioning marker, active publish, reserved
+  // rollback — so the publish is the second one.
+  const stateKey = `${cwd}:orchestra/state/team.json`;
+  failPublishWrite(harness.fs, stateKey);
+
+  await assert.rejects(
+    () => dispatchRoleTask(harness.context, harness.store, harness.exec, { roleId: "implementer", task: "build it" }),
+    /could not be brought up/,
+  );
+
+  const after = await harness.store.read(cwd);
+  const role = roleOf(after);
+  assert.equal(role.phase, "reserved", "the seat goes back to reserved so the next dispatch rebuilds it");
+  assert.equal(role.sessionId, RESERVED_SESSION, "the seat id does not move on a failed materialization");
+  assert.deepEqual(after.team.noticeFailures, [], "the child was never registered as a live agent, so nothing is recorded");
+
+  // The same shape WITH the child registered as live: the breadcrumb must name the
+  // child the provider made, not the seat.
+  const live = subagentDivergenceHarness();
+  await live.store.create(cwd, subagentTeamRecord(), { policy: { kind: "policy" }, signal: undefined });
+  failPublishWrite(live.fs, stateKey);
+  live.agents.set(live.CHILD_ID, { id: live.CHILD_ID, session: sessionFor(live.CHILD_ID), status: "idle" });
+  await assert.rejects(
+    () => dispatchRoleTask(live.context, live.store, live.exec, { roleId: "implementer", task: "build it" }),
+    /could not be brought up/,
+  );
+  const recorded = (await live.store.read(cwd)).team.noticeFailures ?? [];
+  assert.equal(recorded.length, 1, "the abandoned attempt is recorded once");
+  assert.equal(recorded[0].milestone, "materialization-failed");
+  assert.equal(recorded[0].targetSessionId, live.CHILD_ID, "the breadcrumb names the session the attempt created");
+  assert.notEqual(recorded[0].targetSessionId, RESERVED_SESSION, "and therefore NOT the reserved seat id");
+  assert.equal(live.started.length, 1, "the provider was asked for the reserved id as a hint");
+  assert.equal(live.started[0], RESERVED_SESSION);
+});

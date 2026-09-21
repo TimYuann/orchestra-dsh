@@ -433,6 +433,14 @@ export function effectiveApprovalPolicy(session: Session): string | undefined {
  *   default (`ask`) parks on a question nobody answers, with no error and
  *   nothing in the code that notices — so it must be loud, not a silent skip.
  */
+/**
+ * The approval policy every build/restore path pins a role session to.
+ *
+ * One constant, so the record's declaration and the pin itself cannot drift: the
+ * record says {@link PINNED_APPROVAL} and the pin writes the same value.
+ */
+export const PINNED_APPROVAL = "never";
+
 export function pinApprovalNever(ctx: Context, agentCtx: Context, sessionId: string, prepared?: Agent): boolean {
   const session = sessionFrom(ctx, agentCtx, sessionId, prepared) ?? liveSessionOf(ctx, sessionId);
   if (session === undefined) {
@@ -442,8 +450,8 @@ export function pinApprovalNever(ctx: Context, agentCtx: Context, sessionId: str
       { sessionId },
     );
   }
-  if (effectiveApprovalPolicy(session) === "never") return false;
-  setApprovalPolicy(session, "never");
+  if (effectiveApprovalPolicy(session) === PINNED_APPROVAL) return false;
+  setApprovalPolicy(session, PINNED_APPROVAL);
   return true;
 }
 

@@ -83,6 +83,22 @@ export interface TeamRoleBlueprintFacts {
    * names, so the tool set cannot express a row-count difference.
    */
   compositionRowIds?: string[];
+  /**
+   * What the plugin DECLARES it pins the session's approval policy to on every
+   * build/restore path — currently always `"never"`.
+   *
+   * This is NOT an observation: `approval` above is the permission preset's
+   * declared value (what the preset says), while the session's EFFECTIVE policy
+   * is a fact of the session log that only an external reader can see (G-P0 ③
+   * reads it there). Recording the declaration beside the preset's value is what
+   * lets a reader tell "this path pins never" from "this preset declares ask"
+   * without one overwriting the other — the two are different facts and both are
+   * load-bearing.
+   *
+   * Optional because records written before it existed carry none, and absence
+   * means "not declared", which is not the same as "declared as something else".
+   */
+  pinnedApproval?: string;
   compositionTools?: { names: string[]; count: number };
   orchestraTools?: { names: string[]; count: number };
   optionalCapabilities?: string[];

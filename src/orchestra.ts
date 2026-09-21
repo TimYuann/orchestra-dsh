@@ -31,7 +31,7 @@ import { buildRoleSession, createSession, installModelOverride, deliverMessage, 
 import { receiptStoreFor } from "./receipt-store.js";
 import { charterRecordStoreFor } from "./charter-store.js";
 import type { ResolvedPresetFile } from "./a2a.js";
-import { hostToolNamesForPreflight, prepareRoleBlueprint, preflightGovernedRequiredTools, resolveDraftRoleModel, SessionBlueprintError, REMOVED_ORCHESTRA_TOOLS } from "./session-blueprint.js";
+import { hostToolNamesForPreflight, PINNED_APPROVAL, prepareRoleBlueprint, preflightGovernedRequiredTools, resolveDraftRoleModel, SessionBlueprintError, REMOVED_ORCHESTRA_TOOLS } from "./session-blueprint.js";
 import type { GovernedBlueprintReceipt, PreparedGovernedBlueprint } from "./session-blueprint.js";
 import {
   ensureBuiltinRolePresetArtifacts,
@@ -971,6 +971,14 @@ function roleBlueprintFacts(receipt: GovernedBlueprintReceipt, compositionRowIds
     agentPreset: receipt.agentPreset,
     permissionPreset: receipt.permissionPreset,
     effectivePermissionPreset: receipt.effectivePermissionPreset,
+    // `approval` stays the permission preset's DECLARED value. Beside it we record
+    // what the plugin pins the session to (D2-a): an unattended role must never
+    // park on an approval prompt, and `pinApprovalNever` is the one place every
+    // build/restore path funnels through. The declaration is deliberately not an
+    // observation — the session's effective policy is read from its log by an
+    // external checker (G-P0 ③), and writing a prediction into an observation
+    // field is the fabricated-fact shape this project refuses.
+    pinnedApproval: PINNED_APPROVAL,
     approval: receipt.approval,
     sandbox: receipt.sandbox,
     provider: receipt.provider,
@@ -2147,8 +2155,12 @@ export async function handleTeamCommandInvocation(
       const policy = ctx.sandboxPolicy.resolve({ session: invocation.agent.session, mode: "workspace-write" });
 
       if (isTerminal) {
-        // A finished team is not a conflict: archive it silently and move on.
+        // A finished team is not a conflict: archive it and move on. D3: the roles
+        // are stopped and told BEFORE the active slot is cleared — clearing it
+        // first would leave live roles believing they still belong to a team the
+        // record says is gone, which is the same shape as the D3 blocker.
         const dismissedAt = Date.now();
+        await retireTeamRoles(ctx, invocation.agent as Agent, team.roles, cwd);
         const archived = await archiveStore.create(cwd, team, { dismissedAt, policy });
         await activeTeamState.archive(
           observation,
@@ -3239,6 +3251,18 @@ async function materializeRole(
     `Mission Objective: ${team.mission.objective}`;
   const combinedFirstTurn = `${welcomeHeader}\n\n${dispatchNotice}`;
 
+  // The session THIS attempt actually brought up, hoisted so the failure branch
+  // can name it.
+  //
+  // `role.sessionId` is the SEAT id — the value team.json reserved. The id the
+  // attempt created can differ from it: a native child is materialized by the
+  // provider, which owns the child id, and the receipt is the only place that id
+  // appears. A breadcrumb that names the seat therefore points at a session that
+  // was never built, which is the KNOWN LIMIT recorded in
+  // docs/p0-report-materialization-failure-fix.md §5 (裁定 Q). Hoisting the real
+  // id closes it without adding a field.
+  let createdSessionId: string | undefined;
+
   try {
     if (role.execution === "subagent") {
       const receipt = await createSubagentNode(
@@ -3253,6 +3277,7 @@ async function materializeRole(
         exec.signal,
       );
 
+      createdSessionId = receipt.childId;
       await activeTeamState.mutate(
         cwd,
         (t) => ({
@@ -3348,6 +3373,7 @@ async function materializeRole(
       });
       created = { sessionId: role.sessionId };
     }
+    createdSessionId = created.sessionId;
 
     // Belt-and-braces: the governed Blueprint already pins the sandbox at
     // creation time; this only re-asserts it on the live session, and is a
@@ -3379,12 +3405,39 @@ async function materializeRole(
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const created = ctx.agents.get(SID(role.sessionId)) !== undefined;
+    // The session this attempt abandoned: the one it created, or the seat itself
+    // when nothing was created (a build that failed before any session existed).
+    // The liveness probe and the breadcrumb must BOTH read this id — probing the
+    // seat while recording the created session (or the reverse) is how a
+    // breadcrumb ends up describing a session nobody built.
+    const abandonedSessionId = createdSessionId ?? role.sessionId;
+    const created = ctx.agents.get(SID(abandonedSessionId)) !== undefined;
     try {
       await activeTeamState.mutate(
         cwd,
         (t) => ({
           ...t,
+          // The breadcrumb is written on the TEAM, not on the role.
+          //
+          // It used to sit inside the role object, where `normalizeTeam` drops it
+          // on the very next read — so the trace existed for exactly as long as
+          // the in-memory object did and no reader ever saw it. `noticeFailures`
+          // is a Team-level list (the same one `noticeRecorderFor` appends to and
+          // `orchestra_team` surfaces), so that is where an abandoned attempt is
+          // recorded.
+          ...(created
+            ? {
+                noticeFailures: [
+                  ...(t.noticeFailures ?? []),
+                  {
+                    milestone: "materialization-failed",
+                    targetSessionId: abandonedSessionId,
+                    failedAt: Date.now(),
+                    reason: message,
+                  },
+                ].slice(-NOTICE_FAILURE_LIMIT),
+              }
+            : {}),
           roles: t.roles.map((r) =>
             r.id.toLowerCase() === roleId.toLowerCase()
               ? {
@@ -3406,28 +3459,6 @@ async function materializeRole(
                   // deliberately no `replacedAt`, because "replaced" is exactly the
                   // false claim being removed.
                   //
-                  // KNOWN LIMIT, recorded rather than fixed: this breadcrumb names
-                  // `r.sessionId`, and `created` is a liveness probe on THAT id —
-                  // not on the session this attempt created. When an attempt
-                  // registers a session and then fails, the two are different
-                  // values, so the breadcrumb does not point at the abandoned
-                  // session. Naming it correctly needs `created.sessionId` from the
-                  // try block, i.e. widening this catch's scope, which is more than
-                  // a minimal repair. See
-                  // docs/p0-report-materialization-failure-fix.md §5.
-                  ...(created
-                    ? {
-                        noticeFailures: [
-                          ...(t.noticeFailures ?? []),
-                          {
-                            milestone: "materialization-failed",
-                            targetSessionId: r.sessionId,
-                            failedAt: Date.now(),
-                            reason: message,
-                          },
-                        ].slice(-NOTICE_FAILURE_LIMIT),
-                      }
-                    : {}),
                 }
               : r,
           ),
@@ -3563,7 +3594,99 @@ export interface DismissGovernedTeamResult {
   dismissed_at: number;
   reason?: string;
   summary?: string;
-  status: "dismissed";
+  /**
+   * `dismissed` = this call archived the team. `already_archived` = the working
+   * directory already carried an archived marker, so nothing was archived again;
+   * the roles were still told they are retired, because a marker on disk says
+   * nothing to a session that still believes it belongs to a live team.
+   */
+  status: "dismissed" | "already_archived";
+}
+
+/**
+ * The notice a role receives when its team is archived.
+ *
+ * It deliberately does NOT name the archive id or path. The retirement notice is
+ * sent BEFORE the snapshot is written (D3: stop first, record second), so no
+ * archive identity exists yet at the moment the role must be told — and the role
+ * does not need one: the archive id is bookkeeping for the driver, which receives
+ * it in the tool's return value and can list it through `orchestra_team`.
+ */
+export function roleRetirementNotice(): string {
+  return (
+    "Your team has been ARCHIVED and you are retired from active collaboration: stop waiting for new tasks. " +
+    "If the team is reactivated, you will receive a notice."
+  );
+}
+
+/**
+ * Stop every role of a team, then tell every role it is retired.
+ *
+ * WHY THIS ORDER: the D3 blocker is a team recorded as archived while its roles
+ * are still live and still waiting. Stopping first means the durable record can
+ * never describe a team whose roles outlived it; the notice comes second so a
+ * role that is being torn down learns why from its own log rather than from
+ * silence.
+ *
+ * Each step is safe to repeat, which is what makes the surrounding transaction
+ * retryable:
+ *   * `cancel` is a host no-op on an agent that is not running, and a role with
+ *     no live agent is skipped;
+ *   * the notice is best-effort and never throws — a repeat is a visible second
+ *     message, not a corrupted one. It is deliberately NOT given an idempotency
+ *     key: a key derived from the archive identity would also suppress the
+ *     re-entry notice, which must be sent again.
+ *
+ * @param ctx - host context.
+ * @param controller - the dismissing agent; the notice is sent in its name.
+ * @param roles - the roles to retire. Taken as a roster rather than a whole
+ *   TeamState so the archived-snapshot path can pass its own without casting a
+ *   dismissed snapshot into a live team.
+ * @param cwd - the team's working directory.
+ */
+async function retireTeamRoles(ctx: Context, controller: Agent, roles: readonly TeamRole[], cwd: string): Promise<void> {
+  for (const role of roles) {
+    if (role.execution === "subagent") {
+      try {
+        await releaseSubagentNodeDefault(ctx, controller, role.sessionId);
+      } catch (err) {
+        console.error(
+          `orchestra_dismiss: subagent drain for ${role.sessionId} failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      continue;
+    }
+
+    const live = ctx.agents.get(SID(role.sessionId));
+    if (live === undefined) continue;
+
+    try {
+      // Stop first: the active turn is aborted and pending input is discarded.
+      live.cancel({ kind: "hook", reason: "orchestra_dismiss" }, { keepInbox: false });
+    } catch (error) {
+      console.error(
+        `orchestra_dismiss: cancel of ${role.sessionId} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      continue;
+    }
+
+    try {
+      // Then tell: queued for the next step, so it is durable in the role's own
+      // log and survives the cancellation that just cleared everything else.
+      void deliverMessage(ctx, controller.id, role.sessionId, [{ type: "text", text: roleRetirementNotice() }], {
+        wake: false,
+        ...transportStores(ctx, cwd),
+      }).catch((error) => {
+        console.error(
+          `orchestra_dismiss: archive notice to ${role.sessionId} failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+    } catch (error) {
+      console.error(
+        `orchestra_dismiss: archive notice to ${role.sessionId} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
 }
 
 export async function dismissGovernedTeam(
@@ -3578,6 +3701,15 @@ export async function dismissGovernedTeam(
   if (cwd === undefined) throw new Error("current session has no working directory");
   const teamObservation = await activeTeamState.read(cwd, { signal: exec.signal });
   throwIfBlocked("dismiss the team", teamObservation);
+
+  // Re-entry: the state file already carries an archived marker, so there is no
+  // active team to archive and archiving a second snapshot would only litter the
+  // archive directory. The roles are still told they are retired — a marker on
+  // disk says nothing to a session that still believes it belongs to a live
+  // team — and the call reports what already happened.
+  if (teamObservation.kind === "inactive" && teamObservation.reason === "archived") {
+    return dismissAlreadyArchived(ctx, archiveStore, exec.agent, cwd, exec.signal, args);
+  }
   if (teamObservation.kind !== "ready") throw new Error(`cannot dismiss the team: ${teamObservation.diagnostic.message}`);
   const team = teamObservation.team;
 
@@ -3601,6 +3733,16 @@ export async function dismissGovernedTeam(
     handoffSummary,
   };
 
+  // D3: the transaction is STOP → TELL → RECORD.
+  //
+  // It used to be RECORD → TELL, which is the bug: a crash between the archive
+  // write and the notices left a team recorded as archived with its roles still
+  // live and still waiting for work nobody would ever send. Stopping and telling
+  // first means the durable record can never describe that state, and a failure
+  // in either later step leaves the active team slot untouched, so the whole
+  // thing can simply be run again.
+  await retireTeamRoles(ctx, exec.agent, teamWithHandoff.roles, cwd);
+
   const archived = await archiveStore.create(cwd, teamWithHandoff, {
     dismissedAt,
     policy: escrowPolicy(ctx, exec),
@@ -3623,57 +3765,14 @@ export async function dismissGovernedTeam(
       signal: exec.signal,
     });
   } catch (error) {
+    // The roles are already stopped and told, and the snapshot already exists, so
+    // the honest report is "partly done, and here is exactly which part" — not
+    // "nothing happened", which would invite a caller to retry blindly.
     throw new Error(
-      `archive ${archiveId} was created at ${archivePath}, but active team CAS failed; the team was not dismissed and no role retirement notice was sent: ${error instanceof Error ? error.message : String(error)}`,
+      `archive ${archiveId} was created at ${archivePath} and its roles were already retired, but the active team CAS failed, so the working directory still shows an active team; re-run to complete it: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 
-  // Bifurcated cleanup:
-  // - continuable subagents: releaseSubagentNodeDefault
-  // - live sessions: wake: false retirement notice + cancel
-  // - cold sessions: skipped
-  for (const role of team.roles) {
-    if (role.execution === "subagent") {
-      try {
-        await releaseSubagentNodeDefault(ctx, exec.agent, role.sessionId);
-      } catch (err) {
-        console.error(
-          `orchestra_dismiss: subagent drain for ${role.sessionId} failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-      continue;
-    }
-
-    const live = ctx.agents.get(SID(role.sessionId));
-    if (live === undefined) continue;
-
-    try {
-      void deliverMessage(
-        ctx,
-        exec.agent.id,
-        role.sessionId,
-        [
-          {
-            type: "text",
-            text: `Your team has been ARCHIVED (archive_id=${archiveId}, path=${archivePath}). You are retired from active collaboration: stop waiting for new tasks. If the team is reactivated, you will receive a notice.`,
-          },
-        ],
-        {
-          wake: false,
-          ...transportStores(ctx, cwd),
-        },
-      ).catch((error) => {
-        console.error(
-          `orchestra_dismiss: archive notice to ${role.sessionId} failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      });
-      live.cancel({ kind: "hook", reason: "orchestra_dismiss" }, { keepInbox: false });
-    } catch (error) {
-      console.error(
-        `orchestra_dismiss: archive notice or cancel to ${role.sessionId} failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-  }
   return {
     team_id: team.teamId,
     archive_id: archiveId,
@@ -3682,6 +3781,56 @@ export async function dismissGovernedTeam(
     reason: handoffSummary.reason,
     summary: handoffSummary.summary,
     status: "dismissed" as const,
+  };
+}
+
+/**
+ * The re-entry arm of {@link dismissGovernedTeam}: the state file already carries
+ * an archived marker.
+ *
+ * The roster is recovered from the archive the marker points at, because the
+ * marker itself is only bookkeeping (id, path, timestamp) and carries no roles.
+ * The store's classified read does not hand the marker payload back, so the
+ * archive identity is taken from the archive list: the newest ready archive in
+ * this working directory is the one the marker was written against, since the
+ * snapshot and the marker are written by the same call. An empty list is reported
+ * rather than guessed at.
+ *
+ * @returns the already-archived result, carrying that archive's identity.
+ */
+async function dismissAlreadyArchived(
+  ctx: Context,
+  archiveStore: ArchiveStore,
+  controller: Agent,
+  cwd: string,
+  signal: AbortSignal | undefined,
+  args: DismissGovernedTeamArgs,
+): Promise<DismissGovernedTeamResult> {
+  const listing = await archiveStore.list(cwd, { signal });
+  const newest = listing.ready[0];
+  if (newest === undefined) {
+    throw new Error(
+      "cannot dismiss the team: the state carries an archived marker but no archive could be listed, so there is no snapshot to notify from",
+    );
+  }
+  const observed = await archiveStore.read(cwd, newest.archiveId, { signal });
+  if (observed.kind !== "ready") {
+    // "We could not tell the roles they are retired" is a fact the driver needs,
+    // not something to swallow: the call fails loudly instead of reporting a
+    // clean re-entry that never reached anybody.
+    throw new Error(
+      `cannot dismiss the team: archive ${newest.archiveId} could not be read (${observed.diagnostic.code}), so its roles were not told they are retired`,
+    );
+  }
+  await retireTeamRoles(ctx, controller, observed.snapshot.roles, cwd);
+  return {
+    team_id: newest.teamId,
+    archive_id: newest.archiveId,
+    archive_path: newest.archivePath,
+    dismissed_at: newest.dismissedAt,
+    ...(args.reason === undefined ? {} : { reason: args.reason }),
+    ...(args.summary === undefined ? {} : { summary: args.summary }),
+    status: "already_archived",
   };
 }
 
@@ -5059,7 +5208,7 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "orchestra_dismiss",
       description:
-        "Close the current orchestra instance: publish an immutable archive, CAS the active state into an archived marker, then notify every live role session that the team is archived (stop waiting for new tasks). Role sessions are independent assets and stay alive. Requires an instance created by orchestra_create in this working directory.",
+        "Close the current orchestra instance: stop every live role, tell each one it is retired, then publish the immutable archive and CAS the active state into an archived marker (stop first, record second — a crash can no longer leave a team recorded as archived with its roles still waiting). Re-dismissing an already-archived directory sends one more retirement notice and returns already_archived instead of archiving a second snapshot. Role sessions are independent assets and stay alive. Requires an instance created by orchestra_create in this working directory.",
       parameters: {
         reason: { type: "string", description: "Optional reason for dismissing the team, e.g. \"task completed\" or \"mission aborted\"." },
         summary: { type: "string", description: "Optional handoff summary of what was completed and what remains." },
@@ -5073,12 +5222,16 @@ export function apply(ctx: Context): void {
             archive_id: { type: "string", required: true },
             archive_path: { type: "string", required: true },
             dismissed_at: { type: "number", required: true },
+            status: { type: "string", enum: ["dismissed", "already_archived"], required: true },
           },
         },
         render: (_args, value) => [
           {
             type: "text",
-            text: `team ${value.team_id} dismissed and archived to ${value.archive_path}`,
+            text:
+              value.status === "already_archived"
+                ? `team ${value.team_id} was already archived at ${value.archive_path}; its roles were told they are retired again`
+                : `team ${value.team_id} dismissed and archived to ${value.archive_path}`,
           },
         ],
       },
