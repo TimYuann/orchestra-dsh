@@ -16,7 +16,7 @@ import { mountRolePreset } from "./role-preset-mount.js";
 import { setSandboxMode } from "@deepseek-ai/dsh-sandbox-policy";
 import { setApprovalPolicy } from "@deepseek-ai/dsh-user-approval";
 import type { SandboxMode } from "@deepseek-ai/dsh-sandbox";
-import type { Session, SessionEvent } from "@deepseek-ai/dsh-session";
+import type { Session, SessionEvent, SessionId } from "@deepseek-ai/dsh-session";
 import { parseRecordJson, readRecordText, resolveRecordFileSystem, safeSegment, writeRecordJson, type RecordFileSystem } from "./orchestra-records.js";
 import type { ToolSchema } from "@deepseek-ai/dsh-llm";
 import type {} from "@deepseek-ai/dsh-agent-presets";
@@ -278,7 +278,8 @@ export type BlueprintErrorCode =
   | "orchestra_tools_unproven"
   | "orchestra_tools_missing"
   | "composition_mismatch"
-  | "session_unavailable";
+  | "session_unavailable"
+  | "approval_pin_unavailable";
 
 export class SessionBlueprintError extends Error {
   readonly code: BlueprintErrorCode;
@@ -360,6 +361,90 @@ function sandboxOverrideOf(session: Session): SandboxMode | undefined {
     if (event.type === "sandbox/mode") return event.data.mode;
   }
   return undefined;
+}
+
+/**
+ * A published session looked up by id through the owner context, as a LAST
+ * resort for the approval pin.
+ *
+ * A Blueprint setup never needs this: it runs inside the unpublished
+ * transaction, where `sessionFrom` is sufficient. The pin is different — it
+ * also runs on the two build paths that have no Blueprint at all, so it is the
+ * first thing those paths ever ask of the session registry, and a composition
+ * that publishes `ctx.sessions` (or the live agent) without exposing the
+ * `sessions` service through `ctx.get` must not turn into an unpinned role.
+ *
+ * @param ctx - owner context.
+ * @param sessionId - the session to find.
+ * @returns the session, or `undefined` when this context publishes neither.
+ */
+function liveSessionOf(ctx: Context, sessionId: string): Session | undefined {
+  const sid = sessionId as SessionId;
+  const fromSessions = (ctx as { sessions?: { get?: (id: SessionId) => Session | undefined } }).sessions;
+  const published = fromSessions?.get?.(sid) ?? ctx.get("sessions")?.get(sid);
+  if (published !== undefined) return published;
+  const agent = ctx.get("agents")?.get(sid);
+  return agent?.session?.id === sessionId ? agent.session : undefined;
+}
+
+/**
+ * The approval policy a session log currently carries, folded the way the host
+ * folds it: the LAST `approval/policy` event wins. A log with no such event
+ * carries no override, so the deployment default applies — which for
+ * `workspace-write` is `ask`, i.e. a prompt nobody answers on an unattended
+ * run.
+ *
+ * @param session - the session whose override is read.
+ * @returns the winning policy, or `undefined` without an override.
+ */
+export function effectiveApprovalPolicy(session: Session): string | undefined {
+  const events = session.snapshotEvents();
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.type !== "approval/policy") continue;
+    const policy = (event.data as { policy?: unknown }).policy;
+    return typeof policy === "string" ? policy : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Pin a session being built to "never ask", IDEMPOTENTLY.
+ *
+ * WHY IT IS NOT A PLAIN CALL: the governed Blueprint's own setup already pins
+ * the policy, and every role session funnels through that setup or through one
+ * of the other two build paths. Appending the override twice would put two
+ * identical `approval/policy` events in one log for no information, so the fold
+ * is read first and only a session that is not already pinned is written.
+ *
+ * The session is resolved exactly the way a Blueprint setup resolves it — from
+ * the prepared agent, then the scoped sessions service, then the owner context
+ * — because during the unpublished transaction that is the only place the
+ * session exists.
+ *
+ * @param ctx - owner context, the last-resort source of the sessions service.
+ * @param agentCtx - the scope the factory handed to setup.
+ * @param sessionId - the session being built.
+ * @param prepared - the unpublished agent the factory passed to setup.
+ * @returns `true` when this call appended the override, `false` when the session
+ *   was already pinned to `never`.
+ * @throws when the session cannot be reached at all. A build path that cannot
+ *   pin the policy IS the D2 defect — an unattended role left on the deployment
+ *   default (`ask`) parks on a question nobody answers, with no error and
+ *   nothing in the code that notices — so it must be loud, not a silent skip.
+ */
+export function pinApprovalNever(ctx: Context, agentCtx: Context, sessionId: string, prepared?: Agent): boolean {
+  const session = sessionFrom(ctx, agentCtx, sessionId, prepared) ?? liveSessionOf(ctx, sessionId);
+  if (session === undefined) {
+    throw new SessionBlueprintError(
+      "approval_pin_unavailable",
+      `session ${sessionId} is not reachable during setup, so "approval: never" cannot be pinned and an unattended role would park on an approval prompt`,
+      { sessionId },
+    );
+  }
+  if (effectiveApprovalPolicy(session) === "never") return false;
+  setApprovalPolicy(session, "never");
+  return true;
 }
 
 function currentModel(ctx: Context, caller: Agent | undefined): { provider: string; model: string; reasoningEffort?: string } {

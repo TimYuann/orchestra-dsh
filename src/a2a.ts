@@ -26,7 +26,7 @@ import type { SessionId, AgentCancelCause } from "@deepseek-ai/dsh-session";
 import type {} from "@deepseek-ai/dsh-fs";
 import type {} from "@deepseek-ai/dsh-system-prompt";
 import { randomUUID } from "node:crypto";
-import { prepareRoleBlueprint } from "./session-blueprint.js";
+import { pinApprovalNever, prepareRoleBlueprint } from "./session-blueprint.js";
 import { createSubagentNode } from "./subagent-node.js";
 import type { BlueprintPresetFile, GovernedBlueprintReceipt, PreparedGovernedBlueprint, LightweightBlueprintReceipt } from "./session-blueprint.js";
 import { deliverMessage, queryMessageStatus, readDeliveryReceipt } from "./a2a-transport.js";
@@ -319,10 +319,21 @@ export interface BuildRoleSessionResult {
 
 export async function buildRoleSession(ctx: Context, spec: BuildRoleSessionSpec): Promise<BuildRoleSessionResult> {
   if (spec.kind === "resume") {
+    // D2-a: a resumed session gets the same "never ask" pin a created one gets.
+    // The pin is composed INTO the setup rather than applied afterwards, because
+    // that is the only moment the session exists for a write — and composing it
+    // (instead of replacing the caller's setup) keeps the composition work the
+    // reactivation path already does. The governed path pins inside its own
+    // Blueprint setup, so the fold there makes this a no-op.
+    const callerSetup = spec.setup;
+    const setup: AgentSetup = async (agentCtx, agent) => {
+      if (callerSetup !== undefined) await callerSetup(agentCtx);
+      pinApprovalNever(ctx, agentCtx, spec.sessionId, agent);
+    };
     await ctx.agents.resume({
       resumeSessionId: SID(spec.sessionId),
       ...(spec.agentOptions === undefined ? {} : { agentOptions: spec.agentOptions }),
-      ...(spec.setup === undefined ? {} : { setup: spec.setup }),
+      setup,
       ...(spec.signal === undefined ? {} : { signal: spec.signal }),
     } as never);
     return { sessionId: spec.sessionId };
@@ -451,6 +462,25 @@ export async function createSession(ctx: Context, options: CreateSessionOptions 
   } else {
     throw new Error("a2a: createSession requires a complete Agent Preset; mode=lightweight resolves one when no preset is explicit");
   }
+  // D2-a: ONE place where every created session is pinned to "never ask".
+  //
+  // The governed Blueprint pins the policy inside its own setup, and the
+  // lightweight / plain-preset paths had no equivalent — so a role built by
+  // either of them inherited the deployment default, which for
+  // `workspace-write` is `ask`. An unattended role that hits the sandbox is
+  // told escalation is available, raises the prompt, and then parks forever:
+  // its turn never ends, so nothing downstream even fires. Pinning here, on
+  // the single entry point all three paths share, is what makes that
+  // structurally impossible instead of merely unlikely.
+  //
+  // The pin is composed INTO the branch's setup (never replacing it) so the
+  // composition, model and permission work each branch already does still runs
+  // first, and the governed path's own pin is absorbed by the fold.
+  const pinnedSetup: AgentSetup = async (agentCtx, agent) => {
+    const outcome = setup === undefined ? undefined : await setup(agentCtx, agent);
+    pinApprovalNever(ctx, agentCtx, sessionId, agent);
+    return outcome;
+  };
   const handle = await ctx.agents.create({
     sessionId: sid,
     agentOptions,
@@ -458,7 +488,7 @@ export async function createSession(ctx: Context, options: CreateSessionOptions 
       ...(governedMeta === undefined ? (cwd === undefined ? {} : { cwd }) : governedMeta),
       ...(governedMeta === undefined && agentPreset !== undefined ? { agentPreset } : {}),
     },
-    ...(setup === undefined ? {} : { setup }),
+    setup: pinnedSetup,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   });
   if (!lightweight && !governed && typeof options.title === "string" && options.title !== "") {

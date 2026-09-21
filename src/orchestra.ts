@@ -276,6 +276,240 @@ export function stalledRoleNotice(teamId: string, roleId: string, reportCount: n
   );
 }
 
+/**
+ * The steer message sent to a role whose turn is closing empty.
+ *
+ * WHY A STEER AND NOT A NOTICE: the driver-facing notice (above) tells the
+ * human-side controller to go looking. This one is addressed to the ROLE and
+ * asks for the missing hand-off, because the turn boundary is the last moment
+ * the runtime can still make the role produce it: the host re-reads the inbox
+ * after a steer and runs another step, so a role that merely forgot its
+ * hand-off gets one more step to file it instead of the run going quiet.
+ *
+ * It asks for the durable channels by name — `orchestra_report` for the
+ * evidence and `a2a_reply`/`orchestra_send` for the handoff — because "say
+ * something" is exactly the vagueness that produced the silent turn in the
+ * first place.
+ */
+export function roleTurnStallPrompt(teamId: string, roleId: string, reportCount: number): string {
+  return (
+    `orchestra: ${teamId} ${roleId} is closing this turn without handing anything back ` +
+    `(reportCount=${reportCount}). Do not end the turn silently. If the work is done, file it now: ` +
+    `orchestra_report for the durable evidence, then a2a_reply or orchestra_send to hand the result to the driver. ` +
+    `If the work is NOT done, say what is missing and what you need — a one-line handoff is enough, silence is not.`
+  );
+}
+
+/**
+ * Tool calls that hand a result back to the driver. A role that made one of
+ * these inside the turn being closed has delivered something, so steering it
+ * again would only teach it to repeat itself.
+ */
+export const HANDOFF_TOOL_NAMES: readonly string[] = ["orchestra_report", "orchestra_send", "a2a_reply", "a2a_send"];
+
+/** One approval question the host logged that no `approval/decided` has answered. */
+export interface PendingApprovalFact {
+  /** The host's own request id; the pairing key. */
+  id: string;
+  /** Session that asked. */
+  sessionId: string;
+  /** Tool the question was about, when the host named one. */
+  toolName?: string;
+  /** When the question was logged. */
+  askedAt: number;
+}
+
+/** The session-event shapes this guard reads. Structural, so a test can build them. */
+export interface ApprovalEventLike {
+  type?: string;
+  data?: { id?: unknown; toolName?: unknown };
+}
+
+/** The turn-stop payload shapes this guard reads. Structural, so a test can build them. */
+export interface TurnStoppingLike {
+  agent?: {
+    id?: string;
+    session?: { header?: { id?: string; cwd?: string } };
+    inbox?: { hasPending?: boolean };
+    /** The host's steer primitive; absent in a double that only records. */
+    steer?: (message: never) => void;
+  };
+  turn?: number;
+}
+
+/** Channels {@link createRoleTurnGuard} needs. Production wires the real ones; tests inject fakes. */
+export interface RoleTurnGuardOptions {
+  /** Reads the active Team for a working directory. */
+  readTeam(cwd: string): Promise<ActiveTeamRead>;
+  /** Sends one steer message so the role's turn runs another step. */
+  steer(agent: NonNullable<TurnStoppingLike["agent"]>, text: string): void;
+  /** Tells the driver something it must act on. Best-effort by contract. */
+  notifyDriver(team: TeamState, sessionId: string, detail: string): Promise<void>;
+  /** Injectable clock, so a test can pin `askedAt`. */
+  now?(): number;
+}
+
+/** The guard's surface: what `apply` subscribes to, and what a test drives. */
+export interface RoleTurnGuard {
+  /** Records one host audit event (`approval/asked` / `approval/decided`). */
+  noteApprovalEvent(session: { id?: string } | undefined, event: ApprovalEventLike | undefined): void;
+  /** Handles one turn stop boundary. */
+  onTurnStopping(payload: TurnStoppingLike): Promise<void>;
+  /** The questions still unanswered, for diagnostics and assertions. */
+  pendingApprovals(): readonly PendingApprovalFact[];
+}
+
+/** The session id an agent carries: `agent.id` is the session id by the registry's own invariant. */
+function agentSessionId(agent: TurnStoppingLike["agent"]): string | undefined {
+  const candidates = [agent?.id, agent?.session?.header?.id];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate !== "") return candidate;
+  }
+  return undefined;
+}
+
+/**
+ * Whether this role already handed something back inside the turn being closed.
+ *
+ * Read off the session's own `tool/call` events by TURN NUMBER rather than by
+ * scanning for the last `turn/start`: the host stamps every `tool/call` with the
+ * turn it belongs to, which makes "this turn" exact instead of approximate, and
+ * a role that handed off in an earlier turn is not excused from this one.
+ */
+export function handedBackThisTurn(agent: TurnStoppingLike["agent"], turn: number | undefined): boolean {
+  const events = (agent as { session?: { snapshotEvents?: () => readonly { type?: string; data?: { turn?: unknown; name?: unknown } }[] } } | undefined)
+    ?.session?.snapshotEvents?.();
+  if (events === undefined) return false;
+  for (const event of events) {
+    if (event?.type !== "tool/call") continue;
+    if (turn !== undefined && event.data?.turn !== turn) continue;
+    if (typeof event.data?.name === "string" && HANDOFF_TOOL_NAMES.includes(event.data.name)) return true;
+  }
+  return false;
+}
+
+/**
+ * The S4 runtime guard: two FIRST-HAND signals, no inference.
+ *
+ * WHAT REPLACED WHAT. This used to be a `running → idle` inference on
+ * `agent/status` — a state transition the runtime never promised and a
+ * transition that says nothing about whether the role delivered. It is now two
+ * signals the host commits to:
+ *
+ *  1. **`agent/turn-stopping`** — awaited at the boundary, `@mode serial`, and
+ *     carrying the turn number. A role whose turn is closing with nothing
+ *     handed back is steered once for that turn, so the turn runs another step
+ *     instead of ending silently.
+ *  2. **`approval/asked` / `approval/decided`** — the host's own audit pair. A
+ *     question with no answer is the one failure that cannot recover on its
+ *     own, so it is kept in a table until its `decided` arrives and reported at
+ *     the boundary if it never does.
+ *
+ * The two are deliberately independent: a dangling approval is reported even
+ * when the role did hand something back, because a parked approval is not made
+ * harmless by a report.
+ *
+ * @param options - the channels; production supplies the real ones.
+ * @returns the guard, whose handlers `apply` subscribes.
+ */
+export function createRoleTurnGuard(options: RoleTurnGuardOptions): RoleTurnGuard {
+  const now = options.now ?? (() => Date.now());
+  /** Approval questions with no answer yet, keyed by session + request id. */
+  const pending = new Map<string, PendingApprovalFact>();
+  /** `session#turn` keys already steered, so one turn costs at most one steer. */
+  const steeredTurns = new Set<string>();
+
+  return {
+    noteApprovalEvent(session, event) {
+      const type = event?.type;
+      if (type !== "approval/asked" && type !== "approval/decided") return;
+      const sessionId = typeof session?.id === "string" && session.id !== "" ? session.id : undefined;
+      const data = event?.data;
+      const id = typeof data?.id === "string" && data.id !== "" ? data.id : undefined;
+      if (sessionId === undefined || id === undefined) return;
+      const key = `${sessionId}\u0000${id}`;
+      if (type === "approval/decided") {
+        // The answer arrived: the question is no longer dangling, whatever the
+        // outcome was. `unavailable` is an answer too — it is the fail-closed
+        // one, and it ends the turn.
+        pending.delete(key);
+        return;
+      }
+      pending.set(key, {
+        id,
+        sessionId,
+        ...(typeof data?.toolName === "string" && data.toolName !== "" ? { toolName: data.toolName } : {}),
+        askedAt: now(),
+      });
+    },
+
+    async onTurnStopping(payload) {
+      const agent = payload?.agent;
+      const sessionId = agentSessionId(agent);
+      if (agent === undefined || sessionId === undefined) return;
+
+      // 1. the approval watchdog: a question nobody answered is reported even
+      //    when the role handed something back.
+      const dangling = [...pending.values()].filter((entry) => entry.sessionId === sessionId);
+      if (dangling.length > 0) {
+        const cwd = agent.session?.header?.cwd;
+        if (typeof cwd === "string" && cwd !== "") {
+          let observation: ActiveTeamRead | undefined;
+          try {
+            observation = await options.readTeam(cwd);
+          } catch {
+            observation = undefined;
+          }
+          if (observation?.kind === "ready") {
+            const team = observation.team;
+            for (const entry of dangling) {
+              await options.notifyDriver(
+                team,
+                sessionId,
+                `approval ${entry.id} for tool ${entry.toolName ?? "(unnamed)"} was asked at ${entry.askedAt} and never decided`,
+              );
+            }
+          }
+        }
+      }
+
+      // 2. the empty-turn steer. Skipped for the controller itself, for a role
+      //    that is already being woken (pending inbox work IS a wake-up), and
+      //    for a role that handed something back inside this very turn.
+      const turn = typeof payload?.turn === "number" ? payload.turn : undefined;
+      if (turn === undefined) return;
+      const key = `${sessionId}#${turn}`;
+      if (steeredTurns.has(key)) return;
+      const cwd = agent.session?.header?.cwd;
+      if (typeof cwd !== "string" || cwd === "") return;
+      if (agent.inbox?.hasPending === true) return;
+      if (handedBackThisTurn(agent, turn)) return;
+      let observation: ActiveTeamRead;
+      try {
+        observation = await options.readTeam(cwd);
+      } catch {
+        return;
+      }
+      if (observation.kind !== "ready") return;
+      const team = observation.team;
+      if (sessionId === team.controllerSessionId) return;
+      const role = team.roles.find((entry) => entry.sessionId === sessionId);
+      if (role === undefined) return;
+      const reportCount = role.reportCount ?? 0;
+      // The steer is remembered BEFORE it is sent: the host re-reads the inbox
+      // and runs another step, and that step's boundary fires this handler
+      // again with the SAME turn number. Without the key being taken first, a
+      // role that ignores the steer would be steered once per step forever.
+      steeredTurns.add(key);
+      options.steer(agent, roleTurnStallPrompt(team.teamId, role.id, reportCount));
+    },
+
+    pendingApprovals() {
+      return [...pending.values()];
+    },
+  };
+}
+
 /** One milestone notice that could not be delivered, as a durable fact. */
 export interface NoticeFailureFact {
   milestone: MilestoneNoticeKind;
@@ -5220,6 +5454,14 @@ export function apply(ctx: Context): void {
   // it (the event contract says so explicitly), and a thrown error here would be
   // a plugin breaking a session's log write.
   ctx.on("session/event", (session: any, event: any) => {
+    // S4: the approval watchdog reads the host's own audit pair. They are
+    // log-only Session events, so this listener is the only place the plugin can
+    // see them — and routing them through the SAME listener keeps the
+    // "two property reads and return" budget this handler is held to.
+    if (event?.type === "approval/asked" || event?.type === "approval/decided") {
+      turnGuard.noteApprovalEvent(session, event);
+      return;
+    }
     if (event?.type !== "user/message") return;
     if (event?.data?.source?.kind !== "user") return;
     void approvePendingDraftFromUserMessage(ctx, session, { seq: event.seq, data: event.data }).catch((error) => {
@@ -5256,51 +5498,53 @@ export function apply(ctx: Context): void {
     });
   });
 
-  // A role that stops working without reporting must not stall the run.
+  // S4: the stall guard runs on FIRST-HAND signals only.
   //
-  // The driver's discipline is to hand the turn back and be woken by the role
-  // (see the "Turn Handoff & Reactive Wakeup" rule). That only works if the role
-  // actually delivers something. A model that writes its output with the file
-  // tools and then simply ends its turn produces no wake-up at all: the driver
-  // waits for a message nobody sent, and the run sits there looking healthy.
-  // This listener is the runtime's answer to a behaviour it cannot demand.
-  //
-  // It is deliberately narrow, because a wake-up that fires too eagerly is worse
-  // than a late one:
-  //   * only a running -> idle transition counts (a role that was never working
-  //     is not stalled);
-  //   * a role with pending input already IS waking the driver, so it is skipped;
-  //   * one notice per idle transition, keyed by the session that went quiet.
-  const runningRoles = new Set<string>();
-  ctx.on("agent/status", (payload: any) => {
-    const agent = payload?.agent;
-    const sessionId = agent?.session?.header?.id;
-    if (typeof sessionId !== "string" || sessionId === "") return;
-    if (payload?.status === "running") {
-      runningRoles.add(sessionId);
-      return;
-    }
-    if (payload?.status !== "idle" || !runningRoles.delete(sessionId)) return;
-    if (agent?.inbox?.hasPending === true) return;
-    void (async () => {
-      const cwd = agent?.session?.header?.cwd;
-      if (typeof cwd !== "string" || cwd === "") return;
-      const observation = await activeTeamState.read(cwd);
-      if (observation.kind !== "ready") return;
-      const team = observation.team;
-      const role = team.roles.find((entry) => entry.sessionId === sessionId);
-      if (role === undefined) return;
-      try {
-        await deliverMessage(ctx, sessionId, team.controllerSessionId, [
-          { type: "text", text: stalledRoleNotice(team.teamId, role.id, role.reportCount ?? 0) },
-        ], { wake: true, ...transportStores(ctx, cwd) });
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        console.warn(`orchestra: stalled-role notice for ${role.id} could not reach the controller: ${reason}`);
-      }
-    })().catch((error) => {
+  // What used to sit here was a `running -> idle` inference on `agent/status`:
+  // a transition the runtime never promised to emit, which said nothing about
+  // whether the role had delivered anything, and which could not see a turn that
+  // never closed at all. It is gone (see `docs/dsh-native-capabilities.md`
+  // 禁忌 5). What replaces it is two signals the host commits to — the awaited
+  // `agent/turn-stopping` boundary and the `approval/asked`/`approval/decided`
+  // audit pair — wired through one guard so both are testable without a live
+  // instance.
+  const turnGuard = createRoleTurnGuard({
+    readTeam: (cwd) => activeTeamState.read(cwd),
+    steer: (agent, text) => {
+      agent.steer?.(
+        createUserMessage({
+          content: [{ type: "text", text }] as ContentBlock[],
+          source: { kind: "plugin", plugin: "orchestra", form: "notice", summary: "turn stall steer" } as MessageSource,
+        }) as never,
+      );
+    },
+    // The driver notice rides the same best-effort chain every other milestone
+    // notice uses: deliver, and if it cannot be delivered record the failure on
+    // the Team (`noticeFailures`) so "the driver was never told" stops being
+    // invisible. No new Team field, and no step may throw — this runs from a
+    // host dispatch, where an exception would break the boundary it observes.
+    notifyDriver: async (team, sessionId, detail) => {
+      const agent = ctx.get("agents")?.get(sessionId as never);
+      await notifyDriverMilestone(ctx, team, sessionId, "stalled", detail, {
+        recordFailure: noticeRecorderFor(ctx, activeTeamState, team.rootCwd, {
+          // A host dispatch is not a tool call, so there is no callId / name /
+          // arguments to report; the recorder reads only the agent (for the
+          // escrow policy) and the abort signal.
+          agent,
+          signal: undefined,
+        } as unknown as ToolExecutionInput),
+      });
+    },
+  });
+
+  // S4: the awaited turn boundary. `@mode serial`, and the host re-reads the
+  // agent's inbox after this returns, so a listener that steers gets another
+  // step instead of a closed turn. Void-detached on purpose: an observer failure
+  // must never break the boundary it observes.
+  ctx.on("agent/turn-stopping", (payload: any) => {
+    void Promise.resolve(turnGuard.onTurnStopping(payload)).catch((error) => {
       const reason = error instanceof Error ? error.message : String(error);
-      console.warn(`orchestra: stalled-role detection failed: ${reason}`);
+      console.warn(`orchestra: turn-stall guard failed: ${reason}`);
     });
   });
 

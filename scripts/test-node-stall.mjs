@@ -1,5 +1,6 @@
 /**
- * Stall detection and the health projection that carries it.
+ * Stall detection: the health projection that carries it, and the S4 runtime
+ * guard that now produces it from FIRST-HAND signals.
  *
  * Stall is the one unattended failure nobody reports: a node that stopped
  * working looks exactly like a node that is thinking. These tests pin the three
@@ -7,12 +8,44 @@
  * `unknown` into `ok` is precisely how a dead run passes for a healthy one, and
  * they pin that a Loop's declared `stallGraceMs` actually reaches the verdict
  * rather than sitting in the schema as dead policy.
+ *
+ * The S4 half pins the guard's three load-bearing behaviours, each of which was
+ * a defect when it was missing:
+ *
+ *  1. a role closing a turn with nothing handed back is steered ONCE per turn —
+ *     the host re-reads the inbox after a steer and runs another step, so
+ *     without the per-turn key the same turn would be steered once per step;
+ *  2. an `approval/asked` with no `approval/decided` is kept until its answer
+ *     arrives and reported to the driver at the boundary, durably when the
+ *     notice cannot be delivered;
+ *  3. the plugin subscribes to `agent/turn-stopping` and to nothing that
+ *     infers liveness — `agent/status` in particular is gone, because a
+ *     `running -> idle` transition says nothing about whether a role delivered.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { DEFAULT_STALL_GRACE_MS, nodeStall } from "../lib/orchestra-graph.js";
-import { loopsWithAttemptTiming, nodeIsWorking, openAttemptFor, roleAttemptHealth } from "../lib/orchestra.js";
+import {
+  apply as applyOrchestra,
+  createRoleTurnGuard,
+  handedBackThisTurn,
+  loopsWithAttemptTiming,
+  nodeIsWorking,
+  noticeRecorderFor,
+  notifyDriverMilestone,
+  openAttemptFor,
+  roleAttemptHealth,
+} from "../lib/orchestra.js";
+
+const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
+const read = (relative) => readFile(join(REPO, relative), "utf8");
+const cwd = "/tmp/orchestra-turn-guard";
 
 const NOW = 1_000_000;
 
@@ -197,4 +230,258 @@ test("a notice failure is recorded on the Team, never as an invented graph node"
     () => noticeRecorderFor(ctx, { read: async () => ({ kind: "blocked", cwd: "/tmp/x", warnings: [], diagnostic: { code: "invalid_json", message: "bad" } }) }, "/tmp/x", { agent: undefined })(good),
     /active Team state is blocked/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// S4 assertion 1 — the empty-turn steer fires once per turn, and only for a turn
+// that really handed nothing back.
+// ---------------------------------------------------------------------------
+
+/** A live role session double whose log can carry tool calls. */
+function sessionDouble(id, cwd, events = []) {
+  return {
+    id,
+    header: { id, cwd },
+    events,
+    snapshotEvents() {
+      return this.events;
+    },
+  };
+}
+
+/** An agent double carrying the members the guard reads. */
+function agentDouble(id, cwd, overrides = {}) {
+  return {
+    id,
+    session: sessionDouble(id, cwd),
+    inbox: { hasPending: false },
+    ...overrides,
+  };
+}
+
+/** A ready Team observation with one governed role on the given session. */
+function readyTeam(roleId, sessionId, controllerSessionId = "driver-session") {
+  return {
+    kind: "ready",
+    cwd,
+    team: {
+      schemaVersion: 2,
+      teamId: "team-guard",
+      status: "active",
+      rootCwd: cwd,
+      controllerSessionId,
+      controllerHistory: [],
+      topologyRef: { id: "duo", source: "bundled" },
+      mission: { objective: "o", scope: [], constraints: [], acceptanceCriteria: [], nonGoals: [], context: "" },
+      createdAt: 1,
+      activatedFromArchiveId: null,
+      roles: [{ id: roleId, name: roleId, sessionId, phase: "active", execution: "session", sessionHistory: [], preset: "orchestra-v04-reviewer-v1", sandbox: "read-only", reportCount: 0, lastReport: null }],
+      reports: [],
+    },
+  };
+}
+
+function guardHarness(overrides = {}) {
+  const steers = [];
+  const notices = [];
+  const guard = createRoleTurnGuard({
+    readTeam: async () => overrides.read ?? readyTeam("reviewer", "role-session"),
+    steer: (agent, text) => steers.push({ sessionId: agent.id, text }),
+    notifyDriver: async (team, sessionId, detail) => notices.push({ teamId: team.teamId, sessionId, detail }),
+    now: () => NOW,
+  });
+  return { guard, steers, notices };
+}
+
+test("S4 1: a role closing its turn empty is steered once for that turn, and once only", async () => {
+  const { guard, steers } = guardHarness();
+  const agent = agentDouble("role-session", cwd);
+
+  await guard.onTurnStopping({ agent, turn: 1 });
+  await guard.onTurnStopping({ agent, turn: 1 });
+  assert.equal(steers.length, 1, "the same turn must not be steered twice — the host reruns a step after a steer, which re-enters this boundary with the same turn number");
+  assert.match(steers[0].text, /closing this turn without handing anything back/, "the steer says what is wrong");
+  assert.match(steers[0].text, /orchestra_report/, "the steer names the durable channel rather than asking for 'something'");
+
+  // A later turn is a new opportunity: the key is per turn, not per session.
+  await guard.onTurnStopping({ agent, turn: 2 });
+  assert.equal(steers.length, 2, "a new turn may be steered again");
+
+  // A role that DID hand something back inside this turn is left alone.
+  const busy = agentDouble("role-session", cwd, {
+    session: sessionDouble("role-session", cwd, [{ type: "tool/call", data: { turn: 3, name: "orchestra_report" } }]),
+  });
+  await guard.onTurnStopping({ agent: busy, turn: 3 });
+  assert.equal(steers.length, 2, "a turn that filed a report is not a stall");
+
+  // A role with pending input is already being woken.
+  const pending = agentDouble("role-session", cwd, { inbox: { hasPending: true } });
+  await guard.onTurnStopping({ agent: pending, turn: 4 });
+  assert.equal(steers.length, 2, "pending inbox work IS a wake-up; steering on top of it would double the work");
+
+  // The controller is never steered: it is the one asking.
+  const driverAgent = agentDouble("driver-session", cwd);
+  await guard.onTurnStopping({ agent: driverAgent, turn: 5 });
+  assert.equal(steers.length, 2, "the driver's own turns are not the driver's problem");
+
+  // A session that is not a governed role of this Team is nobody's business.
+  const stranger = agentDouble("someone-else", cwd);
+  await guard.onTurnStopping({ agent: stranger, turn: 6 });
+  assert.equal(steers.length, 2, "a session with no role record is not steered");
+
+  // No turn number means the host did not tell us which turn is closing, and a
+  // steer without a turn key could not be deduplicated.
+  const noTurn = agentDouble("role-session", cwd);
+  await guard.onTurnStopping({ agent: noTurn });
+  assert.equal(steers.length, 2, "without a turn number there is nothing to deduplicate on, so nothing is sent");
+});
+
+test("S4 1b: handedBackThisTurn reads the turn stamp, not a scan for the last turn/start", () => {
+  // The host stamps every tool/call with the turn it belongs to, so "this turn"
+  // is exact. A role that handed off in turn 1 and is closing turn 9 empty has
+  // handed nothing back in turn 9.
+  const agent = agentDouble("role-session", cwd, {
+    session: sessionDouble("role-session", cwd, [
+      { type: "turn/start", data: { turn: 1 } },
+      { type: "tool/call", data: { turn: 1, name: "a2a_reply" } },
+      { type: "turn/end", data: { turn: 1, reason: { kind: "completed" } } },
+      { type: "turn/start", data: { turn: 9 } },
+    ]),
+  });
+  assert.equal(handedBackThisTurn(agent, 1), true);
+  assert.equal(handedBackThisTurn(agent, 9), false, "an earlier turn's handoff does not excuse this one");
+  assert.equal(handedBackThisTurn(agent, undefined), true, "with no turn given, any handoff counts — the caller must not ask this without a turn");
+  assert.equal(handedBackThisTurn(agentDouble("role-session", cwd), 9), false, "a session with no log has handed nothing back");
+});
+
+// ---------------------------------------------------------------------------
+// S4 assertion 2 — the approval watchdog: kept until answered, reported at the
+// boundary, durable when the notice cannot be delivered.
+// ---------------------------------------------------------------------------
+
+test("S4 2: an approval question is held until its own decided arrives", () => {
+  const { guard, notices } = guardHarness();
+  guard.noteApprovalEvent({ id: "role-session" }, { type: "approval/asked", data: { id: "ask-1", toolName: "bash" } });
+  assert.deepEqual(guard.pendingApprovals(), [{ id: "ask-1", sessionId: "role-session", toolName: "bash", askedAt: NOW }]);
+
+  // A decided for a DIFFERENT request reconciles nothing: pairing is by id, and
+  // an answer to another question is not an answer to this one.
+  guard.noteApprovalEvent({ id: "role-session" }, { type: "approval/decided", data: { id: "ask-other", outcome: "rejected" } });
+  assert.equal(guard.pendingApprovals().length, 1, "another request's answer must not close this one");
+
+  // Unrelated events are not approval events.
+  guard.noteApprovalEvent({ id: "role-session" }, { type: "user/message", data: { id: "ask-1" } });
+  assert.equal(guard.pendingApprovals().length, 1, "only the two approval event types are read");
+
+  guard.noteApprovalEvent({ id: "role-session" }, { type: "approval/decided", data: { id: "ask-1", outcome: "unavailable" } });
+  assert.deepEqual(guard.pendingApprovals(), [], "its own answer closes it — `unavailable` is an answer too, and it ends the turn");
+  assert.deepEqual(notices, [], "a question that was answered is not reported");
+});
+
+test("S4 2b: a dangling approval is reported to the driver at the turn boundary", async () => {
+  const { guard, notices } = guardHarness();
+  guard.noteApprovalEvent({ id: "role-session" }, { type: "approval/asked", data: { id: "ask-1", toolName: "bash" } });
+  // The role handed its report back in this very turn, so the steer stays quiet
+  // and only the watchdog speaks: a parked approval is not made harmless by a
+  // report.
+  const agent = agentDouble("role-session", cwd, {
+    session: sessionDouble("role-session", cwd, [{ type: "tool/call", data: { turn: 7, name: "orchestra_report" } }]),
+  });
+  await guard.onTurnStopping({ agent, turn: 7 });
+
+  assert.equal(notices.length, 1, "one notice per dangling question");
+  assert.equal(notices[0].teamId, "team-guard");
+  assert.equal(notices[0].sessionId, "role-session");
+  assert.match(notices[0].detail, /ask-1/, "the notice names the request");
+  assert.match(notices[0].detail, /never decided/, "the notice says what is wrong");
+
+  // The boundary fires again on the step the host runs afterwards; the question
+  // is still unanswered, so it is reported again rather than forgotten.
+  await guard.onTurnStopping({ agent, turn: 7 });
+  assert.equal(notices.length, 2, "an unanswered question keeps being reported until it is answered");
+});
+
+test("S4 2c: an undeliverable dangling-approval notice lands durably on the Team", async () => {
+  // The notice chain is the one every milestone notice uses: deliver, and if
+  // that fails, record it on the Team (`noticeFailures`) so "the driver was
+  // never told" stops being invisible. No new Team field, and no step throws.
+  const writes = [];
+  const team = readyTeam("reviewer", "role-session").team;
+  const store = {
+    async read() {
+      return { kind: "ready", cwd, team };
+    },
+    async replace(_snapshot, next) {
+      writes.push(next);
+      return { operation: "replaced", state: next, version: 2, statePath: "p" };
+    },
+  };
+  const ctx = { sandboxPolicy: { resolve: () => ({}) } };
+  const notifyDriver = async (current, sessionId, detail) =>
+    notifyDriverMilestone(ctx, current, sessionId, "stalled", detail, {
+      deliver: async () => {
+        throw new Error("transport down");
+      },
+      recordFailure: noticeRecorderFor(ctx, store, cwd, {}),
+    });
+  const failing = createRoleTurnGuard({
+    readTeam: async () => ({ kind: "ready", cwd, team }),
+    steer: () => {},
+    notifyDriver,
+    now: () => NOW,
+  });
+  failing.noteApprovalEvent({ id: "role-session" }, { type: "approval/asked", data: { id: "ask-9", toolName: "bash" } });
+  await failing.onTurnStopping({ agent: agentDouble("role-session", cwd), turn: 1 });
+
+  assert.equal(writes.length, 1, "the failed notice is recorded once");
+  assert.equal(writes[0].noticeFailures.length, 1);
+  assert.equal(writes[0].noticeFailures[0].milestone, "stalled");
+  assert.match(writes[0].noticeFailures[0].reason, /transport down/, "the recorded reason is the delivery failure");
+});
+
+// ---------------------------------------------------------------------------
+// S4 assertion 3 — the plugin subscribes to the first-hand boundary and to no
+// liveness inference.
+// ---------------------------------------------------------------------------
+
+test("S4 3: the plugin subscribes to agent/turn-stopping and to no agent/status listener", async () => {
+  // Runtime half: drive the real `apply` with a recording context and read back
+  // the event names it subscribed to.
+  const root = await mkdtemp(join(tmpdir(), "orchestra-turn-guard-apply-"));
+  const previousHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = root;
+  const listeners = [];
+  try {
+    applyOrchestra({
+      fs: {},
+      tools: { register: () => {} },
+      get: () => undefined,
+      effect: () => () => {},
+      on: (name) => {
+        listeners.push(name);
+        return () => {};
+      },
+    });
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previousHome;
+    // `apply` installs the catalog artifacts into the scratch home detached, so
+    // give that write chain a moment to finish before the directory is removed.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+  }
+
+  assert.ok(listeners.includes("agent/turn-stopping"), "the awaited turn boundary is subscribed");
+  assert.ok(listeners.includes("session/event"), "the approval audit pair arrives as session events");
+  assert.equal(listeners.filter((name) => name === "agent/status").length, 0, "no listener infers liveness from agent/status");
+
+  // Source half: the inference is not merely unsubscribed, it is gone. A
+  // `runningRoles` set or a status fold left behind would be a second
+  // implementation of the same idea.
+  const orchestra = await read("src/orchestra.ts");
+  const statusSubscriptions = orchestra.split("\n").filter((line) => /ctx\.on\(\s*["']agent\/status["']/.test(line));
+  assert.deepEqual(statusSubscriptions, [], "src/orchestra.ts must not subscribe to agent/status");
+  const statusFolds = orchestra.split("\n").filter((line) => /["']agent\/status["']/.test(line) && !line.trimStart().startsWith("*") && !line.trimStart().startsWith("//"));
+  assert.deepEqual(statusFolds, [], "no agent/status reference survives outside prose");
+  assert.equal(/runningRoles/.test(orchestra), false, "the running->idle bookkeeping is gone with it");
 });

@@ -204,3 +204,148 @@ test("S1: the S2 boundary is stated, not silently assumed", async () => {
     "S2 has NOT landed: a2a-transport.ts still owns its own resume. The repo-wide 'exactly one call site' form of S1 criterion 2 is therefore NOT satisfied yet, and this test says so on purpose.",
   );
 });
+
+// ---------------------------------------------------------------------------
+// D2-a: every build path pins the approval policy, and none double-pins it.
+// ---------------------------------------------------------------------------
+
+/**
+ * A context whose factory honours the `AgentSetup` contract: setup runs on the
+ * unpublished agent, then `commit()` is invoked, then the session is published.
+ *
+ * `recordingContext` above deliberately does NOT call setup — it is a routing
+ * test. The pin cannot be observed there, so this double is the faithful one.
+ */
+function publishingContext() {
+  const sessions = new Map();
+  const agents = new Map();
+  const policies = (id) =>
+    (sessions.get(id)?.snapshotEvents() ?? []).filter((event) => event.type === "approval/policy").map((event) => event.data.policy);
+  const ctx = {
+    sessions: { get: (id) => sessions.get(String(id)) },
+    agents: {
+      get: (id) => agents.get(String(id)),
+      async create(options) {
+        const id = String(options.sessionId);
+        const session = {
+          id,
+          events: [],
+          header: { id, cwd: "/role-workspace" },
+          snapshotEvents() {
+            return this.events;
+          },
+          append(type, data) {
+            this.events.push({ type, data });
+          },
+        };
+        sessions.set(id, session);
+        const child = { ...ctx, agentId: id, on: () => () => {} };
+        const commit = await options.setup?.(child, { id, session });
+        commit?.commit?.();
+        agents.set(id, { id, session });
+        return { agent: agents.get(id), async dispose() {} };
+      },
+      async resume(options) {
+        const id = String(options.resumeSessionId);
+        const session = sessions.get(id) ?? {
+          id,
+          events: [],
+          header: { id, cwd: "/role-workspace" },
+          snapshotEvents() {
+            return this.events;
+          },
+          append(type, data) {
+            this.events.push({ type, data });
+          },
+        };
+        sessions.set(id, session);
+        const child = { ...ctx, agentId: id, on: () => () => {} };
+        await options.setup?.(child, { id, session });
+        return { agent: { id, session }, async dispose() {} };
+      },
+    },
+    get(name) {
+      if (name === "agentPresets") {
+        return {
+          async resolve(id) {
+            return { id };
+          },
+          async mount(agentCtx, id) {
+            agentCtx.composedPreset = id;
+          },
+          composedPreset(agentCtx) {
+            return agentCtx.composedPreset;
+          },
+        };
+      }
+      if (name === "permissionPresets") {
+        return { defaultPreset: "workspace", resolve: () => ({ sandbox: "workspace-write", approval: "ask" }), set: () => {}, current: () => "workspace" };
+      }
+      if (name === "tools") return { schemas: () => [] };
+      if (name === "agentDefaultModel") return { currentSelection: () => ({ provider: "p", model: "m" }) };
+      return undefined;
+    },
+  };
+  return { ctx, policies };
+}
+
+test("D2-a: every build path pins approval to never, and the governed path pins it once", async () => {
+  // Lazy materialization: a plain preset create with no Blueprint at all — the
+  // path that used to inherit the deployment default (`ask`).
+  {
+    const { ctx, policies } = publishingContext();
+    await buildRoleSession(ctx, { kind: "create", sessionId: "role-lazy", cwd: "/role-workspace", presetId: "orchestra-v04-reviewer-v1" });
+    assert.deepEqual(policies("role-lazy"), ["never"], "the lazy path must pin the policy");
+  }
+
+  // Lightweight (a2a_create): same requirement, different plane.
+  {
+    const { ctx, policies } = publishingContext();
+    await buildRoleSession(ctx, {
+      kind: "create",
+      mode: "lightweight",
+      sessionId: "role-light",
+      cwd: "/role-workspace",
+      presetId: "orchestra-v04-reviewer-v1",
+      caller: { id: "driver", ctx: {}, options: {} },
+    });
+    assert.deepEqual(policies("role-light"), ["never"], "the lightweight path must pin the policy");
+  }
+
+  // Reactivation resume with NO setup of its own: nothing else would pin it.
+  {
+    const { ctx, policies } = publishingContext();
+    await buildRoleSession(ctx, { kind: "resume", sessionId: "role-resumed" });
+    assert.deepEqual(policies("role-resumed"), ["never"], "a bare resume must pin the policy");
+  }
+
+  // Reactivation resume WITH a caller setup: the composition work still runs.
+  {
+    const { ctx, policies } = publishingContext();
+    const ran = [];
+    await buildRoleSession(ctx, {
+      kind: "resume",
+      sessionId: "role-resumed-2",
+      setup: async () => {
+        ran.push("caller");
+      },
+    });
+    assert.deepEqual(policies("role-resumed-2"), ["never"]);
+    assert.deepEqual(ran, ["caller"], "composing the pin must not replace the caller's setup");
+  }
+
+  // Governed: the Blueprint's own setup already pins, so the fold must absorb it
+  // rather than appending a second identical event.
+  {
+    const { ctx, policies } = publishingContext();
+    const blueprint = {
+      sessionId: "role-governed",
+      agentOptions: {},
+      meta: { cwd: "/role-workspace", agentPreset: "p" },
+      receipt: { mode: "governed", sessionId: "role-governed", agentPreset: "p" },
+      setup: async () => ({ commit() {} }),
+    };
+    await buildRoleSession(ctx, { kind: "create", mode: "governed", sessionId: "role-governed", cwd: "/role-workspace", governedBlueprint: blueprint });
+    assert.deepEqual(policies("role-governed"), ["never"], "exactly one policy event, not two");
+  }
+});
