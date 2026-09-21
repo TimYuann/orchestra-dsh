@@ -1164,3 +1164,44 @@ driver 实测两条：
 **善后**：**未清理、未归档、4600 未停**（等 Owner 在 space 37 看完回话）。清理范围已定：只删本轮新建的团队记录（`team-d3c21a6d` + 本轮 10 份报告 / 43 张截图），`artifacts/` 与旧归档不动。
 
 **审查轮计数 +0**（执行轮；"扣下未确认项"是诚实报告，不是设计异议）。
+
+---
+
+## 34. 第 20 轮（清理执行 + "原版功能是否落盘"判定）（2026-09-22）
+
+### Owner 的口径澄清（driver 记录，优先）
+> "那些 review 没有必要。那是模型能力的问题，它能不能把这个东西做好，跟我们的系统没有关系。我们只需要确定，这个系统 driver 按照我们的要求进行了团队的拉起、组织、派发，并且 worker 之间的自主循环、自主推进顺利完成就可以了。"
+⇒ **判据口径修正**：这类"系统能力轮"**不把交付物质量当判据**（游戏好不好玩、方块像不像 Minecraft 属**模型能力**，只作观察记录）；判据是 **driver 拉起团队 → 组织 → 派发 → worker 自主循环/自主推进 → 收束**这条链。
+
+### 清理执行（Owner 指示"可以去执行清理了"；删除收据见 `reports/fixture-forensics-2026-09-21/round5-cleanup-manifest.txt`，本地）
+| 动作 | 对象 | driver 实测终态 |
+|---|---|---|
+| **删除** | `orchestra/state/team.json`（本轮 active 团队 `team-d3c21a6d`） | `orchestra/state/` **空**（插件视角 = 该目录无团队） |
+| **删除** | 本轮 10 份报告（`build-v1` / `build-r2fix` / `build-r3fix` / `review-r1..r4` / `closure-driver` / `closure-driver-final` / `correction-r1`） | `orchestra/reports/` 由 25 → **15** 份，**只剩 Sep 19 的旧文件** |
+| **删除** | 本轮 4 张任务卡（`orchestra/tasks/minecraft-html-*.md`） | 由 10 → **6** 份，只剩旧的 |
+| **删除** | `screenshots/`（43 张 / **66 MB**）、`PROGRESS.md` | 均已不存在 |
+| **保留** | `minecraft-html/`（交付物，sha256 `6d342da4d33c90f6bd99…` 未变）· `artifacts/{2048,snake,wordle}` · `orchestra/archive/`（7 份旧快照，mtime 仍 Sep 19） | 均在 |
+| **未动（并说明）** | `orchestra/charter/records.json`（mtime `Sep 22 02:55`，含本轮 draft + 批准记录） | **append-only 历史，刻意不手改**（手改领域文件会破坏其写链不变量）；终态属 Owner 口径的"用过 orchestra，但上一支团队已完整交付"那一支 |
+| **实例** | 4600（PID 201）已停 | `curl 4600 → 000`；4599 全程未碰（401） |
+| **Ego space 37** | **未 finish、未回收** | 已 handOff 给 Owner，属用户所有 ⇒ 不由 agent 关闭 |
+
+### 裁定 AN｜"原版 Orchestra 功能是否可以在最新版 DSH 上落盘？"
+**核心链路：可以判定为落盘。** 证据全部来自本批的 live 轮（当前构建 + DSH 0.1.6-alpha.2，落点 `orchestra_E2E`）：
+1. **拉起**：`orchestra_draft` 出提案 → **硬批准**（短肯定句路径）→ `orchestra_create` 建队（第 14/19 轮）。
+2. **组织成对等会话**：角色经**懒加载物化**成完整 peer 会话，各自带 preset/persona/工具/权限/**模型**（第 19 轮：三份 `request/header` 的 `config` = `minimax-cn / MiniMax-M3 / high`）。
+3. **派发**：driver 经产品路径派活（第 19 轮 R1–R4 四轮）。
+4. **worker 自主循环推进**：implement → 独立 review → **FAIL + 具体问题** → 修 → 复核 ⇒ **两次真实打回后 PASS**，全程无人介入（第 19 轮）。
+5. **收束**：durable 报告落 `orchestra/reports/`，driver 记 closure（第 19 轮）。
+6. **周边链路也已 live**：A2A 投递与冷唤醒（第 14/19 轮）· 归档 + 重激活（第 16 轮）· **跨重启身份**（第 14 轮）· 审批钉死不再悬挂（第 18 轮）· 名册 12/12 + 依赖面已迁到 0.1.6-alpha.2 + dev 实例跑当前构建。
+
+**完整功能：还不能这么说。** 仍未 live 过的六项（只有代码 + 单测）：
+1. **图运行时协议**（loop/attempt/verdict/gate/closure 状态机、typed handoff、completion owner、loop cap）—— 第 19 轮用的是 dispatch+report+closure，**不是**图协议本身；
+2. **`orchestra_wait`**（等待原语与唤醒判据）；
+3. **`orchestra_add_lanes`**（往正在跑的队里加车道）；
+4. **混合后端**（`execution: "subagent"` 的原生子 agent 节点）在 0.1.6 上的真实编队；
+5. **九个内置拓扑**（feature-development / bug-diagnosis-and-fix / …）端到端 —— 第 19 轮用的是 driver **自起草的内联拓扑**；
+6. **重激活的"替换"分支**（候选缺陷 R-5/F-D1-5：按文件挂载而非按名册）；另有 client 设置面板从未在 0.1.6 上真开浏览器验过。
+
+**建议**：**再跑一轮系统能力轮**，用**内置拓扑**（建议 `feature-development`）做第二次真实小交付 —— 它能一次覆盖上面 1/2/5 三项（图协议 + wait + 内置拓扑），并可顺带带上 3（加车道）与 4（subagent 后端）。落点仍 `orchestra_E2E/test-a/`（或 Owner 指定），判据仍按本轮修正后的口径（**只判系统链路，不判交付物质量**）。
+
+**审查轮计数 +0。**
