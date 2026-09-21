@@ -33,11 +33,13 @@
  *     session id taken from the same session store, and the script must report
  *     the mismatch. A real id is essential — a made-up one would only prove
  *     "missing".
- *  2. **record side** — one entry is dropped from that role's recorded
- *     `blueprint.compositionRowIds`, and the cross-check against the roster's
- *     actual row set must fire. Without this, the cross-check could be a branch
- *     that never runs (which is exactly the defect this replaces: the field did
- *     not exist, so the branch was unreachable).
+ *  2. **record side** — one row id in that role's recorded
+ *     `blueprint.compositionRowIds` is REPLACED, keeping the length, and the
+ *     cross-check against the roster's actual row set must fire. The length is
+ *     kept on purpose: a drop-one perturbation would be caught by a comparison
+ *     that only counts, which is exactly the defect this replaces — the recorded
+ *     set and the resolved set can have the same number of rows and still be
+ *     different compositions.
  *
  * A calibration that detects NOTHING returns 2, not 0: an always-OK script and a
  * genuinely clean run must never look the same. Exit 1 is reserved for "the
@@ -281,8 +283,8 @@ function main() {
     //
     //  1. substitution — point it at a real session that is not that role. A
     //     real id is essential; a made-up one would only prove "missing".
-    //  2. record side — drop one entry from the recorded composition row ids,
-    //     which must make the cross-check against the roster's actual rows fire.
+    //  2. record side — replace one recorded composition row id, SAME LENGTH, so
+    //     the cross-check must notice a change a count comparison cannot see.
     //
     // Each perturbation is evaluated on its OWN signal, so a run that fails for
     // an unrelated reason cannot be mistaken for a calibration that worked.
@@ -299,16 +301,22 @@ function main() {
       target.sessionId = substituted;
       const recordedRows = Array.isArray(target.blueprint?.compositionRowIds) ? target.blueprint.compositionRowIds : undefined;
       if (recordedRows !== undefined && recordedRows.length > 0) {
-        const remaining = recordedRows.slice(0, -1);
-        target.blueprint = { ...target.blueprint, compositionRowIds: remaining };
-        recordPerturbation = { remainingRows: remaining.length };
+        // Same length, one id replaced. A drop-one would be caught by a count
+        // comparison; replacing an id is what catches a comparison that only
+        // counts, which is the defect this calibration exists for. The marker
+        // carries a suffix no composition document declares, so its appearance
+        // in the computed difference can only have come from this perturbation.
+        const displaced = recordedRows[0];
+        const marker = `${displaced}--self-test-calibration`;
+        target.blueprint = { ...target.blueprint, compositionRowIds: [marker, ...recordedRows.slice(1)] };
+        recordPerturbation = { marker };
         process.stdout.write(
-          `# self-test: role "${target.id}" recorded composition ${recordedRows.length} -> ${remaining.length} row(s) (one row dropped in memory)\n`,
+          `# self-test: role "${target.id}" recorded composition row "${displaced}" -> "${marker}" (same length, one id replaced in memory)\n`,
         );
       } else {
-        // Nothing to drop means this half of the calibration cannot run here.
-        // Saying so is the point: a fixture whose records carry no row ids gets
-        // `recorded composition is absent` below, which is a real finding.
+        // Nothing to replace means this half of the calibration cannot run
+        // here. Saying so is the point: a fixture whose records carry no row ids
+        // gets `recorded composition is absent` below, which is a real finding.
         process.stdout.write(`# self-test: role "${target.id}" has no recorded compositionRowIds to perturb\n`);
       }
     }
@@ -318,6 +326,12 @@ function main() {
     /** Every problem reported for a role, so the calibration can be judged on signal rather than on "something failed". */
     const problemsByRole = new Map();
     const noteProblems = (roleId, problems) => problemsByRole.set(roleId, problems);
+    /** The record-side set difference per role. Kept separately from the printed
+     *  problems because a verdict line names only the FIRST differing row id,
+     *  while the calibration must be able to see a perturbation that is not the
+     *  first one — otherwise "the perturbation was applied" and "the perturbation
+     *  was noticed" would depend on alphabetical order. */
+    const rowDiffByRole = new Map();
     for (const role of roles) {
       if (role.phase !== "active") {
         process.stdout.write(`IDENTITY_SKIP  ${role.id} phase=${role.phase}\n`);
@@ -382,10 +396,38 @@ function main() {
       if (blueprint !== undefined && recordedRows === undefined) {
         problems.push("recorded composition is absent");
       }
-      if (recordedRows !== undefined && composition !== undefined && recordedRows.length !== composition.rowIds.length) {
-        problems.push(
-          `recorded composition has ${recordedRows.length} row(s), the resolved preset declares ${composition.rowIds.length}`,
-        );
+      if (recordedRows !== undefined && composition !== undefined) {
+        // A SET comparison, not a count. Two presets can declare the same number
+        // of rows with different rows in them, so an equal length is not
+        // agreement — "the preset was swapped in place for one with the same row
+        // count" is exactly the drift this check exists to catch. Both sides are
+        // de-duplicated and sorted first: the plugin's parse order and the host's
+        // read order are different orders, and a difference in ORDER is not a
+        // difference in composition (it would fail a correct record).
+        const recordedSet = [...new Set(recordedRows)].sort();
+        const resolvedSet = [...new Set(composition.rowIds)].sort();
+        const missing = resolvedSet.filter((id) => !recordedSet.includes(id));
+        const extra = recordedSet.filter((id) => !resolvedSet.includes(id));
+        rowDiffByRole.set(role.id, { missing, extra });
+        if (recordedRows.length !== composition.rowIds.length) {
+          problems.push(
+            `recorded composition has ${recordedRows.length} row(s), the resolved preset declares ${composition.rowIds.length}`,
+          );
+        }
+        // Naming the first row id of each side is what makes the failure
+        // actionable: a count says something drifted, an id says WHAT drifted.
+        if (missing.length > 0) {
+          problems.push(
+            `recorded composition is missing row "${missing[0]}" that the resolved preset declares` +
+              (missing.length > 1 ? ` (and ${missing.length - 1} more)` : ""),
+          );
+        }
+        if (extra.length > 0) {
+          problems.push(
+            `recorded composition has an extra row "${extra[0]}" the resolved preset does not declare` +
+              (extra.length > 1 ? ` (and ${extra.length - 1} more)` : ""),
+          );
+        }
       }
 
       // 4. a role whose session id changed must carry sessionHistory, and that
@@ -437,16 +479,17 @@ function main() {
       const substitutionDetected = targetProblems.some(
         (problem) => problem.startsWith("NOT_A_ROLE_SESSION") || problem.startsWith("the session log names no preset"),
       );
-      // The record perturbation's signal is the row-count line, and only the
-      // perturbed count can produce it: the record was rewritten to hold exactly
-      // `remainingRows` rows, so any other number is a pre-existing finding.
-      const rowCountOf = (problem) => {
-        const match = /^recorded composition has (\d+) row\(s\), the resolved preset declares \d+$/.exec(problem);
-        return match === null ? undefined : Number(match[1]);
-      };
+      // The record perturbation's signal is the marker row id it injected: only
+      // the perturbation can put that id into the recorded set, so its appearance
+      // in the computed difference is attributable to the perturbation and not to
+      // a record that was already wrong. The difference is read from what the
+      // check computed rather than from the printed line, because the printed
+      // line names only the FIRST differing id and the perturbation need not be
+      // that one — otherwise whether the calibration "sees" its own injection
+      // would depend on alphabetical order.
+      const rowDiff = calibrationTarget === undefined ? undefined : rowDiffByRole.get(calibrationTarget.id);
       const recordDetected =
-        recordPerturbation !== undefined &&
-        targetProblems.some((problem) => rowCountOf(problem) === recordPerturbation.remainingRows);
+        recordPerturbation !== undefined && rowDiff !== undefined && rowDiff.extra.includes(recordPerturbation.marker);
       const detected = substitutionDetected || recordDetected;
       process.stdout.write(
         `# self-test substitution=${substitutionDetected ? "detected" : "NOT-DETECTED"}` +

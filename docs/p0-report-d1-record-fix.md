@@ -259,7 +259,7 @@ not ok 20 - a reserved role records the EXPECTED composition row ids, and no obs
 | **端到端（记录带行 id → 重启 → 唤醒）** | **未判定**。R-2 只证明"预留时记录带行 id"（进程内）；新 fixture 上 `orchestra_dispatch` 物化后记录是否仍带、以及重启后 cross-check 是否绿，**只能由 live 轮判**。 |
 | **E / F / G 三类 cross-check 分支**（名册解析不了 / BROKEN / 0 行 preset） | **未构造输入**：需要专用 fixture 会话或改 `~/.dsh`（越界）。 |
 | **`~/.dsh/` 与两个 fixture 字节级未改动** | 已核：三个新测试把 `DSH_HOME` 指向 `mkdtemp` Scratch 目录并在 `finally` 还原；N7 `team.json` 只被读。 |
-| **E2E fixture 当前不在盘上** | 只找到 N7（`~/Documents/agentWorkspace/artifacts/projects/orchestra_N7`）与一份已归档 marker（`~/Documents/agentWorkspace/orchestra/state/team.json`，`archived: true`、无 `roles[]`）⇒  analyzer 报告里 E2E 那组对照**本轮无法复跑**，未复跑。 |
+| **E2E fixture 在盘、未改动（**上一版此处写错，已更正**）** | ~~只找到 N7 与一份已归档 marker ⇒ analyzer 报告里 E2E 那组对照无法复跑~~ —— **错因：我用的 `find -maxdepth 3` 对深度 4 的路径太浅**。实测（本节复跑）：`ls -d ~/Documents/agentWorkspace/artifacts/projects/orchestra_E2E/orchestra/state` 存在；`stat` = `Sep 19 15:18:47 2026  34726 bytes`；`shasum -a 256` = `5b8efdf9fcf5179a8ac6a55c8e8086bf1aebf5190ba2fa4b646a30a7abe2749a`（与台账 §23 记录的 `5b8efdf9…` 一致 ⇒ 未被本轮改动）。**该 fixture 的 cross-check 对照组本轮仍未跑**（6 个角色会话的日志 + 名册解析，属只读运行）。 |
 | **4600 仍是 v0.5.1 旧构建** | 未 pack、未同步 profile（Owner 决定：押到"这一波"做完之后）⇒ 本轮改动**没有任何运行期实例在跑**。 |
 
 ---
@@ -289,3 +289,174 @@ not ok 20 - a reserved role records the EXPECTED composition row ids, and no obs
 ---
 
 **报告完毕，原样回 driver。** 实现 commit `861aef7`，本地未推送（等 Owner）。
+
+---
+
+# 跟修（裁定 Z）· cross-check 从"比条数"改成"集合比对"
+
+> **driver 判定**：第 1 任实现已过（typecheck 0 / build 0 / `npm test` 272 / 判据矩阵 6/6），但留下**一条 B 类缺陷**：cross-check 只比条数（`recordedRows.length !== composition.rowIds.length`），driver 的反例是"11 条、内容全错"仍 `IDENTITY_OK`、exit 0。判据原文（`docs/plan-0.8.0-execution.md` §4.7 步 4⑤）= "与节点记录里插件写的'预期组合'**逐项比对**"。
+> **实现 commit**：`<见本节末尾 git log>`（只改 `scripts/verify-role-identity.mjs` 一个文件）。
+> **边界（如实声明）**：未碰 `src/`、未碰两个 fixture、未起实例、未改台账 / ADR / 计划 / 契约；`/tmp` 与 `/private/tmp` 只写 team.json 副本与脚本变异副本（可弃）。
+
+## ① 结论（一句话，可判真假）
+
+**cross-check 现在是集合比对（两边排序去重后逐项比，顺序无关），失败行点名第一条 missing / extra 的行 id，`--self-test` 的记录侧扰动改成"同长度改一个 id" —— driver 的反例（11 条全错）从 `IDENTITY_OK / exit 0` 变成 `exit 1` 且点名到具体行 id，而同集乱序仍 `exit 0`。**
+
+## ② 改了什么（只改 `scripts/verify-role-identity.mjs`）
+
+| # | 驱动要求 | 落地 |
+|---|---|---|
+| 1 | 集合比对、顺序无关 | `const recordedSet = [...new Set(recordedRows)].sort(); const resolvedSet = [...new Set(composition.rowIds)].sort();` → `missing = resolvedSet \ recordedSet`、`extra = recordedSet \ resolvedSet`。两边都去重 + 排序，所以"插件解析序 vs 宿主读取序"不造成假失败（对照 (b) 证明） |
+| 2 | 失败行点名第一条 missing / extra | 新增两行问题：`recorded composition is missing row "<id>" that the resolved preset declares (and N more)` / `recorded composition has an extra row "<id>" the resolved preset does not declare (and N more)`。**原有条数行与 `recorded composition is absent` 一字未动**（条数行仍在条数不等时输出，(c3) 的逐字断言因此不回归） |
+| 3 | 记录侧扰动改"同长度改一个 id" | `recordedRows[0]` → `"<id>--self-test-calibration"`，长度不变。drop-one 只能抓住"只比条数"的比较，同长度改 id 才能抓住"只比条数"这个缺口本身 |
+
+**顺带修掉一个自己引入的问题**：扰动检测原先读"打印出来的问题行"，而失败行只点名**第一条**差异 id ⇒ 当 marker 不是字母序第一时，检测不到（我用 `/tmp/d1-repair/team-quotient2.json` 复现：`record-side=NOT-DETECTED`、exit 2，而扰动明明已注入）。改为读**这一步真正算出来的集合差**（`rowDiffByRole`），检测与"哪条 id 被打印"解耦。这不算扩范围：它是驱动第 3 条要求的必要条件，否则扰动会被字母序欺骗。
+
+## ③ 对照项（全部跑，原始输出）
+
+### (a) 同长度错集（11 条全错 `bogus-1…bogus-11`）⇒ 必须 exit 1 且点名
+
+```
+$ node scripts/verify-role-identity.mjs --repo <N7> --team /tmp/d1-repair/team-bogus.json
+IDENTITY_MISSING reviewer orchestra-team-33be3b56-467d49e7-1312-482b-bf98-d69d158ba92f preset=orchestra-v04-reviewer-v1 rows=11 tools=11
+          recorded composition is missing row "agent-instructions" that the resolved preset declares (and 10 more)
+          recorded composition has an extra row "bogus-1" the resolved preset does not declare (and 10 more)
+# roles 1 ok 0 missing 1
+EXIT=1
+```
+
+### (b) 同集乱序（11 条内容相同、顺序反转）⇒ 必须 exit 0（防新增脆弱性）
+
+```
+$ node scripts/verify-role-identity.mjs --repo <N7> --team /tmp/d1-repair/team-shuffled.json
+IDENTITY_OK    reviewer orchestra-team-33be3b56-467d49e7-1312-482b-bf98-d69d158ba92f preset=orchestra-v04-reviewer-v1 rows=11 tools=11
+# roles 1 ok 1 missing 0
+EXIT=0
+```
+
+### (c) 原有四形态不回归
+
+```
+=== (c1) N7 旧记录 — 期望 exit 1 + recorded composition is absent ===
+IDENTITY_MISSING reviewer orchestra-team-33be3b56-467d49e7-1312-482b-bf98-d69d158ba92f preset=orchestra-v04-reviewer-v1 rows=11 tools=11
+          recorded composition is absent
+# roles 1 ok 0 missing 1
+EXIT=1
+
+=== (c2) correct 11 条 — 期望 exit 0 ===
+IDENTITY_OK    reviewer orchestra-team-33be3b56-467d49e7-1312-482b-bf98-d69d158ba92f preset=orchestra-v04-reviewer-v1 rows=11 tools=11
+# roles 1 ok 1 missing 0
+EXIT=0
+
+=== (c3) stale 10 条 — 期望 exit 1，逐字含 "recorded composition has 10 row(s), the resolved preset declares 11" ===
+IDENTITY_MISSING reviewer orchestra-team-33be3b56-467d49e7-1312-482b-bf98-d69d158ba92f preset=orchestra-v04-reviewer-v1 rows=11 tools=11
+          recorded composition has 10 row(s), the resolved preset declares 11
+          recorded composition is missing row "tool-result-pruner" that the resolved preset declares
+# roles 1 ok 0 missing 1
+EXIT=1
+
+=== (c4) empty 0 条 — 期望 exit 1 ===
+IDENTITY_MISSING reviewer orchestra-team-33be3b56-467d49e7-1312-482b-bf98-d69d158ba92f preset=orchestra-v04-reviewer-v1 rows=11 tools=11
+          recorded composition has 0 row(s), the resolved preset declares 11
+          recorded composition is missing row "agent-instructions" that the resolved preset declares (and 10 more)
+# roles 1 ok 0 missing 1
+EXIT=1
+
+=== (c5) blindspot 副本 + --self-test — 期望 exit 2 ===
+# self-test: role "reviewer" sessionId orchestra-team-33be3b56-… -> session-4289d06b-… (a real, non-role session)
+# self-test: role "reviewer" has no recorded compositionRowIds to perturb
+IDENTITY_MISSING reviewer session-4289d06b-… preset=standard rows=32 tools=32
+          recorded composition is absent
+# roles 1 ok 0 missing 1
+# self-test substitution=NOT-DETECTED record-side=not-applicable
+# self-test detected=NO
+EXIT=2
+
+=== (c6) N7 + --self-test — 期望 exit 1 ===
+# self-test substitution=detected record-side=not-applicable
+# self-test detected=yes
+EXIT=1
+
+=== (c7) correct + --self-test — 记录侧扰动（同长度改 id）被检出 ===
+# self-test: role "reviewer" recorded composition row "persona" -> "persona--self-test-calibration" (same length, one id replaced in memory)
+IDENTITY_MISSING reviewer session-4289d06b-… preset=standard rows=32 tools=32
+          NOT_A_ROLE_SESSION: the session log names preset standard, the role records orchestra-v04-reviewer-v1
+          recorded composition has 11 row(s), the resolved preset declares 32
+          recorded composition is missing row "command-goal" that the resolved preset declares (and 21 more)
+          recorded composition has an extra row "persona--self-test-calibration" the resolved preset does not declare
+# roles 1 ok 0 missing 1
+# self-test substitution=detected record-side=detected
+# self-test detected=yes
+EXIT=1
+```
+
+（另跑两条自定的集合语义对照：一条把最后一行换成 `bogus-tail` ⇒ exit 1，missing/extra 各点名一次；一条多加一条重复的 `persona` ⇒ exit 1 走条数行 `12 row(s) … declares 11`，集合去重后无差异 ⇒ 只有条数行。两条都与"集合比对 + 条数行保留"的预期一致。）
+
+### (d) 闸门
+
+```
+$ npm run typecheck   → EXIT=0
+$ npm run build       → EXIT=0
+$ npm test
+# tests 272
+# pass 272
+# fail 0
+EXIT=0
+```
+
+**272 不变**：本轮未加测试用例（负例校准需要真实 session store，见"未做"栏），所以 269 基线 + 上轮 3 条仍 = 272。
+
+### (e) 变异证明：把集合比对改回条数比对 ⇒ (a) 必须失败
+
+变异做法：把 `missing` / `extra` 的计算门在"条数相等时算空集"后面（等价于只比条数）。
+
+```
+--- 未变异：(a) bogus ---
+IDENTITY_MISSING reviewer … rows=11 tools=11
+          recorded composition is missing row "agent-instructions" that the resolved preset declares (and 10 more)
+          recorded composition has an extra row "bogus-1" the resolved preset does not declare (and 10 more)
+# roles 1 ok 0 missing 1
+EXIT=1
+
+--- 变异后（只比条数）：(a) bogus ⇒ 用例失败 ---
+IDENTITY_OK    reviewer … rows=11 tools=11
+# roles 1 ok 1 missing 0
+EXIT=0
+
+--- 变异后（只比条数）：quotient2 + --self-test ⇒ 记录侧扰动也失去信号 ---
+# self-test substitution=detected record-side=NOT-DETECTED
+# self-test detected=yes
+EXIT=2          （未变异时同一输入是 EXIT=1 / record-side=detected）
+
+--- 变异后（只比条数）：(b) 乱序对照 ⇒ 仍 EXIT=0（证明变异只影响"同长度错集"这一类） ---
+IDENTITY_OK    reviewer … rows=11 tools=11
+EXIT=0
+
+--- 变异后（只比条数）：(c3) stale ⇒ 仍 EXIT=1 且逐字行在（证明条数行未被改动波及） ---
+IDENTITY_MISSING reviewer … rows=11 tools=11
+          recorded composition has 10 row(s), the resolved preset declares 11
+EXIT=1
+```
+
+变异副本在 `/private/tmp/d1-repair/mut2/`（仓库外，已与仓库树隔离）；仓库内 `git status --porcelain` 只有 `scripts/verify-role-identity.mjs` 一个文件被改。
+
+## ④ 未做 · 未验证（本节范围）
+
+| 项 | 状态 |
+|---|---|
+| **新增自动化测试用例** | **未加**。这个脚本的负例校准**结构上依赖真实 session store**（要从 `~/.dsh/sessions/<slug>/` 挑一个真实非角色会话、并让名册解析它的 preset），写成 `npm test` 用例会让测试依赖开发机状态 ⇒ 与"测试必须可复跑"冲突。**建议**：若 driver 要 durable 化，正确形态是"测试自带一个小 fixture 工作区 + 会话日志夹具"，那是独立一轮（可登记为候选）。 |
+| **E2E fixture 的 cross-check 对照组** | **仍未跑**（上一版我错报"不在盘"，已更正：它在盘、sha `5b8efdf9…` 未变）。它需要 6 个角色会话的日志解析，属只读运行，未做。 |
+| **D1 ③ 的"工具名集"半边 / R-5 / R-6 / R-7 / 任何活体** | **仍未做**，与上一节相同（ landing 不变：R-7/D2、批 2、live 轮）。 |
+| **本轮未碰 `src/`** | 已核：`git status --porcelain` 只有 `scripts/verify-role-identity.mjs`；`npm test` 272 与上一轮同数同结果，产品行为零变化。 |
+
+## ⑤ 文件级改动清单（本节）
+
+| 文件 | 改动 |
+|---|---|
+| `scripts/verify-role-identity.mjs` | ① cross-check 改集合比对（去重 + 排序 + missing/extra）② 新增两条点名行 id 的问题行（条数行与 `recorded composition is absent` 原文未动）③ `--self-test` 记录侧扰动改"同长度改一个 id" ④ 扰动检测改读算出来的集合差（`rowDiffByRole`），不再依赖"哪条 id 被打印" ⑤ docstring 两处同步 |
+
+**未改**：`src/`、两个 fixture、`~/.dsh/`、台账 / ADR / 计划 / 契约、4599 / 4600、上三轮已落的任何断言。
+
+---
+
+**跟修报告完毕，原样回 driver。** 本地 commit，未推送（等 Owner）。
