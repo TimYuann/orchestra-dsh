@@ -1015,3 +1015,48 @@ N7 reviewer 日志现状：**71 事件 / 103,858 B / mtime `Sep 21 19:30:37`**�
 - **ADR-0009 的欠账（U11）扩大**：除 §3 的"必须声明"条与 §4 的过期模型条外，**新增本条**（测试文件夹的用法、文件级善后、子目录规则）—— 一并留给 writer 下次唤醒。
 - **`orchestra_E2E` 的 team.json 已删** ⇒ 此前"① 在旧记录上诚实地 exit 1"的那个载体不再存在；该判定已由 N7 的同类数据 + 台账记录承载（证据副本已留档），不影响任何判据。
 - **下一轮 live 轮的落点**：`orchestra_E2E/test-a/`（或 Owner 直接指定的子目录）。
+
+---
+
+## 30. 第 16 轮（D2-a live 轮）的 driver 独立复核与三条裁定（2026-09-21）
+
+**候选**：`b9a3ac6`（**docs-only**：`docs/p0-report-d2a-live.md`，398 行）。`git status` 干净。
+
+### 接受（driver 独立复跑，全部命中）
+| 项 | 期望 | driver 实测 |
+|---|---|---|
+| 硬前提（证据绑 HEAD） | profile == 仓库 lib | ✅ 两侧 sha256 同为 **`4c41ef7f38a416526d92…`**；4600 已停（000）、4599 未碰（401） |
+| **③** `verify-d2-approval.mjs --session <本轮角色会话> --expect-policy never` | 0 | ✅ **exit 0**、`APPROVAL_OK … hanging 0 dangling 0`（我直接对盘上那份会话日志复跑） |
+| **④** 同上 `--self-test` | 1 | ✅ **exit 1**、`dangling=detected` |
+| 负对照（真实 `ask` 悬挂日志，只读） | 非 0 | ✅ **exit 1**、`hanging 0 dangling 1`、点名 `09ecc459-0155-476b-9910-5d64016869c7 … seq 64 turn 1` |
+| 日志实质（我自己解码） | — | ✅ `approval/policy@0 = {"policy":"never"}`（**仅一条**，重激活后未重复钉）；`turn/start@5→turn/end@57`、`turn/start@61→turn/end@72`（两回合都收束）；`approval/asked=0`/`decided=0`；tool/call = `grep/bash/read/grep/read/read/bash/orchestra_report/a2a_reply/a2a_reply`；#41 是**确定性拒绝 + 升级提示**（`bash: notes.md: Operation not permitted` / `[sandbox: file access denied under read-only mode]` / `[sandbox: escalation available …]`）；#58 = 归档通知（`Your team has been ARCHIVED (archive_id=…, path=…/test-a/orchestra/archive/…)`）；#60 = 重激活欢迎（`as role "Reviewer"`）投到**同一个** sessionId |
+| 首波不可达（它自核，我也核） | — | ✅ `grep -rn provisionGovernedPlans src/` 只有**定义**一处、**产品调用点 0** |
+| 善后（§29 硬要求） | 起始/终态两次 `ls` + 文件级清理 | ✅ 我实测：`orchestra_E2E/` 下只剩 `artifacts` 与 `orchestra`，`test-a/` 已删 |
+
+### 裁定 AG｜③④ **绿**（按 §7 的判据形态），但两处 live 缺口**不算闭合**
+- ③ 的判据形态（脚本 exit 0 + `hanging 0 dangling 0`）**已满足**，D2-a 在**两条可达路径**上都成立。
+- **但**：本轮 live 日志 `approval/asked = 0`（写入被 **read-only 沙箱**挡下，模型没发起提权）⇒ §4.8 **D2-a 步骤 3 的"`asked`/`decided` 成对"在新鲜数据上没被喂到**；承担该不变式的目前是 ④ 的自检基线 + 那条真实历史 `ask` 负对照。**这不是缺陷，是覆盖缺口**（弱数据上的绿灯）。
+⇒ 登记为**必须在批 1 收口前闭合**的两项：**D2-a 步骤 3**（按它给的最小配方：明确要求角色带 `sandbox_permissions` 重试写入 ⇒ 预期即时 `rejected` + 成对 + 正常 `turn/end`）与**步骤 5**（把一条路径改回 `ask` 跑反例校准 —— 属 repair 的临时性改动）。**landing = 下一轮 live（与 S4 steer 实证、R-6 修正配方合并成一趟）。**
+
+### 裁定 AH｜记录层偏差 = **B 类缺陷**（不是"判据写法问题"）
+它原样带回的偏差属实：§4.8 D2-a 步骤 1 / E1 的字面判据「blueprint 记录的 `approval === "never"`」**命不中** —— 记录里是 `"ask"`（符号：`src/session-blueprint.ts` 的 `approval: permissionSpec.approval`，即**权限预设的声明值**），而**会话有效策略**确实是 `never`（日志 `approval/policy@0`）。
+**裁定**：记录层不得只留声明值而读不出"这条路径被钉成什么"。**但不得把声明值覆盖掉**（那是记录已经在承载的事实）。修法（最小、且与同类型的既有成对写法一致）：
+- `TeamRoleBlueprintFacts` **新增** `pinnedApproval?: string`：**声明**插件在每条建/恢复路径上会钉成什么（当前恒 `"never"`），**不宣称观测**（观测由会话日志外部核，③ 已经在做）；
+- 保留 `approval`（= 权限预设的声明值）不动；
+- 判据读法（driver 裁定）：D2-a 步骤 1 / E1 的**意图**是"记录必须能证明这条路径被钉死" ⇒ 由 `pinnedApproval === "never"` 满足；**计划的字面措辞需要一条注记**（与 O-4/O-5 同族，记 P-tex 欠账，编号不动）。
+**范围**：进下一轮 repair，含一条"四条路径的预留记录都带 `pinnedApproval: "never"`"的断言。
+
+### 裁定 AI｜⑨ 与 G-BUDGET 在批 1 **不可诚实判定** ⇒ 显式延后（编号不动）
+driver 实测两条：
+- **⑨ `test-tier0-predicate.mjs`**：计划 §0.4 的档 0 谓词在 `src/` 里**零命中**（`grep -rn 'tier0\|tierZero' src/` = 0），而谓词约束的对象（节点记录 / 摄入 / 胶囊 / 租约）全是**批 2/3 的产物**。此刻建脚本，"零节点记录 / 零摄入 / 零胶囊 / 零租约"四条断言**恒真**（不存在的东西当然为零）—— 正是我们明令禁止的**弱 fixture 假绿**（§17/§25 的形态）。
+- **G-BUDGET**：计划 §9.1 给出的判据是一组**对真实节点生命周期的测量**（`per_round.delivery.new == 3 + decisions`、`review.total == 1`、`driver.new == 0`、`tier0.total == 0`、`lifecycle… == Σ`、`extra_slots.every(d => d.decisionId != null)`）。没有节点记录（P2-2）、没有决策记录（E2/E3）、没有胶囊（P3-4），**测不出来**。移交时的"G-BUDGET（等 P2-2）"与实测一致。
+**裁定（同 O-5(d) 的口径：V 条目 > 未同步的计划行；落败行标延后 + 写明 landing，不静默删、不为凑绿把范围拉回来）**：
+- **⑨ → 延后（landing = 批 2 / G-P2）**，与档 0 谓词同期落地；
+- **G-BUDGET → 延后（landing = P2-2 节点记录 + E2/E3 决策记录落地之后，最迟 G-P2/G-P4）**，`verify-agent-budget.mjs` 随之创建；
+- ⇒ **批 1 的判定形态 = ①②③④⑤⑥⑦⑧ 各自命中期望码 + 三项显式延后（计划 §11 判据 ④ / ⑨ / G-BUDGET，各带 landing）**。批 1 交付报告必须在「未做/未验证」栏逐条写明。
+
+### 批 1 剩余（driver 口径）
+只剩**三件小事**，全部在仓库内、无外部依赖 ⇒ 合成**一轮 repair**：**D3 实现 + ⑥ 测试扩展**、**裁定 Q**（留痕指向被抛弃的会话 id）、**裁定 AH**（`pinnedApproval`）。
+之后一趟 **live**（D2-a 步骤 3/5 + S4 steer 实证 + R-6 修正配方，四小项一次取完、每项只跑一次），再出**批 1 交付报告**。
+
+**审查轮计数 +0。**
