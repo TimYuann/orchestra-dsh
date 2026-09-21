@@ -685,6 +685,17 @@ export interface GovernedRolePlan {
   welcome?: string;
   maxRounds?: number;
   protocol?: TopologyProtocol;
+  /**
+   * Composition row ids the preset document declared at RESERVATION time.
+   *
+   * Carried on the plan so the record layer receives plain data rather than the
+   * resolver's own file type: `resolvePresetFile` already mapped the roster's
+   * `composition.rowIds` into this array, and re-deriving it while writing the
+   * record would be a second resolution that could disagree with the one the
+   * Blueprint was built from. Absent for `subagent` roles (they mount no
+   * composition of their own) and for a resolver that returned no composition.
+   */
+  compositionRowIds?: string[];
   /** Complete Blueprint for a `session` role. A `subagent` role has none: the native
    *  contract mounts no composition of its own, so fabricating a receipt would
    *  claim facts the child never had. */
@@ -715,7 +726,7 @@ export function assertUniqueGovernedSessionIds(plans: readonly Pick<GovernedRole
   }
 }
 
-function roleBlueprintFacts(receipt: GovernedBlueprintReceipt): TeamRoleBlueprintFacts {
+function roleBlueprintFacts(receipt: GovernedBlueprintReceipt, compositionRowIds?: string[]): TeamRoleBlueprintFacts {
   return {
     mode: "governed",
     teamId: receipt.teamId,
@@ -733,6 +744,10 @@ function roleBlueprintFacts(receipt: GovernedBlueprintReceipt): TeamRoleBlueprin
     ...(receipt.reasoningEffort === undefined ? {} : { reasoningEffort: receipt.reasoningEffort }),
     cwd: receipt.cwd,
     ...(receipt.title === undefined ? {} : { title: receipt.title }),
+    // The EXPECTED row set, resolved once at reservation. The receipt's own
+    // readiness objects are NOT a substitute: they are only filled inside the
+    // setup window, which two of the three provisioning paths never open.
+    ...(compositionRowIds === undefined ? {} : { compositionRowIds }),
     compositionTools: receipt.compositionTools,
     orchestraTools: receipt.orchestraTools,
     optionalCapabilities: receipt.optionalCapabilities,
@@ -761,7 +776,7 @@ function reservedRole(plan: GovernedRolePlan): TeamRole {
     preset: plan.presetId ?? null,
     sandbox: plan.sandbox ?? INHERITED_SANDBOX,
     ...(model === undefined ? {} : { model }),
-    ...(receipt === undefined ? {} : { blueprint: roleBlueprintFacts(receipt) }),
+    ...(receipt === undefined ? {} : { blueprint: roleBlueprintFacts(receipt, plan.compositionRowIds) }),
     reportCount: 0,
     lastReport: null,
   };
@@ -897,6 +912,10 @@ export async function prepareGovernedRolePlan(
     execution: "session",
     presetId: blueprint.receipt.agentPreset,
     sandbox: blueprint.receipt.sandbox,
+    // The row ids the resolver read out of the preset document, carried through
+    // unchanged so the reserved record pins the approved composition rather than
+    // a re-derived one.
+    ...(presetFile.compositionRowIds === undefined ? {} : { compositionRowIds: presetFile.compositionRowIds }),
     ...(options.welcome === undefined ? {} : { welcome: options.welcome }),
     ...(options.maxRounds === undefined ? {} : { maxRounds: options.maxRounds }),
     ...(options.protocol === undefined ? {} : { protocol: options.protocol }),
@@ -2522,7 +2541,7 @@ export async function provisionGovernedPlans(
         phase: "active",
         diagnostic: undefined,
         welcome,
-        blueprint: roleBlueprintFacts(blueprint.receipt),
+        blueprint: roleBlueprintFacts(blueprint.receipt, plan.compositionRowIds),
       });
       try {
         written = await activeTeamState.replace(snapshot, activeRoleTeam, writeOptions);
@@ -3104,6 +3123,13 @@ async function materializeRole(
       if (session !== undefined) session.append("sandbox/mode", { mode: "read-only" });
     }
 
+    // The Blueprint record is deliberately NOT refreshed here. Reservation is
+    // the moment the approved composition is pinned, so `blueprint` keeps
+    // describing what was approved; overwriting it with whatever the live
+    // session happens to be running would destroy the "approved then" vs
+    // "mounted now" comparison the record exists for. `{...r, phase:"active"}`
+    // is that decision, not an omission — do not "fix" it by writing the
+    // receipt's readiness objects back.
     await activeTeamState.mutate(
       cwd,
       (t) => ({

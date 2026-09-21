@@ -1,8 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { createActiveTeamStateStore, transferOrchestrationControl } from "../lib/orchestra-state.js";
 import { createArchiveStore } from "../lib/orchestra-archive.js";
 import { charterRecordStoreFor } from "../lib/charter-store.js";
+import { BUILTIN_ROLE_PRESETS, parseRolePresetComposition } from "../lib/orchestra-role-presets.js";
 import {
   createGovernedTeam,
   addLanesToTeam,
@@ -351,4 +355,52 @@ test("add lanes: refuses the cases that would corrupt the roster or the plan", a
 
   const observation = await harness.store.read(cwd);
   assert.equal(observation.team.roles.length, roles.length, "no refused call may leave a partially added roster");
+});
+
+test("an added lane records the composition row ids resolved at reservation", async () => {
+  const harness = makeHarness();
+  const roles = [{ id: "worker", name: "Worker", preset: "preset-worker", sandbox: "workspace-write" }];
+  const catalog = { find() { return { kind: "ready", topology: { id: "fleet-topo", title: "Fleet Topology", roles } }; } };
+  const frozenRef = await prepareApprovedFrozenRef(harness, roles, "draft-lane-rows");
+  await createGovernedTeam(harness.context, harness.store, catalog, { frozenRef }, { agent: harness.controller });
+
+  // A user-level preset override in a scratch DSH home: the resolver reads the
+  // composition out of it, so the recorded row ids have a source to be compared
+  // against and nothing under ~/.dsh is touched.
+  const root = await mkdtemp(join(tmpdir(), "orchestra-lane-rows-"));
+  const previousHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = root;
+  try {
+    const spec = BUILTIN_ROLE_PRESETS.find((entry) => entry.role === "reviewer");
+    assert.ok(spec);
+    // The plugin's global override root is `<DSH home>/orchestra/presets/<id>`.
+    const presetPath = join(root, "orchestra", "presets", spec.id, "agent.cordis.yml");
+    await mkdir(dirname(presetPath), { recursive: true });
+    await writeFile(presetPath, spec.cordisYml, "utf8");
+    // Control: the rows the preset document itself declares, parsed the same way
+    // the plugin parses every composition.
+    const expectedRowIds = parseRolePresetComposition(spec.cordisYml).rowIds;
+    assert.equal(expectedRowIds.length, 11, "the reviewer preset declares 11 composition rows");
+
+    const applied = await addLanesToTeam(harness.context, harness.store, { agent: harness.controller }, {
+      roles: [{ roleId: "reviewer", preset: spec.id, sandbox: "read-only", purpose: "review the new objective" }],
+      reason: "objective B",
+      confirm: true,
+    });
+    assert.equal(applied.status, "added");
+
+    const after = await harness.store.read(cwd);
+    const reviewer = after.team.roles.find((role) => role.id === "reviewer");
+    assert.equal(reviewer.phase, "reserved", "an added lane costs nothing until it is dispatched");
+    assert.deepEqual(
+      reviewer.blueprint.compositionRowIds,
+      expectedRowIds,
+      "the lane's record carries the rows resolved at reservation, not a re-derived or invented set",
+    );
+    assert.equal(reviewer.blueprint.compositionRowIds.length, 11);
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previousHome;
+    await rm(root, { recursive: true, force: true });
+  }
 });

@@ -66,6 +66,23 @@ export interface TeamRoleBlueprintFacts {
   reasoningEffort?: string;
   cwd?: string;
   title?: string;
+  /**
+   * Composition row ids the preset document declared when this role was
+   * RESERVED — the same set the Blueprint marker records, read through the same
+   * resolver, so an external reader can compare "what was approved" against
+   * "what the preset resolves to now".
+   *
+   * Optional because records written before this field existed carry none: an
+   * absent array means "not recorded", which a checker must report rather than
+   * treat as agreement. It is written once, at reservation, and deliberately
+   * never refreshed afterwards — the reserved moment is when the approved
+   * composition is pinned.
+   *
+   * NOT a tool-name list: `compositionTools` is a subset of the rows' exported
+   * tools, and two presets with different row counts can share the same tool
+   * names, so the tool set cannot express a row-count difference.
+   */
+  compositionRowIds?: string[];
   compositionTools?: { names: string[]; count: number };
   orchestraTools?: { names: string[]; count: number };
   optionalCapabilities?: string[];

@@ -25,11 +25,32 @@
  *
  * ## It must not be a script that always says OK
  *
- * `--self-test` replaces one role's session id with a REAL, non-role session id
- * taken from the same session store, and requires `NOT_A_ROLE_SESSION` with a
- * non-zero exit. Without that, "no news is good news" would be indistinguishable
- * from a working check. This mirrors `check-session-readable.mjs`, which set the
- * precedent.
+ * `--self-test` perturbs the input in memory and requires the script to NOTICE,
+ * with a non-zero exit. There are two independent perturbations, because there
+ * are two independent things this script can fail to notice:
+ *
+ *  1. **substitution** — one role's session id is replaced with a REAL, non-role
+ *     session id taken from the same session store, and the script must report
+ *     the mismatch. A real id is essential — a made-up one would only prove
+ *     "missing".
+ *  2. **record side** — one entry is dropped from that role's recorded
+ *     `blueprint.compositionRowIds`, and the cross-check against the roster's
+ *     actual row set must fire. Without this, the cross-check could be a branch
+ *     that never runs (which is exactly the defect this replaces: the field did
+ *     not exist, so the branch was unreachable).
+ *
+ * A calibration that detects NOTHING returns 2, not 0: an always-OK script and a
+ * genuinely clean run must never look the same. Exit 1 is reserved for "the
+ * calibration worked, and here is what it caught".
+ *
+ * ## A record with a Blueprint but no row ids is a finding, not a shrug
+ *
+ * When a role records a Blueprint yet carries no `compositionRowIds`, that is
+ * reported as a problem (`recorded composition is absent`). Skipping the
+ * comparison silently is what let a weak fixture look green: an empty record
+ * cannot cross-check anything, so the honest outcome is red.
+ *
+ * This mirrors `check-session-readable.mjs`, which set the precedent.
  *
  * ## Anchoring
  *
@@ -41,9 +62,9 @@
  *   node scripts/verify-role-identity.mjs --repo <abs> --team <abs>
  *   node scripts/verify-role-identity.mjs --repo <abs> --team <abs> --self-test
  *
- * Exit codes: 0 = every role verified; 1 = a role failed or the calibration
- * detected nothing; 2 = usage, or a precondition (team file / session store /
- * roster) could not be read.
+ * Exit codes: 0 = every role verified; 1 = a role failed, or the calibration
+ * detected what it injected; 2 = usage, or a precondition (team file / session
+ * store / roster) could not be read, or the calibration detected nothing.
  */
 
 import { readFileSync, existsSync, readdirSync } from "node:fs";
@@ -256,20 +277,47 @@ function main() {
       fail(`verify-role-identity: roster could not be built: ${error instanceof Error ? error.message : String(error)}`);
     }
 
-    // `--self-test`: point ONE role at a real session that is not that role.
-    // A real id is essential — a made-up one would only prove "missing".
+    // `--self-test`: perturb ONE role in memory, twice, independently.
+    //
+    //  1. substitution — point it at a real session that is not that role. A
+    //     real id is essential; a made-up one would only prove "missing".
+    //  2. record side — drop one entry from the recorded composition row ids,
+    //     which must make the cross-check against the roster's actual rows fire.
+    //
+    // Each perturbation is evaluated on its OWN signal, so a run that fails for
+    // an unrelated reason cannot be mistaken for a calibration that worked.
     let substituted;
+    let calibrationTarget;
+    let recordPerturbation;
     if (options.selfTest) {
       const candidates = realSessionIds(store).filter((id) => !roles.some((role) => role.sessionId === id));
       if (candidates.length === 0) fail("verify-role-identity --self-test: no other real session to substitute");
       substituted = candidates.sort()[0];
       const target = roles.find((role) => role.phase === "active") ?? roles[0];
+      calibrationTarget = target;
       process.stdout.write(`# self-test: role "${target.id}" sessionId ${target.sessionId} -> ${substituted} (a real, non-role session)\n`);
       target.sessionId = substituted;
+      const recordedRows = Array.isArray(target.blueprint?.compositionRowIds) ? target.blueprint.compositionRowIds : undefined;
+      if (recordedRows !== undefined && recordedRows.length > 0) {
+        const remaining = recordedRows.slice(0, -1);
+        target.blueprint = { ...target.blueprint, compositionRowIds: remaining };
+        recordPerturbation = { remainingRows: remaining.length };
+        process.stdout.write(
+          `# self-test: role "${target.id}" recorded composition ${recordedRows.length} -> ${remaining.length} row(s) (one row dropped in memory)\n`,
+        );
+      } else {
+        // Nothing to drop means this half of the calibration cannot run here.
+        // Saying so is the point: a fixture whose records carry no row ids gets
+        // `recorded composition is absent` below, which is a real finding.
+        process.stdout.write(`# self-test: role "${target.id}" has no recorded compositionRowIds to perturb\n`);
+      }
     }
 
     let ok = 0;
     let missing = 0;
+    /** Every problem reported for a role, so the calibration can be judged on signal rather than on "something failed". */
+    const problemsByRole = new Map();
+    const noteProblems = (roleId, problems) => problemsByRole.set(roleId, problems);
     for (const role of roles) {
       if (role.phase !== "active") {
         process.stdout.write(`IDENTITY_SKIP  ${role.id} phase=${role.phase}\n`);
@@ -280,8 +328,10 @@ function main() {
       try {
         identity = readSessionIdentity(host, store, role.sessionId);
       } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
         process.stdout.write(`IDENTITY_MISSING ${role.id} ${role.sessionId} preset=${expectedPreset ?? "(none)"} rows=0 tools=0\n`);
-        process.stdout.write(`          ${error instanceof Error ? error.message : String(error)}\n`);
+        process.stdout.write(`          ${message}\n`);
+        noteProblems(role.id, [message]);
         missing += 1;
         continue;
       }
@@ -321,12 +371,17 @@ function main() {
         problems.push(`preset ${identity.presetId} resolves but declares no composition rows`);
       }
       // The recorded EXPECTED composition must be consistent with what the preset
-      // file now says. The plugin writes whichever of these fields it has; when a
-      // field is absent there is nothing to cross-check and that is stated, not
-      // silently treated as agreement.
-      const recordedRows = Array.isArray(role.blueprint?.compositionRowIds) ? role.blueprint.compositionRowIds : undefined;
-      const recordedTools = Array.isArray(role.blueprint?.orchestraTools) ? role.blueprint.orchestraTools : undefined;
+      // file now says. The plugin writes whichever of these fields it has; a
+      // Blueprint that records NO row set at all is a finding, not an agreement —
+      // an empty record cannot cross-check anything, and treating it as a pass is
+      // exactly how a weak fixture looks green.
+      const blueprint = role.blueprint !== undefined && role.blueprint !== null && typeof role.blueprint === "object" ? role.blueprint : undefined;
+      const recordedRows = Array.isArray(blueprint?.compositionRowIds) ? blueprint.compositionRowIds : undefined;
+      const recordedTools = Array.isArray(blueprint?.orchestraTools) ? blueprint.orchestraTools : undefined;
       const crossChecked = recordedRows !== undefined || recordedTools !== undefined;
+      if (blueprint !== undefined && recordedRows === undefined) {
+        problems.push("recorded composition is absent");
+      }
       if (recordedRows !== undefined && composition !== undefined && recordedRows.length !== composition.rowIds.length) {
         problems.push(
           `recorded composition has ${recordedRows.length} row(s), the resolved preset declares ${composition.rowIds.length}`,
@@ -352,6 +407,7 @@ function main() {
           `IDENTITY_MISSING ${role.id} ${role.sessionId} preset=${identity.presetId ?? "(none)"} rows=${rows} tools=${tools}\n`,
         );
         for (const problem of problems) process.stdout.write(`          ${problem}\n`);
+        noteProblems(role.id, problems);
         missing += 1;
       }
 
@@ -371,11 +427,38 @@ function main() {
     process.stdout.write(`# roles ${roles.length} ok ${ok} missing ${missing}\n`);
 
     if (options.selfTest) {
-      // Calibration passes when the substitution was DETECTED, which means this
-      // invocation must fail. Exit 1 is the expected code for --self-test.
-      const detected = missing > 0;
+      // Calibration passes when each injected perturbation produced the signal
+      // it exists to produce — which means this invocation must FAIL. A
+      // calibration that notices nothing returns 2, never 0: "the check said OK"
+      // and "the check was never exercised" must not look alike.
+      const targetProblems = (calibrationTarget === undefined ? [] : problemsByRole.get(calibrationTarget.id)) ?? [];
+      // The substitution's signal is the log disagreeing with the record: a
+      // different preset, or a session that names no preset at all.
+      const substitutionDetected = targetProblems.some(
+        (problem) => problem.startsWith("NOT_A_ROLE_SESSION") || problem.startsWith("the session log names no preset"),
+      );
+      // The record perturbation's signal is the row-count line, and only the
+      // perturbed count can produce it: the record was rewritten to hold exactly
+      // `remainingRows` rows, so any other number is a pre-existing finding.
+      const rowCountOf = (problem) => {
+        const match = /^recorded composition has (\d+) row\(s\), the resolved preset declares \d+$/.exec(problem);
+        return match === null ? undefined : Number(match[1]);
+      };
+      const recordDetected =
+        recordPerturbation !== undefined &&
+        targetProblems.some((problem) => rowCountOf(problem) === recordPerturbation.remainingRows);
+      const detected = substitutionDetected || recordDetected;
+      process.stdout.write(
+        `# self-test substitution=${substitutionDetected ? "detected" : "NOT-DETECTED"}` +
+          ` record-side=${recordPerturbation === undefined ? "not-applicable" : recordDetected ? "detected" : "NOT-DETECTED"}\n`,
+      );
       process.stdout.write(`# self-test detected=${detected ? "yes" : "NO"}\n`);
-      return detected ? 1 : 0;
+      // Either perturbation applied and missed ⇒ this script cannot be trusted
+      // to notice that class of defect, which is a different failure from a
+      // clean run and must not share exit 0 with one.
+      if (!substitutionDetected) return 2;
+      if (recordPerturbation !== undefined && !recordDetected) return 2;
+      return 1;
     }
     return missing === 0 ? 0 : 1;
   })();

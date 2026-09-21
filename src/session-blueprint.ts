@@ -831,6 +831,15 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
   const model = governedModel(ctx, input);
   const capabilities = capabilityTools(input);
   const predictedEffectivePermission = sandbox === permissionSpec.sandbox ? permissionPreset : "custom";
+  // Three readiness snapshots start EMPTY and are only filled inside `setup`
+  // below, where the live agent scope exists (`visibleToolNames(agentCtx)`).
+  // They are UNAVAILABLE at reservation time — the moment the Blueprint is
+  // prepared and the team record is written — because the Agent does not exist
+  // yet, and two of the three provisioning paths never open a setup window at
+  // all. They must stay empty rather than be filled with the predicted/expected
+  // values: an expected value presented as an observed one is a fabricated fact
+  // (capability-boundaries #4). The expected row set lives on the plan as
+  // `compositionRowIds` and is recorded separately, for exactly that reason.
   const readiness: LightweightToolReadiness = { names: [], count: 0 };
   const compositionReadiness: LightweightToolReadiness = { names: [], count: 0 };
   const orchestraReadiness: LightweightToolReadiness = { names: [], count: 0 };

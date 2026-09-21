@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { ActiveTeamStateError, createActiveTeamStateStore, normalizeTeam } from "../lib/orchestra-state.js";
+import { BUILTIN_ROLE_PRESETS, parseRolePresetComposition } from "../lib/orchestra-role-presets.js";
 
 const cwd = "/tmp/orchestra-state-interface-test";
 
@@ -385,4 +386,55 @@ test("an unclassifiable execution backend blocks the team instead of degrading t
     "a direct normalize call reports the same corruption rather than coercing it to session",
   );
   assert.equal(normalizeTeam(team({ roles: [{ ...team().roles[0], execution: null }] }), cwd).roles[0].execution, "session", "null is an unwritten field, not a corrupt one");
+});
+
+test("a reserved blueprint's recorded composition row ids survive normalization and a store round trip", async () => {
+  const spec = BUILTIN_ROLE_PRESETS.find((entry) => entry.role === "reviewer");
+  assert.ok(spec);
+  // The rows the preset document declares, parsed the way the plugin parses every
+  // composition — the same set a roster resolution returns.
+  const rowIds = parseRolePresetComposition(spec.cordisYml).rowIds;
+  assert.equal(rowIds.length, 11, "the reviewer preset declares 11 composition rows");
+  const blueprint = {
+    mode: "governed",
+    teamId: "team-test",
+    roleId: "reviewer",
+    topologyId: "duo",
+    topologySource: "bundled",
+    controllerSessionId: "session-driver",
+    agentPreset: spec.id,
+    permissionPreset: "workspace-write",
+    effectivePermissionPreset: "workspace-write",
+    approval: "never",
+    sandbox: "read-only",
+    provider: "provider",
+    model: "model",
+    compositionRowIds: rowIds,
+    compositionTools: { names: [], count: 0 },
+    orchestraTools: { names: [], count: 0 },
+    tools: { names: [], count: 0 },
+  };
+  const reserved = { ...team().roles[0], blueprint };
+
+  const normalized = normalizeTeam(team({ roles: [reserved] }), cwd);
+  assert.deepEqual(
+    normalized.roles[0].blueprint.compositionRowIds,
+    rowIds,
+    "the recorded row set is passed through, not rebuilt or dropped",
+  );
+
+  const fs = new MemoryFs();
+  const store = createActiveTeamStateStore(fs);
+  fs.seed(team({ roles: [reserved] }));
+  const observed = await store.read(cwd);
+  assert.equal(observed.kind, "ready");
+  assert.deepEqual(observed.team.roles[0].blueprint.compositionRowIds, rowIds, "the row set survives the durable round trip");
+
+  // A record written before the field existed has none. Absence is not zero: a
+  // checker must be able to tell "not recorded" from "recorded as empty".
+  const legacyBlueprint = { ...blueprint };
+  delete legacyBlueprint.compositionRowIds;
+  const legacy = normalizeTeam(team({ roles: [{ ...team().roles[0], blueprint: legacyBlueprint }] }), cwd);
+  assert.equal(legacy.roles[0].blueprint.compositionRowIds, undefined);
+  assert.equal("compositionRowIds" in legacy.roles[0].blueprint, false, "normalization must not invent an empty array");
 });

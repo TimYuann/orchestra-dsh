@@ -1,8 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createActiveTeamStateStore, normalizeTeam } from "../lib/orchestra-state.js";
 import { blueprintStoreFor, parseGovernedBlueprint, prepareGovernedBlueprint } from "../lib/session-blueprint.js";
 import { charterRecordStoreFor } from "../lib/charter-store.js";
+import { ensureBuiltinRolePresetArtifacts, resolveRolePresetFile } from "../lib/orchestra-role-presets.js";
 import { assertUniqueGovernedSessionIds, createGovernedTeam, dispatchRoleTask, prepareGovernedRolePlan, provisionGovernedPlans, abbreviateMissionObjective, roleSessionTitle } from "../lib/orchestra.js";
 import { preflightGovernedRequiredTools } from "../lib/session-blueprint.js";
 import { prepareApprovalEvent, prepareDraftEvent, prepareFreezeEvent } from "../lib/orchestration-charter.js";
@@ -811,4 +815,61 @@ test("a failed native provisioning releases the child it already materialized", 
   assert.equal(state.team.status, "failed");
   assert.equal(state.team.roles.find((role) => role.id === "helper").phase, "active", "the role whose child was created keeps its activated record");
   assert.equal(state.team.roles.find((role) => role.id === "helper-2").phase, "failed");
+});
+
+test("a reserved role records the EXPECTED composition row ids, and no observed tool facts", async () => {
+  const runtime = makeRuntime({ tools: ["read", "write", "orchestra_report"] });
+  const roles = [{ id: "reviewer", name: "reviewer", preset: "orchestra-v04-reviewer-v1", sandbox: "read-only" }];
+  const catalog = topologyCatalog(roles);
+  const frozenRef = await approvedFrozenRef(runtime, roles, "draft-row-ids");
+  // The catalog root is redirected to a scratch directory so the builtin
+  // artifacts are installed there and nothing under ~/.dsh is written.
+  const root = await mkdtemp(join(tmpdir(), "orchestra-row-ids-"));
+  const previousHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = root;
+  try {
+    await ensureBuiltinRolePresetArtifacts(root);
+    const reviewerPath = join(root, "catalog-presets", "orchestra-v04-reviewer-v1", "agent.cordis.yml");
+    // The roster knows this preset by id and resolves it to a real file, which
+    // is the production shape since S3 (the catalog is a roster root).
+    runtime.presets.resolve = async (id) => ({ id, trust: "system", path: reviewerPath });
+    // Control: the row set an INDEPENDENT resolution of the same preset derives,
+    // so the recorded value is compared against its source rather than against
+    // itself. This is also the number an external checker sees.
+    const resolved = await resolveRolePresetFile(runtime.context, cwd, "orchestra-v04-reviewer-v1", root);
+    const expectedRowIds = resolved.composition?.rowIds;
+    assert.ok(Array.isArray(expectedRowIds) && expectedRowIds.length > 0);
+
+    await createGovernedTeam(
+      runtime.context,
+      runtime.store,
+      catalog,
+      { frozenRef },
+      { agent: runtime.controller },
+      { createSession: runtime.createSessionAdapter },
+    );
+    const observed = await runtime.store.read(cwd);
+    assert.equal(observed.kind, "ready");
+    const reviewer = observed.team.roles.find((role) => role.id === "reviewer");
+    assert.equal(reviewer.phase, "reserved", "orchestra_create reserves; it does not materialize");
+    assert.deepEqual(
+      reviewer.blueprint.compositionRowIds,
+      expectedRowIds,
+      "the record carries the rows the resolver read at reservation time",
+    );
+    assert.equal(reviewer.blueprint.compositionRowIds.length, 11, "the reviewer preset declares 11 composition rows");
+
+    // The three readiness objects describe what the LIVE agent scope exposed.
+    // At reservation no Agent exists, and the two provisioning paths without a
+    // setup window can never fill them, so they stay empty. Writing the expected
+    // values here would present a prediction as an observation — a fabricated
+    // fact. This assertion is the tripwire for that: filling them in fails it.
+    assert.deepEqual(reviewer.blueprint.compositionTools, { names: [], count: 0 });
+    assert.deepEqual(reviewer.blueprint.orchestraTools, { names: [], count: 0 });
+    assert.deepEqual(reviewer.blueprint.tools, { names: [], count: 0 });
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previousHome;
+    await rm(root, { recursive: true, force: true });
+  }
 });
