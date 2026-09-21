@@ -984,3 +984,34 @@ N7 reviewer 日志现状：**71 事件 / 103,858 B / mtime `Sep 21 19:30:37`**�
 **同时更正 §23 的措辞**：N7 的日志**不是不可变的** —— 加载即可追加。**"封存"= 复制 + sha256**，不是指望原文件不动（第 10/14 轮的做法正确）。
 
 **审查轮计数 +0。**
+
+---
+
+## 29. 裁定 AF｜测试环境纪律按 Owner 口径改写 + 三处 fixture 清理（2026-09-21）
+
+**Owner 的原话口径（driver 记录，优先于本台账此前一切相关表述）**：`artifacts/projects/orchestra_E2E` 是他建的**测试文件夹**。每轮跑完、结果拿到后，**在文件级把 team 清掉**（哪怕直接 `rm team.json`）——**这就是"善后"**。终态 = 「没有使用过 orchestra」或「用过 orchestra、但上一个团队**要么完整 archive、要么完整交付掉**」。卡住的 team 直接文件级清掉，**不需要注册工作区**。需要同时跑两三支队伍 ⇒ 在该文件夹下建子目录（`test-a`/`test-b`/`test-c`；`n7`/`n8` 这类命名也可，前提是"**测试顺利 + 善后得当**"）。
+**他指出的真问题**：他的文件夹里明明有一支 active team，我们**没有对它做任何处理**，反而绕开它去造新目录、还试着注册工作区；他看到的结论是"**测试不顺利**"。**driver 接受此判定。**
+
+### driver 的自我更正（三处）
+1. **"善后"被我读成了"别弄脏"**，实际是"**用测试文件夹的规矩：用完就清**"。前几轮反而把"不碰 E2E"当成纪律，导致那支 active team 一直挂在那里。
+2. **落点错了**：一次性 fixture 造在 `artifacts/projects/` 的**兄弟位置**，而不是他指定的文件夹（或其子目录）。已确立：**以后一律落在 `orchestra_E2E/` 或其子目录**。
+3. **上一轮提的"注册工作区 + `attachSession` + 看这里三行"方案：撤回**。可见性不是本轮的目标；报告只对**证据**负责。多支队伍只用子目录解决（子目录 = 独立 cwd，天然满足"一目录一 team"）。
+
+### 本轮执行的清理（先留档、后删除；全过程见 `docs/fixture-cleanup-2026-09-21.md`）
+| 动作 | 对象 | 证据 |
+|---|---|---|
+| 留档（仓库内 `reports/fixture-forensics-2026-09-21/`，含 `MANIFEST.md` 逐文件 sha256） | E2E team.json（`5b8efdf9…`）+ **7 份历史 archive 快照**；N7 team.json（`cad1b5a7…`）+ charter records；N7b team.json（`dc66b9b5…`）+ 2 份快照 + closure.md + **形状非法的手写 marker**（R-6 反例） | 副本 + 哈希 |
+| **删除** | `orchestra_E2E/orchestra/state/team.json`（那支 active/受损团队） | `state/` 现为空；插件视角 = 该目录无团队 |
+| **删除** | `orchestra_N7/`、`orchestra_N7b/` 整个目录 | `projects/` 下只剩 `orchestra_E2E/` 与历史空目录 `orchestra_serial/`（非本项目产物，未动） |
+| **保留** | `orchestra_E2E/artifacts/{2048,snake,wordle}` 与 `orchestra/{archive,charter,reports,tasks}` | 属"完整交付掉"的合法终态；若要连这些也清成"从未用过 orchestra"，Owner 一句话即可 |
+| 未动 | `~/.dsh/sessions/` 下的 fixture 会话日志 | 是 §17/§18/§23/§27 证据的原始载体；需要时再单独处理 |
+
+### 由此确立的三条纪律（写进**每一轮** brief，缺一不予接受）
+1. **落点**：测试一律在 `artifacts/projects/orchestra_E2E/`（或其下 `test-a|test-b|test-c` 子目录）里做；**不再在兄弟位置造新目录**。
+2. **善后**：brief 必带「环境与善后」一节 —— 开跑前贴 `ls`（起始态），收尾时**文件级清理**并再贴 `ls`（终态）；**终态证据缺失 = 材料不全，退回**。
+3. **不做可见性表演**：不注册工作区、不挂 `attachSession`。
+
+### 对 outstanding 项的影响
+- **ADR-0009 的欠账（U11）扩大**：除 §3 的"必须声明"条与 §4 的过期模型条外，**新增本条**（测试文件夹的用法、文件级善后、子目录规则）—— 一并留给 writer 下次唤醒。
+- **`orchestra_E2E` 的 team.json 已删** ⇒ 此前"① 在旧记录上诚实地 exit 1"的那个载体不再存在；该判定已由 N7 的同类数据 + 台账记录承载（证据副本已留档），不影响任何判据。
+- **下一轮 live 轮的落点**：`orchestra_E2E/test-a/`（或 Owner 直接指定的子目录）。
