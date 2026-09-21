@@ -1060,3 +1060,43 @@ driver 实测两条：
 之后一趟 **live**（D2-a 步骤 3/5 + S4 steer 实证 + R-6 修正配方，四小项一次取完、每项只跑一次），再出**批 1 交付报告**。
 
 **审查轮计数 +0。**
+
+---
+
+## 31. 第 17 轮（批 1 代码面收口：D3 + 裁定 Q + 裁定 AH）的 driver 独立复跑与三条裁定（2026-09-21）
+
+**候选**：`d58c817`（实现）+ `0f6fb9d` / `11acd80` / `b8998f1`（报告）。范围已核 = 7 文件（3 src + 3 测试 + 1 报告），**`package.json` 未动**，主仓树干净。
+
+### driver 独立复跑（detached worktree `/tmp/orch-verify-d58c817` @ `d58c817`）
+`typecheck` **0** · `build` **0** · `npm test` **284 tests / 284 pass / 0 fail**（279 + 5）。
+判据：`test-orchestra-archive.mjs` **exit 0、14 条**（`ok 12/13/14` = D3 三条）；`test-materialization-failure-history.mjs` **exit 0**（`ok 4` = 裁定 Q）；`test-role-session-single-path.mjs` **5/5**（含 `ok 5` = 裁定 AH）。
+
+**driver 变异（三次，每次都先 `npm run build`）**：
+| 变异 | 结果 |
+|---|---|
+| A：Q 的留痕回退到座位 id（`createdSessionId ?? role.sessionId` → `role.sessionId`） | `not ok 4 - 裁定 Q`、exit 1；还原后 exit 0 |
+| B：终态旧队分支不再通知（删 `retireTeamRoles`） | `not ok 13 - D3 2`、exit 1 |
+| C：`PINNED_APPROVAL` 由 `"never"` 改 `"ask"` | `not ok 4`（D2-a 钉死）+ `not ok 5`（裁定 AH）⇒ 两条断言都在负载上 |
+
+三次变异均已还原、worktree 干净。
+
+**★ driver 自己的一次流程失误（如实记）**：变异 A 第一次跑时**忘了 `npm run build`**，测试跑的是**旧 `lib/`**，于是报"变异未被抓住"。这正是方法学第③条（"验证脚本类产物前必须先 build"）要防的事 —— **是我踩了自己的规矩**。补上 build 后变异立刻被抓住。**结论**：本轮所有变异读数以"带 build"的那组为准；后续任何变异测试必须把 build 写进命令序列。
+
+### 它带回的既有缺陷：**driver 已严格核过，成立**
+它的说法：裁定 Q 的那条 breadcrumb 原先写在 **role 对象**上，`TeamRole` 无此字段 ⇒ `normalizeTeam` 下一次 read 就丢 ⇒ **留痕从未落盘**；旧测试对应那段 `for (const entry of recorded)`（`recorded = after.noticeFailures ?? []`）**循环体一次都没执行**。
+**driver 核验（对 `856a13c` 的原件）**：✅ `git show 856a13c:src/orchestra.ts` 的失败分支把 `noticeFailures` spread 在 `{...r, noticeFailures: [… ]}` 里（role），而 `noticeFailures` 是 **Team 级**字段（`src/orchestra-state.ts` 的 team 接口 + `normalizeTeam` 只读 `record.noticeFailures`）；✅ 旧测试文件 `243-251` 行确实在空数组上循环。
+⇒ **更正 §19**：那一轮写的"留痕改记既有的 `noticeFailures` 字段 ✅"**实质是空转**（写错了对象、断言也没喂到）。**裁定 Q 到本轮才真正闭合**（留痕移到 Team 级 + `createdSessionId` 提到 catch 可见作用域 + 一条**非空转**的用例，且经我变异确认）。
+⇒ 它把"旧断言原样保留"并登记为候选：**接受**（"不改既有断言"的纪律优先；新用例已覆盖同一意图）。
+
+### 裁定 AJ｜§30 里"步骤 5 排进下一轮 live"的写法**由 driver 更正**
+§4.8 D2-a 步骤 5 要求"把某一条路径的 `approval` 改回 `ask` 并重跑"—— 那是**临时改产品码**（改完还要 build/pack/sync/重启），属 **repair** 的活，不是 test runner 能做的。而它的**目的**（证明该判据不是恒真）已由两条**已复现**的证据承担：④ 的 `--self-test`（含内部干净基线 `APPROVAL_OK`）+ 那条真实历史 `ask` 负对照（`dangling 1`、点名 `09ecc459-…`）。
+⇒ **step 5 不再排进 live 轮**；若批 1 交付报告被要求**逐字兑现** §4.8 步骤 5，则由 Owner 决定是否再开一轮只做这一件事的 repair。
+
+### 裁定 AK｜退休通知不再带 archive id：**接受**
+重排后的顺序是 **cancel → notify → 落快照 → 写 marker**（计划原文要求），而 archive id 在 notify 那一刻**还不存在** ⇒ 通知里没有它是**结构的必然**，不是遗漏。id 仍可从归档记录与 `orchestra_team` 读出。**不改**；记为一条 UX/文本注记（P-tex 欠账）。
+
+### 批 1 现状
+**已绿**：①（记录侧集合比对）· ②（自检）· ③④（两条可达路径 live + 负对照）· ⑤（名册）· ⑥（D3 三用例）· ⑦⑧（E-1）。
+**显式延后（各带 landing）**：计划 §11 判据 ④（批 2 / G-P2）· ⑨ 档 0 谓词（批 2 / G-P2）· G-BUDGET（P2-2 + E2/E3 之后）。
+**live 遗留**：D2-a **步骤 3**（新鲜数据上的 `asked`/`decided` 成对；上一轮 `asked=0` 未喂到）—— **必须在批 1 交付报告之前闭合**；机会项：S4 steer 实证、R-6 修正配方。
+**下一跳**：一趟 live（**一个结果 = 批 1 的 live 遗留清零**，每小项只跑一次、取不到就记下继续），落点 `orchestra_E2E/test-a/`，收尾按 §29 文件级清理。
