@@ -909,3 +909,49 @@ node scripts/verify-role-identity.mjs --repo ~/Documents/agentWorkspace/artifact
 dev profile 副本仍是**旧构建** `c469b7245bf7b549…`，仓库 HEAD 的 `lib/orchestra.js` 已是 `50c5d6b9125539d9…` ⇒ **live 轮必须重新 pack + sync + 等价性核验**（"证据绑 HEAD"的唯一凭据），否则记录里不会有 `compositionRowIds`，① 不可能真绿。
 
 **审查轮计数 +0。**
+
+---
+
+## 27. 第 14 轮（N7b live 轮）的 driver 独立复核与三条裁定（2026-09-21）
+
+**候选**：`b91485b`（**docs-only**：`docs/p0-report-n7b-live-round.md`，200 行）。**通道** = Ego lite space 33（未 finish）。
+
+### 接受并已由 driver 独立复现
+| 项 | 它的读数 | driver 复核 |
+|---|---|---|
+| 硬前提（证据绑 HEAD） | profile == repo lib | ✅ 我实测两者 sha256 同为 `50c5d6b9125539d9db2e…`；4600 已停（000）、4599 未碰（401） |
+| **G-P0 ① 真绿** | N7b exit 0、rows=11、`compositionRowIds` 11 条 | ✅ **我在归档快照上独立复现**：最新 archive 快照的 `roles[0].blueprint.compositionRowIds` 长度 **11**；`node scripts/verify-role-identity.mjs --repo <N7b> --team <archive>` ⇒ **exit 0**、`IDENTITY_OK reviewer … rows=11 tools=11`、无 `absent`/无 `(no recorded composition…)`。当前 `team.json`（已 `dismissed`、roles 0）⇒ exit 2 `team file has no roles[]`，与其自述一致（① 的绿是**物化时**捕获，快照可复跑） |
+| **★ D1 live 半边** | 重启后产品路径唤醒同一冷角色、成功 tool/call、无宿主 warning | ✅ **我独立解码日志**：reviewer 会话 175 事件；**重启前** `tool/call 15`（`bash 11 / read 2 / orchestra_report 1 / a2a_reply 1`）、**error 0**；**重启后** `tool/call 10`（`read 2 / bash 6 / orchestra_report 1 / a2a_reply 1`）、**error 0**；重启后该会话的回合入口是 **`agent/inbox/spliced` → `turn/start` → `user/message`**（= A2A 投递，即**产品路径**，不是直接 prompt）；driver 会话重启后确有 `orchestra_activate`(12:03:45) → `orchestra_dispatch`。⇒ **判定：D1 的 live 半边闭合**（恢复路径层：组合带得回） |
+
+### 裁定 AB｜判据 ② 的"仪器"是空的（**不得记为命中**）
+它把"实例日志里 `was published without joining an agent preset` = 0"当成段 B 的判据 ②。**driver 实测**：它保存的实例日志（`/tmp/orch-4600b|c|d|e.log`）**每份仅 314 B**，内容只有 UNDICI 警告、`web-access-chain.init` 与 URL —— **这套部署的 web 模式根本不向 stdout/stderr 打印会话发布类运行时消息**，所以"0 命中"什么也证明不了（空日志里当然没有）。
+**处置**：② **改记为"未取证"**，不写成命中。该主张由**主判据**覆盖：一个"未加入任何预设"的会话按宿主语义会退化成**空全局层**，它**不可能**成功 `read` / `bash`（而重启后 10 次调用全 ok）⇒ 结论不变，但证据链要写对。
+
+### 裁定 AC｜R-6 = **未判定（实验被形状校验混淆）**
+它写进 fixture 的 marker 我逐字对了宿主的 `parseGovernedBlueprint`（符号：`src/session-blueprint.ts` 的 `parseGovernedBlueprint`）：
+```
+required: controllerSessionId / permissionPreset / effectivePermissionPreset / provider / model   ← marker 全缺
+topologySource ∈ {"project","global","bundled"}                                                  ← marker 写的是 "inline"
+```
+⇒ `read()` 在**形状校验**这一步就返回 `undefined`，与"读侧是 memory store"**在观测上完全同形** ⇒ 该实验**无法区分两个假设**，**R-6 结论（memory store）不成立**，改记 **未判定**。
+**正确实验配方（留给下一次 live 轮，非阻断）**：marker 必须**逐字段通过** `parseGovernedBlueprint`（含 `controllerSessionId`/`permissionPreset`/`effectivePermissionPreset`/`provider`/`model`，`topologySource` 取合法域）+ **阳性对照**（`presetPath` 指向真实预设文件 ⇒ 必须**按文件挂上那个预设**，表现为角色以**另一个预设**的身份行事）+ 基线（无 marker ⇒ 投递成功且用 header 预设）。
+**同时登记**：`orchestra_N7b/orchestra/blueprints/orchestra-team-e310ff28-…json` 是**手工写入且形状非法**的测试残留，**不是**插件产物 —— 下一轮不得把它当真实 marker 读。
+
+### 裁定 AA｜D2-c 步骤 2 在批 1 **不可满足**，标延后（同 O-5(d) 的口径）
+**实测**：`grep -rn "orchestra/nodes\|nodeRecord\|approvalFacts" src/` **零命中** ⇒ 节点记录（`orchestra/nodes/<node-id>.json`）是 **P2-2（批 2）** 的产物。而 §4.8 **D2-c 步骤 2** 要求"读节点记录，留下 `approvalFacts[]`" ⇒ **批 1 判不了**。
+**裁定**：批 1 的 D2-c = **步骤 1（`asked`/`decided` 成对 + `outcome` 集合断言）+ 步骤 3（删一条 `decided` ⇒ 必须报 `dangling_approval` 且非 0）**；**步骤 2 标「延后（landing = 批 2 / G-P2）」**，编号不动。**G-P0 ③ 的期望形态（`hanging 0 dangling 0`）不受影响**（它只吃步骤 1/3）。
+
+### S4 的宿主前提：driver 已核（**不是**照抄计划）
+| 计划断言 | 实测（安装版 0.1.6-alpha.2） |
+|---|---|
+| `agent/turn-stopping`：`Promise\|void`、`@mode serial`、回合关闭前 await 派发 | ✅ `dsh-agent` 的 `runtime-types.d.ts` 声明：payload `{agent, turn, signal}`、`@mode serial`、`Returns Promise<void> \| void`、agent 作用域过滤。**计划的 `:396-400` 已漂到 `:387-395`** ⇒ 锚点用**符号**不用行号 |
+| `approval/asked` / `approval/decided` 成对且被回合包住 | ✅ `dsh-user-approval` 的 `request()`：`hasOpenTurn` 前置（无回合直接抛）、先无条件 append `asked` → `decide()` → append `decided`（同 `id`） |
+| 本插件在 `agent/status` 上的推断路径要删 | ✅ 全仓**恰好一处**：`src/orchestra.ts` 的 `ctx.on("agent/status", …)` 段 |
+
+### 方法学：新加的那条硬规则**当场生效了**
+它自报的五个工具/手法问题里，第 1 条（用小写 slug `…-orchestra-N7b--` 去 `ls`，差点第二次写下"盘上 log 被 GC"）**被上一轮加的规则挡下**——"凡'不存在/被删/不在盘'必须附 `ls`/`stat`/`shasum`"。**登记为方法学生效证据**（§25 那条规则保留）。
+
+**审查轮计数 +0**（执行轮；AB 是仪器问题、AC 是实验设计混淆，都不是对契约的设计异议）。
+
+### 批 1 现状（driver 口径）
+**① 真绿（快照可复跑）· D1 闭合**（静态半边 = ① 的集合比对；live 半边 = 段 B + 我的独立解码）。**剩**：**S4 → D2-a/D2-c（③）**、**D3 + ⑥**、**⑨ `test-tier0-predicate.mjs`**、**G-BUDGET**、**裁定 Q**；R-6 修正与 D2-c 步骤 2 分别落在下一次 live 轮与批 2。
