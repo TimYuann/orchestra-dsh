@@ -2,7 +2,7 @@
 
 > **作者**：repair（第 2 任，只按 driver 方案实现）。
 > **任务书**：`docs/plan-0.8.0-execution.md` §1 的 **S4 行**与 **D2 行**、**§4.8 的 D2-a / D2-c**、§11 G-P0 的 ③ 行；宿主前提表 = `docs/review-rounds-ledger.md` §27（裁定 AA/AB/AC + S4 表）。
-> **实现 commit**：`<见本节末尾 git log>`（`src/` + 3 个测试脚本 + 1 个新判据脚本 + 本报告）。
+> **实现 commit**：`856a13c`（`src/` 3 个文件 + 2 个测试脚本 + 1 个新判据脚本 + 本报告；`git show --stat` 可核，工作树干净）。
 > **锚点纪律**：全部用 **commit + 符号**；宿主类型行号已漂过一次（`agent/turn-stopping` 的计划 `:396-400` 实测在 `runtime-types.d.ts:387-395`），故不引行号。
 > **本轮边界（如实声明）**：未起 4600 / 未碰 4599 / 未做任何活体；未写两个 fixture（只读运行）；未改 ADR / 计划 / 契约 / 台账；未向 Owner 提问。
 
