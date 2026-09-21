@@ -1130,3 +1130,37 @@ driver 实测两条：
 · ⇒ **批 1 的 live 侧无遗留**；批 1 交付报告由 driver 出具（见 `docs/p0-batch1-delivery-report.md`）。
 
 **审查轮计数 +0。**
+
+---
+
+## 33. 第 19 轮（`orchestra_E2E` 真实两角色交付 live 轮）的 driver 独立复核（2026-09-22）
+
+**候选**：`f7d6e5d`（**docs-only**：`docs/p0-report-e2e-minecraft.md`，302 行）。**通道** = Ego lite space 37（**已 handOff 给 Owner**）；**4600 仍在运行**（未清理、未归档，等 Owner 确认）。
+
+### 接受（driver 逐条复跑）
+| 项 | 它自述 | driver 实测 |
+|---|---|---|
+| 硬前提/交付物 | `index.html` sha `6d342da4…` | ✅ 44,738 B、sha256 **`6d342da4d33c90f6bd99…`**；`minecraft-html/` 下只有这一个文件 |
+| **模型（Owner 的硬要求）** | 三条会话全 `minimax-cn / MiniMax-M3 / high` | ✅ **我从三份会话日志的 `request/header` 逐条读出**：队长（`standard`）、`orchestra-v04-reviewer-v1`、`orchestra-v04-implementer-v1` 的 `config` 全是 `{"provider":"minimax-cn","model":"MiniMax-M3","reasoningEffort":"high"}` |
+| **侧边栏可见性** | 队长界面新建、两角色**未手工挂**却自动归组 | ✅ **我读 `~/.dsh/storages/workspace.json`**：`orchestra_E2E.sessionIds` 现为 **8 条**，新增的三条正是本轮 —— 两个角色 `orchestra-team-d3c21a6d-0da867cd-…` / `-b22d2a38-…` + 队长 `session-278b59b7-…`；`updatedAt = 2026-09-21T19:00:53Z` |
+| 真实交付与真打回 | 打回两次（R1 口径纠正 → R2 FAIL → R3 FAIL → R4 PASS 12/12） | 接受其读数（`orchestra/reports/` 下 R1–R4 与四份 build 报告在盘；driver 未逐字复算评审结论） |
+| **自己扣下一条 PASS** | AC7（左键放 / 右键挖）**不确认** | ✅ **接受这个处理**（详见下） |
+
+### ★ 更正 §16 的可见性结论（driver 自己的错，如实记）
+§16 我据"E2E 工作区 `sessionIds` 5 条 vs 该 slug 下 ~30 个会话目录"，推出并**向 Owner 汇报**过："插件创建的角色会话不会进工作区名单 ⇒ 侧边栏看不到"。**本轮实测推翻**：注册工作区 `orchestra_E2E` 下，插件建的两个角色会话**自动进了名单**，而 verifier **一次 `workspace.*` 都没调、`workspace.json` 未碰**。
+⇒ **正确表述**：**在"已注册为工作区"的目录里，插件创建的角色会话会被列进侧边栏**；此前 N7 / N7b "看不见"的原因是**那两个目录从未注册为工作区**（不是"插件绕过了 attach"）。**我给 Owner 的那条解释是错的，已更正。**
+**机制未归因（开放问题，非缺陷）**：究竟是谁把角色会话挂进名单（App 载入时按 cwd 归并 / 插件路径间接经过 session controller / 其它）**未定**；"第 16 轮 5 条 → 现在 8 条"的差异也待解释（可能与归档后 detach、或注册前创建有关）。
+
+### 它扣下的那条 AC7：**driver 判"未确认"成立，并给出差异的性质**
+- reviewer 的 R4 证据（`review-r4-reviewer.md`）：**相机冻结在 look `0,-89`**、5 px stride 全图 diff ⇒ 右键序列 36,409 个 >30 RGB-unit 变化、左键 38,592 个，并给出新块像素 `[91,166,60]`。
+- verifier 的独立复核：拿 reviewer 落在盘上的 43 张截图算差分，得 `R4 place 285,274 px` / `R4 break 2,902,623 px ≈ 整屏`（**相机位移**）/ `R3 final 2,531 px`（只 HUD 文本区）⇒ **它算的那几对与 reviewer 用的不是同一对**，既不能证实也不能证伪。
+- **driver 定性**：这是**测量口径差异**（不同的 before/after 对、是否冻结相机、采样 stride 不同），**不是"游戏坏了"的证据**，也**不是"reviewer 编数"的证据**。verifier **不带现场再试、原样带回**，处理正确。
+- **决定性的那一测只有真人能做**：Owner 在 space 37 的 p2 里双击进游戏、正常放/挖一次即可。
+
+### 两条开放问题（各只差一次人工动作）
+1. **`file://` 下 pointer-lock 被拒**：浏览器策略，还是自动化点击缺 user activation？⇒ Owner 真人双击一次即可分辨（v3 已提供不依赖 pointer-lock 的路径：右键拖拽 + Q/E/R/F 视角）。
+2. **正常视角下的放置 / 破坏**：reviewer 只证了"俯视 fallback"那一支；verifier 的受控点击在相机冻结下零变化 ⇒ 同样由 Owner 手动一次判定。
+
+**善后**：**未清理、未归档、4600 未停**（等 Owner 在 space 37 看完回话）。清理范围已定：只删本轮新建的团队记录（`team-d3c21a6d` + 本轮 10 份报告 / 43 张截图），`artifacts/` 与旧归档不动。
+
+**审查轮计数 +0**（执行轮；"扣下未确认项"是诚实报告，不是设计异议）。
