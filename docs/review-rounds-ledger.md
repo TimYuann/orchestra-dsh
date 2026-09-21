@@ -955,3 +955,32 @@ topologySource ∈ {"project","global","bundled"}                               
 
 ### 批 1 现状（driver 口径）
 **① 真绿（快照可复跑）· D1 闭合**（静态半边 = ① 的集合比对；live 半边 = 段 B + 我的独立解码）。**剩**：**S4 → D2-a/D2-c（③）**、**D3 + ⑥**、**⑨ `test-tier0-predicate.mjs`**、**G-BUDGET**、**裁定 Q**；R-6 修正与 D2-c 步骤 2 分别落在下一次 live 轮与批 2。
+
+---
+
+## 28. 第 15 轮（S4 + D2-a 实现轮）的 driver 独立复跑与两条裁定（2026-09-21）
+
+**候选**：`856a13c`（实现）+ `be36a49`（报告补 hash）。范围已核 = 7 文件（`src/orchestra.ts` / `src/a2a.ts` / `src/session-blueprint.ts` + 3 个脚本 + 1 份报告），主仓树干净。
+
+### driver 独立复跑（detached worktree `/tmp/orch-verify-856a13c` @ `856a13c`）
+| 项 | 期望 | driver 实测 |
+|---|---|---|
+| `typecheck` / `build` | 0 / 0 | **0 / 0** |
+| `npm test` | 272 基线不回归 | **279 tests / 279 pass / 0 fail**（272 + 7 新增） |
+| `test-node-stall.mjs` | 0，三条 S4 断言在 | **exit 0**，**12 条**（原 5 + 新 7）；S4 三条 = `ok 7`（steer 每回合恰好一次）、`ok 9/10/11`（悬空审批记账 + 通知 + durable）、`ok 12`（只订阅 `turn-stopping`、无 `agent/status` 监听） |
+| `test-role-session-single-path.mjs` | D2-a 钉死 | **exit 0，4/4**（四条建/恢复路径各恰好一条 `approval/policy: never`） |
+| 全仓 `agent/status` 监听 | 0 | `grep -rn 'on("agent/status"' src/` ⇒ **0** |
+| `verify-d2-approval.mjs --self-test` | 1 | **exit 1** + `dangling_approval: ask-calibration … never decided`；**同时**它的配对基线印 `APPROVAL_OK … hanging 0 dangling 0` ⇒ **仪器不是恒红** |
+| `verify-d2-approval.mjs` 真实悬挂日志（N7 reviewer，只读） | 非 0 | **exit 1**、`hanging 0 dangling 1`、点名 `09ecc459-0155-476b-9910-5d64016869c7 … seq 64 in turn 1 and never decided` —— **与 §23 我独立解码到的那条 asked 逐字一致** |
+| **driver 变异**（我自己做） | 断言是负载 | 关掉 `steeredTurns` 去重 ⇒ `not ok 7` + exit 1；还原 ⇒ exit 0 |
+
+### 裁定 AD｜它登记的"mtime 变了、疑为并行 driver 会话"：**归因错误，无污染**
+实测：`~/.dsh/orchestra/catalog-presets` 12 个文件的 mtime = **`Sep 21 20:25`**，与它**最后一次重启 4600** 的时刻同刻（`/tmp/orch-4600e.log`：`20:25:30`）。写者是**插件自己的启动期目录同步**（符号：`ensureBuiltinRolePresetArtifacts` → `ensureBuiltinRolePresetArtifact`，其中含把旧 `text:` 就地迁移为 `prefix:` 的 `writeFile`）⇒ **不是并行会话**。N7b 的那几个文件 mtime 也都是它自己那轮的写入（marker `20:24:55` / `closure.md` `20:21` / `team.json`+archive `20:10`）。内容未变（12 个目录仍解析出 11 行）。**无污染，登记结案。**
+
+### 裁定 AE｜"N7 没有 `turn/end`"的差异已解释 —— 顺带抓到一条宿主行为（对 D2 有用）
+N7 reviewer 日志现状：**71 事件 / 103,858 B / mtime `Sep 21 19:30:37`**。新增的 4 条是：
+`#67 tool/result{interrupted}`、`#68 step/end`、`#69 turn/end{kind:"interrupted"}`（时间戳 = `20:30:09.906Z`，即第 10 轮收尾那一瞬）+ `#70 session/end-seed`（`11:30:37Z` = 第 14 轮开实例那一刻）。
+⇒ **宿主在会话被重新加载时会补写 crash-tail 的收尾事件**（回合被 `turn/end{interrupted}` 关闭），但**不会**补 `approval/decided` ⇒ 脚本报 `dangling 1` **依然正确**（问题不在悬挂回合，而在没人应答的那次请示）。
+**同时更正 §23 的措辞**：N7 的日志**不是不可变的** —— 加载即可追加。**"封存"= 复制 + sha256**，不是指望原文件不动（第 10/14 轮的做法正确）。
+
+**审查轮计数 +0。**
