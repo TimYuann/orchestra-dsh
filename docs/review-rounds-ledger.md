@@ -831,3 +831,45 @@ node scripts/verify-role-identity.mjs --repo ~/Documents/agentWorkspace/artifact
 
 ### 下一跳
 **repair**（R-1+R-4 / R-2 / R-3）→ 之后 **一趟 live 轮**：新 fixture（`orchestra_N7b/`）create + 懒加载物化（验 R-2 的端到端：记录带行 id）→ 重启 → 唤醒（段 B）→ **R-6**（marker 读侧判定，写在 N7 上、取证封存后做）。
+
+---
+
+## 25. 第 12 轮（repair 实现轮）的 driver 独立复跑与裁定 Z（2026-09-21）
+
+**候选**：`861aef7`（实现）+ `674aa80`（报告）。`git show --stat` 已核：改动 = 3 个测试脚本 + `scripts/verify-role-identity.mjs` + `src/orchestra-state.ts` / `src/orchestra.ts` / `src/session-blueprint.ts`，与它自述的清单一致；工作树干净。
+
+### driver 独立复跑（**detached worktree** `/tmp/orch-verify-861aef7` @ `861aef7`，软链 `node_modules`）
+| 项 | 期望 | driver 实测 |
+|---|---|---|
+| `npm run typecheck` | 0 | **0** |
+| `npm run build` | 0 | **0** |
+| `npm test` | 269 基线不回归 | **272 tests / 272 pass / 0 fail**（269 + 3 新增） |
+| 判据矩阵（**输入由我自己构造**；行 id 由我**独立解析名册预设 YAML** 得到 11 条：`persona, agent-instructions, tool-fs, tool-fs-search, tool-bash, skill-filesystem, tool-skill, compaction, compaction-basic, command-compact, tool-result-pruner`） | | |
+| ① N7 旧记录（无 self-test） | exit 1 + `recorded composition is absent` | **exit 1**，逐字命中 |
+| ② N7 旧记录 + `--self-test` | exit 1 + 检出 | **exit 1**，`substitution=detected`（并印 `has no recorded compositionRowIds to perturb`，诚实） |
+| ③ correct 副本（11 条，与名册一致） | exit 0 | **exit 0** |
+| ④ stale 副本（10 条） | exit 1 + 逐字文案 | **exit 1**，`recorded composition has 10 row(s), the resolved preset declares 11` |
+| ⑤ empty 副本（0 条） | exit 1 | **exit 1** |
+| ⑥ blindspot 副本 + `--self-test` | **exit 2** + `detected=NO` | **exit 2**，`substitution=NOT-DETECTED record-side=not-applicable` |
+| 产品 diff | 只有裁定 Y 的形状 | ✅ 一个可选字段 + `GovernedRolePlan` 透传 + 预留时写定 + `materializeRole` 保留不刷新并加注释 + readiness 不填 |
+| 新增用例非恒真 | 是 | ✅ 含 readiness 的 tripwire（"填预期值必须让它失败"）与"记录行 id 深等于解析器读到的集合 + 长度 11" |
+
+### ★ 裁定 Z｜cross-check 仍是**只比条数**，属 B 类缺陷 ⇒ 小跟修（同一 repair session，不新开轮）
+**实测反例（driver 构造）**：把 role 的 `compositionRowIds` 填成 **11 条、内容全错**（`bogus-1…bogus-11`）⇒ `IDENTITY_OK … rows=11 tools=11`、**exit 0**。
+**判据原文**：§4.7 步 4⑤ = "与节点记录里插件写的'预期组合'**逐项比对**"。条数相等即通过，等于"预设被原地改过但行数不变"这一整类漂移**检测不到**（正是 D1 ③ 要防的东西）。
+**修法（driver 定）**：
+1. 改为**集合比对**（`recordedRows` 与 `composition.rowIds` 排序去重后逐项比），**顺序无关** —— 防止"插件解析序 vs 宿主读取序"造成假失败；
+2. 失败行**点名第一条** missing / extra 的行 id（不只报条数）；
+3. `--self-test` 的记录侧扰动改为**同长度改一个 id**（比"删一条"更严格，正是能抓住本缺口的那种扰动）；
+4. **对照项两条**：(a) 同长度错集 ⇒ 必须失败；(b) **同集乱序 ⇒ 必须通过**（防新增脆弱性）。
+**未做前不得声称 ① 已诚实**（① 现在对"同数错集"仍是假绿）。
+
+### 登记第三条观察失误（不影响本轮判定，但同类已第三次）
+它在"未做/未验证"栏写"**E2E fixture 当前不在盘上**，无法复跑 analyzer 的那组对照"。**driver 实测：在盘** —— `~/Documents/agentWorkspace/artifacts/projects/orchestra_E2E/orchestra/state/team.json` 存在、sha `5b8efdf9…` 与 §23 记录一致、会话 slug 下 30 条。
+⇒ 与 §23 驳回的"盘上 log 被 GC"、§19 的 `spaceId: 29` 同族：**取证侧的读法/环境问题被写成产品事实**。**处置**：不改变本轮结论（其"未跑 E2E 对照组"仍可从其他输入复跑），但方法学里再加一条：**凡"不存在 / 被删 / 不在盘"的断言，必须附 `ls`/`stat`/`shasum` 的原始输出**。
+
+**审查轮计数 +0**（实现轮；裁定 Z 是机制未命中，不是设计异议）。
+
+### 下一跳
+1. **小跟修**（裁定 Z，同一 repair session，一条消息即可）→ driver 复跑矩阵（含新的 (a)/(b) 对照项）。
+2. 之后 **live 轮**（test runner）：新 fixture `orchestra_N7b/` create → 懒加载物化（① 期望真绿）→ 重启 → 唤醒（段 B，判据 = 宿主 `agent/created` 的 preset warning + 角色实际 tool/call）→ **R-6**（marker 读侧）。
