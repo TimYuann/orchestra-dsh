@@ -114,6 +114,8 @@ function wrapVersion(version: FsVersion): ArchiveVersion {
 
 export interface ArchiveWriteOptions {
   dismissedAt: number;
+  /** Persisted caller-owned attempt identity for a retryable dismissal. */
+  archiveId?: string;
   policy: SandboxExecutionPolicy;
   signal?: AbortSignal;
 }
@@ -507,7 +509,7 @@ export function createArchiveStore(fs: ArchiveFileSystem, options: ArchiveStoreO
   async function create(cwd: string, team: TeamState, writeOptions: ArchiveWriteOptions): Promise<ArchiveCreateResult> {
     if (!Number.isFinite(writeOptions.dismissedAt)) throw new ArchiveStoreError("write_failed", "dismissedAt must be a finite number");
     const identity = safeSegment(makeDismissalId(), "dismissal");
-    const archiveId = `team-${safeSegment(team.teamId, "unknown")}-${writeOptions.dismissedAt}-${identity}`;
+    const archiveId = writeOptions.archiveId ?? `team-${safeSegment(team.teamId, "unknown")}-${writeOptions.dismissedAt}-${identity}`;
     validateArchiveId(archiveId);
     const filename = filenameFor(archiveId);
     let target: FsTarget;

@@ -3674,7 +3674,7 @@ export async function dismissGovernedTeam(
   // disk says nothing to a session that still believes it belongs to a live
   // team — and the call reports what already happened.
   if (teamObservation.kind === "inactive" && teamObservation.reason === "archived") {
-    return dismissAlreadyArchived(ctx, archiveStore, exec.agent, cwd, exec.signal, args);
+    return dismissAlreadyArchived(ctx, archiveStore, exec.agent, cwd, exec.signal, args, teamObservation.marker);
   }
   if (teamObservation.kind !== "ready") throw new Error(`cannot dismiss the team: ${teamObservation.diagnostic.message}`);
   const team = teamObservation.team;
@@ -3684,7 +3684,12 @@ export async function dismissGovernedTeam(
     throw new Error(`orchestra_dismiss: only controller session "${team.controllerSessionId}" can dismiss the team; caller is "${exec.agent.id}"`);
   }
 
-  const dismissedAt = Date.now();
+  // Persist the attempt identity before writing the immutable snapshot. If the
+  // snapshot wins but marker CAS loses, retry addresses this exact id rather
+  // than guessing from archive ordering or minting a duplicate.
+  const priorAttempt = team.dismissalAttempt;
+  const dismissedAt = priorAttempt?.dismissedAt ?? Date.now();
+  const archiveIdForAttempt = priorAttempt?.archiveId ?? `team-${team.teamId}-${dismissedAt}-${randomUUID()}`;
   const pendingTasks = team.roles
     .filter((r) => r.reportCount === 0 || r.phase === "provisioning" || r.phase === "reserved")
     .map((r) => ({ roleId: r.id, phase: r.phase, reportCount: r.reportCount }));
@@ -3693,11 +3698,15 @@ export async function dismissGovernedTeam(
     summary: args.summary ?? "Team dismissed and archived.",
     pendingTasks,
   };
+  let teamWithHandoff: TeamState = { ...team, handoffSummary, dismissalAttempt: { archiveId: archiveIdForAttempt, dismissedAt } };
+  let markerObservation = teamObservation;
+  if (priorAttempt === undefined) {
+    const written = await activeTeamState.replace(teamObservation, teamWithHandoff, { policy: escrowPolicy(ctx, exec), signal: exec.signal });
+    if (written.snapshot === undefined) throw new Error("orchestra_dismiss: dismissal attempt was not persisted");
+    markerObservation = written.snapshot;
+    teamWithHandoff = written.snapshot.team;
+  }
 
-  const teamWithHandoff: TeamState = {
-    ...team,
-    handoffSummary,
-  };
 
   // D3: the transaction is STOP → TELL → RECORD.
   //
@@ -3709,11 +3718,18 @@ export async function dismissGovernedTeam(
   // thing can simply be run again.
   await retireTeamRoles(ctx, exec.agent, teamWithHandoff.roles, cwd);
 
-  const archived = await archiveStore.create(cwd, teamWithHandoff, {
-    dismissedAt,
-    policy: escrowPolicy(ctx, exec),
-    signal: exec.signal,
-  });
+  const existingAttempt = await archiveStore.read(cwd, archiveIdForAttempt, { signal: exec.signal });
+  const archived = existingAttempt.kind === "ready"
+    ? (() => {
+        if (existingAttempt.snapshot.teamId !== team.teamId || existingAttempt.snapshot.dismissedAt !== dismissedAt) {
+          throw new Error(`orchestra_dismiss: persisted attempt ${archiveIdForAttempt} names an unrelated archive`);
+        }
+        return { summary: existingAttempt.summary };
+      })()
+    : await archiveStore.create(cwd, teamWithHandoff, {
+        dismissedAt, archiveId: archiveIdForAttempt,
+        policy: escrowPolicy(ctx, exec), signal: exec.signal,
+      });
   const archiveId = archived.summary.archiveId;
   const archivePath = archived.summary.archivePath;
   const marker: ActiveTeamArchivedMarker = {
@@ -3726,7 +3742,7 @@ export async function dismissGovernedTeam(
     teamId: team.teamId,
   };
   try {
-    await activeTeamState.archive(teamObservation, marker, {
+    await activeTeamState.archive(markerObservation, marker, {
       policy: escrowPolicy(ctx, exec),
       signal: exec.signal,
     });
@@ -3771,9 +3787,10 @@ async function dismissAlreadyArchived(
   cwd: string,
   signal: AbortSignal | undefined,
   args: DismissGovernedTeamArgs,
+  marker?: ActiveTeamArchivedMarker,
 ): Promise<DismissGovernedTeamResult> {
   const listing = await archiveStore.list(cwd, { signal });
-  const newest = listing.ready[0];
+  const newest = marker === undefined ? listing.ready[0] : listing.ready.find((entry) => entry.archiveId === marker.archiveId);
   if (newest === undefined) {
     throw new Error(
       "cannot dismiss the team: the state carries an archived marker but no archive could be listed, so there is no snapshot to notify from",

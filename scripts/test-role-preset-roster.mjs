@@ -74,6 +74,14 @@ test("S3: file presets fail loudly; declarations mount only by registry id", asy
   await assert.rejects(() => mountRolePreset(agentCtx, {
     presetId: "team-preset", overrideFile: { id: "team-preset", trust: "user", path: "/legacy/agent.cordis.yml" },
   }), /unsupported/);
+  const mounted = [];
+  const result = await mountRolePreset(agentCtx, {
+    presetId: "declared-role",
+    mountById: async (_ctx, id) => { mounted.push(id); },
+  });
+  assert.deepEqual(mounted, ["declared-role"]);
+  assert.deepEqual(result, { mountedBy: "id", presetId: "declared-role" });
+  await assert.rejects(() => mountRolePreset(agentCtx, { presetId: "missing-registry" }), (error) => error?.code === "preset_roster_unavailable");
 });
 
 // ---------------------------------------------------------------------------

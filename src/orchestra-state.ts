@@ -202,6 +202,8 @@ export interface TeamState {
     summary?: string;
     pendingTasks?: Array<{ roleId: string; phase: string; reportCount: number }>;
   };
+  /** Stable archive identity retained if snapshot publication beat marker CAS. */
+  dismissalAttempt?: { archiveId: string; dismissedAt: number };
 }
 
 /** One driver milestone notice that could not be delivered. */
@@ -303,6 +305,7 @@ export interface ActiveTeamReady extends ActiveTeamReadCommon {
 export interface ActiveTeamInactive extends ActiveTeamReadCommon {
   kind: "inactive";
   reason: "archived" | "dismissed";
+  marker?: ActiveTeamArchivedMarker;
   version: ActiveTeamVersion;
 }
 
@@ -433,7 +436,7 @@ function asRecord(raw: unknown): Record<string, any> | undefined {
 
 function classifyRaw(raw: unknown, cwd: string):
   | { kind: "ready"; team: TeamState; compatibility: ActiveTeamCompatibility; warnings: string[]; diagnostic: ActiveTeamDiagnostic }
-  | { kind: "inactive"; reason: "archived" | "dismissed"; compatibility: ActiveTeamCompatibility; warnings: string[]; diagnostic: ActiveTeamDiagnostic }
+  | { kind: "inactive"; reason: "archived" | "dismissed"; marker?: ActiveTeamArchivedMarker; compatibility: ActiveTeamCompatibility; warnings: string[]; diagnostic: ActiveTeamDiagnostic }
   | { kind: "blocked"; warnings: string[]; diagnostic: ActiveTeamDiagnostic } {
   const record = asRecord(raw);
   if (record === undefined) {
@@ -648,6 +651,9 @@ export function normalizeTeam(raw: unknown, cwd: string, options: { allowDismiss
     ...(record.handoffSummary !== undefined && typeof record.handoffSummary === "object"
       ? { handoffSummary: record.handoffSummary as any }
       : {}),
+    ...(asRecord(record.dismissalAttempt) && typeof record.dismissalAttempt.archiveId === "string" && Number.isFinite(record.dismissalAttempt.dismissedAt)
+      ? { dismissalAttempt: { archiveId: record.dismissalAttempt.archiveId, dismissedAt: record.dismissalAttempt.dismissedAt } }
+      : {}),
     ...(Array.isArray(record.addedLanes) ? { addedLanes: record.addedLanes as any } : {}),
     // A malformed breadcrumb is DROPPED rather than fatal: this list exists to
     // explain a stalled run, and refusing to read the Team because one entry is
@@ -752,6 +758,7 @@ export function createActiveTeamStateStore(fs: ActiveTeamStateFileSystem): Activ
         kind: "inactive",
         cwd,
         reason: classified.reason,
+        ...(classified.marker === undefined ? {} : { marker: classified.marker }),
         compatibility: classified.compatibility,
         warnings: classified.warnings,
         diagnostic: classified.diagnostic,

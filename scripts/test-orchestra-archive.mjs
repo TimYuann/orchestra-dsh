@@ -438,7 +438,7 @@ test("D3 1: dismissing twice notifies both times and the second call reports alr
 
     const first = await dismissGovernedTeam(harness.ctx, activeStore, archiveStore, harness.exec, { reason: "done" });
     assert.equal(first.status, "dismissed");
-    assert.match(first.archive_id, /^team-team-archive-test-\d+-first$/, "the archive id is derived from the team and the dismissal id");
+    assert.match(first.archive_id, /^team-team-archive-test-\d+-/, "the archive id is a persisted attempt identity");
     // STOP before TELL: the role was cancelled, and then told.
     assert.deepEqual(harness.events.filter((entry) => entry.startsWith("cancel:")), [`cancel:${role.sessionId}`]);
     assert.deepEqual(harness.events.filter((entry) => entry.startsWith("notice:")), [`notice:${role.sessionId}`]);
@@ -533,3 +533,36 @@ test("D3 3: after the marker lands, orchestra_team reports no team and lists the
 async function statePathOf(fs) {
   return fs.absolute("orchestra/state/team.json");
 }
+
+test("C8: marker CAS retry reuses its persisted snapshot, never the newest unrelated archive", async () => {
+  await withTempFs(async (fs) => {
+    const harness = dismissHarness(fs);
+    const activeStore = createActiveTeamStateStore(fs);
+    const archiveStore = createArchiveStore(fs, { dismissalId: (() => { let n = 0; return () => `attempt-${++n}`; })() });
+    const role = { ...team().roles[0], execution: "session", sessionHistory: [] };
+    await activeStore.create(cwd, team({ roles: [role] }), { policy: {} });
+    harness.register(role.sessionId);
+    const realArchive = activeStore.archive.bind(activeStore);
+    let failOnce = true;
+    activeStore.archive = async (...args) => {
+      if (failOnce) { failOnce = false; throw new ActiveTeamStateError("stale_write", "injected marker CAS failure"); }
+      return realArchive(...args);
+    };
+    await assert.rejects(() => dismissGovernedTeam(harness.ctx, activeStore, archiveStore, harness.exec, {}), /CAS failed/);
+    const afterFailure = await activeStore.read(cwd);
+    assert.equal(afterFailure.kind, "ready");
+    assert.ok(afterFailure.team.dismissalAttempt, "attempt id survives the snapshot/marker interruption");
+    const attemptId = afterFailure.team.dismissalAttempt.archiveId;
+    assert.equal((await archiveStore.read(cwd, attemptId)).kind, "ready");
+    // A later unrelated archive must not be selected by either retry or inactive re-entry.
+    await archiveStore.create(cwd, team({ teamId: "unrelated" }), { dismissedAt: Date.now() + 1000, policy: {} });
+    const retried = await dismissGovernedTeam(harness.ctx, activeStore, archiveStore, harness.exec, {});
+    assert.equal(retried.status, "dismissed");
+    assert.equal(retried.archive_id, attemptId);
+    assert.equal((await archiveStore.list(cwd)).ready.filter((entry) => entry.teamId === "team-archive-test").length, 1);
+    const later = await activeStore.create(cwd, team({ teamId: "later-team", roles: [] }), { policy: {} });
+    assert.equal(later.operation, "replaced");
+    const laterArchive = await archiveStore.create(cwd, team({ teamId: "later-team", roles: [] }), { dismissedAt: Date.now() + 2000, policy: {} });
+    assert.notEqual(laterArchive.summary.archiveId, attemptId, "a subsequent lifecycle owns a distinct archive identity");
+  });
+});
