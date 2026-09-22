@@ -1,43 +1,51 @@
-# DSH 0.1.7-alpha.1 implementation report
+# DSH 0.1.7-alpha.1 迁移验证记录
 
-> **Latest checkpoint: `f54383c` is WIP, with three TypeScript failures; last green commit is `f479b23` (292/292).** Full continuation, pending source defects and v2 design blockers: [handoff-2026-09-22-upgrade.md](handoff-2026-09-22-upgrade.md). Earlier results below belong to their named snapshots, not to current HEAD.
+> **2026-09-22收尾源码：`2f08a05`。机械验证通过；浏览器/真实会话/跨重启/正式Web安装未完成。**
+> 下一轮唯一接续入口：[详细handoff](handoff-2026-09-22-upgrade.md)。包版本保持 **0.5.1**，未发布/推送/tag。
 
-Package remains `0.5.1`. Commits: `6a0f0d8` (declaration migration, roles/lanes), `2386304` (lazy lifecycle), `ecd9db7` (C8 retry), **`3bd275b`** (parent's actual right-sizing guidance, full runtime playbook, catalog-generated declarations). Reports before the last commit overstated driver-guidance delivery and installed composition parity; these were found and corrected during parent takeover. Follow-up investigation completed and found remaining production defects; this is not a final acceptance report.
+## 已落源码
 
-## Migration and intermediate implementation (not full scope acceptance)
+- 原生preset声明注册取代旧roots/file mount；完整声明由typed catalog生成，包含persona、工具、skills、planning和compaction；V4消息源与client API适配。
+- driver指引支持直接做/native child/独立Session/Team，不强制所有工作先画图；完整preset-authoring playbook可被发现并从包内加载。
+- 模型按显式节点配置优先，否则继承driver实际当前request路由/推理；旧tier机制删除，governed reservation冻结展示路由。
+- mission/lane输入、返回与团队投影具有真实结构化schema；支持复用成员、责任人/职责/完成条件，不把零新增座位说成零新增lane。
+- 子代理persona/filter经持久化读回保留；接管已物化child使用新身份并留history；后续消息用native continuation。
+- Session的expected工具要求与观测readiness分开；完整governed setup/commit用于新建、冷恢复与替换；live先核验，不补写权限掩盖问题。公开AgentRegistry.resume不是SessionController的私有helper。
+- same-birth marker允许幂等重试、不同birth拒绝；marker不代表发布成功。归档激活不继承旧dismissalAttempt，成功恢复清除failed状态。
+- 正式dismiss及/team归档严格停止/等待；drain失败不宣告归档。快照CAS重试遇晚到报告保留旧快照并创建明确superseding快照。
 
-- Replaced removed `dsh-agent-presets` and client runtime imports with 0.1.7 registry/client APIs. Orchestra's twelve ids ship as declaration-owned bundle rows; legacy file-root/file-mount behavior rejects loudly.
-- Added V4 `plugin:orchestra` notices, client slot augmentation, target catalog behavior, bundled native preset-authoring skill and declaration example. The playbook directs authors to the native composition/plugin/reference skills.
-- Reworked thin role personas and driver guidance; direct work, native children, independent Sessions, and Teams remain distinct choices. Existing topology defaults remain Session.
-- Added lane-first incremental mission records (objective, scope, constraints, acceptance, relationship, participants, new roles) and existing-role reuse without seat creation. Team render exposes lanes and notice failures.
-- Persisted native child persona/toolFilter, uses them on materialization, routes subsequent child dispatch through native `sendMessage`, and assigns a fresh child identity on takeover. Per-node model remains explicit when supplied; unspecified routes inherit the driver/default selection seam.
-- Lazy Session reconstruction exists, but expected tool requirements are still confused with empty observed readiness; governed cold restore/replacement remains unfinished. Use public `ctx.agents.resume({setup: preparedBlueprint.setup})` with both setup parameters and returned commit, not SessionController's private resume helpers or post-publication-only checks. Registered turn-stopping returns the awaited Promise.
-- Formal dismiss requires child drain or Session cancel followed by `whenIdle()` before archive publication. Successful `orchestra_dismiss` output declares `reason` and `summary`.
-- C8: a dismissal now persists `{archiveId,dismissedAt}` on the active Team before snapshot write. A marker-CAS interruption retries that exact archive id, reconciles only the matching Team/timestamp snapshot, and never selects an unrelated newest archive. A later lifecycle receives a distinct attempt/archive id.
+源码提交链与各阶段曾发现的真实缺口见handoff§2；早期子报告的“完成”不作为当前验证依据。
 
-## Validation
+## 最终独立机械证据
 
-- `npm run typecheck` — passed.
-- `npm run build` — passed.
-- Sol medium isolated checkpoint at `ecd9db7`: **283/283 pass**. Candidate patch then tested: **285/285 pass**, typecheck/build also passed.
-- Tested patch SHA-256 `2ea67f375c5cbed047d6549f50146e48b526e52e965d36b43248d7c04442fe7b` exactly matched the staged diff committed as `3bd275b`.
-- `npm pack --cache /tmp/dsh-npm-cache` and extracted package import passed. Tarball `/tmp/orchestra-ecd9db7-checkpoint.yC635u/orchestra-dsh-0.5.1.tgz`, SHA-256 `00a2788f5103ff3fd717fcd5461681540cfdc53c58b48275f46b50ff70cf9a96`.
-- Native target registry accepted all 12 generated declarations with no import/config errors. Full host services were absent in that probe; waiting fibers do **not** prove live persona/tools activation.
-- Runtime-loaded playbook equals the packed SKILL.md; generated declaration equals the complete catalog composition (skills/planning/compaction included). These were missing from the earlier handoff.
-- Evidence: `/Users/yuantian/.pi/agent/sessions/--Users-yuantian-Developer-orchestra-dsh--/subagent-artifacts/outputs/14914f7b-24f3-4c0a-95ed-fb14ad389ffc/evidence/checkpoint-tests.md`.
+Sol high在**全新隔离快照**中执行，无profile安装/宿主启动：
 
-The previous baseline's 284 tests became 282 because two obsolete standalone S3 tests (file-root ID mount and missing-roster behavior) were consolidated into the one target-native declaration-mount test while file overrides became explicitly unsupported. That consolidated test now asserts all three required behaviors: reject file presets, mount a declared ID, and typed failure without registry. The C8 injected-failure test raised that checkpoint to 283. Parent added declaration parity and truthful right-sizing checks, giving **285** in the tested candidate.
+- base `c58a59c3f262bfff29a02d8e387e0e524009a596`。
+- patch `/tmp/orchestra-web-ready-handoff-candidate.patch`，SHA-256 `f866e1a2d49f917b0858a390875a0eedc0a5548be9203e1faf5e50c33423ce47`，与2f08a05的staged diff逐字一致。
+- `npm run typecheck`：exit0。
+- `npm test`（含build）：**295 pass / 0 fail / 0 cancelled / 0 skipped**。
+- 模型路由探针：**5/5**；真实注册工具/schema/lane探针：**9/9**。这些额外探针尚在临时目录，不冒称已全部纳入维护套件。
+- `npm pack --cache /tmp/dsh-npm-cache`：exit0；78文件，351.9kB packed；runtime dependencies仅js-yaml，22 peers；无src/scripts/probes/node_modules。
 
-## Later verified fixes and current blocker
+最终候选：`/tmp/orchestra-web-ready-017-final.f1Wcab/orchestra-dsh-0.5.1.tgz`。
+SHA-256：`a9745496d7b2a2f5758d2b7af43b116d5ee42197519c0217958b56aef689f178`。
 
-- `f479b23`: child persona/filter normalization and takeover identity, strict native drain and shared /team dismissal, snapshot supersession after late reports. Sol verified the exact patch in a fresh snapshot: **292/292**, typecheck passed; seven new regressions integrated.
-- `f54383c`: model inheritance and registered lane mission fields, owner/responsibilities and reuse render; old tier module removed. **Typecheck and npm test both exit 2 before tests run**: generic JSON lane renderer, generic role input vs typed handler, and absent owner in team projection. Fixed snapshot `/tmp/orchestra-f479b23-model-lane.KpX6TB`; probes are ready there, not yet executed.
-- No current completed runtime test or release artifact exists. The previously packed file corresponds only to `3bd275b`.
+完整报告：`/Users/yuantian/.pi/agent/sessions/--Users-yuantian-Developer-orchestra-dsh--/subagent-artifacts/outputs/8139acf1-cb0e-432c-8cdd-2e58fe70ad5b/validation/web-ready-017.md`。
+日志：`/tmp/orchestra-web-ready-017-final-{typecheck,test,probes,pack}.log`。
 
-## PENDING-RUNTIME
+## 失败记录与fixture边界
 
-Parent integrates; Sol medium/xhigh test agents may execute against a specifically handed-off instance and new test sessions. Install only into `dev-orchestra:4600`. It was newly initialized from the official web template, so do not assume an obsolete root override exists or edit another profile looking for one; no registry override is needed. In a new Session validate browser slot registration, registry composition, create→persist→dispatch (including child persona/filter), Session Controller restore, strict stop, and cross-restart identity. Do not touch web, old shared dev, global settings, historical sessions, processes, or ports.
+- f54383c的3处TS错误已修，不再是当前阻断。
+- candidate1又暴露native AgentOptions被Record错误收窄，主agent已修。
+- 更完整的运行期守卫使13个旧fixture不符合真实host形状。主agent审阅并整合5个测试文件的夹具修正（ctx/preset/权限/工具/创建参数位置）；没有削弱产品校验。**raw候选282/295不被记成通过**。
+- 额外探针随后发现governed child继承模型未落team状态，主agent补冻结；最终已包含fixture和源码修正，295/295不是在隐藏的测试变体上凑出的数字。
 
-Existing file-only custom presets and children created before persona/filter persistence cannot be repaired in place; use declared/new-instance handoff.
+## 仍需真实运行验收
 
-Audit provenance: `/Users/yuantian/.pi/agent/sessions/--Users-yuantian-Developer-orchestra-dsh--/subagent-artifacts/outputs/222843dd-e1bf-46a4-8835-7c4ddf53a589/upgrade/audit-017.md`.
+Owner要求此处收尾，因此**没有**安装dev依赖、启动4600、打开浏览器、发真实M3请求、重启或安装正式web。
+
+`dev-orchestra:4600`只做了profile-local设置迁移：4 provider配置/4现有credential引用，默认`minimax-cn/MiniMax-M3`。原全局legacy设置已被第一个0.1.7 profile消费，新profile/未来web不会自动继承；逐entry核effective config/credential状态。凭据复制有授权，但原文不得输出或入仓库。
+
+下一轮：从干净提交重新pack（含最新README）→ 安装dev-orchestra → 单个fresh Sol high做browser/完整host/M3角色/child/strict stop/跨重启 → Owner确认正式web安装窗口。正式web4599、旧dev、dev-trinity4601和历史会话保持不动。
+
+**结论：机械候选PASS，完整Web安装资格仍未完成。**

@@ -2,12 +2,12 @@
 
 > 2026-09-22。本文不再维护第二套任务地图或覆盖规则。
 > **开始实现**读 [`plan-0.8.0-execution.md`](plan-0.8.0-execution.md)；**查字段、Git/证据/权限语义**读 [`plan-0.8.0-delivery-layer.md`](plan-0.8.0-delivery-layer.md)。旧 S/P/V/O 编号见 Git 历史；遇到冲突以 v2 的明确修正为准。
-> **当前v2有9项未修设计阻断，源码f54383c有3处TS错误；先读 `docs/handoff-2026-09-22-upgrade.md`，不能直接进入交付层实施。**
+> **当前v2有9项未修设计阻断；源码2f08a05已通过机械验证但未验收真实Web/跨重启；先读 `docs/handoff-2026-09-22-upgrade.md`，不能直接进入交付层实施。**
 > 当前只优化交付层计划，未实现新交付层。第一部分升级状态见 `upgrade-0.1.7-alpha.1-implementation.md`，不是从计划推断。
 
 ## 工作分工
 
-主 agent 直接实现、修订计划和集成；subagent 用于探查、搜证、调研和测试，新派发仅 Sol medium / Sol xhigh。主仓保持一个源码写者。测试对固定 commit 或带 hash 的差异快照进行，不能把边改边测的输出算作最终版本证明。每个子代理只做一个大任务或一组相关小任务，完成后结束；新主题fresh context，不不断追加导致无谓压缩。
+主 agent 直接实现、修订计划和集成；subagent 用于探查、搜证、调研和测试，一般新派发仅Sol medium / Sol xhigh；Owner另指定单个Sol high浏览器验收，实际DSH会话统一MiniMax-M3。主仓保持一个源码写者。测试对固定 commit 或带 hash 的差异快照进行，不能把边改边测的输出算作最终版本证明。每个子代理只做一个大任务或一组相关小任务，完成后结束；新主题fresh context，不不断追加导致无谓压缩。
 
 旧编排中的 Luna/Terra 实现/文档 writer 步骤已经被 Owner 取代，不继续启动。不将此 harness 配置写成 Orchestra 产品的角色模型默认值。
 
