@@ -26,7 +26,7 @@
 | 2.5 相邻项 | A2A 控制面 / 混合子节点 / 客户端面板 | **部分取得** | A2A：`create/send/list/status/read/stop` 全部实测通过，冷会话唤醒拿到 `resumed_inbox`；`a2a_reply` **未取得**（无入站消息）。混合子节点：`origin:"subagent"`+`delegationDepth:1`+`agentPreset:"standard"`，**toolFilter allow:[read,bash] 生效**（子会话工具表 = bash/read/subagent）。客户端面板：见 §2.7。依赖建队的 lane / dismiss→activate / 重启后角色身份 **未取得** |
 | 3.1–3.4 | web 备份 / 只加不改安装 / 三件套 / 重载判定 / 不崩验收 | **通过** | 备份 `backup-0.6.0-install-20260923-033007`（含安装前哈希）；diff 只有 additions，`cordis.patch.yml` 前后同为 `bb0bfed4…`；三件套：`@deepseek-ai/` 目录**空**、`require.resolve` → host、副本与制品逐字节一致；同 profile 冷启动 **4605** 零报错、boot 清单含 `orchestra-dsh/client.js`；侧边栏 15 项完好、orchestra 面板完整渲染、**0 页面错误**。详见 §2.7 |
 | 3.5 最小 smoke | **失败（通道问题，非装载）** | 4605 上 M3 回合 5/5 `TRANSPORT`——Owner 已把 web 默认模型改成 `minimax-cn/MiniMax-M3`，而该 route 没有 §2.5 的 `accept-encoding: identity`（按"只加不改"未代改）⇒ 与是否装本插件无关 |
-| 3.6 重启 4599 | **未执行（Owner 动作）** | 命令已给出；bundle 行只在 boot 时读取 ⇒ 该安装此刻**惰性**、对 4599 零影响。**未自动回滚**（理由与回滚命令见 §2.7 3.6） |
+| 3.6 回滚 | **已执行（Owner 指示）** | 「回滚，我们还没有彻底完成验证」⇒ 恢复三件 + 清实体包 + 冷启动复验：四项哈希全部回到安装前、组合树 0 条 orchestra 行、boot 清单 0 次提及本插件、4599 PID 未变。详见 §2.7 3.6 |
 
 ### 本轮登记（只登记，不修）
 
@@ -458,7 +458,7 @@ Error: cannot create a charter draft: draft draft-fix-parseDuration-p0-0.6.0-tea
 
 
 
-### 2.7 Phase 3（装 web）——**不崩验收通过**；最小 smoke 被 §2.5 的同一通道问题挡住
+### 2.7 Phase 3（装 web）——不崩验收通过、smoke 被通道挡住；**已按 Owner 指示回滚**
 
 > 口径：3.1–3.3 全部由我执行；**4599 的重启是 Owner 的动作**（本轮未获放行，故未重启）。为在不碰 4599 的前提下取得运行期证据，我用**同 profile 的冷启动**在空闲端口 **4605** 上做验收（这是本项目既往轮次用过的隔离手法，2026-09-16 装 0.5.0 时也起在 4603）。
 
@@ -556,21 +556,44 @@ UI 读数：处理失败 / 已重试模型请求（5/5） · 9s / 本轮运行�
 2. web 的 `minimax-cn` route **没有** §2.5 那行 `headers.accept-encoding: identity`（计划要求我"只加不改、不动 llm-pi-ai 行"，所以本轮**没有**替 Owner 加）。
 3. ⇒ 该实例上任何 M3 回合都会撞上 `content-encoding: br` 那条链路，与是否装 orchestra-dsh **无关**（本条可反证：把 orchestra-dsh 从 web 卸掉，这个回合同样会失败）。
 
-**3.6 回滚判定（偏离计划字面，显式登记）**
+**3.6 回滚（Owner 指示，已执行并复验）**
 
-计划写"任一步失败 ⇒ 立即回滚"。**本轮没有自动回滚**，理由与状态如下，决定权交 Owner：
+时间线：我在 03:31 完成安装并按计划停在"只差重启"；03:5x **Owner 指示"回滚，我们还没有彻底完成验证"** ⇒ 立即执行回滚。
 
-- 失败发生在**模型通道**，不在装载面；`不崩验收`（3.4）是**通过**的，三件套与 boot 清单都是干净读数；
-- 回滚**不会改变**该失败（§2.5 的成因与插件无关），却会把一个已验证可用的装载动作撤掉；
-- 且当前 4599 **尚未重启**，bundle 行只在 boot 时读取 ⇒ **该安装此刻是完全惰性的**，对你的工作实例零影响；
-- 回滚随时可做，命令与料都在：
+```console
+# ① 先校验备份 == 安装前记录（四个文件逐字匹配）
+$ shasum -a 256 <备份目录>/{package.json,cordis.patch.yml,pnpm-workspace.yaml,pnpm-lock.yaml}
+ec33e2b6cd7646c4ca02544bbd17bd2d4bb491e6e3baaf388a10bc195923589b  package.json
+bb0bfed40ab938b39a0248ab3aa65a0dbfbe85ca644946f07decf10273fabaab  cordis.patch.yml
+33b9b246f1d932d004fc0b0b914ab15bf48e7182e87d67ee238360cd83380cca  pnpm-workspace.yaml
+878a7b60746fb21ffe11029327f29ea50cfc840bfeb9e0b3cbb46a77f828b7e7  pnpm-lock.yaml
 
-```bash
-BK=~/.dsh/profiles/web/backup-0.6.0-install-20260923-033007
-cd ~/.dsh/profiles/web && cp "$BK"/package.json "$BK"/pnpm-workspace.yaml "$BK"/pnpm-lock.yaml . \
-  && rm -f node_modules/.modules.yaml node_modules/.pnpm-workspace-state-v1.json node_modules/.pnpm/lock.yaml \
-  && pnpm install && lsof -ti tcp:4599 | xargs -r kill     # 重启 4599 由 Owner 执行
+# ② 恢复三件 + 删 pnpm 状态文件 + pnpm install
+$ cp <备份>/{package.json,pnpm-workspace.yaml,pnpm-lock.yaml} .
+$ rm -f node_modules/.modules.yaml node_modules/.pnpm-workspace-state-v1.json node_modules/.pnpm/lock.yaml
+$ pnpm install                      # Done in 407ms（无依赖 ⇒ 无变更）
+
+# ③ 回滚后哈希 —— 四个文件全部回到安装前的值（逐字相同，见上）
+# ④ pnpm 不会主动删遗留目录，手动清掉本次安装的三个实体包
+$ rm -rf node_modules/{orchestra-dsh,argparse,js-yaml}
+$ ls -a node_modules/               # 与安装前一致：.bin .modules.yaml .package-map.json .pnpm
+                                    # .pnpm-workspace-state-v1.json + 8 个空的 @scope 壳（无实体包）
+$ node -e '…/node_modules/.package-map.json' → {"packages":{".":{"url":"..","dependencies":{"dsh-profile-web":"."}}}}
+$ dsh --profile web --dump-config | grep -c 'id: orchestra-'   → 0
+
+# ⑤ 回滚后冷启动复验（4605，临时起停）
+$ dsh --profile web --port 4605 --no-open     # 启动日志零报错
+  health HTTP 401 ; boot page HTTP 200
+$ grep -c 'orchestra-dsh' <boot 页>           → 0        # 客户端插件清单里已无本插件
+# 验证完即停：4605 listeners 0
+
+# ⑥ 现场归位
+$ mv backup-0.6.0-install-20260923-033007 /tmp/orchestra-web-rollback-20260923/   # 备份移出 profile，证据保留
+$ lsof -nP -iTCP:4599 -sTCP:LISTEN   → node 94859（与 02:14 侦察时的 PID 相同；全程未重启）
+  4599 HTTP 401 ；4600 HTTP 401（dev 验收实例保留）
 ```
+
+**回滚后 web profile 状态**：`package.json` `ec33e2b6…`、`pnpm-workspace.yaml` `33b9b246…`、`pnpm-lock.yaml` `878a7b60…`、`cordis.patch.yml` `bb0bfed4…` —— **四项全部等于安装前**；`node_modules` 顶层条目与安装前逐项一致；组合树 0 条 orchestra 行；**4599 全程未被重启也未被写入运行期状态**（PID 未变）。唯一与安装前不同的只有 `node_modules/.modules.yaml` / `.package-map.json` / `.pnpm-workspace-state-v1.json` 这三个 **pnpm 内部状态文件的内容**（被 `pnpm install` 重新生成，等价语义；这三个文件未纳入备份，如实登记）。
 
 **✅ Owner 动作（尚未执行）**：让 web profile 的组合生效需要重启，命令：
 
@@ -663,15 +686,15 @@ dsh --profile web --port 4599
 | 根因取证产物（`tmp/`，gitignore） | `fetch-trace-hook.mjs`（fetch 探针）、`host-request-body-1.json`（宿主原始请求 97 KB）、`host-fetch-trace.log`（状态/空 header/未解压 br 首块）、`repro-undici-encoding.mjs`、`repro-sdk-stream.mjs`、`identity-encoding.patch.yml`（一次性 4604 验证用 overlay）、`minimax-diagnosis.md`、`OWNER-runbook-team-test.md` | 诊断实例 4604（作业 `bash-404`，**保留**以便随时复现；4600 为验收实例 `bash-409`） |
 | profile 被宿主写回（**非我所改，见 F-070-3**） | `~/.dsh/profiles/dev-orchestra/cordis.patch.yml` | 02:16 由 1980 → 2135 B：`agent-default-model` +`reasoningEffort: high`；新增 `ui-settings-general`（`welcomeNoticeVersion: 2026-08-13.1`）。diff 见 §A3；**未回滚** |
 | git | commit `27b29af`（版本号）；工作区仅 `?? .pi/` | 未 push / 未 tag |
-| web 安装痕迹 | `~/.dsh/profiles/web/{package.json,pnpm-workspace.yaml,pnpm-lock.yaml,node_modules/orchestra-dsh}` + 备份目录 `backup-0.6.0-install-20260923-033007/` | 后值：package.json `ddf84312…`、pnpm-workspace.yaml `36623595…`、pnpm-lock `cae7dc12…`；**`cordis.patch.yml` 未变（`bb0bfed4…`）** |
+| web 安装→回滚痕迹（**已归位**） | 备份与证据移至 `/tmp/orchestra-web-rollback-20260923/backup-0.6.0-install-20260923-033007/`；web profile 内**无残留**（顶层条目与安装前逐项一致） | 安装期后值（留档）：package.json `ddf84312…`、pnpm-workspace.yaml `36623595…`、pnpm-lock `cae7dc12…`；回滚后四项回到 `ec33e2b6…` / `33b9b246…` / `878a7b60…` / `bb0bfed4…` |
 | 本轮新建会话（**保留，勿删**） | E2E：`session-573effd7`(网关闸通过)、`session-45b916c1`(/team 被阻断)、`session-d61e2732`(A2A)、`bcb533db-…`(子代理)、`540f4377-…`(被 stop 的子代理)、`session-69458e9a`(workspace 选错的 /team 尝试) | 另有 web 侧 4605 上的一条 smoke 会话 |
 | 未产生 | 团队记录 / 角色座位 / 归档 / 交付层产物 | 建队被 §2.6 阻断；`orchestra_E2E/orchestra/state` 仍空 |
 
 ### A2 "看这里"（三行，按 Phase 4 格式，供 Owner 现场复核）
 
-1. **URL + token**：dev/4600 → <http://127.0.0.1:4600/?token=_LA52YJk05JIokXZ5H09ecZ6gKGUlArf6gbmwu1ske8>（作业 `bash-409`，**通道已修好**，可用 M3）；web 组合证据 4605 → <http://127.0.0.1:4605/?token=5nWsG1NXH4YmHyarssSP80Y6vYRjylIUBk2juBPQUY0>。要停：`lsof -ti tcp:4600 tcp:4605 | xargs kill`；要起：`dsh --profile <profile> --port <port> --no-open`（重启换新 token）。
+1. **URL + token**：dev/4600 → <http://127.0.0.1:4600/?token=_LA52YJk05JIokXZ5H09ecZ6gKGUlArf6gbmwu1ske8>（作业 `bash-409`，**通道已修好**，可用 M3）。**web/4599 与 4605 均已不在运行本插件**（web 安装已回滚、4605 已停）。要停 4600：`lsof -ti tcp:4600 | xargs kill`；要起：`dsh --profile dev-orchestra --port 4600 --no-open`（重启换新 token）。
 2. **工作区与会话**：`orchestra_E2E`（=`/Users/yuantian/Documents/agentWorkspace/artifacts/projects/orchestra_E2E`）。可看的三条：`session-573effd7`（通道闸通过：`收到` + `orchestra_topologies` 真调用）、`session-45b916c1`（`/team` 被 preset 阻断的全过程）、`session-d61e2732` + 子代理 `bcb533db`（A2A 六工具与 toolFilter 生效）。
-3. **Owner 可以亲手做的一步**：在 4600 上**再敲一次 `/team`**——预期仍会在 `orchestra_draft` 处报 `DSH declared preset orchestra-implementer could not be resolved`（§2.6 的缺陷未修）；若你不打算重启 4599，也就**不会被 §2.5 的通道问题影响**（那只是 M3 回合的问题，4599 未重启前不受本次安装影响）。
+3. **Owner 可以亲手做的一步**：在 4600 上**再敲一次 `/team`**——预期仍会在 `orchestra_draft` 处报 `DSH declared preset orchestra-implementer could not be resolved`（§2.6 的缺陷未修）。**web/4599 现已在安装前状态**（回滚完成、PID 未变），本次安装不会再对它产生任何影响。
 
 ### A3 宿主写回的 profile diff（F-070-3 原文）
 
