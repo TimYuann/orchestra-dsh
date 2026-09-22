@@ -4,8 +4,8 @@
 > **候选 commit**：`27b29af8cad628fa68fb7f987f638c878881ef44`（`chore(release): bump version to 0.6.0`，父提交 `a0914d6`）。制品由**该 commit 的干净 detached worktree** 构建。
 > **硬前提（P0 全绿）**：`typecheck` 0 / `build` 0 / `npm test` → `# tests 295 / # pass 295 / # fail 0 / # cancelled 0`（exit 0）/ `npm pack` exit 0。
 > **判据口径（Owner 原话）**：只判**角色行为与机制是否按设计发生**；产物好不好 = 模型能力，不进判据，只作观察。
-> **停机点**：**Phase 1.3 通道闸失败 ⇒ 按停机条件「Phase 0/1 失败 ⇒ 停」停止**。Phase 2（七项功能验收）、Phase 3（web 安装）**未执行**；**4599 与 web profile 全程未写**（只读取证；读数与一处无法归因的占位重写见 §2.4）。**未向 Owner 提问**（全程只执行 + 取证）。
-> **Owner 动作**：原计划中"Phase 3 由 Owner 当场放行重启 4599"**未到达**，本报告**不需要**该动作；现在需要 Owner 决策的是 §⑤ 的三件事（是否授权控制实验 / 4600 实例是否保留 / 是否清理 F-070-3 的 profile 写回）。
+> **停机点（已解除）**：Phase 1.3 通道闸初次失败，按停机条件停表并交付报告；随后 Owner 判定该 `TRANSPORT` 属"发『继续』即可恢复"的类别并要求继续排查。**3 次「继续」+ 1 个全新会话均未恢复**，改为根因排查 ⇒ **定位到 `content-encoding: br` 压缩链路**（§2.5），加一行 route 级 `accept-encoding: identity` 后 **Phase 1.3/1.4 均通过**。Phase 2/3 仍**未执行**（2 由 Owner 亲手驱动；3 待通道结论确认后进入）。**4599 与 web profile 全程未写**（只读取证；读数与一处无法归因的占位重写见 §2.4）。
+> **Owner 动作**：① Phase 2 由 Owner 在 4600 上亲手执行（runbook 已交付）；② Phase 3 的 4599 重启仍需 Owner 当场放行；③ `dev-orchestra/cordis.patch.yml` 被我追加了 3 行注释 + `headers.accept-encoding: identity`（备份 `*.bak-before-accept-encoding-fix-20260923-025118`），是否保留/上提到其它 profile 由 Owner 决定。
 > **规模**：live 操作窗口 02:14 → 02:19（≈5 分钟）；对模型只发起 **1 个回合**（6 次传输尝试，全部失败），**0 次工具调用**。
 
 ---
@@ -20,9 +20,9 @@
 | 0.4 | 制品断言 | **通过** | `dependencies` 只有 `js-yaml`；`@deepseek-ai` 实体副本 **0**；无 `src/`/`scripts/`/`node_modules`；含 `presets/orchestra-roles.patch.yml` + `skills/orchestra-preset-authoring/SKILL.md`；无 `.ts` 源码残留、无绝对路径、无密钥 |
 | 1.1 | 装进 **dev-orchestra** + 三件套 + health | **通过** | profile `node_modules` 只有 `argparse/js-yaml/orchestra-dsh`（**连 `@deepseek-ai` 目录都不存在**）；`require.resolve` 从插件 lib 指向 **host**；health 401（= 活着且要 token） |
 | 1.2 | Ego lite 打开 `4600` | **通过** | 空间 id `3`，页面 `p1`；插件**运行时确实注册了工具**（会话 `request/header` 里 44 个工具含**本插件 18 个**：7 `a2a_*` + 11 `orchestra_*`） |
-| 1.3 | **通道闸**：M3/high 无工具最小消息的**完整终止** | **失败** | **6/6 次传输尝试全部 `TRANSPORT`**：`Anthropic stream ended without a stop reason`；`turn/end` reason = `error`；**工具调用 0 次**。UI 原文：`已重试模型请求（5/5） · 9s` / `本轮运行失败` |
-| 1.4 | 最小工具调用 | **未执行** | 停机条件：1.3 任一失败即停，**不换模型绕过** |
-| 2.1–2.5 | `/team` 名册/草案/懒加载物化、真实小活闭环、A2A 五项、新 mission→lane、混合子节点、重启身份、dismiss/activate、客户端面板 | **未执行** | 全部依赖 1.3 的通道；按停机条件不进入 |
+| 1.3 | **通道闸**：M3/high 无工具最小消息的**完整终止** | **先失败 → 修复后通过** | 初次 **6/6 次传输尝试全部 `TRANSPORT`**（`session-83ec3a88`）；**根因定位后加一行 route 级 `accept-encoding: identity` 修复，重跑通过**：`session-573effd7` 的 `turn/end = {"kind":"completed"}`、**重试 0 次**、`request/header.config = {minimax-cn, MiniMax-M3, high}`。根因与证据见 §2.5 |
+| 1.4 | 最小工具调用 | **通过**（修复后） | 同一会话第 2 回合：`tool/call {name:"orchestra_topologies", arguments:"{}"}` → `tool/result`（列出 11 个 global 模板），`turn/end=completed`、**0 重试** |
+| 2.1–2.5 | `/team` 名册/草案/懒加载物化、真实小活闭环、A2A 五项、新 mission→lane、混合子节点、重启身份、dismiss/activate、客户端面板 | **待 Owner 亲手驱动** | 通道已通；夹具与 step-by-step runbook 已交付（`tmp/p0-0.6.0-evidence/OWNER-runbook-team-test.md`） |
 | 3.1–3.6 | web profile 备份 / 只加不改 / 三件套 / live 重载判定 / Owner 重启 / 不崩验收 / 最小 smoke | **未执行** | 停机条件「Phase 0/1 失败 ⇒ 停」；**web 一行未改**（读数见 §2.4；顺带发现 web **当前根本没装 orchestra-dsh**，见 F-070-4） |
 
 ### 本轮登记（只登记，不修）
@@ -322,19 +322,95 @@ $ grep -i orchestra ~/.dsh/profiles/web/pnpm-workspace.yaml
 
 ---
 
+### 2.5 根因定位：`content-encoding: br` 压缩链路（Phase 1.3 失败的真正原因）
+
+**症状回顾**：`minimax-cn / MiniMax-M3 / high` 的每个回合都在第一次模型调用就失败并重试 5 次，`failure={"message":"Anthropic stream ended without a stop reason","code":"TRANSPORT"}`，**0 次工具调用**；3 次「继续」+ 1 个全新会话（共 30 次传输尝试）**全部同签名**。
+
+**先排除的假设（每条都有反证，故不作为结论）**
+
+| 假设 | 反证 |
+|---|---|
+| key 失效 / 端点错误 | 直接 `curl https://api.minimaxi.com/anthropic/v1/messages` → **HTTP 200**、`stop_reason:"end_turn"`、内容 "Pong!"；凭据 sha256 前 12 位 `dee63b86b766` 与两份 `.bak-before-*` 一致（未被改坏） |
+| profile 里 minimax-cn 少写字段 | `dsh --dump-default-config` 显示宿主默认 `llm-pi-ai` **不带任何 config**；provider 目录来自 `@earendil-works/pi-ai`（`baseUrl=https://api.minimaxi.com/anthropic`、`api=anthropicMessagesApi()`）。`dsh-llm-pi-ai` 的合并语义是 *"merging the installed catalog defaults under the configured entries … keeps an existing `providers: { deepseek: { apiKeyEnv: … } }` profile working untouched"* ⇒ 只写 `apiKeyEnv` 合法且完整 |
+| 模型/推理等级组合不对 | 09-22 跑通 **18 回合全 `completed`** 的会话（`session-278b59b7`）用的是**逐字相同**的 `{minimax-cn, MiniMax-M3, high}` |
+| 工具 schema 非法（"function parameters is empty 2013"） | **这是我一次错误测试的假象**：我用会话日志里的 `parameters` 键构造请求，而 pi-ai 上线时发的是 `input_schema`。按真实形状重发后，44 个工具（含 4 个 `properties:{}` 的）**全部 HTTP 200 + message_stop** |
+| 本地代理 `http_proxy=127.0.0.1:10808` 破坏 SSE | `--noproxy '*'` 直连结果完全相同；同代理下 `curl` 与裸 `node`+`@anthropic-ai/sdk` 流式**都能跑通** |
+| 会话被污染 | 全新会话（`session-c7fc1412`）同样 6/6 失败 |
+| `max_tokens:512000` / `thinking:{type:"enabled"}` / `cache_control` / `betas` 触发 400 | 逐项加在已知可用的 44 工具请求上，curl 全部 **200 + message_stop** |
+
+**决定性取证：抓宿主自己的请求**（不改任何 profile）：用一个 `NODE_OPTIONS="--import fetch-trace-hook.mjs"` 注入的 fetch 探针，在**一次性诊断实例 4604** 上重放同一回合，捕获到：
+
+```json
+{"url":"https://api.minimaxi.com/anthropic/v1/messages?beta=true","method":"POST",
+ "bodyBytes":97137,"status":200,"ct":null,"headers":{},
+ "reqHeaders":{"accept":"application/json","anthropic-beta":"interleaved-thinking-2025-05-14",
+               "anthropic-version":"2023-06-01","x-stainless-package-version":"0.123.0", ...}}
+{"responseFirstChunk":"\u0005�\u0000\u0000�̩�\u0004�\u001egM\u0001\u001e�:3�n�W+�~..."}
+```
+
+⇒ 宿主拿到的是 **HTTP 200 + 空 header 集 + 一段二进制 body**（`05 ad 00 00 …`），**不是 SSE**。6 次重试**每次都是同一形态**。
+
+**回放定位到压缩**（同一份 body、同一端点）：
+
+```console
+$ curl -H 'accept: application/json' -H 'anthropic-beta: interleaved-thinking-2025-05-14' \
+       -H 'accept-encoding: gzip, deflate, br, zstd' -d @host-request-body-1.json \
+       'https://api.minimaxi.com/anthropic/v1/messages?beta=true' -D -
+HTTP/2 200
+content-type: text/event-stream; charset=utf-8
+vary: Accept-Encoding
+content-encoding: br                     # ← Brotli
+# body 首 8 字节 = 05ad0000c4ef9dd3     ← 与宿主收到的完全同一形态；grep 'event:' = 0
+$ # 去掉 accept-encoding 再发一次（或不带 br）：body 首 8 字节 = 6576656e743a206d（"event: m"）= 正常 SSE，message_stop 在场
+```
+
+**机制闭环**（读源码得到的两处）：
+
+1. `@earendil-works/pi-ai/dist/api/anthropic-messages.js`：SSE 解析器 `iterateSseMessages` 只认 `event:`/`data:` 行；body 是压缩字节时**一个事件都产生不了** ⇒ `output.stopReason` 停在 `"pending"`：
+   ```js
+   if (output.stopReason === "pending") {
+     throw new Error("Anthropic stream ended without a stop reason");
+   }
+   ```
+2. `@deepseek-ai/dsh-llm-pi-ai/lib/index.js` 把该文案归类为可重试的传输错误：
+   ```js
+   if (/stream ended (?:before|without)\b/i.test(message)) return "TRANSPORT";
+   ```
+   ⇒ 于是"服务端把 SSE 压成 Brotli、客户端没解开"被报成"流没有停止原因"，并触发 5 次注定失败的重试。
+
+**修复（一行 route 级 header）**：`api.minimaxi.com` 只在客户端声明 `br` 时才压缩；客户端不声明即返回明文 SSE。因此在 minimax-cn 这条 route 上强制 `accept-encoding: identity`：
+
+```yaml
+      minimax-cn:
+        apiKeyEnv: MINIMAX_CN_API_KEY
+        headers:
+          accept-encoding: identity
+```
+
+**修复验证（两级）**
+
+| 级别 | 实例 | 结果 |
+|---|---|---|
+| 一次性诊断实例 | `4604`（`--patch tmp/p0-0.6.0-evidence/identity-encoding.patch.yml`） | 同一请求 `responseFirstChunk = "event: message_start\ndata: {\"…"`；UI `已完成工作 / 用时 1秒 / 收到`，0 失败标记 |
+| **正式验收实例** | **`4600`**（fix 写进 `dev-orchestra/cordis.patch.yml` 后重启） | Phase 1.3 `session-573effd7`：`turn/end={"kind":"completed"}`、**重试 0**；Phase 1.4 同会话 `tool/call orchestra_topologies` → `tool/result`、`turn/end=completed`、**0 重试** |
+
+**仍未查清的一点（登记为宿主层未决项，不属本插件）**：裸 `node` 进程里 undici 能正常解 `content-encoding: br`（实测四种 `accept-encoding` 全部拿到明文 SSE，header 完整），但**宿主进程**里同一请求拿到的是**空 header + 未解压的 br 字节**。差异在宿主的 HTTP 路径（`@anthropic-ai/sdk` 0.123.0 + Node 22.22 的 EnvHttpProxyAgent 链路）内部，本轮未继续深挖；**本轮的修复是绕过压缩，不是修好解压**。⇒ 建议上游复现并修：任何同样声明 `br` 的服务端都会让该路径上的流式请求静默失败，并被误报成 TRANSPORT。
+
+
+
 ## ③ 分层定位
 
 | 层 | 判定 | 读数 |
 |---|---|---|
 | **制品层** | **通过** | 78 文件 / 351,882 B / sha256 `8250b6ea…`；`dependencies` 仅 `js-yaml`；22 peer；无 `@deepseek-ai` 副本、无 `src`/`scripts`/`node_modules`、无 `.ts` 源码、无绝对路径、无密钥；`presets/orchestra-roles.patch.yml` + `skills/` 在内；`lib/` 与本次构建**逐字节一致**；来自 commit `27b29af` |
 | **宿主解析层** | **通过** | profile 内**无** `@deepseek-ai` 实体副本（`node_modules/` 只有 `argparse/js-yaml/orchestra-dsh`）；`require.resolve` 从插件 lib 指向 **host**（`…/dsh/node_modules/@deepseek-ai/…`）；组合树含 `orchestra-bundle/orchestra-a2a/orchestra-manager`；**运行时** 44 个工具里含本插件 18 个 ⇒ 插件装载 + 工具注册成功 |
-| **名册与预设层** | **未触及** | 未到 `/team`、未建队、未物化角色（无 `orchestra_create`，`orchestra_E2E/orchestra/state` 仍为空） |
-| **会话与交接层** | **失败点** | 会话 `session-83ec3a88…`：`turn/end` = `{"kind":"error", … code:"TRANSPORT"}`；6 次 `assistant/attempt` 全失败；**0 工具调用**；回合在第一次模型流就断，属"通道未建立"，不是"交接/记录"环节 |
-| **恢复层** | **未触及** | 未做重启、未做 dismiss/activate、未做归档 |
+| **名册与预设层** | **待 Owner 驱动** | 通道已通后未到 `/team`、未建队、未物化角色（`orchestra_E2E/orchestra/state` 仍为空） |
+| **会话与交接层** | **修复后通过** | 修复前：`session-83ec3a88…` 的 `turn/end` = `{"kind":"error", … code:"TRANSPORT"}`、6 次 attempt 全败、0 工具调用。修复后：`session-573effd7…` 两回合均 `turn/end=completed`、**0 重试**、`tool/call orchestra_topologies` → `tool/result` |
+| **恢复层** | **未触及** | 未做角色身份重启、未做 dismiss/activate、未做归档（实例重启本身已做：修复需重启 4600） |
 | **web 装载层** | **未执行** | 停机条件拦截；web profile 未被写入（读数见 §2.4；`web/cordis.yml` 出现一处无法归因的占位重写，内容 hash 与 dev-orchestra 的同名文件相同） |
-| **（补充）供应商传输层** | **失败（阻断）** | `provider: minimax-cn`、`model: MiniMax-M3`、`reasoningEffort: high`；失败 message `Anthropic stream ended without a stop reason`、code `TRANSPORT`；每次尝试 ~0.9–1.7 s 即结束；`request/header` 已被正常构造并发出（凭证引用 `MINIMAX_CN_API_KEY` 在 `~/.dsh/.credentials.yaml` 的 `refs` 里存在，长度 125，**值未读取/未输出**），⇒ 不是"没配 key"这一类 401 失败，而是**流已开始但无终止原因** |
+| **供应商/HTTP 编码层** | **根因所在（已用一行 route header 绕过）** | `api.minimaxi.com` 在客户端声明 `br` 时以 `content-encoding: br` 回传 SSE；宿主 HTTP 路径把**未解压的 br 字节 + 空 header 集**交给 pi-ai 的 SSE 解析器 ⇒ `stopReason` 停在 `"pending"` ⇒ 被 `dsh-llm-pi-ai` 归类为 `TRANSPORT` 并重试 5 次。`curl` / 裸 `node`+SDK 在同代理下均正常（能解 br），只有宿主进程这一条路径拿不到明文 ⇒ 绕过方式：该 route 强制 `accept-encoding: identity`。详见 §2.5 |
 
-**定位结论**：阻断点在**供应商传输层**，`orchestra-dsh 0.6.0` 的**制品层与宿主解析层均无异常**（插件仅贡献工具表，且 0 次工具调用）。按现有证据**不能**判定与插件无关的最后一公里是"请求内容"还是"供应商/网关"——**该判定需要一个控制实验（见 §⑤），本轮按停机条件未做**。
+**定位结论**：阻断点**不在** `orchestra-dsh 0.6.0` 的制品层或宿主解析层（插件只贡献工具表，失败回合 0 次工具调用），而在**宿主 HTTP 路径对 `content-encoding: br` 流式响应的处理**——一个与插件无关、但会让该 profile 上任何 M3 回合静默失败的宿主侧问题。修复以 route 级 header 绕过，**Phase 1.3/1.4 已通过**；Phase 2 由 Owner 亲手驱动。
 
 ---
 
@@ -342,7 +418,7 @@ $ grep -i orchestra ~/.dsh/profiles/web/pnpm-workspace.yaml
 
 **未做（按停机条件或计划"不做"）**
 
-1. Phase 1.4 最小工具调用；Phase 2 **全部 7 项**（`/team` 草案与逐角色 `runtime`、批准与懒加载物化、`request/header` 一致性、真实小活闭环含**至少一次打回**、A2A 五项 + `a2a_stop` + 冷会话唤醒、运行中新 mission→lane（"0 新座位 + 新增 lane"）、混合 `execution:"subagent"` 与续派、**重启后身份**、`orchestra_dismiss`→归档→`orchestra_activate`、设置面板与控制台无报错）。
+1. Phase 2 **全部 7 项**（`/team` 草案与逐角色 `runtime`、批准与懒加载物化、`request/header` 一致性、真实小活闭环含**至少一次打回**、A2A 五项 + `a2a_stop` + 冷会话唤醒、运行中新 mission→lane（"0 新座位 + 新增 lane"）、混合 `execution:"subagent"` 与续派、**重启后身份**、`orchestra_dismiss`→归档→`orchestra_activate`、设置面板与控制台无报错）——**改为由 Owner 在 4600 上亲手驱动**（Phase 1.4 已由本轮完成并通过）。
 2. Phase 3 全部（备份/只加不改/三件套/live 重载判定/**Owner 放行重启 4599**/不崩验收/最小 smoke）；**4599 与 web profile 一行未改**。
 3. 确定性交付层（worktree/租约/合并门/证据层）——计划明确"不做，留给下一个版本号"。
 4. 未 push / 未 tag / 未 publish；未碰 4601、旧 dev、历史会话；未用 browser-use。
@@ -387,7 +463,8 @@ $ grep -i orchestra ~/.dsh/profiles/web/pnpm-workspace.yaml
 | 失败会话（**保留，勿删**） | `~/.dsh/sessions/--Users-yuantian-Documents-agentWorkspace-artifacts-projects-orchestra_E2E--/session-83ec3a88-7371-455b-8ffa-c49f1860a7cf/` | `session.v4.jsonl.zstd` 43,694 B / 35 events |
 | 运行中实例 | 作业 `bash-307`：`dsh --profile dev-orchestra --port 4600 --no-open` | URL+token 见 §A2；**按计划不清理，留给 Owner 查看** |
 | 浏览器 | Ego lite 空间 id `3`（页面 `p1` 停在 4600 的失败会话上） | 未 `finish()`（任务因失败停止，按 skill 规则保留） |
-| profile 改动（dev-orchestra） | `package.json`（+dep `orchestra-dsh`、bundles +1）、`pnpm-workspace.yaml`（+`minimumReleaseAgeExclude`） | 备份 `*.bak-20260923-021406`；`node_modules/` 新增 3 包 |
+| profile 改动（dev-orchestra） | `package.json`（+dep `orchestra-dsh`、bundles +1）、`pnpm-workspace.yaml`（+`minimumReleaseAgeExclude`）、**`cordis.patch.yml`：minimax-cn route 追加 `headers.accept-encoding: identity`（本轮根因修复）** | 备份 `*.bak-20260923-021406`、**`cordis.patch.yml.bak-before-accept-encoding-fix-20260923-025118`**（Owner 02:38 那次编辑之后的现场）；`node_modules/` 新增 3 包 |
+| 根因取证产物（`tmp/`，gitignore） | `fetch-trace-hook.mjs`（fetch 探针）、`host-request-body-1.json`（宿主原始请求 97 KB）、`host-fetch-trace.log`（状态/空 header/未解压 br 首块）、`repro-undici-encoding.mjs`、`repro-sdk-stream.mjs`、`identity-encoding.patch.yml`（一次性 4604 验证用 overlay）、`minimax-diagnosis.md`、`OWNER-runbook-team-test.md` | 诊断实例 4604（作业 `bash-404`，**保留**以便随时复现；4600 为验收实例 `bash-409`） |
 | profile 被宿主写回（**非我所改，见 F-070-3**） | `~/.dsh/profiles/dev-orchestra/cordis.patch.yml` | 02:16 由 1980 → 2135 B：`agent-default-model` +`reasoningEffort: high`；新增 `ui-settings-general`（`welcomeNoticeVersion: 2026-08-13.1`）。diff 见 §A3；**未回滚** |
 | git | commit `27b29af`（版本号）；工作区仅 `?? .pi/` | 未 push / 未 tag |
 | 未产生 | 团队记录 / 角色座位 / web 备份目录 / 除一张截图外的任何产物 | web 未安装（且 web 侧**本来就没有** orchestra-dsh，F-070-4）；`orchestra_E2E/orchestra/state` 仍空 |
@@ -494,4 +571,4 @@ $ ls -la ~/.dsh/profiles/web/                                     # 无安装动
 
 ---
 
-**一句话总结**：**0.6.0 制品与 dev 装载全绿（295/295、78 文件、三件套通过、18 个插件工具已注册），但通道闸在 `minimax-cn / MiniMax-M3 / high` 上 6/6 次传输尝试全部 `Anthropic stream ended without a stop reason`（0 工具调用），据此按停机条件停表——Phase 2/3 未执行，4599 与 web 全程只读未写，复现了兄弟项目报过的同一签名；另登记三项观察：会话日志已换 v4（仓库检查脚本仍认 v3）、宿主把 UI 选择写回了 dev-orchestra 的 patch、web 侧当前其实并未安装 orchestra-dsh（与 `DSH-INTEGRATION.md` 记载不符）。**
+**一句话总结**：**0.6.0 制品与 dev 装载全绿（295/295、78 文件、三件套通过、18 个插件工具已注册）；Phase 1.3 通道闸初次 6/6 次 `TRANSPORT` 失败，根因定位为「服务端把 SSE 以 `content-encoding: br` 回传、宿主 HTTP 路径未解压就交给 SSE 解析器」（§2.5），在 minimax-cn route 加一行 `accept-encoding: identity` 后 4600 上 Phase 1.3/1.4 均通过（`turn/end=completed`、0 重试、`tool/call orchestra_topologies` 成功）；Phase 2 改由 Owner 亲手驱动，Phase 3 未执行、4599 与 web 全程只读未写。**
