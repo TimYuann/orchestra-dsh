@@ -398,6 +398,61 @@ $ # 去掉 accept-encoding 再发一次（或不带 br）：body 首 8 字节 = 
 
 
 
+### 2.6 Phase 2（`/team`）——`orchestra_draft` 被 **preset 声明未装载** 阻断（**插件侧缺陷**，非模型能力、非环境）
+
+**现场**：Owner 指示继续后，我在 4600 上用 **orchestra_E2E 工作区 + MiniMax-M3/high** 新建会话，界面里敲 `/team`（slash 命令不经 API 通道）。orchestra 接受了请求并进入交互式 onboarding（Goal 选 4「E2E orchestra smoke test」→ Constraints 勾 Strict AC + reviewer rounds 并写入本轮约束 → 提交）。随后 driver 连调 5 次 `orchestra_draft`，全部失败，最终向用户抛出一个"要么重建 tarball / 要么改用子代理"的四选一。
+
+**工具返回的原文（会话 `session-45b916c1`，权威读数，不是模型自述）**
+
+```
+Error: cannot create a charter draft: role blueprint pre-parsing failed: DSH declared preset orchestra-implementer could not be resolved
+Error: cannot create a charter draft: role blueprint pre-parsing failed: DSH declared preset preset-orchestra-v04-implementer-v1 could not be resolved
+Error: cannot resolve the charter topology: inlineTopology is not a valid topology config:
+       topology id "trio-parseDuration-fix" must use lower-kebab syntax. …
+Error: cannot create a charter draft: draft draft-fix-parseDuration-p0-0.6.0-team-smoke was not found
+```
+
+**根因链（每一步都可复现）**
+
+1. `orchestra-role-presets.js` 的解析路径**只问宿主注册表**（旧 catalog/roots 方案已在该版本删除）：
+   ```js
+   const presets = ctx.get("agentPresets");
+   try { await presets.resolve(id); }
+   catch (error) { throw new RolePresetError("preset_unavailable", "DSH declared preset " + id + " could not be resolved", …); }
+   ```
+   （函数签名里 `_cwd` / `_globalRoot` 都已被下划线忽略。）
+2. 注册表要拿到角色预设，只能靠 bundle patch 里的声明。0.6.0 的 `cordis.patch.yml` 末尾是：
+   ```yaml
+   - include: ./presets/orchestra-roles.patch.yml
+   ```
+   而 **patch 语义里根本没有 `include`**——`@deepseek-ai/cordis-plugin-include/lib/index.js` 的 `applyEntryPatches` 只解构：
+   ```js
+   const { id, insert, name, ...overrides } = patch;
+   ```
+   该文件的注释明写：*"A patch that matches nothing warns and is skipped."* ⇒ 这一行**不匹配任何行、被静默跳过**。
+3. **受控实验**（`--patch` overlay + `--dump-config`，不改任何 profile）：
+   | overlay 内容 | 结果（`test-leaf-preset` 行数） |
+   |---|---|
+   | 直接把 `- insert:` 写进 overlay（对照组） | **2**（生效） |
+   | `- include: /abs/path/leaf.yml` | **0** |
+   | `- include: ./leaf.yml` | **0** |
+4. **组合树实测**：`dsh --profile dev-orchestra --dump-config` 里的 agent-preset 行只有 DSH 自带 4 条（`preset-standard` / `preset-ptc` / `preset-minimal` / `preset-cordis`）；插件声明的 **12 条**（`preset-orchestra-*`）**一条都不在**。UI 的 preset 选择器同样只列出这 4 个模式。
+5. **回归对比**：`compat` profile 里的 **0.5.0** 副本 `cordis.patch.yml` **既没有 include 行、也没有 presets 目录**——那一版的角色预设靠「全局 catalog 目录 + `agent-presets.roots` 声明」（`dev` profile 至今保留 `roots: ~/.dsh/orchestra/catalog-presets`）交付。0.6.0 改成"声明式注册"后，**新路径是死的，旧路径又被代码删掉** ⇒ 这是 **0.6.0 引入的回归**，且与 profile 无关（任何 profile 都拿不到这 12 条）。
+
+**归属判定（按 Owner 要求：区分"插件设计问题"与"模型理解不了"）**
+
+| 现象 | 归属 | 依据 |
+|---|---|---|
+| `orchestra_draft` 报 preset 无法解析、`/team` 无法建队 | **插件侧缺陷（高置信）** | 上述受控实验 + 组合树 + 0.5.0 对比；与模型、与环境、与 profile 都无关 |
+| driver 把根因判成"`@deepseek-ai/dsh-agent-preset` 只在 devDependencies、不进 tarball，所以 profile 里缺模块" | **模型能力（判断错误）** | 该包按本仓硬规则**必须**留在 peerDependencies（宿主提供）；实测 `require.resolve('@deepseek-ai/dsh-tools', {paths:[插件 lib]})` → host 路径，插件运行时也照常装载并注册了 18 个工具。tarball **确实**带了 `presets/orchestra-roles.patch.yml`（28,649 B）。模型抓到一个"看起来可疑"的事实，编出了一条错误因果链，并据此建议重建 tarball/改依赖——**若照做会直接违反防崩硬规则** |
+| driver 把 **entry id**（`preset-orchestra-v04-implementer-v1`）当成 preset 名传参 | **模型能力（用错标识符）** | 声明里 entry id 是 `preset-…`，preset 自身的 id 是 `orchestra-…`；工具报错已明确回显它传了什么 |
+| inlineTopology 报 `"trio-parseDuration-fix" must use lower-kebab syntax` | **模型能力（违反已声明的 id 约束）** | 工具报错信息本身是精确且可执行的 |
+| 该回合 110 步、7M tok 都在"调基础设施" | **模型能力（策略）** | 观察：把预算花在猜 id 与翻 profile 上，而不是先向用户确认 |
+
+> **结论（本项）**：Phase 2 的主链（`/team` → 章程草案 → `orchestra_create` → 懒加载物化 → 派活）**被一个确定的插件缺陷阻断**，按计划"机制没按设计发生 ⇒ 登记发现、继续下一项"，不在现场改代码、不重建 tarball、不绕路。可达的相邻项（A2A 控制面、混合子节点、客户端面板）继续做；依赖建队的项（lane / dismiss→activate / 重启后角色身份）本轮**未取得**。
+
+
+
 ## ③ 分层定位
 
 | 层 | 判定 | 读数 |
@@ -410,7 +465,7 @@ $ # 去掉 accept-encoding 再发一次（或不带 br）：body 首 8 字节 = 
 | **web 装载层** | **未执行** | 停机条件拦截；web profile 未被写入（读数见 §2.4；`web/cordis.yml` 出现一处无法归因的占位重写，内容 hash 与 dev-orchestra 的同名文件相同） |
 | **供应商/HTTP 编码层** | **根因所在（已用一行 route header 绕过）** | `api.minimaxi.com` 在客户端声明 `br` 时以 `content-encoding: br` 回传 SSE；宿主 HTTP 路径把**未解压的 br 字节 + 空 header 集**交给 pi-ai 的 SSE 解析器 ⇒ `stopReason` 停在 `"pending"` ⇒ 被 `dsh-llm-pi-ai` 归类为 `TRANSPORT` 并重试 5 次。`curl` / 裸 `node`+SDK 在同代理下均正常（能解 br），只有宿主进程这一条路径拿不到明文 ⇒ 绕过方式：该 route 强制 `accept-encoding: identity`。详见 §2.5 |
 
-**定位结论**：阻断点**不在** `orchestra-dsh 0.6.0` 的制品层或宿主解析层（插件只贡献工具表，失败回合 0 次工具调用），而在**宿主 HTTP 路径对 `content-encoding: br` 流式响应的处理**——一个与插件无关、但会让该 profile 上任何 M3 回合静默失败的宿主侧问题。修复以 route 级 header 绕过，**Phase 1.3/1.4 已通过**；Phase 2 由 Owner 亲手驱动。
+**定位结论**：两个阻断点分别落在**宿主 HTTP 编码层**（§2.5：br 未解压 → 误报 TRANSPORT，已用 route 级 header 绕过，Phase 1.3/1.4 通过）与**插件声明层**（§2.6：bundle patch 的 `- include:` 在 patch 语义里无效 ⇒ 12 条 role preset 从未注册 ⇒ `/team` 主链不可用）。`orchestra-dsh 0.6.0` 的**制品层与宿主解析层无异常**（18 个工具照常注册、`orchestra_topologies` 可用）。Phase 2 的可达相邻项（A2A 控制面、混合子节点、客户端面板）继续取证；依赖建队的项未取得。
 
 ---
 
