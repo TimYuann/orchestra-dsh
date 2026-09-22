@@ -10,6 +10,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   PRINCIPLES_SECTION_NAME,
   PRINCIPLES_SECTION_TEXT,
@@ -43,22 +44,38 @@ test("the principles reach the driver on both surfaces", () => {
   // The always-on half must stay small: it is paid for on every request of
   // every session, so it carries decisions rather than their reasoning.
   assert.ok(section.text.length < 3500, `always-on principles section is ${section.text.length} chars`);
-  for (const rule of ["GRAPH", "NODES", "RIGHT-SIZE", "BACKEND", "EDGES", "AUTHORITY", "UNATTENDED"]) {
+  for (const rule of ["MISSION", "SCALE", "BACKEND", "LANES", "HANDOFF", "LIMITS", "PRESETS"]) {
     assert.ok(section.text.includes(rule), `the section must state the ${rule} rule`);
   }
   // The one rule whose violation is a safety bug rather than a style problem.
   assert.match(section.text, /toolFilter narrows availability and is NOT a permission guarantee/);
 
-  assert.equal(runtime.skills.length, 1);
+  assert.equal(runtime.skills.length, 2);
   const skill = runtime.skills[0];
   assert.equal(skill.name, PRINCIPLES_SKILL_NAME);
   assert.equal(skill.source, "runtime");
   assert.ok(skill.description.length > 40 && skill.whenToUse.length > 40, "routing metadata is what gets the skill loaded");
   assert.ok(skill.content.includes(PRINCIPLES_SKILL_CONTENT));
   // The skill is the elaborated half: it carries the checklist and the why.
-  assert.match(skill.content, /## Checking the graph before you propose/);
+  assert.match(skill.content, /## Before dispatch/);
   assert.match(skill.content, /joins the driver's LIVE Agent Preset/);
   assert.ok(skill.content.length > section.text.length, "the skill must carry more than the section");
+  const presetSkill = runtime.skills[1];
+  assert.equal(presetSkill.name, "orchestra-preset-authoring");
+  assert.equal(presetSkill.content, readFileSync(new URL("../skills/orchestra-preset-authoring/SKILL.md", import.meta.url), "utf8"));
+  assert.match(presetSkill.content, /editing-cordis-compositions/);
+  assert.match(presetSkill.content, /- insert:/);
+  assert.match(presetSkill.content, /restart and resume/);
+});
+
+test("driver guidance permits direct work and is truthful about runtime enforcement", () => {
+  assert.match(PRINCIPLES_SECTION_TEXT, /A small task needs no graph or task-card file/);
+  assert.match(PRINCIPLES_SECTION_TEXT, /do not enforce attempt caps or deadlines/);
+  assert.match(PRINCIPLES_SECTION_TEXT, /All members use approval never/);
+  assert.match(PRINCIPLES_SKILL_CONTENT, /A2A remains usable without an Orchestra team/);
+  assert.match(PRINCIPLES_SKILL_CONTENT, /Native children already have durable logs and continuation/);
+  assert.match(PRINCIPLES_SKILL_CONTENT, /a new lane need not add a member/);
+  assert.doesNotMatch(PRINCIPLES_SECTION_TEXT + PRINCIPLES_SKILL_CONTENT, /entropy|strictly \$O|limits are enforced by the runtime/);
 });
 
 test("a deployment without a skill registry keeps the rules, not silence", () => {

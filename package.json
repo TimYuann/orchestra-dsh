@@ -37,7 +37,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && tsdown",
+    "build": "tsc -p tsconfig.json && node scripts/build-role-presets.mjs && tsc -p tsconfig.client.json && tsdown",
     "dev": "node --import tsx scripts/loader.mjs",
     "dev:harness": "dsh web --patch ./cordis.patch.yml",
     "test": "npm run build && node --test scripts/test-v0.3.0.mjs scripts/test-orchestra-state.mjs scripts/test-orchestra-archive.mjs scripts/test-orchestra-topology.mjs scripts/test-session-blueprint.mjs scripts/test-governed-provisioning.mjs scripts/test-orchestra-role-presets.mjs scripts/test-a2a-transport.mjs scripts/test-receipt-store.mjs scripts/test-charter-store.mjs scripts/test-orchestration-document.mjs scripts/test-orchestration-charter.mjs scripts/test-orchestra-graph.mjs scripts/test-bounded-run.mjs scripts/test-feature-development.mjs scripts/test-bug-diagnosis-and-fix.mjs scripts/test-architecture-decision.mjs scripts/test-refactor-and-migration.mjs scripts/test-audit-and-hardening.mjs scripts/test-recovery.mjs scripts/test-cp8-notices.mjs scripts/test-tool-schemas.mjs scripts/test-principles.mjs scripts/test-team-change-bus.mjs scripts/test-node-stall.mjs scripts/test-subagent-node.mjs scripts/test-v05-slimming.mjs scripts/test-active-team-mutate.mjs scripts/test-fleet-lifecycle.mjs scripts/test-topology-lanes.mjs scripts/test-orchestra-preferences.mjs scripts/test-workspace-binding.mjs scripts/test-add-lanes.mjs scripts/test-role-session-single-path.mjs scripts/test-role-blueprint-single-prepare.mjs scripts/test-role-preset-roster.mjs scripts/test-materialization-failure-history.mjs",

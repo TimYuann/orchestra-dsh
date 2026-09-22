@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { load } from "js-yaml";
 import {
   ALL_BUILTIN_ROLE_PRESETS,
   BUILTIN_ROLE_PRESETS,
@@ -16,6 +17,18 @@ import {
 } from "../lib/orchestra-role-presets.js";
 import { blueprintStoreFor, prepareGovernedBlueprint, preflightGovernedRequiredTools, SessionBlueprintError } from "../lib/session-blueprint.js";
 import { prepareGovernedRolePlan } from "../lib/orchestra.js";
+
+test("shipped preset declarations preserve the complete catalog composition", async () => {
+  const patch = load(await readFile(new URL("../presets/orchestra-roles.patch.yml", import.meta.url), "utf8"));
+  const rows = patch.flatMap((operation) => operation.insert ?? []);
+  assert.equal(rows.length, ALL_BUILTIN_ROLE_PRESETS.length);
+  for (const spec of ALL_BUILTIN_ROLE_PRESETS) {
+    const row = rows.find((entry) => entry.config?.id === spec.id);
+    assert.ok(row, `missing declared preset ${spec.id}`);
+    assert.equal(row.name, "@deepseek-ai/dsh-agent-preset");
+    assert.deepEqual(row.config.plugins, load(spec.cordisYml), `${spec.id}: shipped persona/tools must match catalog`);
+  }
+});
 
 function nativeFs() {
   return {

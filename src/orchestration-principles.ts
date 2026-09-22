@@ -1,145 +1,84 @@
-/**
- * The orchestration method, as the driver is taught it.
- *
- * What this plugin stores is higher-order than a DAG: it is HOW to design a
- * multi-agent advancement orchestration, and a graph is that method's product.
- * `/team` is a three-step pipeline — sketch the mission WITH the user, turn it
- * into a graph under these principles, then explain the graph and dispatch
- * only after the user approves — so the principles are the product, and a
- * graph drawn without them is just a shape.
- *
- * They are delivered twice, on purpose, because the two halves have different
- * jobs:
- *
- * - {@link PRINCIPLES_SECTION_TEXT} is a SHORT system-prompt section. It is
- *   present on every request, so it carries only the decisions that change what
- *   a driver does — never the reasoning behind them, which would be paid for on
- *   every single turn of every session.
- * - {@link PRINCIPLES_SKILL_CONTENT} is a skill body, loaded when the driver is
- *   actually about to decompose a mission. It carries the worked detail, the
- *   full checklist, and the why.
- *
- * The split is also the degradation story: a deployment that composes no skill
- * registry still gets the rules that matter, so the driver never silently loses
- * its discipline — it only loses the elaboration.
- *
- * @module orchestra-dsh/orchestration-principles
- */
-
+/** Thin driver guidance, with detailed methods loaded only when needed. */
+import { readFileSync } from "node:fs";
 import type { Context } from "@deepseek-ai/cordis";
-// Type-only: pulls in the `ctx.skills` Context augmentation without a runtime
-// import (the registry is provided by the host composition).
 import type {} from "@deepseek-ai/dsh-skill";
 
-/** Kebab-case identifier the model addresses this skill by. */
 export const PRINCIPLES_SKILL_NAME = "orchestration-principles";
-
-/** Prompt-section name; distinct from the tool guidance so it can be read on its own. */
+export const PRESET_AUTHORING_SKILL_NAME = "orchestra-preset-authoring";
 export const PRINCIPLES_SECTION_NAME = "orchestra:principles";
 
-/**
- * The rules that change behaviour, on every request.
- *
- * Kept deliberately short: anything a driver would only need while actively
- * decomposing belongs in the skill, not here.
- */
+// Use the shipped playbook itself, not a second abbreviated runtime copy.
+export const PRESET_AUTHORING_SKILL_CONTENT = readFileSync(
+  new URL("../skills/orchestra-preset-authoring/SKILL.md", import.meta.url),
+  "utf8",
+);
+
 export const PRINCIPLES_SECTION_TEXT = [
-  "Orchestra principles (the method behind /team; load the `orchestration-principles` skill before you decompose a mission):",
-  "GRAPH: a bounded acyclic graph — finite nodes, every path finite. Loops are its ONLY back edge; each needs an attempt cap plus three exits (pass / retry / capExhausted). A mission usually has several Loops of 2-4 nodes; more nodes is not more rigour.",
-  "NODES: one node, one decidable responsibility — if you cannot say in one sentence what makes it complete, split it. Split for ATTENTION (a focused context explores deeper); merge two duties that need the same deep context.",
-  "TEAM DYNAMICS: one working directory, ONE team, one closure owner. A new objective for the same project is a NEW LANE on the running graph (orchestra_add_lanes), never a second team.",
-  "RIGHT-SIZE & TASK CARDS: do not expand beyond necessity (worker cost ≈ entropy × model price). Low-entropy work: the driver writes the task card itself, in a few sentences, and spins up nobody. High-entropy work: dispatch to a reserved planner/architect, who returns hard facts plus a drafted card body through its ONLY write channel (`orchestra/reports/`) — the DRIVER persists cards under `orchestra/tasks/`, since a read-only role has no write path there. The human approves the Macro Charter once; micro task cards run JIT inside it.",
-  "BACKEND: a node that needs its own Agent Preset, the ability to ask the user for approval, its own cwd, or a real read-only guarantee MUST be a session node; anything else is a cheaper subagent node. A subagent inherits the driver's composition and permission, so toolFilter narrows availability and is NOT a permission guarantee — never claim read-only for one.",
-  "PRESET: when a node looks like it wants a role-specific preset, ASK THE USER whether to build that preset into the graph. It is their composition, their cost, and their call — do not decide it silently, and do not fall back to a generic node to avoid asking.",
-  "REACHABILITY: a subagent node talks ONLY to the driver. Native delegation authorizes on the direct-parent edge alone, so a session node cannot message a subagent node and a subagent node cannot reach a session node. Route every exchange with a subagent node THROUGH the driver; any other edge describes a message that cannot be sent.",
-  "EDGES: an edge is a contract — declare its kind and the payload fields it carries; the receiver must not need the sender's history to understand a handoff.",
-  "AUTHORITY: exactly one owner per decision; two owners means none. The evaluator is never the author. The driver owns decisions but never fabricates a quality verdict. Roster changes and closure belong to the controller alone.",
-  "UNATTENDED: without the user, the run must still reach a definite terminal state. Every attempt has a deadline, and limits are enforced by the runtime rather than written as discipline in a welcome message; exceeding one reports an error, never a silent shortfall; a gate needing a human carries a pre-approved fallback or an explicit blocked/failed destination — never a silent hang.",
-  "BEFORE PROPOSING: the mission's five parts present (objective, scope, constraints, acceptance criteria, non-goals), every node decidable, backend justified per node, every edge contracted, one owner per decision, every Loop bounded with a live capExhaustedRoute, no unreachable node, and a closure exactly one owner can declare. Then explain the graph in plain language: if you cannot explain it, it is not right yet.",
+  "Orchestra: choose the smallest collaboration that meets the user's mission.",
+  "MISSION: align the outcome, scope and success check; ask only about missing decisions that change the work. The driver owns user discussion and final synthesis.",
+  "SCALE: work directly when enough; delegate bounded work to native subagents; use independent Sessions for separate capabilities or peer collaboration. Add a Team only when shared roles and lanes help. A small task needs no graph or task-card file.",
+  "BACKEND: native children inherit the driver's composition/cwd; toolFilter narrows availability and is NOT a permission guarantee. Use Session for a separate preset, cwd or enforced read-only boundary. All members use approval never and route questions to the driver.",
+  "LANES: discuss a new mission, then add its goal and completion conditions to the existing team's lanes; reuse suitable available members before reserving new ones. Keep the original mission and authorization intact.",
+  "HANDOFF: give the next actor the goal, relevant inputs, constraints, success check and recipient. Reports distinguish verified results, remaining work and blockers. Name one closure owner; use independent checking when the task requires it.",
+  "LIMITS: set a bounded retry/escalation path where needed. Current graph declarations do not enforce attempt caps or deadlines; use observed runtime facts, and report blocked work rather than inventing progress or approval.",
+  "PRESETS: reuse authorized capabilities. For a new composition load orchestra-preset-authoring; for team design or scaling load orchestration-principles. Get approval for new scope, permissions or cost, not for every in-scope dispatch.",
 ].join("\n");
 
-/** The skill body: the same method with the reasoning and the full checklist. */
-export const PRINCIPLES_SKILL_CONTENT = `# Orchestration Principles
+export const PRINCIPLES_SKILL_CONTENT = `# Right-sized orchestration
 
-Use this before you turn a mission into a graph, and again before you show it to the user.
+## Choose a working shape
 
-${PRINCIPLES_SECTION_TEXT.split("\n").slice(1).join("\n")}
+Start with the outcome discussed with the user, the real constraints and a concrete success check. Infer routine details from evidence; ask about material unknowns. Explain the chosen shape in plain language. Use the smallest option that fits:
 
-## The three steps, in order
+- **Direct**: the driver does bounded work. No team, mandatory graph, task-card file or extra reviewer.
+- **Native subagent**: one or a few bounded investigations, implementations or checks using the driver's composition. Native children already have durable logs and continuation; persistence alone is not a reason for Session.
+- **Independent Session / A2A**: a separate declared preset, execution cwd, enforced permission boundary, or peer-to-peer collaboration. A2A remains usable without an Orchestra team.
+- **Team**: shared roles, mission lanes and explicit handoffs are useful. Start with the needed members, often one to three, then scale. Session and native-child seats may coexist. Existing topology entries without execution keep their Session meaning.
+- **Host delivery layer**: a separately enabled, future deterministic delivery mechanism, not something available merely because a graph exists. Do not claim it currently runs evidence or gates Git changes. Risk and required guarantees, not headcount, determine whether it is needed.
 
-1. **Sketch the mission WITH the user.** objective (one sentence), scope, constraints, acceptance criteria, non-goals. Ask for whichever is missing; never assume one the user did not give and that you cannot verify from the repository.
-2. **Turn it into a graph** under the rules above.
-3. **Explain it in natural language and get approval.** The explanation must let the user judge the plan without reading JSON: what each node does, who owns each decision, where the Loops are, why each one stops, where they are needed, and what happens when something fails. Approval is the ONLY hard gate, and it is cheap for the user: they reply with a plain yes (启动 / 可以 / ok) and the plugin records it against the exact revision you last showed them. Do not make them type a slash command or copy an id. What has NOT changed: only the user can approve — your own text is not consent, a plugin notice is not consent, and a message relayed from another session is not consent either. Wait for their reply before freezing or creating anything.
+A graph describes dependencies when they matter; it is not the entrance fee for work. Planner and architect are optional tools for unresolved scope or structural decisions, not required seats. Keep longer handoffs in the project's existing document locations when useful; no prescribed file for a short dispatch.
 
-## Right-Size Principle & JIT Task Cards (Macro Charter vs Micro Task Card)
+## Choose the backend honestly
 
-Worker cost is proportional to \`remaining entropy × model price\`. Assign cognitive power and structure proportionately:
+A native child joins the driver's LIVE Agent Preset. Per-child persona, tool filter and model can vary; a tool filter does not enforce a filesystem boundary. Use a Session when a separate preset, cwd or read-only sandbox is required. Check the actual native contract before promising another per-child capability. Permissions are enforced by the host, not by role prose.
 
-1. **Macro Charter vs Micro Task Card**:
-   - **Macro Charter**: High-level alignment between Driver and Human User defining overall mission objective, phases, lanes, roles, and acceptance criteria. Approved by the user ONCE.
-   - **Micro Task Card (JIT Just-In-Time Generation)**: Detailed, execution-ready card written right before a lane executes and saved to \`orchestra/tasks/<phase>-<lane>.md\`. So long as it stays within the approved Charter boundaries, it requires NO additional human approval or interruption.
+Both member types keep approval never. A member reports a question or denied operation to the driver, who resolves it within authorization or discusses a scope change with the user; a Session is not a back door to member approval UI.
 
-2. **Moderate Scaling (RIGHT-SIZE / 非必要不扩大原则)**:
-   - **Low-Entropy Work** (known files, straightforward fixes, minor extensions): Driver writes a concise 3-5 sentence Task Card directly. Do not spin up a planner or architect.
-   - **High-Entropy Work** (unknown codebase areas, complex design choices, architectural trade-offs): Driver dispatches to a reserved \`planner\` or \`architect\` role. The architect researches the codebase and returns **strictly hard facts plus the drafted card body** through its ONLY write channel (\`orchestra_report\`, which lands under \`orchestra/reports/\`). The **Driver** is the one who persists the card to \`orchestra/tasks/<phase>-<lane>.md\` — a read-only role cannot write there, and widening its sandbox for a task card would destroy the read-only guarantee that makes its research independent.
+Native continuation communication uses the direct-parent edge. Route exchanges involving a native child through its driver, using native child dispatch rather than generic A2A addressing. Independent Sessions can use A2A. Design handoffs only along reachable paths.
 
-3. **Driver Context Preservation**:
-   - The Driver never digests entire research corpora or raw task logs into its main conversation turn. By relying on Task Card paths on disk, the Driver's context growth remains strictly $O(\\text{lanes})$ rather than bloating with intermediate research.
+## Close the collaboration loop
 
-## Reachability: the driver is the hub
+Before dispatch, make clear: goal and scope; relevant inputs; success check; who receives the result. Add time/retry bounds for work that can loop, not as ceremony on every small task.
 
-A sub-agent child is addressed only by its direct parent. Native delegation authorizes delivery on that adjacency edge alone, and the platform refuses a sub-agent child's session id on its generic Session routing. So:
+An implementer supplies the change and verification; a reviewer checks the assigned candidate when independent review is warranted; a verifier explains what execution evidence proves. These are responsibilities, not a requirement to spawn three agents. Read-only reviewers cannot execute checks that write build/cache files: route those checks to an appropriately authorized executor.
 
-- a **session node cannot message a sub-agent node** — it is not the parent;
-- a **sub-agent node cannot message a session node** — its only partner is the driver.
+A receiver accepts a useful result, requests a specific correction, or escalates a concrete blocker. A report being filed does not itself prove success. If the bounded correction allowance is exhausted, surface the unresolved finding to the driver; never conceal a new blocking defect merely because it appeared late. The driver owns final synthesis, not invented quality verdicts.
 
-Every exchange involving a sub-agent node therefore goes THROUGH the driver: the child reports to the driver, and the driver relays onward. Draw the edges that way, because the other version describes a message that can never be sent and will only show up as a stalled run.
+Current graph attempt/cap fields are declarative. Observe actual tool results, reports and host lifecycle state; do not claim the runtime enforces graph deadlines or advances graph counters. Permission rejection, missing capability or uncertain external effects should become an explicit blocked outcome, not blind retries. Existing stop/archive tools must confirm stopping before success is reported.
 
-## Presets are the user's call
+## Grow an existing team
 
-When a node looks like it wants a role-specific preset, ask the user whether to build that preset into the graph. The preset is their composition and their cost, and the choice between a preset-carrying session node and a cheaper sub-agent node is exactly the trade-off they should make deliberately — not one you settle silently, and not a reason to quietly pick a generic node instead of asking.
+Discuss a new objective with the user and identify its relation to the running mission. Use orchestra_add_lanes to retain the lane's objective, scope, constraints, acceptance, relationship and participant ids. Preview and apply under the tool's approval contract. Preserve the original mission and already approved boundaries.
 
-## Why the backend rule is structural
+Reuse appropriate available roles when possible; a new lane need not add a member. Keep each dispatch self-contained and avoid overlapping writes or mixing unrelated active tasks into the same conversation. Reserve new roles only when needed; first dispatch materializes them. The board and recovered team record should still explain why the lane exists and who handles it.
 
-A native sub-agent child of the driver joins the driver's LIVE Agent Preset — it cannot mount its own composition. Its approval policy is pinned to \`never\` at the delegation boundary, so its asks are rejected deterministically and it can never reach the user. Its sandbox mode is frozen from the driver's explicit override at that same boundary, so a declared read-only mode would simply not take effect. Per-child variation stops at persona, tool filter, and the model route.
+A goal outside the project's execution/permission boundary is not silently absorbed into this team. Discuss a separate workspace or explicit boundary change. Do not claim canonical cross-worktree team discovery or future delivery governance unless that capability has actually been implemented and verified.
 
-That is why a read-only role MUST be a session: a role that believes it is read-only while it is not is a safety bug, not a configuration preference.
+## Presets and approval
 
-## Checking the graph before you propose
+Reuse installed, authorized presets without repeatedly asking to rebuild them. When a real composition is missing, load orchestra-preset-authoring. Separate durable persona/capabilities from the current task. Explain any new tools, installation, permissions or cost before seeking the needed approval.
 
-- [ ] the mission's five parts are all present, and the missing ones were asked for
-- [ ] every node has a one-sentence completion condition
-- [ ] tasks right-sized: low-entropy tasks handled directly; high-entropy architecture mapped via JIT task cards
-- [ ] every node needing its own preset, approval, cwd, or read-only is a **session**
-- [ ] every edge declares a kind and its payload contract
-- [ ] exactly one owner per decision, and no author evaluates their own work
-- [ ] every Loop has an attempt cap, all three exits, and a live receiver for \`capExhaustedRoute\`
-- [ ] no back edge exists outside a Loop
-- [ ] every node lies on a path to Closure (no unreachable node)
-- [ ] every Attempt has a deadline, and exceeding a limit reports rather than truncates
-- [ ] every human gate has a pre-approved fallback or an explicit blocked/failed destination
-- [ ] closure is checkable and exactly one owner can declare it
-- [ ] **you can explain the whole graph in one plain-language pass** — if you cannot, it is not right yet
+For an Orchestra charter, show the exact proposed scope, roles/backends and model choices, then use the existing approval flow. A user's actual reply is consent; the driver's prose or another member's message is not. Subsequent dispatch within that authorization does not require repeated approval. Changed goals or expanded authority do.
+
+## Before dispatch
+
+Check that the chosen capabilities can do the job, the recipient knows what done means, the next recipient/closure owner is clear, and unresolved prerequisites are visible. For a team, verify membership and approved scope; for direct work, simply proceed within the user's request.
 `;
 
-/** What registration managed to install. */
 export interface PrinciplesRegistration {
-  /** Whether the skill body was registered (a deployment may compose no skill registry). */
   readonly skill: boolean;
 }
 
-/**
- * Register the method where a driver will actually meet it.
- *
- * The prompt section is registered whenever the deployment composes a system
- * prompt, because it IS the discipline and its absence would be silent. The
- * skill is registered opportunistically: a deployment that mounts no skill
- * registry loses the elaboration and keeps the rules, which is a bounded,
- * documented degradation rather than a hidden one.
- *
- * @param ctx - host context carrying the system-prompt and skill registries.
- * @returns which halves were installed.
- */
 export function registerOrchestrationPrinciples(ctx: Context): PrinciplesRegistration {
   const systemPrompt = ctx.get("systemPrompt");
   if (systemPrompt !== undefined) {
@@ -153,14 +92,17 @@ export function registerOrchestrationPrinciples(ctx: Context): PrinciplesRegistr
   if (skills === undefined) return { skill: false };
   skills.register({
     name: PRINCIPLES_SKILL_NAME,
-    // The registry's own vocabulary for a skill contributed by live code rather
-    // than discovered on disk.
     source: "runtime",
-    description:
-      "How to design a multi-agent advancement orchestration: the graph rules (bounded acyclic graph, Loops as its only back edge), the node rules (one decidable responsibility, and which backend a node needs), edge and authority contracts, and the unattended-completion invariant.",
-    whenToUse:
-      "Load before decomposing a mission into a graph, before drafting a collaboration charter, and before explaining a plan to the user for approval.",
+    description: "Choose direct work, native children, independent Sessions or a Team; design reachable handoffs and add mission lanes without unnecessary seats.",
+    whenToUse: "Load when choosing a collaboration shape, designing team handoffs, or adding a new mission to an active team.",
     content: PRINCIPLES_SKILL_CONTENT,
+  });
+  skills.register({
+    name: PRESET_AUTHORING_SKILL_NAME,
+    source: "runtime",
+    description: "Create and verify a native DSH declared preset when an existing dispatch, skill or preset cannot supply the required capabilities.",
+    whenToUse: "Load before proposing or authoring a new role capability composition; reuse existing presets for ordinary dispatch.",
+    content: PRESET_AUTHORING_SKILL_CONTENT,
   });
   return { skill: true };
 }
