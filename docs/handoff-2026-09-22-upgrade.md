@@ -136,6 +136,14 @@ DSH的legacy importer读取全局`~/.dsh/settings.yaml`，先rename为`.imported
 
 ## 7. 明确未完成/已知边界
 
+### 收尾后新增：MiniMax-M3通道风险（2026-09-22 10:24 UTC）
+
+Trinity主会话报告：在其 **dev-trinity / DSH0.1.7-alpha.1** 中，两次有界真实UI turn均在任何tool调用之前失败：`TRANSPORT: Anthropic stream ended without a stop reason`。其durable计数为 **10次llm/retry、0 tool/call、0 tool/result**，host warn/error为0；插件commands/GUI/runtime另行通过。
+
+这是**兄弟项目的一手报告，本项目未独立复现**。当前证据指向MiniMax的Anthropic-compatible streaming/终止通道，而不是已证明Orchestra或Trinity工具有缺陷；credential可解析也不等于模型通道可用。
+
+下一轮启动dev-orchestra后，先用指定的M3做**一个不用工具的最小普通turn并核终止事实**，再做最小tool turn；两者通过才跑团队/重启验收。若同样失败，保留脱敏请求/终止/重试证据，停止重复消耗并定位通道，不盲改插件、不擅自换测试模型、不动正式web。
+
 - **浏览器、真实provider回合、dev服务冷启动、跨重启、正式web安装：未做。** 本轮收尾是Owner指定的中断点，不是验收完成。
 - 存量file-only preset/缺少expected字段的未知custom角色不能无证据重建；报错后走明确批准的新实例交接，不能为了旧mock让守卫变松。
 - marker是恢复意图，非外部文件ACID；native commit和真实工具/策略仍须核验。

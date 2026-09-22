@@ -48,4 +48,6 @@ Owner要求此处收尾，因此**没有**安装dev依赖、启动4600、打开�
 
 下一轮：从干净提交重新pack（含最新README）→ 安装dev-orchestra → 单个fresh Sol high做browser/完整host/M3角色/child/strict stop/跨重启 → Owner确认正式web安装窗口。正式web4599、旧dev、dev-trinity4601和历史会话保持不动。
 
+**额外运行风险（收尾后，未在本项目复现）**：Trinity报告同宿主/MiniMax-M3两次普通UI turn在tool调用前报 `Anthropic stream ended without a stop reason`，10次retry、0 tool/call。下一轮先验证M3最小turn的完整终止，再做插件验收；凭据迁移成功不能替代通道验证。详见handoff§7。
+
 **结论：机械候选PASS，完整Web安装资格仍未完成。**
