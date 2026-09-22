@@ -14,10 +14,10 @@ import { readdir } from "node:fs/promises";
 
 const dshRoot = join(process.execPath, "..", "..", "lib", "node_modules", "@deepseek-ai", "dsh");
 const hostNM = join(dshRoot, "node_modules", "@deepseek-ai");
-const require = createRequire(join(hostNM, "dsh-agent-presets", "package.json"));
+const require = createRequire(join(hostNM, "dsh-agent-preset-registry", "package.json"));
 const load = (name) => import(require.resolve(name));
 
-const presetsPkg = await load("@deepseek-ai/dsh-agent-presets");
+const presetsPkg = await load("@deepseek-ai/dsh-agent-preset-registry");
 const appBoot = await load("@deepseek-ai/dsh-app-boot");
 
 const home = join(homedir(), ".dsh");

@@ -12,3 +12,7 @@
 
     - id: orchestra-manager
       name: orchestra-dsh/orchestra
+
+# Role identity is declaration-owned in DSH 0.1.7.  The registry is host-owned;
+# this bundle contributes only its named preset rows.
+- include: ./presets/orchestra-roles.patch.yml

@@ -9,7 +9,7 @@
 import type { Context } from "@deepseek-ai/cordis";
 import { createUserMessage, freezeMessage, MessageId, ReasoningEffortId } from "@deepseek-ai/dsh-llm";
 import type { ContentBlock, MessageSource } from "@deepseek-ai/dsh-llm";
-import { agentPresetProjectionDefinition } from "@deepseek-ai/dsh-agent-presets";
+import { agentPresetProjectionDefinition } from "@deepseek-ai/dsh-agent-preset-registry";
 import { mountRolePreset } from "./role-preset-mount.js";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
 import type { Session, SessionEvent, SessionHeader } from "@deepseek-ai/dsh-session";
@@ -158,7 +158,7 @@ async function existingReceipt(
 /**
  * The preset a persisted session actually runs, folded from its cold snapshot.
  *
- * `resolveSessionPreset` was removed from `@deepseek-ai/dsh-agent-presets`
+ * `resolveSessionPreset` was removed from `@deepseek-ai/dsh-agent-preset-registry`
  * (DSH 0.1.5-rc.2); the same fold is now published as the `agentPreset`
  * projection definition, whose `init`/`apply` pair is exactly the removed
  * helper's body. The header supplies the creation-time value and the last

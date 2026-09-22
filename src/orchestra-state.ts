@@ -129,6 +129,9 @@ export interface TeamRole {
    * parent edge, so the address must be durable to survive a restart.
    */
   parentSessionId?: string;
+  /** Frozen native child identity knobs, restored at first materialization. */
+  persona?: string;
+  toolFilter?: { allow?: string[]; deny?: string[] };
   diagnostic?: TeamRoleDiagnostic;
   blueprint?: TeamRoleBlueprintFacts;
   welcome?: TeamWelcomeReceipt;
@@ -191,13 +194,8 @@ export interface TeamState {
    * say so rather than letting the roster silently differ from the plan the
    * user approved.
    */
-  addedLanes?: {
-    roleId: string;
-    phase?: string;
-    lane?: string;
-    addedAt: number;
-    reason?: string;
-  }[];
+  /** Incremental missions are lane-first: participants may reuse existing roles. */
+  addedLanes?: AddedLane[];
   /** Summary snapshot recorded when dismissed or handed off. */
   handoffSummary?: {
     reason?: string;
@@ -207,6 +205,19 @@ export interface TeamState {
 }
 
 /** One driver milestone notice that could not be delivered. */
+export interface AddedLane {
+  laneId: string;
+  objective: string;
+  scope: string[];
+  constraints: string[];
+  acceptanceCriteria: string[];
+  relationshipToMission: string;
+  participantRoleIds: string[];
+  addedRoleIds: string[];
+  addedAt: number;
+  reason?: string;
+}
+
 export interface TeamNoticeFailure {
   milestone: string;
   targetSessionId: string;

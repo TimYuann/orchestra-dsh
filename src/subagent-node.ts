@@ -238,20 +238,10 @@ export async function sendToSubagentNode(
  *   silently rendered as "no children".
  */
 export async function subagentNodeActivity(
-  ctx: Context,
-  parentSessionId: string,
-  signal?: AbortSignal,
+  ctx: Context, parentSessionId: string, signal?: AbortSignal,
 ): Promise<Map<string, SubagentNodeActivity>> {
-  const subagents = requireSubagents(ctx);
-  const parent = requireNonEmpty(parentSessionId, "parentSessionId");
-  const entries = await subagents.listChildren(SID(parent), signal);
-  const activity = new Map<string, SubagentNodeActivity>();
-  for (const entry of entries) {
-    if (entry.kind === "child") {
-      activity.set(String(entry.id), entry.activity);
-      continue;
-    }
-    activity.set(String(entry.id), "unknown");
-  }
-  return activity;
+  const entries = await requireSubagents(ctx).listChildren(SID(requireNonEmpty(parentSessionId, "parentSessionId")), signal);
+  // 0.1.7 exposes a durable catalog, not activity. Absence/activity is not a
+  // lifecycle fact, so expose only the honest unknown hint.
+  return new Map(entries.map((entry) => [String(entry.id), "unknown" as const]));
 }

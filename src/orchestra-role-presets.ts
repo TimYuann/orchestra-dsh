@@ -138,27 +138,24 @@ function validPresetId(id: string): boolean {
   return /^[a-z0-9][a-z0-9-]*$/.test(id);
 }
 
-function rolePrompt(role: RolePresetRole, purpose: string, write: boolean, baseStrategy: RolePresetBase, handoff: RolePresetHandoffContract): string {
-  const writeRule = write
-    ? "You may edit only the explicitly dispatched write scope; do not expand it."
-    : "You are read-only for repository files; your only durable write is the Orchestra report channel.";
+function rolePrompt(role: RolePresetRole, purpose: string, write: boolean, _baseStrategy: RolePresetBase, _handoff: RolePresetHandoffContract): string {
+  const methods: Record<RolePresetRole, string> = {
+    implementer: "Make the smallest correct assigned change; inspect the real path and report validation plus unverified assumptions. Do not release your own work.",
+    reviewer: "Name each finding's location, trigger, impact, and evidence; separate defects, unknowns, and preferences. Do not author or release the candidate; surface new blockers even after a cap.",
+    investigator: "Separate observation from hypothesis, compare alternatives, and seek the cheapest disproof. Hand off a bounded actionable diagnosis; do not take over implementation.",
+    verifier: "Verify evidence source, conditions, result, and coverage. Explain what is and is not proven; do not impersonate a reviewer or call write-producing checks read-only.",
+    architect: "Resolve the assigned structural tradeoff with constraints, alternatives, and costs. Do not broaden it into an unbounded redesign.",
+    planner: "Produce an execution-ready task description with critical assumptions. Do not require planning for simple work or mistake planning for progress.",
+    researcher: "Report source-backed facts, inferences, and unknowns separately to the decision owner. Do not take decision authority.",
+    oracle: "Address the escalated uncertainty with recommendation, basis, confidence boundary, and consequence if wrong. You are not a standing approver.",
+    "hardening-auditor": "Report reachable risks with reproduction evidence or why it was not reproduced, priority, and repair verification. Do not expand scope from speculation."
+  };
   return [
-    "You are the Orchestra v0.4 " + role + " role.",
-    "Base DSH composition strategy: " + baseStrategy + ".",
-    purpose,
-    writeRule,
-    "Wait for a concrete driver dispatch; a welcome is not a task.",
-    "Do not change the canonical Charter, Document, Graph, Journal or role roster.",
-    "Do not claim another role's verdict, user approval or closure decision.",
-    "Handoff payload fields: " + handoff.requiredPayloadFields.join(", ") + ".",
-    "Required evidence kinds: " + handoff.requiredEvidenceKinds.join(", ") + ".",
-    "Persist durable evidence with the orchestra_report TOOL — it is your write channel and it works even under a read-only sandbox. " +
-      "Do NOT use the generic write/edit tool for a report: under read-only it is denied, and retrying it raises a permission prompt that nobody answers in an unattended run, which hangs the whole team. " +
-      "If a report write is ever refused, say so in your reply instead of escalating.",
-    "Report back to the controller with a2a_reply before you end your turn: a turn that ends silently gets no reply and stalls the run.",
+    `You are the Orchestra ${role} role.`, purpose, methods[role],
+    write ? "Edit only the dispatched write scope." : "Do not edit repository files; report through orchestra_report.",
+    "Task details, acceptance, and recipient come from dispatch. Continue when evidence is sufficient; report blockers and hand off a concise result to the driver. Do not ask the user or claim another role's approval or closure."
   ].join(" ");
 }
-
 function renderComposition(options: {
   role: RolePresetRole;
   purpose: string;
@@ -973,90 +970,15 @@ export async function ensureBuiltinRolePresetArtifacts(globalRoot: string): Prom
 
 export async function resolveRolePresetFile(
   ctx: Context,
-  cwd: string,
+  _cwd: string,
   id: string,
-  globalRoot: string,
+  _globalRoot: string,
 ): Promise<RolePresetFileResolution> {
   if (!validPresetId(id)) throw new RolePresetError("invalid_id", "role preset id must use safe lower-kebab syntax: " + id, { id });
-  const spec = rolePresetSpec(id);
-
-  const project = await projectCandidate(ctx, cwd, id);
-  if (project !== undefined) {
-    return {
-      id,
-      trust: project.trust,
-      path: project.path,
-      source: project.source,
-      spec,
-      composition: validateCandidate(spec, project),
-    };
-  }
-
-  const global = await globalCandidate(globalRoot, id);
-  if (global !== undefined) {
-    return {
-      id,
-      trust: global.trust,
-      path: global.path,
-      source: global.source,
-      spec,
-      composition: validateCandidate(spec, global),
-    };
-  }
-
   const presets = ctx.get("agentPresets");
-  if (presets !== undefined) {
-    try {
-      const resolved = await presets.resolve(id);
-      if (isRecord(resolved) && typeof resolved.broken === "string") {
-        throw new RolePresetError("preset_unavailable", "DSH native preset " + id + " is broken: " + resolved.broken, { id, source: "dsh" });
-      }
-      if (typeof resolved.path !== "string" || resolved.path === "") {
-        return {
-          id: resolved.id,
-          trust: resolved.trust,
-          path: "",
-          source: "dsh",
-          spec,
-        };
-      }
-      const candidate: Candidate = {
-        path: resolved.path,
-        trust: resolved.trust,
-        source: "dsh",
-        text: await readFile(resolved.path, "utf8"),
-      };
-      return {
-        id: resolved.id,
-        trust: resolved.trust,
-        path: resolved.path,
-        source: "dsh",
-        spec,
-        composition: validateCandidate(spec, candidate),
-      };
-    } catch (error) {
-      if (!isUnknownPresetError(error)) {
-        if (error instanceof RolePresetError) throw error;
-        throw new RolePresetError("preset_unavailable", "DSH native preset " + id + " could not be resolved", { id, source: "dsh" }, error);
-      }
-    }
+  if (presets === undefined) throw new RolePresetError("preset_unavailable", "DSH agent preset registry is unavailable", { id });
+  try { await presets.resolve(id); } catch (error) {
+    throw new RolePresetError("preset_unavailable", "DSH declared preset " + id + " could not be resolved", { id, source: "dsh" }, error);
   }
-
-  if (spec === undefined) {
-    throw new RolePresetError("preset_unavailable", "role preset " + id + " was not found in project, global, DSH native or catalog sources", { id });
-  }
-  let path: string;
-  try {
-    path = await ensureBuiltinRolePresetArtifact(globalRoot, spec);
-  } catch (error) {
-    throw new RolePresetError("artifact_failed", "catalog preset " + id + " could not be installed", { id, source: "builtin" }, error);
-  }
-  return {
-    id: spec.id,
-    trust: "system",
-    path,
-    source: "builtin",
-    spec,
-    composition: parseRolePresetComposition(spec.cordisYml),
-  };
+  return { id, trust: "system", path: "", source: "dsh", spec: rolePresetSpec(id) };
 }

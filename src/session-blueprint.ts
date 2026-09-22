@@ -19,7 +19,7 @@ import type { SandboxMode } from "@deepseek-ai/dsh-sandbox";
 import type { Session, SessionEvent, SessionId } from "@deepseek-ai/dsh-session";
 import { parseRecordJson, readRecordText, resolveRecordFileSystem, safeSegment, writeRecordJson, type RecordFileSystem } from "./orchestra-records.js";
 import type { ToolSchema } from "@deepseek-ai/dsh-llm";
-import type {} from "@deepseek-ai/dsh-agent-presets";
+import type {} from "@deepseek-ai/dsh-agent-preset-registry";
 import type {} from "@deepseek-ai/dsh-permission-presets";
 import type {} from "@deepseek-ai/dsh-session-title";
 

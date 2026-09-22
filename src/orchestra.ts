@@ -13,6 +13,13 @@
 import type { Context } from "@deepseek-ai/cordis";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import type { ContentBlock, MessageSource } from "@deepseek-ai/dsh-llm";
+
+declare module "@deepseek-ai/dsh-llm" {
+  interface MessageSourceMap {
+    "plugin:orchestra": { kind: "plugin:orchestra"; form: "notice"; summary: string };
+  }
+}
+
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolExecutionInput } from "@deepseek-ai/dsh-tools";
 // `JsonValue` moved out of `@deepseek-ai/dsh-tools` in DSH 0.1.5-rc.2.
@@ -1014,6 +1021,8 @@ function reservedRole(plan: GovernedRolePlan): TeamRole {
     phase: "reserved",
     execution: plan.execution,
     ...(plan.execution === "subagent" && plan.parentSessionId !== undefined ? { parentSessionId: plan.parentSessionId } : {}),
+    ...(plan.execution === "subagent" && plan.persona !== undefined ? { persona: plan.persona } : {}),
+    ...(plan.execution === "subagent" && plan.toolFilter !== undefined ? { toolFilter: { ...(plan.toolFilter.allow === undefined ? {} : { allow: [...plan.toolFilter.allow] }), ...(plan.toolFilter.deny === undefined ? {} : { deny: [...plan.toolFilter.deny] }) } } : {}),
     sessionHistory: [],
     preset: plan.presetId ?? null,
     sandbox: plan.sandbox ?? INHERITED_SANDBOX,
@@ -1925,8 +1934,7 @@ function approvalNotice(draftId: string, revision: number, result: RecordApprova
   return createUserMessage({
     content: [{ type: "text", text: `(orchestra /team approval notice) Draft ${draftId}@${revision} approved ${how} (digest=${result.digest}, freeze target=${result.ref}). The plan is ready. You can now dispatch tasks using orchestra_dispatch(roleId, task) and let roles execute autonomously. You will be awakened when reports arrive.` }] as ContentBlock[],
     source: {
-      kind: "plugin",
-      plugin: "orchestra",
+      kind: "plugin:orchestra",
       form: "notice",
       summary: "orchestra /team charter approval",
     } as MessageSource,
@@ -2061,8 +2069,7 @@ export async function handleTeamGateDecisionCommand(
   const gateNotice = createUserMessage({
     content: [{ type: "text", text: `(orchestra /team gate decision notice) Gate ${gate.gateInstanceId} resolved: ${match[2]}. Continue per the Frozen Charter (reconcile, then proceed along the declared pass route).` }] as ContentBlock[],
     source: {
-      kind: "plugin",
-      plugin: "orchestra",
+      kind: "plugin:orchestra",
       form: "notice",
       summary: "orchestra /team gate decision",
     } as MessageSource,
@@ -2295,8 +2302,7 @@ export async function handleTeamCommandInvocation(
           createUserMessage({
             content: [{ type: "text", text: noticeText }] as ContentBlock[],
             source: {
-              kind: "plugin",
-              plugin: "orchestra",
+              kind: "plugin:orchestra",
               form: "notice",
               summary: "orchestra /team active-team arbitration",
             } as MessageSource,
@@ -2324,8 +2330,7 @@ export async function handleTeamCommandInvocation(
   const marker = createUserMessage({
     content: [{ type: "text", text: noticeText }] as ContentBlock[],
     source: {
-      kind: "plugin",
-      plugin: "orchestra",
+      kind: "plugin:orchestra",
       form: "notice",
       summary: "orchestra /team orchestration request",
     } as MessageSource,
@@ -3017,10 +3022,10 @@ export interface OrchestraDispatchResult {
 }
 
 export interface AddLaneRoleArgs {
-  /** Role id to graft onto the running Team; must not already exist in the roster. */
+  /** Existing roles are participants; a new role reserves a seat on confirmation. */
   roleId: string;
-  /** Agent Preset that carries the persona. Must resolve — an unknown id fails here. */
-  preset: string;
+  /** Required only for a new role. Existing participants reuse their frozen identity. */
+  preset?: string;
   /** Read-only when the role must not touch the repository. Defaults to workspace-write. */
   sandbox?: "read-only" | "workspace-write";
   /** Phase this lane belongs to (free-form label, shown on the team board). */
@@ -3037,6 +3042,13 @@ export interface AddLaneRoleArgs {
 
 export interface AddLanesArgs {
   roles: AddLaneRoleArgs[];
+  /** Incremental mission facts; the original team mission remains immutable. */
+  laneId?: string;
+  objective?: string;
+  scope?: string[];
+  constraints?: string[];
+  acceptanceCriteria?: string[];
+  relationshipToMission?: string;
   /** Why this lane is being added; recorded on the Team so the roster change is explainable. */
   reason?: string;
   /**
@@ -3110,9 +3122,13 @@ export async function addLanesToTeam(
       throw new Error(`orchestra_add_lanes: roleId "${roleId}" must be lowercase kebab-case (letters, digits, single hyphens)`);
     }
     const key = roleId.toLowerCase();
-    if (existing.has(key)) throw new Error(`orchestra_add_lanes: role "${roleId}" already exists in this team; dispatch it instead of adding it`);
     if (seen.has(key)) throw new Error(`orchestra_add_lanes: role "${roleId}" is listed twice in one call`);
     seen.add(key);
+    if (existing.has(key)) {
+      const current = team.roles.find((role) => role.id.toLowerCase() === key)!;
+      plan.push({ roleId: current.id, preset: current.preset ?? "inherited", sandbox: current.sandbox, model: current.model ? `${current.model.provider ?? "driver"}/${current.model.model ?? "inherited"}` : "inherited-from-driver", summary: "reuse existing role" });
+      continue;
+    }
 
     const preset = typeof entry?.preset === "string" ? entry.preset : "";
     if (preset === "") throw new Error(`orchestra_add_lanes: role "${roleId}" requires a "preset" — an unnamed role has no persona`);
@@ -3174,16 +3190,22 @@ export async function addLanesToTeam(
   }
 
   const addedAt = Date.now();
-  const addedLanes = [
-    ...(team.addedLanes ?? []),
-    ...plan.map((entry) => ({
-      roleId: entry.roleId,
-      ...(entry.phase === undefined ? {} : { phase: entry.phase }),
-      ...(entry.lane === undefined ? {} : { lane: entry.lane }),
-      addedAt,
-      ...(args.reason === undefined ? {} : { reason: args.reason }),
-    })),
-  ];
+  const laneId = args.laneId?.trim() || `lane-${addedAt}`;
+  if (!ROLE_ID_PATTERN.test(laneId)) throw new Error("orchestra_add_lanes: laneId must be lowercase kebab-case");
+  if ((team.addedLanes ?? []).some((lane) => lane.laneId === laneId)) throw new Error(`orchestra_add_lanes: lane "${laneId}" already exists`);
+  const addedRoleIds = plans.map((entry) => entry.roleId);
+  const addedLanes = [...(team.addedLanes ?? []), {
+    laneId,
+    objective: args.objective?.trim() || args.reason?.trim() || "incremental mission",
+    scope: [...(args.scope ?? [])],
+    constraints: [...(args.constraints ?? [])],
+    acceptanceCriteria: [...(args.acceptanceCriteria ?? [])],
+    relationshipToMission: args.relationshipToMission?.trim() || "extends the approved mission",
+    participantRoleIds: plan.map((entry) => entry.roleId),
+    addedRoleIds,
+    addedAt,
+    ...(args.reason === undefined ? {} : { reason: args.reason }),
+  }];
   const nextTeam: TeamState = {
     ...team,
     roles: [...team.roles, ...plans.map(reservedRole)],
@@ -3273,6 +3295,8 @@ async function materializeRole(
           prompt: combinedFirstTurn,
           childId: role.sessionId,
           ...(role.model ? { agentOptions: role.model } : {}),
+          ...(role.toolFilter === undefined ? {} : { toolFilter: role.toolFilter }),
+          ...(role.persona === undefined ? {} : { persona: role.persona }),
         },
         exec.signal,
       );
@@ -3560,17 +3584,14 @@ export async function dispatchRoleTask(
     };
   }
 
-  // Role already active: deliver regular task payload
-  const delivery = await deliverMessage(
-    ctx,
-    exec.agent.id,
-    roleEntry.sessionId,
-    [{ type: "text", text: dispatchNotice }],
-    {
-      wake: true,
-      ...transportStores(ctx, cwd),
-    },
-  );
+  // Role already active: native children must stay on their direct-parent
+  // continuation seam; generic inbox delivery only applies to Session roles.
+  const delivery = roleEntry.execution === "subagent"
+    ? await sendToSubagentNode(ctx, exec.agent, roleEntry.sessionId, [{ type: "text", text: dispatchNotice }], { signal: exec.signal })
+    : await deliverMessage(ctx, exec.agent.id, roleEntry.sessionId, [{ type: "text", text: dispatchNotice }], {
+        wake: true,
+        ...transportStores(ctx, cwd),
+      });
 
   return {
     status: "dispatched",
@@ -4930,9 +4951,14 @@ export function apply(ctx: Context): void {
                         type: "object",
                         additionalProperties: false,
                         properties: {
-                          roleId: { type: "string", required: true },
-                          phase: { type: "string" },
-                          lane: { type: "string" },
+                          laneId: { type: "string", required: true },
+                          objective: { type: "string", required: true },
+                          scope: { type: "array", required: true, items: { type: "string" } },
+                          constraints: { type: "array", required: true, items: { type: "string" } },
+                          acceptanceCriteria: { type: "array", required: true, items: { type: "string" } },
+                          relationshipToMission: { type: "string", required: true },
+                          participantRoleIds: { type: "array", required: true, items: { type: "string" } },
+                          addedRoleIds: { type: "array", required: true, items: { type: "string" } },
                           addedAt: { type: "number", required: true },
                           reason: { type: "string" },
                         },
@@ -5052,6 +5078,8 @@ export function apply(ctx: Context): void {
                   )
                   .join(", ");
           if (value.team == null) return [{ type: "text", text: `no active team; archives: ${archiveText}` }];
+          const laneText = value.team.added_lanes.length === 0 ? "lanes: none" : `lanes: ${value.team.added_lanes.map((lane) => `${lane.laneId} (${lane.objective}; participants=${lane.participantRoleIds.join(",")})`).join("; ")}`;
+          const noticeText = value.team.notice_failures.length === 0 ? "notices: none" : `notice failures: ${value.team.notice_failures.length}`;
           const graphText =
             value.team.graph == null
               ? "graph: none"
@@ -5061,7 +5089,7 @@ export function apply(ctx: Context): void {
               type: "text",
               text: `team ${value.team.team_id} (${value.team.topology}, ${value.team.status}): ${value.team.roles
                 .map((r) => `${r.id}(${r.status},R${r.reportCount}${r.lastReport === null ? "" : `, report=${r.lastReport}`}${r.lastActivity === undefined ? "" : `, last="${r.lastActivity}"`})`)
-                .join(", ")} | archives: ${archiveText}\n${graphText}`,
+                .join(", ")} | archives: ${archiveText} | ${laneText} | ${noticeText}\n${graphText}`,
             },
           ];
         },
@@ -5636,8 +5664,7 @@ export function apply(ctx: Context): void {
               },
             ] as ContentBlock[],
             source: {
-              kind: "plugin",
-              plugin: "orchestra",
+              kind: "plugin:orchestra",
               form: "notice",
               summary: "orchestra approval failure",
             } as MessageSource,
@@ -5667,7 +5694,7 @@ export function apply(ctx: Context): void {
       agent.steer?.(
         createUserMessage({
           content: [{ type: "text", text }] as ContentBlock[],
-          source: { kind: "plugin", plugin: "orchestra", form: "notice", summary: "turn stall steer" } as MessageSource,
+          source: { kind: "plugin:orchestra", form: "notice", summary: "turn stall steer" } as MessageSource,
         }) as never,
       );
     },
@@ -5694,12 +5721,12 @@ export function apply(ctx: Context): void {
   // agent's inbox after this returns, so a listener that steers gets another
   // step instead of a closed turn. Void-detached on purpose: an observer failure
   // must never break the boundary it observes.
-  ctx.on("agent/turn-stopping", (payload: any) => {
-    void Promise.resolve(turnGuard.onTurnStopping(payload)).catch((error) => {
+  ctx.on("agent/turn-stopping", (payload: any) =>
+    Promise.resolve(turnGuard.onTurnStopping(payload)).catch((error) => {
       const reason = error instanceof Error ? error.message : String(error);
       console.warn(`orchestra: turn-stall guard failed: ${reason}`);
-    });
-  });
+    }),
+  );
 
   ctx.on("internal/service", (name) => {
     if ((WEB_SERVER_KEYS as readonly string[]).includes(name) || name === "workspaceRegistry") {

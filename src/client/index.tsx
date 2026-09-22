@@ -11,7 +11,15 @@
  * Data comes from the host route /plugins/orchestra-dsh/state (polled).
  */
 
-import type { ClientContext } from "@deepseek-ai/dsh-client-runtime/client";
+import type { Context } from "@deepseek-ai/cordis";
+import type {} from "@deepseek-ai/dsh-client-ui-renderer/client";
+import type { SettingsSectionOwnerProps } from "@deepseek-ai/dsh-client-ui-settings/client";
+
+declare module "@deepseek-ai/dsh-client-ui-slots" {
+  interface SlotMap {
+    "settings.section": { kind: "list"; scope: "root"; owner: SettingsSectionOwnerProps };
+  }
+}
 import type {} from "@deepseek-ai/dsh-client-ui-slots";
 import type {} from "@deepseek-ai/dsh-client-ui-settings/client";
 import * as React from "react";
@@ -175,7 +183,7 @@ function instanceRoleLine(r: InstanceRole): string {
 }
 
 /** Settings panel page: two display-only scrollable panes. */
-export function OrchestraPanel(): React.JSX.Element {
+export function OrchestraPanel(_props: SettingsSectionOwnerProps): React.JSX.Element {
   const [snapshot, setSnapshot] = React.useState<StateSnapshot | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
@@ -320,7 +328,7 @@ export const inject = ["slots"];
  *
  * @param ctx - client root context carrying the slot registry.
  */
-export function apply(ctx: ClientContext): void {
+export function apply(ctx: Context): void {
   ctx.slots.inject("settings.section", () =>
     ctx.slots.register(
       {

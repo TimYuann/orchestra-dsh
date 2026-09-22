@@ -217,3 +217,13 @@ D4 工具闭包守卫；C3 上下文可观察（先查 DSH 有无现成的）；
 | `docs/2026-09-20-repo-delivery-requirements.md` | 需求与验收 |
 | `reports/pro-review-round1-raw.md` | Pro 档审核原文（含六条） |
 | `reports/alignment-round7-nod-on-v1.1.md` | UCBIP 对 v1.1 的定稿前五条 |
+
+## 2026-09-22 executable implementation constraints (delivery remains optional)
+
+This plan is not enabled by the role/lane work. Before any delivery implementation, establish one repository/team root and a minimal node/candidate identity shared by existing reports, recovery, lanes, and backend/session identities. A candidate is a **commit** (`candidateCommit`); its tree is evidence only. Validation worktrees are detached at that commit, never at a tree OID, and an integration ref must not be checked out.
+
+The host computes the merge tree, creates the exact integration commit with `git commit-tree` and explicit parents/identity, then persists `{expectedOld,candidateCommit,expectedNew,tree,parents}` before `git update-ref <ref> <expectedNew> <expectedOld>`. Recovery identifies success by the persisted `expectedNew` (matching tree/parents and reachable from observed ref), not by candidate ancestry; later refs are observations and never rewrite intent.
+
+Start whole-tree and explicit-run-condition evidence with default rerun. “Declared inputs bound” is not “complete inputs proven.” Shell environments are overlays, so unnamed environment remains unsealed. Without a trusted deployment observer network/external-call evidence is `unknown` and therefore unqualified; stdout self-report is not proof.
+
+The first optional vertical slice is `candidate → host validation → fresh independent review bound to candidate → exact CAS → crash recovery`. Its adapter consumes `{teamId,laneId,roleId,execution,sessionId/reportRefs}` from the current Orchestra state. It creates neither a second team nor implicit governance for direct, A2A, or native-child work. Report total actions honestly (including messages, failures, retries); separate new governance actions. Leases, merge queues, capsules, intake, and P4 health remain deferred.
