@@ -598,46 +598,51 @@ dsh --profile web --port 4599
 | **名册与预设层** | **待 Owner 驱动** | 通道已通后未到 `/team`、未建队、未物化角色（`orchestra_E2E/orchestra/state` 仍为空） |
 | **会话与交接层** | **修复后通过** | 修复前：`session-83ec3a88…` 的 `turn/end` = `{"kind":"error", … code:"TRANSPORT"}`、6 次 attempt 全败、0 工具调用。修复后：`session-573effd7…` 两回合均 `turn/end=completed`、**0 重试**、`tool/call orchestra_topologies` → `tool/result` |
 | **恢复层** | **未触及** | 未做角色身份重启、未做 dismiss/activate、未做归档（实例重启本身已做：修复需重启 4600） |
-| **web 装载层** | **未执行** | 停机条件拦截；web profile 未被写入（读数见 §2.4；`web/cordis.yml` 出现一处无法归因的占位重写，内容 hash 与 dev-orchestra 的同名文件相同） |
+| **web 装载层** | **不崩验收通过；功能 smoke 被通道挡住** | 安装后三件套全绿、同 profile 冷启动 4605 零报错、boot 清单含 `orchestra-dsh/client.js`、侧边栏 15 项完好、orchestra 面板完整渲染、**0 页面错误**；但 4605 上的 M3 回合 5/5 `TRANSPORT`（web 的 minimax-cn route 没有 §2.5 的绕过行）⇒ 详见 §2.7 |
 | **供应商/HTTP 编码层** | **根因所在（已用一行 route header 绕过）** | `api.minimaxi.com` 在客户端声明 `br` 时以 `content-encoding: br` 回传 SSE；宿主 HTTP 路径把**未解压的 br 字节 + 空 header 集**交给 pi-ai 的 SSE 解析器 ⇒ `stopReason` 停在 `"pending"` ⇒ 被 `dsh-llm-pi-ai` 归类为 `TRANSPORT` 并重试 5 次。`curl` / 裸 `node`+SDK 在同代理下均正常（能解 br），只有宿主进程这一条路径拿不到明文 ⇒ 绕过方式：该 route 强制 `accept-encoding: identity`。详见 §2.5 |
 
-**定位结论**：两个阻断点分别落在**宿主 HTTP 编码层**（§2.5：br 未解压 → 误报 TRANSPORT，已用 route 级 header 绕过，Phase 1.3/1.4 通过）与**插件声明层**（§2.6：bundle patch 的 `- include:` 在 patch 语义里无效 ⇒ 12 条 role preset 从未注册 ⇒ `/team` 主链不可用）。`orchestra-dsh 0.6.0` 的**制品层与宿主解析层无异常**（18 个工具照常注册、`orchestra_topologies` 可用）。Phase 2 的可达相邻项（A2A 控制面、混合子节点、客户端面板）继续取证；依赖建队的项未取得。
+**定位结论（只记录层次，不做归属判定）**：两个阻断点分别落在**宿主 HTTP 编码层**（§2.5：`content-encoding: br` 未被解压即交给 SSE 解析器 → 误报 TRANSPORT；已用 route 级 header 绕过，Phase 1.3/1.4 通过）与**插件声明投递层**（§2.6：bundle patch 的 `- include:` 在 patch 语义里无效 ⇒ 12 条 role preset 行未进入组合树 ⇒ `agentPresets.resolve` 取不到值 ⇒ `/team` 主链不可用）。`orchestra-dsh 0.6.0` 的**制品层与宿主解析层无异常**（18 个工具照常注册、`orchestra_topologies` 可用；web 装载后冷启动零报错）。Phase 2 的可达相邻项（A2A 控制面、混合子节点、客户端面板）已取证；依赖建队的项未取得。§2.6 中 driver 的因果判断与建议**原样并列保真、不下结论**，交 analyze session。
 
 ---
 
 ## ④ 未做 · 未验证
 
-**未做（按停机条件或计划"不做"）**
+**未取得（机制未按设计发生 / 依赖被阻断的链路）**
 
-1. Phase 2 **全部 7 项**（`/team` 草案与逐角色 `runtime`、批准与懒加载物化、`request/header` 一致性、真实小活闭环含**至少一次打回**、A2A 五项 + `a2a_stop` + 冷会话唤醒、运行中新 mission→lane（"0 新座位 + 新增 lane"）、混合 `execution:"subagent"` 与续派、**重启后身份**、`orchestra_dismiss`→归档→`orchestra_activate`、设置面板与控制台无报错）——**改为由 Owner 在 4600 上亲手驱动**（Phase 1.4 已由本轮完成并通过）。
-2. Phase 3 全部（备份/只加不改/三件套/live 重载判定/**Owner 放行重启 4599**/不崩验收/最小 smoke）；**4599 与 web profile 一行未改**。
-3. 确定性交付层（worktree/租约/合并门/证据层）——计划明确"不做，留给下一个版本号"。
-4. 未 push / 未 tag / 未 publish；未碰 4601、旧 dev、历史会话；未用 browser-use。
+1. **`/team` 主链全部**：章程草案逐角色 `runtime`、批准、`orchestra_create`、首次派活懒加载物化、逐角色会话 `request/header` 与草案一致性、真实小活闭环（含至少一次打回）、运行中新 mission→lane（"0 新座位 + 新增 lane"）、`orchestra_dismiss` 严格排空 → 归档 marker → `orchestra_activate`、**重启后角色身份** —— 全部依赖建队，被 §2.6 阻断。
+2. **`a2a_reply`**：两个对等体都是请求-响应模式，没有 peer → driver 的入站消息，故无 `reply_to` 目标可回（其余 6 个 A2A 工具均已实测）。
+3. **web/4599 的重启与重启后验收**：Owner 动作，未获放行 ⇒ 4599 仍是旧组合（安装对它是惰性的）。
+4. **web profile 上的 M3 回合**：被 §2.5 的同一通道问题挡住（web 的 minimax-cn route 没有绕过行），故 web 侧只能确认"不崩"，不能确认"功能可用"。
+5. 确定性交付层（worktree/租约/合并门/证据层）——计划明确"不做，留给下一个版本号"。
+6. 未 push / 未 tag / 未 publish；未碰 4601、旧 dev、历史会话；未用 browser-use（全程 Ego lite）。
 
-**未验证（本轮无法确认，需下一跳）**
+**未验证（本轮无法确认的读法）**
 
-- **是否间歇**：只发了 1 个回合（策略内 6 次传输尝试）；**未重试**（停机条件禁止"继续/绕过"），故不能区分"持续故障"与"瞬时抖动"。
-- **是否与插件有关**：**未做控制实验**（同宿主、不含 orchestra-dsh 的干净 profile 上跑同一模型口径）。
-- **是否 profile patch 引起**：未做对照（patch 里 `minimax-cn` 只覆盖 `apiKeyEnv`，`api/baseURL/models` 来自宿主内置默认；未验证该默认端点与本机网络/代理的关系）。
-- 宿主侧无更多细节可取证：4600 作业日志（`bash-307`）只有启动行，无错误；`~/.dsh/logs/dsh-web.log` 是 4599 的旧日志（09-22 21:47），与本轮无关。
-- 截图 `4600-gate-failure.png` **未以图像方式查看**（当前模型不接受图像输入）；改以截图裁切区的 DOM 文本自证。
-- 未核实 `require.resolve` 之外的其它解析路径（如 `dsh-session-persistence` 等宿主内部模块）——不必要，解析层已由 dump-config + 运行期工具注册双重证明。
+- **同一 blocker 的成因归属**：按 Owner 指示不做判定；§2.6 只并列"driver 的陈述"与"盘上可复现事实"，交 analyze session。
+- **`content-encoding: br` 那条链路的内部机理**：裸 `node` 能解 br、宿主进程解不开——差异在宿主 HTTP 路径内部，本轮只做到"绕过"，未做到"解释"。
+- **`a2a_stop` 之后 `a2a_status` 仍报 `claimed`**：这是本轮观察到的事实（生命周期状态字不回退），是否属设计意图未验证。
+- `a2a_list` 的发现上限：本轮看到 `discovery cap 200` 与"507 older persisted session(s) from other working directories were not listed"提示，未验证其分页/发现规则。
+- 截图 `4600-gate-failure.png` **未以图像方式查看**（当前模型不接受图像输入），改以截图裁切区的 DOM 文本自证。
 
 ---
 
 ## ⑤ 下一跳建议
 
-1. **先做控制实验（1 个回合，成本最低的判定）**：在**同宿主**上起一个**不含 orchestra-dsh** 的干净 profile（建议 `dsh rescue --from-default-profile web` 落到一个未占用端口，或复用 `headless` 类空 profile），同样选 `minimax-cn / MiniMax-M3 / high`，发同一条无工具消息。
-   - **也失败** ⇒ 判定为**供应商/宿主流层阻断**，与 0.6.0 制品无关；0.6.0 的 Phase 2/3 验收必须**等通道恢复**，期间不要动 web。
-   - **通过** ⇒ 说明 4600/dev-orchestra 这一路有额外变量（profile patch、网络/代理、实例进程），需要在 4600 上重放并采集传输层日志。
-   > 本轮按停机条件**未自行执行**这一步；需要 driver/Owner 授权（它会产生新的模型回合）。
-2. **通道恢复后的最短验收路线**：直接回到本报告的 Phase 1.3 闸 → 通过后再进 Phase 2 七项 → 最后才做 Phase 3（web 装机 + Owner 放行重启）。
-   - **执行 Phase 3 前先读 F-070-4**：web 现在**没有** orchestra-dsh（`bundles` 只有 base+web-app，`node_modules` 里 0 个插件包，`pnpm-lock.yaml` importer 为 `{}`），所以 §3.2 的"只加不改"实为**首次安装**；`pnpm-workspace.yaml` 里那条 `orchestra-dsh@0.5.0` 是**过期遗留**（要不要顺手清，需要 Owner 决定，本轮未动）。
-3. **工程侧建议（不属本轮范围，仅登记）**：
-   - `scripts/check-session-readable.mjs` 增加 `session.v4.jsonl.zstd` 支持（F-070-2）；否则对**新会话**的"日志可读性"检查会假失败。
-   - 该 `TRANSPORT` 失败**没有任何重试可救**（6/6 同签名），可考虑在 UI 上把"5/5 重试"文案与"传输层阻断"区分，减少"再试一次"的误判空间。
-4. **0.6.0 制品可先冻结**：Phase 0 全绿、版本号与制品哈希已固定（`8250b6ea…`），无需重打包即进入下一轮。
-5. **需要 Owner 决定的两件善后事**（本轮按计划**不自行清理**）：① 4600 实例（作业 `bash-307`）是否保留——它是失败现场，保留便于复核，停掉则 `lsof -ti tcp:4600 | xargs kill`；② F-070-3 的 profile 写回（`reasoningEffort: high` + `ui-settings-general` 行）保留还是恢复（备份 `~/.dsh/profiles/dev-orchestra/cordis.patch.yml.bak-20260923-021406` 在场，随时可回滚）。
+1. **修 preset 投递（0.6.0 的下一版必做项，需实现者而非 test runner）**：`cordis.patch.yml` 里的 `- include: ./presets/orchestra-roles.patch.yml` 在 patch 语义下无效（受控实验：直接 `insert` → 生效，`include` 绝对/相对 → 均 0）。可选两条路，**任选其一即可让 12 条 preset 进入组合树**：
+   - 让 `scripts/build-role-presets.mjs` 把生成的行**直接并入 `cordis.patch.yml`**（即取消 include 这一层）；
+   - 或在 bundle patch 里以 **entry** 形式挂载 include 插件：`- insert: [{id: …, name: '@deepseek-ai/cordis-plugin-include', config: {path: …}}]`。
+   修完请用同一条受控实验复验（`--dump-config` 里应出现 12 条 `preset-orchestra-*`），再跑 `/team`。
+2. **若要让 web/4599 用 M3**：在 `~/.dsh/profiles/web/cordis.patch.yml` 的 `minimax-cn:` 下补 `headers.accept-encoding: identity`（与 dev-orchestra 同一行修复）。这是 Owner 的配置行，本轮按"只加不改"未代改。**在补上之前重启 4599，只会把 §2.5 的 TRANSPORT 失败带进你的工作实例**。
+3. **analyze session 的输入已备好**：§2.6 的"driver 陈述 vs 现场事实"两列、§2.5 的完整证据链、本节的修复选项，都不含判定结论，可直接作为裁决材料。
+4. **Owner 动作清单（按需）**：
+   - 重启 4599 让 web 的 orchestra-dsh 生效：`dsh --profile web --port 4599`（**重启前先决定是否补 §2 那行 header**）；
+   - 回滚 web 安装（可选，命令见 §2.7 3.6，备份目录 `backup-0.6.0-install-20260923-033007`）；
+   - 决定 4600（`bash-409`）与 4605（`bash-473`，web 组合证据）两个实例是否保留：`lsof -ti tcp:4600 tcp:4605 | xargs kill`；
+   - 决定 F-070-3 的 dev-orchestra 写回是否回滚（备份 `cordis.patch.yml.bak-20260923-021406`）。
+5. **工程侧建议（仅登记）**：
+   - `scripts/check-session-readable.mjs` 增加 `session.v4.jsonl.zstd` 支持（F-070-2），否则对新会话的日志可读性检查会假失败；
+   - UI 可把"5/5 重试"与"传输层阻断（不可重试）"区分（§2.5 的失败 100% 重试无救）。
+6. **0.6.0 制品本身可继续沿用**：Phase 0 全绿、哈希已固定（`8250b6ea…`），上述第 1 项修的是**生成物与 patch 组织**，不必重打版本号即可在同一版本线上复验。
 
 ---
 
@@ -652,19 +657,21 @@ dsh --profile web --port 4599
 | 旧货移出 | `/tmp/orchestra-stale-artifacts/orchestra-dsh-0.5.1.tgz.stale-pre-0.6.0` | 346,673 B / `61bfafaa…6fb1`（16:07 旧货） |
 | 证据目录（`tmp/` 已 gitignore） | `tmp/p0-0.6.0-evidence/` | `artifact-hashes.txt`、`artifact-filelist.txt`、`npm-test.log`、`npm-pack.log`、`gate-session-summary.txt`、`gate-session-key-events.txt`、`gate-attempt-timeline.txt`、`gate-tool-surface.txt`、`4600-gate-failure.png`、`summarize-session-log.mjs`、`profile-staging/` |
 | 失败会话（**保留，勿删**） | `~/.dsh/sessions/--Users-yuantian-Documents-agentWorkspace-artifacts-projects-orchestra_E2E--/session-83ec3a88-7371-455b-8ffa-c49f1860a7cf/` | `session.v4.jsonl.zstd` 43,694 B / 35 events |
-| 运行中实例 | 作业 `bash-307`：`dsh --profile dev-orchestra --port 4600 --no-open` | URL+token 见 §A2；**按计划不清理，留给 Owner 查看** |
+| 运行中实例 | ① `bash-409`：`dsh --profile dev-orchestra --port 4600 --no-open`（验收实例，含 §2.5 修复）② `bash-473`：`dsh --profile web --port 4605 --no-open`（web 组合冷启动证据） | 均已停不用的旧实例：`bash-307`（旧 4600）、`bash-404`（诊断 4604，已 kill）。URL+token 见 §A2 |
 | 浏览器 | Ego lite 空间 id `3`（页面 `p1` 停在 4600 的失败会话上） | 未 `finish()`（任务因失败停止，按 skill 规则保留） |
 | profile 改动（dev-orchestra） | `package.json`（+dep `orchestra-dsh`、bundles +1）、`pnpm-workspace.yaml`（+`minimumReleaseAgeExclude`）、**`cordis.patch.yml`：minimax-cn route 追加 `headers.accept-encoding: identity`（本轮根因修复）** | 备份 `*.bak-20260923-021406`、**`cordis.patch.yml.bak-before-accept-encoding-fix-20260923-025118`**（Owner 02:38 那次编辑之后的现场）；`node_modules/` 新增 3 包 |
 | 根因取证产物（`tmp/`，gitignore） | `fetch-trace-hook.mjs`（fetch 探针）、`host-request-body-1.json`（宿主原始请求 97 KB）、`host-fetch-trace.log`（状态/空 header/未解压 br 首块）、`repro-undici-encoding.mjs`、`repro-sdk-stream.mjs`、`identity-encoding.patch.yml`（一次性 4604 验证用 overlay）、`minimax-diagnosis.md`、`OWNER-runbook-team-test.md` | 诊断实例 4604（作业 `bash-404`，**保留**以便随时复现；4600 为验收实例 `bash-409`） |
 | profile 被宿主写回（**非我所改，见 F-070-3**） | `~/.dsh/profiles/dev-orchestra/cordis.patch.yml` | 02:16 由 1980 → 2135 B：`agent-default-model` +`reasoningEffort: high`；新增 `ui-settings-general`（`welcomeNoticeVersion: 2026-08-13.1`）。diff 见 §A3；**未回滚** |
 | git | commit `27b29af`（版本号）；工作区仅 `?? .pi/` | 未 push / 未 tag |
-| 未产生 | 团队记录 / 角色座位 / web 备份目录 / 除一张截图外的任何产物 | web 未安装（且 web 侧**本来就没有** orchestra-dsh，F-070-4）；`orchestra_E2E/orchestra/state` 仍空 |
+| web 安装痕迹 | `~/.dsh/profiles/web/{package.json,pnpm-workspace.yaml,pnpm-lock.yaml,node_modules/orchestra-dsh}` + 备份目录 `backup-0.6.0-install-20260923-033007/` | 后值：package.json `ddf84312…`、pnpm-workspace.yaml `36623595…`、pnpm-lock `cae7dc12…`；**`cordis.patch.yml` 未变（`bb0bfed4…`）** |
+| 本轮新建会话（**保留，勿删**） | E2E：`session-573effd7`(网关闸通过)、`session-45b916c1`(/team 被阻断)、`session-d61e2732`(A2A)、`bcb533db-…`(子代理)、`540f4377-…`(被 stop 的子代理)、`session-69458e9a`(workspace 选错的 /team 尝试) | 另有 web 侧 4605 上的一条 smoke 会话 |
+| 未产生 | 团队记录 / 角色座位 / 归档 / 交付层产物 | 建队被 §2.6 阻断；`orchestra_E2E/orchestra/state` 仍空 |
 
 ### A2 "看这里"（三行，按 Phase 4 格式，供 Owner 现场复核）
 
-1. **URL + token**：<http://127.0.0.1:4600/?token=8xUA9LSTiJ1f31a87QOj0HqZW4gjp6GJXO2B2xFSvYU>（dev-orchestra；进程目前作为本会话的后台作业 `bash-307` 运行。**要停**：`lsof -ti tcp:4600 | xargs kill`；**要起**：`dsh --profile dev-orchestra --port 4600 --no-open`——重启会换新 token，从启动日志第一行取）。
-2. **工作区与会话标题**：工作区 `orchestra_E2E`（=`/Users/yuantian/Documents/agentWorkspace/artifacts/projects/orchestra_E2E`）；失败会话 `session-83ec3a88-7371-455b-8ffa-c49f1860a7cf`（首条消息"只回复两个字：收到。不要调用任何工具。"，标题由宿主生成；UI 上显示 `处理失败 / 已重试模型请求（5/5） · 9s / Anthropic stream ended without a stop reason / TRANSPORT`）。
-3. **Owner 可以亲手做的一步**：在同一个 4600 页面上**再发一条任意短消息**（模型已是 M3/High）——若仍是同样的 `TRANSPORT`，即为"持续故障"的现场复现；若成功，则说明是瞬时抖动，可据此决定是否继续 Phase 2。**注意：这一条会把"重试判定"的责任交给 Owner，本轮我按停机条件没有自行重试。**
+1. **URL + token**：dev/4600 → <http://127.0.0.1:4600/?token=_LA52YJk05JIokXZ5H09ecZ6gKGUlArf6gbmwu1ske8>（作业 `bash-409`，**通道已修好**，可用 M3）；web 组合证据 4605 → <http://127.0.0.1:4605/?token=5nWsG1NXH4YmHyarssSP80Y6vYRjylIUBk2juBPQUY0>。要停：`lsof -ti tcp:4600 tcp:4605 | xargs kill`；要起：`dsh --profile <profile> --port <port> --no-open`（重启换新 token）。
+2. **工作区与会话**：`orchestra_E2E`（=`/Users/yuantian/Documents/agentWorkspace/artifacts/projects/orchestra_E2E`）。可看的三条：`session-573effd7`（通道闸通过：`收到` + `orchestra_topologies` 真调用）、`session-45b916c1`（`/team` 被 preset 阻断的全过程）、`session-d61e2732` + 子代理 `bcb533db`（A2A 六工具与 toolFilter 生效）。
+3. **Owner 可以亲手做的一步**：在 4600 上**再敲一次 `/team`**——预期仍会在 `orchestra_draft` 处报 `DSH declared preset orchestra-implementer could not be resolved`（§2.6 的缺陷未修）；若你不打算重启 4599，也就**不会被 §2.5 的通道问题影响**（那只是 M3 回合的问题，4599 未重启前不受本次安装影响）。
 
 ### A3 宿主写回的 profile diff（F-070-3 原文）
 
