@@ -210,6 +210,9 @@ export interface TeamState {
 /** One driver milestone notice that could not be delivered. */
 export interface AddedLane {
   laneId: string;
+  /** Missing on older records means the current controller owns the lane. */
+  ownerRoleId?: string;
+  responsibilities?: Record<string, string>;
   objective: string;
   scope: string[];
   constraints: string[];

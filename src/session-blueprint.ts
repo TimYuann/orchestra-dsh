@@ -123,6 +123,7 @@ export interface LightweightBlueprintReceipt {
 }
 
 export interface GovernedBlueprintInput {
+  caller?: Agent;
   sessionId: string;
   teamId: string;
   roleId: string;
@@ -456,10 +457,11 @@ export function pinApprovalNever(ctx: Context, agentCtx: Context, sessionId: str
 }
 
 function currentModel(ctx: Context, caller: Agent | undefined): { provider: string; model: string; reasoningEffort?: string } {
-  if (caller?.options.provider !== undefined && caller.options.model !== undefined) {
+  if (caller?.options?.provider !== undefined && caller.options.model !== undefined) {
     return {
       provider: caller.options.provider,
       model: caller.options.model,
+      ...(caller.options.reasoningEffort === undefined ? {} : { reasoningEffort: String(caller.options.reasoningEffort) }),
     };
   }
   const service = ctx.get("agentDefaultModel");
@@ -795,6 +797,7 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
 }
 
 export interface GovernedModelInput {
+  caller?: Agent;
   provider?: string;
   model?: string;
   reasoningEffort?: string;
@@ -847,9 +850,7 @@ function governedModel(ctx: Context, input: GovernedModelInput): { provider: str
     }
   }
 
-  const service = ctx.get("agentDefaultModel");
-  if (service === undefined) throw new SessionBlueprintError("model_unavailable", "agentDefaultModel service is unavailable for governed role");
-  const selection = service.currentSelection();
+  const selection = currentModel(ctx, input.caller);
   if (typeof selection.provider !== "string" || selection.provider === "" || typeof selection.model !== "string" || selection.model === "") {
     throw new SessionBlueprintError("model_unavailable", "deployment default model selection is incomplete for governed role");
   }

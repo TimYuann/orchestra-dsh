@@ -68,17 +68,6 @@ import { createArchiveStore } from "./orchestra-archive.js";
 import { createGovernedRoleAddressResolver } from "./orchestra-address.js";
 import type { GovernedRoleAddress, GovernedRoleAddressResolver } from "./orchestra-address.js";
 import {
-  readPreferences,
-  writePreferences,
-  resolveModelForRole,
-  DEFAULT_PREFERENCES,
-} from "./orchestra-preferences.js";
-import type {
-  OrchestraPreferences,
-  IntelligenceTier,
-  ModelPreferenceConfig,
-} from "./orchestra-preferences.js";
-import {
   appendDriverDecision,
   applyFrozenCharterRevision,
   documentSummary,
@@ -1096,6 +1085,7 @@ export async function prepareGovernedRolePlan(
     signal?: AbortSignal;
     /** Reconstruct an already-reserved Session's complete birth contract. */
     sessionId?: string;
+    caller?: Agent;
   },
 ): Promise<GovernedRolePlan> {
   const sessionId = options.sessionId ?? governedSessionId(options.teamId);
@@ -1153,6 +1143,7 @@ export async function prepareGovernedRolePlan(
     model: options.model,
     reasoningEffort: options.reasoningEffort,
     runtime: options.role.runtime,
+    caller: options.caller,
     compositionTools,
     orchestraTools,
     optionalCapabilities: roleSpec?.optionalCapabilities,
@@ -1469,14 +1460,14 @@ export async function preparseDraftRoleFacts(
   ctx: Context,
   cwd: string,
   role: RoleConfig,
-  preferences?: OrchestraPreferences,
+  caller?: Agent,
 ): Promise<DraftRoleFacts> {
   // The two backends have disjoint fact sets, so the draft must branch exactly
   // where provisioning branches. Without this, a hybrid topology whose
   // `subagent` role correctly declares no preset would fail the session path's
   // "requires an explicit complete Agent Preset" check and no proposal could
   // ever be drafted for it.
-  if (resolveRoleExecution(role) === "subagent") return preparseSubagentDraftRoleFacts(ctx, cwd, role, preferences);
+  if (resolveRoleExecution(role) === "subagent") return preparseSubagentDraftRoleFacts(ctx, cwd, role, caller);
   const presetId = role.preset;
   if (typeof presetId !== "string" || presetId === "") {
     throw new Error(`draft topology role "${role.id}" requires an explicit complete Agent Preset`);
@@ -1493,18 +1484,7 @@ export async function preparseDraftRoleFacts(
     );
   }
   const permission = await draftPermissionFacts(ctx, role.sandbox);
-  const activePrefs = preferences ?? (await readPreferences(cwd, { fs: ctx.fs }));
-  let model: { provider: string; model: string; reasoningEffort?: string };
-  if (role.runtime?.provider !== undefined && role.runtime?.model !== undefined) {
-    model = resolveModelForRole(role.id, role.runtime, activePrefs);
-  } else if (activePrefs !== undefined) {
-    // A preference file exists, so the project asked for this ladder. It is
-    // consulted ONLY when it exists: falling back to a built-in ladder would
-    // silently reroute every role away from the deployment's own default model.
-    model = resolveModelForRole(role.id, role.runtime, activePrefs);
-  } else {
-    model = resolveDraftRoleModel(ctx, { runtime: role.runtime });
-  }
+  const model = resolveDraftRoleModel(ctx, { runtime: role.runtime, caller });
   if (model.provider === "" || model.model === "") throw new Error(`draft role "${role.id}" resolved an empty provider/model selection`);
   return {
     roleId: role.id,
@@ -1549,7 +1529,7 @@ async function preparseSubagentDraftRoleFacts(
   ctx: Context,
   cwd: string,
   role: RoleConfig,
-  preferences?: OrchestraPreferences,
+  caller?: Agent,
 ): Promise<DraftRoleFacts> {
   if (typeof role.preset === "string" && role.preset !== "") {
     throw new Error(
@@ -1561,18 +1541,7 @@ async function preparseSubagentDraftRoleFacts(
       `draft topology role "${role.id}" resolves to the "subagent" backend but declares sandbox "${String(role.sandbox)}": a native sub-agent's sandbox mode is frozen from its parent's explicit override at the delegation boundary — use execution: "session" for a read-only or otherwise restricted role`,
     );
   }
-  const activePrefs = preferences ?? (await readPreferences(cwd, { fs: ctx.fs }));
-  let model: { provider: string; model: string; reasoningEffort?: string };
-  if (role.runtime?.provider !== undefined && role.runtime?.model !== undefined) {
-    model = resolveModelForRole(role.id, role.runtime, activePrefs);
-  } else if (activePrefs !== undefined) {
-    // A preference file exists, so the project asked for this ladder. It is
-    // consulted ONLY when it exists: falling back to a built-in ladder would
-    // silently reroute every role away from the deployment's own default model.
-    model = resolveModelForRole(role.id, role.runtime, activePrefs);
-  } else {
-    model = resolveDraftRoleModel(ctx, { runtime: role.runtime });
-  }
+  const model = resolveDraftRoleModel(ctx, { runtime: role.runtime, caller });
   if (model.provider === "" || model.model === "") throw new Error(`draft topology role "${role.id}" resolved an empty provider/model selection`);
   const toolFilter = role.toolFilter;
   return {
@@ -2264,14 +2233,7 @@ export async function handleTeamCommandInvocation(
   }
 
   // 常规 onboarding 逻辑
-  let prefNotice = "";
-  if (cwd !== undefined) {
-    const preferences = await readPreferences(cwd, { fs: ctx.fs });
-    prefNotice =
-      preferences === undefined
-        ? "\n(orchestra model routing: no preference file was found for this project or globally, so every role will use THIS DEPLOYMENT's default model. If the user wants a per-tier ladder [high_intelligence / standard_work / fast_verification], ask them ONCE and then persist it with the preferences writer — do not invent model names, and never write a preference file without the user agreeing to it.)"
-        : `\n(orchestra model routing: a preference file IS in effect, so role models come from it, not from the deployment default. Say so when you show the draft card.)`;
-  }
+  const prefNotice = "\n(orchestra model routing: explicit node model/reasoning wins; otherwise inherit the driver's current selection. Show the resolved choices before approval. Old per-tier preference files are not applied.)";
 
   const noticeText =
     raw === ""
@@ -2880,18 +2842,10 @@ export async function createGovernedTeam(
   };
   void topologyCatalog;
   const teamId = `team-${randomUUID().slice(0, 8)}`;
-  const preferences = await readPreferences(cwd, { fs: ctx.fs });
   const plans: GovernedRolePlan[] = [];
   for (const role of topology.config.roles) {
-    // Mirrors draft-time resolution exactly, so the model a user approved is the
-    // model provisioning pins: role runtime > preference file (only when one
-    // exists) > the deployment default resolved inside the Blueprint.
-    const preferredModel =
-      role.runtime?.provider !== undefined && role.runtime?.model !== undefined
-        ? resolveModelForRole(role.id, role.runtime, preferences)
-        : preferences !== undefined
-          ? resolveModelForRole(role.id, role.runtime, preferences)
-          : undefined;
+    // Node selection wins over a batch override; omission inherits the driver.
+    const preferredModel = role.runtime;
     plans.push(
       await prepareGovernedRolePlan(ctx, {
         cwd,
@@ -2905,9 +2859,10 @@ export async function createGovernedTeam(
         protocol: topology.config.protocol,
         maxRounds: role.maxRounds,
         permissionPreset: args.permissionPreset,
-        provider: args.provider ?? preferredModel?.provider,
-        model: args.model ?? preferredModel?.model,
-        reasoningEffort: args.reasoningEffort ?? preferredModel?.reasoningEffort,
+        provider: preferredModel?.provider ?? args.provider,
+        model: preferredModel?.model ?? args.model,
+        reasoningEffort: preferredModel?.reasoningEffort ?? args.reasoningEffort,
+        caller: exec.agent,
         title: roleSessionTitle({ roleId: role.id, missionObjective: frozen.mission.objective, cwd }),
         signal: exec.signal,
       }),
@@ -2999,6 +2954,8 @@ export interface AddLanesArgs {
   constraints?: string[];
   acceptanceCriteria?: string[];
   relationshipToMission?: string;
+  /** Participant responsible for the lane; omitted means the team's controller. */
+  ownerRoleId?: string;
   /** Why this lane is being added; recorded on the Team so the roster change is explainable. */
   reason?: string;
   /**
@@ -3016,6 +2973,7 @@ export interface AddLanesResult {
   /** One line per role, ready for the driver to show the user verbatim. */
   plan: { roleId: string; preset: string; sandbox: string; phase?: string; lane?: string; model: string; summary: string }[];
   added?: { roleId: string; sessionId: string; phase: string }[];
+  lane: NonNullable<TeamState["addedLanes"]>[number];
 }
 
 const ROLE_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -3076,7 +3034,7 @@ export async function addLanesToTeam(
     seen.add(key);
     if (existing.has(key)) {
       const current = team.roles.find((role) => role.id.toLowerCase() === key)!;
-      plan.push({ roleId: current.id, preset: current.preset ?? "inherited", sandbox: current.sandbox, model: current.model ? `${current.model.provider ?? "driver"}/${current.model.model ?? "inherited"}` : "inherited-from-driver", summary: "reuse existing role" });
+      plan.push({ roleId: current.id, preset: current.preset ?? "inherited", sandbox: current.sandbox, model: current.model ? `${current.model.provider ?? "driver"}/${current.model.model ?? "inherited"}` : "inherited-from-driver", summary: entry.purpose?.trim() || "reuse existing role" });
       continue;
     }
 
@@ -3115,6 +3073,7 @@ export async function addLanesToTeam(
         topologyId: `amendment-${team.topologyRef.id}`,
         topologySource: team.topologyRef.source,
         role: working,
+        caller: exec.agent,
         title: roleSessionTitle({ roleId, missionObjective: team.mission.objective, cwd }),
         signal: exec.signal,
       }),
@@ -3135,17 +3094,19 @@ export async function addLanesToTeam(
 
   assertUniqueGovernedSessionIds([...plans]);
 
-  if (args.confirm !== true) {
-    return { status: "planned", team_id: team.teamId, state_path: "", plan };
-  }
-
   const addedAt = Date.now();
   const laneId = args.laneId?.trim() || `lane-${addedAt}`;
   if (!ROLE_ID_PATTERN.test(laneId)) throw new Error("orchestra_add_lanes: laneId must be lowercase kebab-case");
   if ((team.addedLanes ?? []).some((lane) => lane.laneId === laneId)) throw new Error(`orchestra_add_lanes: lane "${laneId}" already exists`);
   const addedRoleIds = plans.map((entry) => entry.roleId);
-  const addedLanes = [...(team.addedLanes ?? []), {
+  const ownerRoleId = args.ownerRoleId?.trim() || "$controller";
+  if (ownerRoleId !== "$controller" && !plan.some((entry) => entry.roleId === ownerRoleId)) {
+    throw new Error("orchestra_add_lanes: ownerRoleId must name a participant or $controller");
+  }
+  const lane: AddLanesResult["lane"] = {
     laneId,
+    ownerRoleId,
+    responsibilities: Object.fromEntries(plan.map((entry) => [entry.roleId, entry.summary])),
     objective: args.objective?.trim() || args.reason?.trim() || "incremental mission",
     scope: [...(args.scope ?? [])],
     constraints: [...(args.constraints ?? [])],
@@ -3155,11 +3116,14 @@ export async function addLanesToTeam(
     addedRoleIds,
     addedAt,
     ...(args.reason === undefined ? {} : { reason: args.reason }),
-  }];
+  };
+  if (args.confirm !== true) {
+    return { status: "planned", team_id: team.teamId, state_path: "", plan, lane };
+  }
   const nextTeam: TeamState = {
     ...team,
     roles: [...team.roles, ...plans.map(reservedRole)],
-    addedLanes,
+    addedLanes: [...(team.addedLanes ?? []), lane],
   };
 
   const written = await activeTeamState.replace(observation, nextTeam, { policy, signal: exec.signal });
@@ -3168,6 +3132,7 @@ export async function addLanesToTeam(
     team_id: team.teamId,
     state_path: written.statePath,
     plan,
+    lane,
     added: plans.map((entry) => ({ roleId: entry.roleId, sessionId: entry.sessionId, phase: "reserved" as const })),
   };
 }
@@ -4642,10 +4607,17 @@ export function apply(ctx: Context): void {
         let roleBlueprintPreview: DraftRoleFacts[];
         try {
           roleBlueprintPreview = [];
-          const preferences = await readPreferences(cwd, { fs: ctx.fs });
           for (const role of topology.config.roles) {
-            roleBlueprintPreview.push(await preparseDraftRoleFacts(ctx, cwd, role, preferences));
+            roleBlueprintPreview.push(await preparseDraftRoleFacts(ctx, cwd, role, exec.agent));
           }
+          // Freeze the route displayed for inherited selections at approval.
+          topology = { ...topology, config: { ...topology.config, roles: topology.config.roles.map((role, index) => ({
+            ...role,
+            runtime: role.runtime ?? {
+              provider: roleBlueprintPreview[index].provider, model: roleBlueprintPreview[index].model,
+              ...(roleBlueprintPreview[index].reasoningEffort === undefined ? {} : { reasoningEffort: roleBlueprintPreview[index].reasoningEffort }),
+            },
+          })) } };
         } catch (error) {
           throw new Error(`cannot create a charter draft: role blueprint pre-parsing failed: ${error instanceof Error ? error.message : String(error)}`);
         }
@@ -4721,7 +4693,7 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "orchestra_add_lanes",
       description:
-        "Graft a NEW lane (one or more roles) onto the team that is already running here, instead of starting a second team. THIS IS HOW A TEAM STAYS ADAPTIVE: when the user brings another objective that belongs to the same project, decompose it into roles and add them to this graph — there is one team and one closure owner by design. " +
+        "Graft a NEW mission lane (reuse existing participants or reserve new roles) onto the team that is already running here, instead of starting a second team. THIS IS HOW A TEAM STAYS ADAPTIVE: when the user brings another objective that belongs to the same project, decompose it into roles and add them to this graph — there is one team and one closure owner by design. " +
         "TWO-STEP BY DESIGN: call it WITHOUT `confirm` first. You get the plan back (role, preset, sandbox, phase/lane, model, one-line purpose) — show that to the user as a single sentence, ask once, and call again with confirm: true. Never pass confirm on the first call. " +
         'Roles enter "reserved" and cost nothing until you dispatch them. `preset` must be a real role preset (see orchestra_topologies for the role library; an unknown id fails here); required tools, sandbox and handoff contract come from that preset. Only the controller session may change the roster.',
       parameters: {
@@ -4730,8 +4702,15 @@ export function apply(ctx: Context): void {
           required: true,
           items: { type: "json" },
           description:
-            "One entry per role to add: { roleId (lowercase kebab-case, must not already exist), preset (role preset id), sandbox?: 'read-only'|'workspace-write', phase?, lane?, purpose? (one line, becomes the role's welcome), maxRounds?, model?: { provider, model, reasoningEffort } }.",
+            "One entry per participant: { roleId (lowercase kebab-case; existing ids reuse the role), preset (required for a NEW role only), sandbox?: 'read-only'|'workspace-write', phase?, lane?, purpose? (one line, becomes the role's welcome), maxRounds?, model?: { provider, model, reasoningEffort } }.",
         },
+        laneId: { type: "string", description: "Stable new lane id; reuse the preview id on confirmation." },
+        objective: { type: "string", description: "New mission outcome; does not overwrite the original team mission." },
+        scope: { type: "array", items: { type: "string" }, description: "Scope of the new mission." },
+        constraints: { type: "array", items: { type: "string" }, description: "Constraints within the existing authorization." },
+        acceptanceCriteria: { type: "array", items: { type: "string" }, description: "How this lane's outcome will be checked." },
+        relationshipToMission: { type: "string", description: "How the new objective relates to the original mission." },
+        ownerRoleId: { type: "string", description: "Responsible participant roleId; omitted or $controller means the current team controller. Final team closure remains the controller's." },
         reason: { type: "string", description: "Why this lane is being added; recorded on the team so the roster change is explainable later." },
         confirm: { type: "boolean", description: "Set true ONLY on the second call, after the user agreed to the plan. Omitted, the call changes nothing and just returns the plan." },
       },
@@ -4744,6 +4723,7 @@ export function apply(ctx: Context): void {
             team_id: { type: "string", required: true },
             state_path: { type: "string", required: true },
             plan: { type: "array", required: true, items: { type: "json" } },
+            lane: { type: "json", required: true },
             added: { type: "array", items: { type: "json" } },
           },
         },
@@ -4752,12 +4732,12 @@ export function apply(ctx: Context): void {
             type: "text",
             text:
               value.status === "planned"
-                ? `orchestra_add_lanes: plan for team ${value.team_id} (nothing changed yet) — ${(value.plan ?? []).map((entry: any) => `${entry.roleId} via ${entry.preset} [${entry.sandbox}]${entry.lane === undefined ? "" : ` lane=${entry.lane}`}`).join("; ")}. Ask the user once, then call again with confirm: true.`
-                : `orchestra_add_lanes: ${(value.added ?? []).length} lane(s) added to ${value.team_id} as reserved — ${(value.added ?? []).map((entry: any) => entry.roleId).join(", ")}. Dispatch one to materialize it.`,
+                ? `orchestra_add_lanes: lane ${value.lane.laneId}: ${value.lane.objective}; owner=${value.lane.ownerRoleId}; acceptance=${value.lane.acceptanceCriteria.join("; ")} — plan for team ${value.team_id} (nothing changed yet) — ${(value.plan ?? []).map((entry: any) => `${entry.roleId} via ${entry.preset} [${entry.sandbox}]${entry.lane === undefined ? "" : ` lane=${entry.lane}`}`).join("; ")}. Ask the user once, then call again with confirm: true.`
+                : `orchestra_add_lanes: lane ${value.lane.laneId} added to ${value.team_id}: ${value.lane.objective}; owner=${value.lane.ownerRoleId}; participants=${value.lane.participantRoleIds.join(", ")}; ${(value.added ?? []).length} new reserved seat(s). Existing roles are reused; dispatch only when ready.`,
           },
         ],
       },
-      async execute(args: { roles: unknown[]; reason?: string; confirm?: boolean }, exec: ToolExecutionInput) {
+      async execute(args: AddLanesArgs, exec: ToolExecutionInput) {
         return addLanesToTeam(ctx, activeTeamState, exec, args as unknown as AddLanesArgs) as any;
       },
     }),
@@ -5018,7 +4998,7 @@ export function apply(ctx: Context): void {
                   )
                   .join(", ");
           if (value.team == null) return [{ type: "text", text: `no active team; archives: ${archiveText}` }];
-          const laneText = value.team.added_lanes.length === 0 ? "lanes: none" : `lanes: ${value.team.added_lanes.map((lane) => `${lane.laneId} (${lane.objective}; participants=${lane.participantRoleIds.join(",")})`).join("; ")}`;
+          const laneText = value.team.added_lanes.length === 0 ? "lanes: none" : `lanes: ${value.team.added_lanes.map((lane) => `${lane.laneId} (${lane.objective}; owner=${lane.ownerRoleId ?? "$controller"}; participants=${lane.participantRoleIds.join(",")}; acceptance=${lane.acceptanceCriteria.join("; ")})`).join("; ")}`;
           const noticeText = value.team.notice_failures.length === 0 ? "notices: none" : `notice failures: ${value.team.notice_failures.length}`;
           const graphText =
             value.team.graph == null
@@ -5716,16 +5696,4 @@ export function apply(ctx: Context): void {
     });
   }
 }
-
-export {
-  readPreferences,
-  writePreferences,
-  resolveModelForRole,
-  DEFAULT_PREFERENCES,
-};
-export type {
-  OrchestraPreferences,
-  IntelligenceTier,
-  ModelPreferenceConfig,
-};
 
