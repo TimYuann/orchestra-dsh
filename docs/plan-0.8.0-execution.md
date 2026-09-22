@@ -3,7 +3,8 @@
 > **本文是什么**：**计划**，不是契约。契约是 `docs/plan-0.8.0-delivery-layer.md`；需求是 `docs/2026-09-20-repo-delivery-requirements.md`；边界是 `docs/capability-boundaries.md`；原生能力对照是 `docs/dsh-native-capabilities.md`。
 > **本文不重述它们的内容**，只写"谁在哪个文件做什么、怎么验、失败怎么退"。任何口径冲突以契约 v1.2 为准。
 > **作者**：Session 2（计划作者）。**执行者**：Session 3。**审核**：Session 1（计划门，十二条）→ ChatGPT Pro 二审。
-> **状态**：草案，未过门。本文中所有"将/计划"均为**尚未实现**；仓库现状仍以 `6bd8d9b` 为准。
+> **状态注（2026-09-22）**：本计划后来已冻结并按裁定推进批 1；原“草案未过门 / 全部未实现 / 基线仍为 6bd8d9b”已过期。当前事实先看 `STATE.md` 顶部与 `docs/p0-batch1-delivery-report.md`，批 2/3 尚未实现。
+> **实施前审阅**：`docs/review-2026-09-22-plugin-and-delivery.md` 的 D1–D5 指出 Git tree/commit、恢复 B5、证据采集/复用、仓库根与预算等问题；§4.3.1 依赖的现有 Loop cap 在 live 中不运行。这些是待修正的设计问题，**本次仅加审阅入口，未静默修改冻结契约或以下历史判据**。
 
 ---
 
