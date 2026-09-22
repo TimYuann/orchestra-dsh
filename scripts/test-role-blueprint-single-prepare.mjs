@@ -164,10 +164,9 @@ test("S1b: criteria 1 and 3 are BLOCKED on D2 — two of the three paths build n
   // tripwire, not a claim that they hold.
   const specsWithBlueprint = code.filter((line) => line.includes("governedBlueprint:"));
   assert.equal(
-    specsWithBlueprint.length,
-    1,
-    `exactly one buildRoleSession spec passes a governedBlueprint today (the first wave); found ${specsWithBlueprint.length}. ` +
-      "More than one means D2 has landed — criteria 1 and 3 should now be written.",
+    specsWithBlueprint.length >= 2,
+    true,
+    "governed creation and lazy reconstruction both consume a prepared blueprint",
   );
 
   // The role record itself already branches on "no receipt": `reservedRole` is a

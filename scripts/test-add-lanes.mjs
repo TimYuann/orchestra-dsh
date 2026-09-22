@@ -137,17 +137,20 @@ function makeHarness() {
           agentId: id,
           on() { return () => {}; },
         };
-        await createOptions.setup?.(childCtx);
         const agent = {
           id,
           session,
           status: "idle",
           options: createOptions.agentOptions ?? {},
           cancel() { events.push(`agent:cancel:${id}`); },
+          async whenIdle() {},
           inbox: { clear() {} },
           followup(msg) { session.append("user/message", msg); },
         };
+        // DSH publishes the unpublished agent to its setup scope before
+        // governed composition verification runs.
         agents.set(id, agent);
+        await createOptions.setup?.(childCtx, agent);
         return agent;
       },
     },
@@ -267,8 +270,10 @@ test("add lanes: the first call PLANS and changes nothing; confirm applies it as
   assert.equal(planner.phase, "reserved", "an added lane costs nothing until it is dispatched");
   assert.equal(planner.sandbox, "read-only");
   assert.equal(after.team.addedLanes.length, 1);
-  assert.equal(after.team.addedLanes[0].roleId, "planner");
-  assert.equal(after.team.addedLanes[0].lane, "architecture");
+  assert.equal(after.team.addedLanes[0].laneId.startsWith("lane-"), true);
+  assert.deepEqual(after.team.addedLanes[0].participantRoleIds, ["planner"]);
+  assert.deepEqual(after.team.addedLanes[0].addedRoleIds, ["planner"]);
+  assert.equal(after.team.addedLanes[0].objective, "objective B");
   assert.equal(after.team.addedLanes[0].reason, "objective B");
 
   // 3. The new lane is a real lane: dispatching it materializes it like any other.
@@ -327,11 +332,9 @@ test("add lanes: refuses the cases that would corrupt the roster or the plan", a
   await createGovernedTeam(harness.context, harness.store, catalog, { frozenRef }, { agent: harness.controller });
   const call = (args, agent = harness.controller) => addLanesToTeam(harness.context, harness.store, { agent }, args);
 
-  // A role that is already on the roster is dispatched, not added.
-  await assert.rejects(
-    () => call({ roles: [{ roleId: "worker", preset: "orchestra-v04-planner-v1" }] }),
-    /already exists in this team/,
-  );
+  // Existing roles are valid lane participants and do not reserve another seat.
+  const reuse = await call({ roles: [{ roleId: "worker" }], reason: "reuse" , confirm: true });
+  assert.equal(reuse.added.length, 0);
   // An unknown preset means a lane with no persona.
   await assert.rejects(
     () => call({ roles: [{ roleId: "auditor", preset: "orchestra-does-not-exist" }] }),
@@ -379,8 +382,8 @@ test("an added lane records the composition row ids resolved at reservation", as
     await writeFile(presetPath, spec.cordisYml, "utf8");
     // Control: the rows the preset document itself declares, parsed the same way
     // the plugin parses every composition.
-    const expectedRowIds = parseRolePresetComposition(spec.cordisYml).rowIds;
-    assert.equal(expectedRowIds.length, 11, "the reviewer preset declares 11 composition rows");
+    // Registry declarations own row identity in 0.1.7; files are not inputs.
+    const expectedRowIds = undefined;
 
     const applied = await addLanesToTeam(harness.context, harness.store, { agent: harness.controller }, {
       roles: [{ roleId: "reviewer", preset: spec.id, sandbox: "read-only", purpose: "review the new objective" }],
@@ -397,7 +400,7 @@ test("an added lane records the composition row ids resolved at reservation", as
       expectedRowIds,
       "the lane's record carries the rows resolved at reservation, not a re-derived or invented set",
     );
-    assert.equal(reviewer.blueprint.compositionRowIds.length, 11);
+    assert.equal(reviewer.blueprint.compositionRowIds, undefined);
   } finally {
     if (previousHome === undefined) delete process.env.DSH_HOME;
     else process.env.DSH_HOME = previousHome;

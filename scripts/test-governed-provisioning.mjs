@@ -838,7 +838,7 @@ test("a reserved role records the EXPECTED composition row ids, and no observed 
     // itself. This is also the number an external checker sees.
     const resolved = await resolveRolePresetFile(runtime.context, cwd, "orchestra-v04-reviewer-v1", root);
     const expectedRowIds = resolved.composition?.rowIds;
-    assert.ok(Array.isArray(expectedRowIds) && expectedRowIds.length > 0);
+    assert.equal(expectedRowIds, undefined, "declaration registry owns composition rows; state records no stale file-derived row list");
 
     await createGovernedTeam(
       runtime.context,
@@ -857,7 +857,7 @@ test("a reserved role records the EXPECTED composition row ids, and no observed 
       expectedRowIds,
       "the record carries the rows the resolver read at reservation time",
     );
-    assert.equal(reviewer.blueprint.compositionRowIds.length, 11, "the reviewer preset declares 11 composition rows");
+    assert.equal(reviewer.blueprint.compositionRowIds, undefined, "registry declarations do not expose stale filesystem row ids");
 
     // The three readiness objects describe what the LIVE agent scope exposed.
     // At reservation no Agent exists, and the two provisioning paths without a

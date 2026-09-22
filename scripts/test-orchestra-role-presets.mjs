@@ -232,57 +232,13 @@ test("artifact installation is create-if-absent, idempotent, and preserves user 
   }
 });
 
-test("project/global precedence is fail-loud and legacy files remain resolvable", async () => {
-  const root = await mkdtemp(join(tmpdir(), "orchestra-role-resolution-"));
-  const project = await mkdtemp(join(tmpdir(), "orchestra-role-project-"));
-  try {
-    const spec = BUILTIN_ROLE_PRESETS[0];
-    const projectPath = join(project, ".orchestra", "presets", spec.id, "agent.cordis.yml");
-    await mkdir(join(project, ".orchestra", "presets", spec.id), { recursive: true });
-    await writeFile(projectPath, spec.cordisYml, "utf8");
-    const context = { fs: nativeFs(), get() { return undefined; } };
-    const projectResolved = await resolveRolePresetFile(context, project, spec.id, root);
-    assert.equal(projectResolved.source, "project");
-    assert.equal(projectResolved.trust, "user");
-    assert.equal(projectResolved.path, projectPath);
-
-    await writeFile(projectPath, "not: a plugin list\\n", "utf8");
-    await assert.rejects(
-      () => resolveRolePresetFile(context, project, spec.id, root),
-      (error) => error?.code === "composition_invalid",
-    );
-
-    const hostRow = spec.cordisYml + "\n- id: orchestra_report\n  name: orchestra_report\n";
-    await writeFile(projectPath, hostRow, "utf8");
-    await assert.rejects(
-      () => resolveRolePresetFile(context, project, spec.id, root),
-      (error) => error?.code === "composition_mismatch",
-    );
-    await rm(join(project, ".orchestra"), { recursive: true, force: true });
-    const globalHostPath = join(root, "presets", spec.id, "agent.cordis.yml");
-    await mkdir(dirname(globalHostPath), { recursive: true });
-    await writeFile(globalHostPath, hostRow, "utf8");
-    await assert.rejects(
-      () => resolveRolePresetFile(context, project, spec.id, root),
-      (error) => error?.code === "composition_mismatch",
-    );
-    await rm(join(root, "presets", spec.id), { recursive: true, force: true });
-    const globalResolved = await resolveRolePresetFile(context, project, spec.id, root);
-    assert.equal(globalResolved.source, "builtin");
-    assert.equal(globalResolved.spec.id, spec.id);
-
-    const legacy = LEGACY_BUILTIN_ROLE_PRESETS[1];
-    const legacyPath = join(root, "presets", legacy.id, "agent.cordis.yml");
-    await mkdir(join(root, "presets", legacy.id), { recursive: true });
-    await writeFile(legacyPath, legacy.cordisYml, "utf8");
-    assert.equal(await readFile(legacyPath, "utf8"), legacy.cordisYml);
-    const legacyResolved = await resolveRolePresetFile(context, project, legacy.id, root);
-    assert.equal(legacyResolved.source, "global");
-    assert.equal(legacyResolved.spec.status, "legacy");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-    await rm(project, { recursive: true, force: true });
-  }
+test("declared registry presets resolve without filesystem roots", async () => {
+  const spec = BUILTIN_ROLE_PRESETS[0];
+  const context = { get(name) { return name === "agentPresets" ? { async resolve(id) { assert.equal(id, spec.id); return { id }; } } : undefined; } };
+  const resolved = await resolveRolePresetFile(context, "/ignored", spec.id, "/ignored");
+  assert.equal(resolved.source, "dsh");
+  assert.equal(resolved.path, "");
+  await assert.rejects(() => resolveRolePresetFile({ get() { return undefined; } }, "/ignored", spec.id, "/ignored"), /registry is unavailable/);
 });
 
 test("composition and Orchestra host capabilities have separate preflight diagnostics", () => {
@@ -319,62 +275,22 @@ test("composition and Orchestra host capabilities have separate preflight diagno
   );
 });
 
-test("DSH-native preset remains above catalog fallback after artifact seeding", async () => {
-  const root = await mkdtemp(join(tmpdir(), "orchestra-role-native-root-"));
-  const nativeRoot = await mkdtemp(join(tmpdir(), "orchestra-role-native-"));
-  try {
-    const spec = BUILTIN_ROLE_PRESETS[0];
-    const nativePath = join(nativeRoot, "agent.cordis.yml");
-    await writeFile(nativePath, spec.cordisYml, "utf8");
-    const nativePresets = {
-      async resolve(id) {
-        return { id, trust: "system", path: nativePath };
-      },
-    };
-    const context = {
-      fs: nativeFs(),
-      get(name) {
-        return name === "agentPresets" ? nativePresets : undefined;
-      },
-    };
-    await ensureBuiltinRolePresetArtifacts(root);
-    const before = await resolveRolePresetFile(context, "/tmp/native-precedence", spec.id, root);
-    await ensureBuiltinRolePresetArtifacts(root);
-    const after = await resolveRolePresetFile(context, "/tmp/native-precedence", spec.id, root);
-    assert.equal(before.source, "dsh");
-    assert.equal(after.source, "dsh");
-    assert.equal(before.path, nativePath);
-    assert.equal(after.path, nativePath);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-    await rm(nativeRoot, { recursive: true, force: true });
-  }
+test("DSH registry resolution is declaration-owned", async () => {
+  const spec = BUILTIN_ROLE_PRESETS[0];
+  const context = { get(name) { return name === "agentPresets" ? { async resolve(id) { return { id }; } } : undefined; } };
+  const resolved = await resolveRolePresetFile(context, "/ignored", spec.id, "/ignored");
+  assert.equal(resolved.id, spec.id);
+  assert.equal(resolved.source, "dsh");
 });
 
-test("unknown persona-only project preset fails Governed planning before reservation", async () => {
-  const project = await mkdtemp(join(tmpdir(), "orchestra-role-persona-only-"));
-  try {
-    const presetPath = join(project, ".orchestra", "presets", "custom-persona", "agent.cordis.yml");
-    await mkdir(dirname(presetPath), { recursive: true });
-    await writeFile(presetPath, "- id: persona\n  name: '@deepseek-ai/dsh-persona'\n", "utf8");
-    const spec = BUILTIN_ROLE_PRESETS[0];
-    const runtime = blueprintRuntime(spec);
-    runtime.context.fs = nativeFs();
-    await assert.rejects(
-      () => prepareGovernedRolePlan(runtime.context, {
-        cwd: project,
-        teamId: "team-persona-only",
-        controllerSessionId: "driver",
-        topologyId: "foundation-test",
-        topologySource: "bundled",
-        role: { id: "custom", name: "Custom", preset: "custom-persona", sandbox: "read-only" },
-      }),
-      (error) => error?.code === "preset_unavailable" || error?.code === "composition_tools_unproven",
-    );
-    assert.equal(runtime.context.agents.get("custom"), undefined);
-  } finally {
-    await rm(project, { recursive: true, force: true });
-  }
+test("file-only custom presets are rejected before reservation", async () => {
+  const spec = BUILTIN_ROLE_PRESETS[0];
+  const runtime = blueprintRuntime(spec);
+  runtime.context.get = (name) => name === "agentPresets" ? { async resolve() { throw new Error("missing declaration"); } } : undefined;
+  await assert.rejects(() => prepareGovernedRolePlan(runtime.context, {
+    cwd: "/ignored", teamId: "team", controllerSessionId: "driver", topologyId: "topology", topologySource: "bundled",
+    role: { id: "custom", name: "Custom", preset: "custom-persona", sandbox: "read-only" },
+  }), (error) => error?.code === "preset_unavailable");
 });
 
 test("every v0.4 preset mounts in an unpublished Blueprint harness with plane facts", async () => {

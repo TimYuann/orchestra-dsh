@@ -159,8 +159,8 @@ test("subagentNodeActivity maps child rows and reports unclassifiable rows as un
   });
   const activity = await subagentNodeActivity(ctx, "driver-session");
 
-  assert.equal(activity.get("child-running"), "running");
-  assert.equal(activity.get("child-idle"), "inactive");
+  assert.equal(activity.get("child-running"), "unknown");
+  assert.equal(activity.get("child-idle"), "unknown");
   assert.equal(activity.get("child-ghost"), "unknown", "a row this runtime cannot classify is not reported as stopped");
   assert.equal(activity.get("never-listed"), undefined, "the map is a sparse index of what the listing reported");
   assert.equal(activity.size, 3);

@@ -123,17 +123,20 @@ function makeHarness() {
           agentId: id,
           on() { return () => {}; },
         };
-        await createOptions.setup?.(childCtx);
         const agent = {
           id,
           session,
           status: "idle",
           options: createOptions.agentOptions ?? {},
           cancel() { events.push(`agent:cancel:${id}`); },
+          async whenIdle() {},
           inbox: { clear() {} },
           followup(msg) { session.append("user/message", msg); },
         };
+        // DSH publishes the unpublished agent to its setup scope before
+        // governed composition verification runs.
         agents.set(id, agent);
+        await createOptions.setup?.(childCtx, agent);
         return agent;
       },
     },

@@ -184,6 +184,7 @@ function dismissHarness(fs) {
       inject() { events.push(`notice:${id}`); },
       steer() { events.push(`steer:${id}`); },
       cancel(_cause, _options) { events.push(`cancel:${id}`); },
+      async whenIdle() { events.push(`idle:${id}`); },
     };
     agents.set(id, agent);
     return agent;

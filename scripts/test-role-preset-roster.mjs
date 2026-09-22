@@ -69,77 +69,11 @@ function scopeContext() {
 // The decision itself
 // ---------------------------------------------------------------------------
 
-test("S3: an override file mounts through the file API, and the roster is not consulted", async () => {
-  const { agentCtx, calls } = scopeContext();
-  const mounted = [];
-  const rosterMounts = [];
-
-  const result = await mountRolePreset(agentCtx, {
-    presetId: "team-preset",
-    overrideFile: { id: "team-preset", trust: "user", path: "/project/.orchestra/presets/team-preset/agent.cordis.yml" },
-    mountByFile: async (ctx, file) => {
-      mounted.push(file);
-      return file.id;
-    },
-    mountById: async (_ctx, id) => {
-      rosterMounts.push(id);
-    },
-  });
-
-  assert.equal(result.mountedBy, "file");
-  assert.equal(result.presetId, "team-preset");
-  assert.equal(mounted.length, 1, "the file API must run exactly once for an override");
-  assert.equal(mounted[0].path, "/project/.orchestra/presets/team-preset/agent.cordis.yml");
-  assert.deepEqual(rosterMounts, [], "an override must not also be mounted by id");
-});
-
-test("S3: a preset with no override mounts BY ID through the roster, and no file is read", async () => {
-  const { agentCtx, calls } = scopeContext();
-  const rosterMounts = [];
-  const fileMounts = [];
-
-  const result = await mountRolePreset(agentCtx, {
-    presetId: "orchestra-v04-implementer-v1",
-    roster: {
-      async mount(ctx, id) {
-        rosterMounts.push({ ctx, id });
-        return { id, trust: "system", path: "/Users/x/.dsh/orchestra/catalog-presets/orchestra-v04-implementer-v1/agent.cordis.yml" };
-      },
-    },
-    mountByFile: async (_ctx, file) => {
-      fileMounts.push(file);
-    },
-  });
-
-  assert.equal(result.mountedBy, "id");
-  assert.equal(result.presetId, "orchestra-v04-implementer-v1");
-  assert.equal(rosterMounts.length, 1, "the roster API must run exactly once");
-  assert.equal(rosterMounts[0].id, "orchestra-v04-implementer-v1");
-  assert.deepEqual(fileMounts, [], "a roster preset must not be composed from a file path");
-
-  // The measured fact that keeps this function small: mounting by id never needs
-  // the preset's path. Nothing here read a file, and the roster returned a path
-  // that was ignored — so there is no `readFile(preset.path)` to assert against,
-  // which is the honest form of the plan's "no path is generated" requirement.
-  assert.deepEqual(
-    calls.filter((entry) => entry.name === "agentPresets"),
-    [],
-    "the caller's roster wins; the agent context is not consulted for it",
-  );
-});
-
-test("S3: with neither an override nor any roster, the failure is typed and says why", async () => {
+test("S3: file presets fail loudly; declarations mount only by registry id", async () => {
   const { agentCtx } = scopeContext();
-  await assert.rejects(
-    () => mountRolePreset(agentCtx, { presetId: "ghost-preset" }),
-    (error) => {
-      assert.equal(error instanceof RolePresetMountError, true);
-      assert.equal(error.code, "preset_roster_unavailable");
-      assert.match(error.message, /ghost-preset/);
-      return true;
-    },
-    "an id with nothing to resolve it must fail loudly rather than mount nothing",
-  );
+  await assert.rejects(() => mountRolePreset(agentCtx, {
+    presetId: "team-preset", overrideFile: { id: "team-preset", trust: "user", path: "/legacy/agent.cordis.yml" },
+  }), /unsupported/);
 });
 
 // ---------------------------------------------------------------------------
@@ -167,8 +101,8 @@ test("S3: every role-session mount site goes through mountRolePreset", async () 
   }
   assert.deepEqual(
     importers,
-    ["role-preset-mount.ts"],
-    "exactly the mount module may import the engine's mountPreset; a second importer means a second decision point",
+    [],
+    "DSH 0.1.7 registry mounting must not import the removed file mount API",
   );
 });
 

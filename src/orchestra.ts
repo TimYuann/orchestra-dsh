@@ -1093,9 +1093,11 @@ export async function prepareGovernedRolePlan(
     /** Native per-child persona; only meaningful for a `subagent` role. */
     persona?: string;
     signal?: AbortSignal;
+    /** Reconstruct an already-reserved Session's complete birth contract. */
+    sessionId?: string;
   },
 ): Promise<GovernedRolePlan> {
-  const sessionId = governedSessionId(options.teamId);
+  const sessionId = options.sessionId ?? governedSessionId(options.teamId);
   const execution = resolveRoleExecution(options.role);
   if (execution === "subagent") {
     return prepareSubagentRolePlan(options, sessionId);
@@ -3238,6 +3240,19 @@ export async function addLanesToTeam(
  * it may change to bring the role up (a one-off substitution; it is not written
  * back to any preference file).
  */
+async function reconstructReservedSessionPlan(ctx: Context, team: TeamState, role: TeamRole, cwd: string, signal?: AbortSignal): Promise<GovernedRolePlan> {
+  if (role.preset === null || role.blueprint === undefined) throw new Error(`reserved Session role ${role.id} has no complete governed birth facts`);
+  return prepareGovernedRolePlan(ctx, {
+    cwd, teamId: team.teamId, controllerSessionId: team.controllerSessionId,
+    topologyId: role.blueprint.topologyId, topologySource: role.blueprint.topologySource,
+    role: { id: role.id, name: role.name, preset: role.preset, sandbox: role.sandbox as any,
+      compositionTools: role.blueprint.compositionTools?.names, orchestraTools: role.blueprint.orchestraTools?.names } as RoleConfig,
+    presetId: role.preset, sandbox: role.sandbox, permissionPreset: role.blueprint.permissionPreset,
+    provider: role.model?.provider, model: role.model?.model, reasoningEffort: role.model?.reasoningEffort,
+    title: role.blueprint.title, sessionId: role.sessionId, signal,
+  });
+}
+
 async function materializeRole(
   ctx: Context,
   activeTeamState: ActiveTeamStateStore,
@@ -3321,81 +3336,29 @@ async function materializeRole(
       return receipt;
     }
 
-    let presetFile: ResolvedPresetFile | undefined;
-    if (role.preset) {
-      try {
-        const resolved = await resolvePresetFile(ctx, cwd, role.preset);
-        if (resolved.source !== "dsh" && resolved.path !== "") {
-          presetFile = resolved;
-        }
-      } catch {
-        // fall back to the preset id: the blueprint preflight already proved it
-      }
-    }
-
-    // Materialization must be IDEMPOTENT on the reserved id.
-    //
-    // The seat named by team.json is also the id its session is created with, so
-    // any earlier attempt that created the session and then failed later (or a
-    // reactivation that rebuilt it) leaves that id taken. Creating it again is a
-    // hard error — "session ... already exists" — which stranded a real lane:
-    // the seat was reserved, the session existed, and every retry failed the
-    // same way. A live agent means the role is already up, so the honest action
-    // is to treat this as the successful end of the transaction and hand the
-    // first turn to the session that is already there.
+    // Fresh creation and retry reconstruction consume the identical governed
+    // blueprint facts that were approved at reservation; never fall back to a
+    // plain preset setup.
+    const rebuilt = await reconstructReservedSessionPlan(ctx, team, role, cwd, exec.signal);
+    let created: { sessionId: string };
     const existing = ctx.agents.get(SID(role.sessionId));
     if (existing !== undefined) {
-      await activeTeamState.mutate(
-        cwd,
-        (t) => ({
-          ...t,
-          roles: t.roles.map((r) =>
-            r.id.toLowerCase() === roleId.toLowerCase() ? { ...r, phase: "active", diagnostic: undefined } : r,
-          ),
-        }),
-        { policy, signal: exec.signal },
-      );
-      return deliverMessage(ctx, controller.id, role.sessionId, [{ type: "text", text: combinedFirstTurn }], {
-        wake: true,
-        ...transportStores(ctx, cwd),
-      });
-    }
-
-    // The same idempotency has a second face: the session can exist on DISK
-    // without a live agent (a restart unloads agents but keeps session logs).
-    // `createSession` then fails with "session ... already exists", which is a
-    // statement about the id, not about the work — retrying can never succeed.
-    // Resume it instead, so a lane whose seat was already built becomes usable
-    // again rather than permanently failing to materialize.
-    let created: { sessionId: string };
-    try {
-      created = await buildRoleSession(ctx, {
-        kind: "create",
-        sessionId: role.sessionId,
-        cwd,
-        createdBySessionId: controller.id,
-        // `...(x === undefined ? {} : {x})` rather than passing `undefined`:
-        // a literally-undefined option is a present key, so it defeats
-        // `createSession`'s own `options.provider !== undefined` checks and can
-        // flip the model-route branch. Same defect class D4's guard caught on
-        // tool RETURN values; here it is on the way IN.
-        ...(role.preset === null ? {} : { presetId: role.preset }),
-        ...(presetFile !== undefined ? { presetFile } : {}),
-        title: roleSessionTitle({ roleId: role.id, missionObjective: team.mission.objective, cwd }),
-        ...(role.model?.provider === undefined ? {} : { provider: role.model.provider }),
-        ...(role.model?.model === undefined ? {} : { model: role.model.model }),
-        ...(role.model?.reasoningEffort === undefined ? {} : { reasoningEffort: role.model.reasoningEffort }),
-        signal: exec.signal,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!/already exists/i.test(message)) throw error;
-      await buildRoleSession(ctx, {
-        kind: "resume",
-        sessionId: role.sessionId,
-        ...(role.model === undefined ? {} : { agentOptions: { provider: role.model.provider, model: role.model.model } }),
-      });
       created = { sessionId: role.sessionId };
+    } else {
+      try {
+        const createdResult = await buildRoleSession(ctx, {
+          kind: "create", mode: "governed", sessionId: role.sessionId, cwd,
+          governedBlueprint: rebuilt.blueprint!, signal: exec.signal,
+        });
+        created = { sessionId: createdResult.sessionId };
+      } catch (error) {
+        if (!/already exists/i.test(error instanceof Error ? error.message : String(error))) throw error;
+        const controller = ctx.get("sessionController");
+        if (controller === undefined) throw new Error(`cannot restore role ${role.id}: sessionController is unavailable`);
+        const resolved = await controller.resolveAgent(SID(role.sessionId));
+        if ("error" in resolved) throw new Error(`cannot restore role ${role.id}: ${resolved.error.message}`);
+        created = { sessionId: role.sessionId };
+      }
     }
     createdSessionId = created.sessionId;
 
@@ -3667,46 +3630,28 @@ export function roleRetirementNotice(): string {
  */
 async function retireTeamRoles(ctx: Context, controller: Agent, roles: readonly TeamRole[], cwd: string): Promise<void> {
   for (const role of roles) {
-    if (role.execution === "subagent") {
-      try {
+    try {
+      if (role.execution === "subagent") {
         await releaseSubagentNodeDefault(ctx, controller, role.sessionId);
-      } catch (err) {
-        console.error(
-          `orchestra_dismiss: subagent drain for ${role.sessionId} failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
+      } else {
+        const live = ctx.agents.get(SID(role.sessionId));
+        if (live !== undefined) {
+          live.cancel({ kind: "parent" }, { keepInbox: false });
+          await live.whenIdle();
+        }
       }
-      continue;
-    }
-
-    const live = ctx.agents.get(SID(role.sessionId));
-    if (live === undefined) continue;
-
-    try {
-      // Stop first: the active turn is aborted and pending input is discarded.
-      live.cancel({ kind: "hook", reason: "orchestra_dismiss" }, { keepInbox: false });
     } catch (error) {
-      console.error(
-        `orchestra_dismiss: cancel of ${role.sessionId} failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      continue;
+      throw new Error(`orchestra_dismiss: required stop for role ${role.id} (${role.sessionId}) failed; team remains active: ${error instanceof Error ? error.message : String(error)}`);
     }
-
-    try {
-      // Then tell: queued for the next step, so it is durable in the role's own
-      // log and survives the cancellation that just cleared everything else.
-      void deliverMessage(ctx, controller.id, role.sessionId, [{ type: "text", text: roleRetirementNotice() }], {
-        wake: false,
-        ...transportStores(ctx, cwd),
-      }).catch((error) => {
-        console.error(
-          `orchestra_dismiss: archive notice to ${role.sessionId} failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      });
-    } catch (error) {
-      console.error(
-        `orchestra_dismiss: archive notice to ${role.sessionId} failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
+  }
+  // Retirement notification is deliberately non-authoritative: stopping has
+  // already completed, and a notification failure cannot falsely authorize an
+  // archive. It remains observable through the existing notice mechanism.
+  for (const role of roles) {
+    if (role.execution === "subagent") continue;
+    void deliverMessage(ctx, controller.id, role.sessionId, [{ type: "text", text: roleRetirementNotice() }], {
+      wake: false, ...transportStores(ctx, cwd),
+    }).catch((error) => console.error(`orchestra_dismiss: archive notice to ${role.sessionId} failed: ${error instanceof Error ? error.message : String(error)}`));
   }
 }
 
@@ -4020,21 +3965,23 @@ export async function activateArchivedTeam(
       // Step 5c: authoritatively missing → create a replacement session.
       try {
         if (role.execution === "subagent") {
-          // Re-creating the missing child as a Session would silently change the
-          // role's backend and drop its direct-parent address: the replacement
-          // would no longer be deliverable through the native edge team.json
-          // records. Re-establishing a native child is not implemented, so this
-          // role fails loudly and the team degrades for a human to re-provision.
-          throw new Error(
-            `role ${role.id} runs on the "subagent" backend and its child session ${role.sessionId} is missing; replacing it with a Session would silently change the role's backend, and re-establishing a native child is not implemented — re-provision this role instead`,
-          );
+          // Native continuations reject reuse of a materialized child id under a
+          // new controller. Reserve a fresh id and let the normal first-dispatch
+          // path establish it with the persisted persona/filter.
+          const oldSessionId = role.sessionId;
+          role.sessionId = governedSessionId(newTeam.teamId);
+          role.phase = "reserved";
+          role.parentSessionId = exec.agent.id;
+          role.sessionHistory = [...role.sessionHistory, { sessionId: oldSessionId, replacedAt: Date.now(), reason: "subagent-takeover" }];
+          results.push({ role_id: role.id, sessionId: role.sessionId, action: "replaced" });
+          continue;
         }
         const presetFile =
           role.preset === null ? undefined : await resolvePresetFile(ctx, cwd, role.preset);
         const roleModel = role.model;
         const created = await createRoleSession(ctx, {
           kind: "create",
-          sessionId: role.sessionId,
+          sessionId: governedSessionId(newTeam.teamId),
           cwd,
           ...(presetFile === undefined ? {} : { presetFile }),
           ...(roleModel === undefined || roleModel.provider === undefined || roleModel.model === undefined
@@ -5251,6 +5198,8 @@ export function apply(ctx: Context): void {
             archive_path: { type: "string", required: true },
             dismissed_at: { type: "number", required: true },
             status: { type: "string", enum: ["dismissed", "already_archived"], required: true },
+            reason: { type: "string" },
+            summary: { type: "string" },
           },
         },
         render: (_args, value) => [
