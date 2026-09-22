@@ -13,7 +13,7 @@ import { agentPresetProjectionDefinition } from "@deepseek-ai/dsh-agent-preset-r
 import { mountRolePreset } from "./role-preset-mount.js";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
 import type { Session, SessionEvent, SessionHeader } from "@deepseek-ai/dsh-session";
-import type { BlueprintStore } from "./session-blueprint.js";
+import { prepareGovernedBlueprint, resumeGovernedSession, type BlueprintStore } from "./session-blueprint.js";
 import type { ReceiptStore } from "./receipt-store.js";
 
 const SID = (value: string) => value as import("@deepseek-ai/dsh-session").SessionId;
@@ -199,18 +199,32 @@ async function tryResume(
   const stored = store === undefined ? undefined : await store.read(sessionId);
   const governed = stored?.mode === "governed" ? stored : undefined;
   const lightweight = stored?.mode === "lightweight" ? stored : undefined;
-  const presetId = governed?.agentPreset ?? lightweight?.agentPreset ?? presetFromSnapshot(snapshot.session, snapshot.events);
+  if (governed !== undefined) {
+    const blueprint = await prepareGovernedBlueprint(ctx, {
+      sessionId, teamId: governed.teamId, roleId: governed.roleId, roleName: governed.roleId,
+      topologyId: governed.topologyId, topologySource: governed.topologySource,
+      controllerSessionId: governed.controllerSessionId, cwd: governed.cwd,
+      presetId: governed.agentPreset, permissionPreset: governed.permissionPreset,
+      sandbox: governed.sandbox, provider: governed.provider, model: governed.model,
+      reasoningEffort: governed.reasoningEffort, title: governed.title,
+      compositionTools: governed.compositionTools, orchestraTools: governed.orchestraTools,
+      optionalCapabilities: governed.optionalCapabilities,
+    });
+    await resumeGovernedSession(ctx, blueprint);
+    return;
+  }
+  const presetId = lightweight?.agentPreset ?? presetFromSnapshot(snapshot.session, snapshot.events);
   if (typeof presetId !== "string" || presetId === "") throw new Error(`a2a transport: session ${sessionId} has no recoverable Agent Preset`);
-  const marker = governed ?? lightweight;
+  const marker = lightweight;
   const presetFile = marker?.presetSource === "file" && marker.presetPath !== undefined
     ? { id: presetId, trust: marker.presetTrust ?? "user", path: marker.presetPath }
     : undefined;
   const resolved = presetFile === undefined ? await presets.resolve(presetId) : undefined;
   const model = ctx.get("agentDefaultModel");
   const selection = model === undefined ? undefined : model.currentSelection();
-  const provider = governed?.provider ?? lightweight?.provider ?? selection?.provider;
-  const modelId = governed?.model ?? lightweight?.model ?? selection?.model;
-  const reasoningEffort = governed?.reasoningEffort ?? lightweight?.reasoningEffort ?? selection?.reasoningEffort;
+  const provider = lightweight?.provider ?? selection?.provider;
+  const modelId = lightweight?.model ?? selection?.model;
+  const reasoningEffort = lightweight?.reasoningEffort ?? selection?.reasoningEffort;
   await ctx.agents.resume({
     resumeSessionId: SID(sessionId),
     agentOptions: provider === undefined || modelId === undefined ? {} : { provider, model: modelId },

@@ -277,12 +277,29 @@ function activateContext(fs, options = {}) {
       return persisted;
     },
   };
+  const presets = {
+    async resolve(id) { return { id, trust: "system", path: "" }; },
+    composedPreset(agentCtx) { return agentCtx.composedPreset; },
+  };
+  const permissions = {
+    defaultPreset: "workspace",
+    resolve() { return { sandbox: "workspace-write", approval: "ask" }; },
+    current() { return "workspace"; },
+    set() {},
+  };
+  const tools = {
+    schemas() {
+      return ["read", "write", "grep", "bash", "orchestra_report"].map((name) => ({ name, description: name, parameters: {} }));
+    },
+  };
   const ctx = {
     fs,
     get(name) {
       if (name === "sessionQuery") return query;
       if (name === "agentDefaultModel") return { currentSelection: () => ({ provider: "p", model: "m" }) };
-      if (name === "agentPresets") return { async resolve(id) { return { id, trust: "system", path: "" }; } };
+      if (name === "agentPresets") return presets;
+      if (name === "permissionPresets") return permissions;
+      if (name === "tools") return tools;
       return undefined;
     },
     agents: {
@@ -303,7 +320,7 @@ function activateContext(fs, options = {}) {
 function activateDeps(events) {
   return {
     createSession: async (agentCtx, options) => {
-      const roleId = typeof options.title === "string" ? options.title.split(" · ")[0] : "role";
+      const roleId = options.governedBlueprint?.receipt?.roleId ?? (typeof options.title === "string" ? options.title.split(" · ")[0] : "role");
       const sessionId = `replacement-${roleId}`;
       events.push(`create:${roleId}`);
       return { sessionId, handle: { dispose: async () => {} } };
@@ -403,7 +420,26 @@ test("activate live branch reuses the existing session and keeps its mapping", a
     const activeStore = createActiveTeamStateStore(fs);
     const archiveStore = createArchiveStore(fs);
     const { ctx, agents } = activateContext(fs, { missingSessions: ["session-implementer"] });
-    agents.set("session-reviewer", { id: "session-reviewer" });
+    const reviewerSession = {
+      header: { cwd },
+      snapshotEvents() {
+        return [
+          { type: "sandbox/mode", data: { mode: "read-only" } },
+          { type: "approval/policy", data: { policy: "never" } },
+        ];
+      },
+    };
+    const reviewerCtx = {
+      ...ctx,
+      composedPreset: "orchestra-reviewer",
+      get(name) { return ctx.get(name); },
+    };
+    agents.set("session-reviewer", {
+      id: "session-reviewer",
+      session: reviewerSession,
+      ctx: reviewerCtx,
+      options: { provider: "p", model: "m" },
+    });
     const events = [];
     const result = await activateArchivedTeam(ctx, activeStore, archiveStore, { archiveId: "team-recovery-100-restore" }, exec, activateDeps(events));
     const reviewer = result.roles.find((role) => role.role_id === "reviewer");

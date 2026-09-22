@@ -77,7 +77,11 @@ function makeHarness() {
 
   const presets = {
     defaultId: "default",
-    async resolve(id) { return { id }; },
+    async resolve(id) {
+      if (id === "orchestra-does-not-exist") throw new Error(`unknown declared preset ${id}`);
+      return { id };
+    },
+    composedPreset(ctx) { return ctx.composedPreset; },
     async mount(ctx, id) { events.push(`mount:${id}`); ctx.composedPreset = id; },
     composeFrom(ctx, parent) { ctx.composedPreset = parent.composedPreset; return parent.composedPreset; },
   };
@@ -115,6 +119,7 @@ function makeHarness() {
           { name: "orchestra_report", description: "escrow report", parameters: {} },
           { name: "fs_read", description: "read a file", parameters: {} },
           { name: "fs_search", description: "search files", parameters: {} },
+          { name: "grep", description: "search file contents", parameters: {} },
           { name: "bash", description: "shell", parameters: {} },
           { name: "fs_write", description: "write a file", parameters: {} },
         ],
@@ -305,9 +310,26 @@ test("dispatch is idempotent on a reserved seat whose session already exists", a
   // A session already sits on the reserved id: an earlier attempt created it and
   // a later step failed, or a reactivation rebuilt it. Creating it again fails
   // with "session ... already exists", which stranded a real lane in testing.
+  const existingSession = {
+    header: { cwd },
+    snapshotEvents() {
+      return [
+        { type: "sandbox/mode", data: { mode: seat.sandbox } },
+        { type: "approval/policy", data: { policy: "never" } },
+      ];
+    },
+    append() {},
+  };
+  const existingCtx = {
+    ...harness.context,
+    composedPreset: seat.preset,
+    get(name) { return harness.context.get(name); },
+  };
   harness.agents.set(seat.sessionId, {
     id: seat.sessionId,
-    session: { header: { cwd }, snapshotEvents() { return []; }, append() {} },
+    session: existingSession,
+    ctx: existingCtx,
+    options: { ...seat.model },
     status: "idle",
     inbox: { hasPending: false },
     followup() { harness.events.push(`reused:${seat.sessionId}`); },

@@ -980,5 +980,15 @@ export async function resolveRolePresetFile(
   try { await presets.resolve(id); } catch (error) {
     throw new RolePresetError("preset_unavailable", "DSH declared preset " + id + " could not be resolved", { id, source: "dsh" }, error);
   }
-  return { id, trust: "system", path: "", source: "dsh", spec: rolePresetSpec(id) };
+  const inventory = typeof presets.compositionInventory === "function"
+    ? (await presets.compositionInventory()).find((entry) => entry.id === id)
+    : undefined;
+  if (inventory?.broken !== undefined) throw new RolePresetError("composition_invalid", inventory.broken, { id });
+  return { id, trust: "system", path: "", source: "dsh", spec: rolePresetSpec(id),
+    ...(inventory === undefined ? {} : { composition: {
+      rows: inventory.rows.filter((row) => row.enabled !== false).map((row) => ({ id: row.entryId, name: row.moduleName })),
+      rowIds: inventory.rows.filter((row) => row.enabled !== false && row.entryId !== null).map((row) => row.entryId!),
+      pluginNames: inventory.rows.filter((row) => row.enabled !== false).map((row) => row.moduleName),
+    } }),
+  };
 }

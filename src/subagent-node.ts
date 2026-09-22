@@ -143,7 +143,14 @@ export async function createSubagentNode(
   const label = requireNonEmpty(spec.label, "label");
   const prompt = requireNonEmpty(spec.prompt, "prompt");
   const provider = spec.provider === undefined || spec.provider === "" ? "spawn" : spec.provider;
-  const agentOptions = nativeAgentOptions(spec);
+  const header = parent.session?.requestHeader?.();
+  const current = header?.config;
+  const inheritedRoute = typeof current?.provider === "string" && typeof current.model === "string"
+    ? { provider: current.provider, model: current.model,
+        ...(header?.adapterDefaults?.reasoningEffort === true || current.reasoningEffort === undefined
+          ? {} : { reasoningEffort: String(current.reasoningEffort) }),
+      } : undefined;
+  const agentOptions = nativeAgentOptions({ ...spec, agentOptions: spec.agentOptions ?? inheritedRoute });
   const toolFilter = nativeToolFilter(spec);
   try {
     const started = await subagents.startContinuable({

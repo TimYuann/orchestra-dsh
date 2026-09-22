@@ -104,7 +104,10 @@ function makeHarness() {
       if (name === "fs") return fs;
       if (name === "agentPresets") return presets;
       if (name === "permissionPresets") return permissions;
-      if (name === "tools") return { schemas: () => [{ name: "read", description: "read", parameters: {} }] };
+      if (name === "tools") return { schemas: () => [
+        { name: "read", description: "read", parameters: {} },
+        { name: "orchestra_report", description: "report", parameters: {} },
+      ] };
       if (name === "agentDefaultModel") return { currentSelection: () => ({ provider: "default-p", model: "default-m" }) };
       return undefined;
     },

@@ -100,6 +100,9 @@ export interface TeamRoleBlueprintFacts {
    * means "not declared", which is not the same as "declared as something else".
    */
   pinnedApproval?: string;
+  expectedCompositionTools?: string[];
+  expectedOrchestraTools?: string[];
+  expectedRequiredTools?: string[];
   compositionTools?: { names: string[]; count: number };
   orchestraTools?: { names: string[]; count: number };
   optionalCapabilities?: string[];

@@ -95,9 +95,11 @@ test("S3: every role-session mount site goes through mountRolePreset", async () 
   for (const [name, source] of [["src/session-blueprint.ts", blueprint], ["src/orchestra.ts", orchestra]]) {
     const direct = codeLines(source).filter((line) => line.includes("mountPreset("));
     assert.deepEqual(direct, [], `${name} must not call the engine's mountPreset directly`);
-    const viaEntry = codeLines(source).filter((line) => line.includes("mountRolePreset("));
-    assert.notDeepEqual(viaEntry, [], `${name} must mount role presets through mountRolePreset`);
   }
+  const blueprintEntry = codeLines(blueprint).filter((line) => line.includes("mountRolePreset("));
+  assert.notDeepEqual(blueprintEntry, [], "the single blueprint owner must mount role presets through mountRolePreset");
+  const orchestraEntry = codeLines(orchestra).filter((line) => line.includes("mountRolePreset("));
+  assert.deepEqual(orchestraEntry, [], "orchestra.ts must delegate mounting to the single blueprint owner");
 
   // Only the module that OWNS the decision may import the file API. If another
   // file imports `mountPreset` from the package, a second decision has appeared.

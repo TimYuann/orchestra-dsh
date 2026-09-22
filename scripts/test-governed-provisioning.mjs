@@ -72,6 +72,12 @@ function makeRuntime(options = {}) {
       if (options.brokenPreset === id) throw new Error(`broken preset ${id}`);
       return { id };
     },
+    async compositionInventory() {
+      return [{
+        id: "preset-reviewer",
+        rows: [{ entryId: "tool-fs", moduleName: "@deepseek-ai/dsh-tool-fs", enabled: true }],
+      }];
+    },
     async mount(context, id) {
       events.push(`mount:${id}`);
       context.composedPreset = id;
@@ -105,7 +111,7 @@ function makeRuntime(options = {}) {
   };
   const tools = {
     schemas() {
-      return (options.tools ?? ["read", "write"]).map((name) => ({ name, description: name, parameters: {} }));
+      return (options.tools ?? ["read", "write", "orchestra_report"]).map((name) => ({ name, description: name, parameters: {} }));
     },
   };
   const sessionFor = (id) => {
@@ -429,7 +435,7 @@ test("Governed Blueprint applies explicit model over topology runtime and record
   const commit = await blueprint.setup({ ...runtime.context, composedPreset: undefined, get: (name) => name === "agentPresets" ? runtime.presets : name === "permissionPresets" ? runtime.permissions : runtime.context.get(name) });
   commit.commit();
   assert.equal(blueprint.receipt.effectivePermissionPreset, "custom");
-  assert.deepEqual(blueprint.receipt.tools, { names: ["read", "write"], count: 2 });
+  assert.deepEqual(blueprint.receipt.tools, { names: ["orchestra_report", "read", "write"], count: 3 });
   const storedMarker = await blueprintStoreFor(runtime.context, cwd).read("orchestra-team-test-reviewer");
   assert.equal(storedMarker.teamId, "team-test");
   assert.equal(
@@ -463,7 +469,7 @@ test("Governed create preflights required capabilities before reservation and fa
       topologySource: "bundled",
       role: { id: "reviewer", name: "reviewer", preset: "preset-reviewer", sandbox: "read-only", requiredTools: ["missing-tool"] },
     }),
-    (error) => error?.code === "required_tools_unproven" && /reservation was not attempted/.test(error.message),
+    (error) => error?.code === "composition_tools_missing" && /missing-tool/.test(error.message),
   );
   assert.equal(runtime.fs.files.size, 0, "preflight failure does not write active Team state");
   assert.equal(runtime.agents.size, 0, "preflight failure does not create an Agent");
@@ -480,7 +486,7 @@ test("actual orchestra_create bounded entrypoint rejects missing required tool b
   const frozenRef = await approvedFrozenRef(runtime, roles, "draft-required-tool");
   await assert.rejects(
     () => createGovernedTeam(runtime.context, runtime.store, catalog, { frozenRef }, { agent: runtime.controller }, { createSession: runtime.createSessionAdapter }),
-    (error) => error?.code === "required_tools_unproven" && /reservation was not attempted/.test(error.message),
+    (error) => error?.code === "composition_tools_missing" && /missing-tool/.test(error.message),
   );
   assert.equal(runtime.fs.files.size, 0, "orchestra_create did not write active Team state");
   assert.equal(runtime.sessions.size, 1, "only the caller Session exists");

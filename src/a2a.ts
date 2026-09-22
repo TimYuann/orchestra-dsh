@@ -21,12 +21,12 @@ import { mountRolePreset } from "./role-preset-mount.js";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolExecutionInput } from "@deepseek-ai/dsh-tools";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
-import type { Agent, AgentHandle, AgentSetup } from "@deepseek-ai/dsh-agent";
+import type { Agent, AgentHandle, AgentSetup, AgentOptions } from "@deepseek-ai/dsh-agent";
 import type { SessionId, AgentCancelCause } from "@deepseek-ai/dsh-session";
 import type {} from "@deepseek-ai/dsh-fs";
 import type {} from "@deepseek-ai/dsh-system-prompt";
 import { randomUUID } from "node:crypto";
-import { pinApprovalNever, prepareRoleBlueprint } from "./session-blueprint.js";
+import { pinApprovalNever, prepareRoleBlueprint, resumeGovernedSession } from "./session-blueprint.js";
 import { createSubagentNode } from "./subagent-node.js";
 import type { BlueprintPresetFile, GovernedBlueprintReceipt, PreparedGovernedBlueprint, LightweightBlueprintReceipt } from "./session-blueprint.js";
 import { deliverMessage, queryMessageStatus, readDeliveryReceipt } from "./a2a-transport.js";
@@ -297,8 +297,8 @@ export interface BuildRoleSessionSpec {
   /** Needed by `mode: "governed"`: prepared by `prepareGovernedBlueprint`. */
   governedBlueprint?: PreparedGovernedBlueprint;
   /** Only for `kind: "resume"`: the setup to run, and the model options to apply. */
-  setup?: (agentCtx: Context) => Promise<void>;
-  agentOptions?: Record<string, unknown>;
+  setup?: AgentSetup;
+  agentOptions?: AgentOptions;
   /** Only the first-wave path needs this: it rolls back sessions it already started. */
   returnHandle?: boolean;
   signal?: AbortSignal;
@@ -318,6 +318,14 @@ export interface BuildRoleSessionResult {
 }
 
 export async function buildRoleSession(ctx: Context, spec: BuildRoleSessionSpec): Promise<BuildRoleSessionResult> {
+  if (spec.mode === "governed" && spec.governedBlueprint?.receipt.sessionId !== spec.sessionId) {
+    throw new Error("governed role session requires its matching prepared blueprint");
+  }
+  if (spec.kind === "resume" && spec.mode === "governed") {
+    const handle = await resumeGovernedSession(ctx, spec.governedBlueprint!, spec.signal);
+    return { sessionId: spec.sessionId, governedReceipt: spec.governedBlueprint!.receipt,
+      ...(handle === undefined ? {} : { handle }) };
+  }
   if (spec.kind === "resume") {
     // D2-a: a resumed session gets the same "never ask" pin a created one gets.
     // The pin is composed INTO the setup rather than applied afterwards, because
@@ -327,15 +335,16 @@ export async function buildRoleSession(ctx: Context, spec: BuildRoleSessionSpec)
     // Blueprint setup, so the fold there makes this a no-op.
     const callerSetup = spec.setup;
     const setup: AgentSetup = async (agentCtx, agent) => {
-      if (callerSetup !== undefined) await callerSetup(agentCtx);
+      const commit = await callerSetup?.(agentCtx, agent);
       pinApprovalNever(ctx, agentCtx, spec.sessionId, agent);
+      return commit;
     };
     await ctx.agents.resume({
       resumeSessionId: SID(spec.sessionId),
       ...(spec.agentOptions === undefined ? {} : { agentOptions: spec.agentOptions }),
       setup,
       ...(spec.signal === undefined ? {} : { signal: spec.signal }),
-    } as never);
+    });
     return { sessionId: spec.sessionId };
   }
   const created =

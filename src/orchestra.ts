@@ -24,7 +24,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import type { ToolExecutionInput } from "@deepseek-ai/dsh-tools";
 // `JsonValue` moved out of `@deepseek-ai/dsh-tools` in DSH 0.1.5-rc.2.
 import type { JsonValue } from "@deepseek-ai/dsh-util-values";
-import type { AgentHandle, Agent } from "@deepseek-ai/dsh-agent";
+import type { AgentHandle, Agent, AgentOptions } from "@deepseek-ai/dsh-agent";
 import type {} from "@deepseek-ai/dsh-session";
 import type { SessionId } from "@deepseek-ai/dsh-session";
 import type {} from "@deepseek-ai/dsh-fs";
@@ -34,11 +34,11 @@ import type {} from "@deepseek-ai/dsh-sandbox-policy";
 import type {} from "@deepseek-ai/dsh-permission-presets";
 import type {} from "@deepseek-ai/dsh-system-prompt";
 import type {} from "@deepseek-ai/dsh-commands";
-import { buildRoleSession, createSession, installModelOverride, deliverMessage, readDeliveryReceipt, transportStores } from "./a2a.js";
+import { buildRoleSession, createSession, deliverMessage, readDeliveryReceipt, transportStores } from "./a2a.js";
 import { receiptStoreFor } from "./receipt-store.js";
 import { charterRecordStoreFor } from "./charter-store.js";
 import type { ResolvedPresetFile } from "./a2a.js";
-import { hostToolNamesForPreflight, PINNED_APPROVAL, prepareRoleBlueprint, preflightGovernedRequiredTools, resolveDraftRoleModel, SessionBlueprintError, REMOVED_ORCHESTRA_TOOLS } from "./session-blueprint.js";
+import { hostToolNamesForPreflight, PINNED_APPROVAL, prepareRoleBlueprint, preflightGovernedRequiredTools, resolveDraftRoleModel, verifyGovernedAgent, SessionBlueprintError, REMOVED_ORCHESTRA_TOOLS } from "./session-blueprint.js";
 import type { GovernedBlueprintReceipt, PreparedGovernedBlueprint } from "./session-blueprint.js";
 import {
   ensureBuiltinRolePresetArtifacts,
@@ -131,7 +131,6 @@ import type { SubagentNodeSpec } from "./subagent-node.js";
 import { createTopologyCatalog, resolveRoleExecution, validateTopology } from "./orchestra-topology.js";
 import type { RoleConfig, TopologyCatalog, TopologyClosureDefinition, TopologyConfig, TopologyList, TopologyLoopContract, TopologyProtocol, TopologyResolution, TopologyRoleSummary } from "./orchestra-topology.js";
 export { validateTopology } from "./orchestra-topology.js";
-import { mountRolePreset } from "./role-preset-mount.js";
 import { registerOrchestrationPrinciples } from "./orchestration-principles.js";
 import "./relay-types.js";
 import { basename, join } from "node:path";
@@ -987,6 +986,9 @@ function roleBlueprintFacts(receipt: GovernedBlueprintReceipt, compositionRowIds
     // readiness objects are NOT a substitute: they are only filled inside the
     // setup window, which two of the three provisioning paths never open.
     ...(compositionRowIds === undefined ? {} : { compositionRowIds }),
+    expectedCompositionTools: receipt.expectedCompositionTools,
+    expectedOrchestraTools: receipt.expectedOrchestraTools,
+    expectedRequiredTools: receipt.expectedRequiredTools,
     compositionTools: receipt.compositionTools,
     orchestraTools: receipt.orchestraTools,
     optionalCapabilities: receipt.optionalCapabilities,
@@ -1091,7 +1093,13 @@ export async function prepareGovernedRolePlan(
   const sessionId = options.sessionId ?? governedSessionId(options.teamId);
   const execution = resolveRoleExecution(options.role);
   if (execution === "subagent") {
-    return prepareSubagentRolePlan(options, sessionId);
+    const plan = prepareSubagentRolePlan(options, sessionId);
+    // Reservation is the approval boundary for a governed seat. Freeze the
+    // inherited route now rather than silently changing it on first dispatch.
+    if (plan.agentOptions === undefined) {
+      plan.agentOptions = resolveDraftRoleModel(ctx, { caller: options.caller });
+    }
+    return plan;
   }
   const presetId = options.presetId ?? options.role.preset;
   if (typeof presetId !== "string" || presetId === "") {
@@ -1104,8 +1112,9 @@ export async function prepareGovernedRolePlan(
   const presetFile = await resolvePresetFile(ctx, options.cwd, presetId);
   const roleSpec = rolePresetSpec(presetId);
   const roleConfig = options.role as RoleConfig & { requiredTools?: string[] };
-  const compositionTools = options.compositionTools ?? roleConfig.compositionTools ?? roleSpec?.compositionTools;
-  const orchestraTools = options.orchestraTools ?? roleConfig.orchestraTools ?? roleSpec?.orchestraTools;
+  const compositionTools = options.compositionTools ?? roleConfig.compositionTools ?? roleSpec?.compositionTools ??
+    presetFile.compositionRowIds?.filter((id) => ["tool-fs", "tool-fs-search", "tool-bash", "tool-skill", "tool-todo"].includes(id));
+  const orchestraTools = options.orchestraTools ?? roleConfig.orchestraTools ?? roleSpec?.orchestraTools ?? ["orchestra_report"];
   const requiredTools = roleConfig.requiredTools;
   if (roleSpec === undefined && presetFile.path !== "" && compositionTools === undefined && (requiredTools === undefined || requiredTools.length === 0)) {
     throw new SessionBlueprintError(
@@ -2978,6 +2987,24 @@ export interface AddLanesResult {
 
 const ROLE_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
+const LANE_OUTPUT_SCHEMA = {
+  type: "object", additionalProperties: false,
+  properties: {
+    laneId: { type: "string", required: true },
+    objective: { type: "string", required: true },
+    ownerRoleId: { type: "string" },
+    responsibilities: { type: "json" },
+    scope: { type: "array", required: true, items: { type: "string" } },
+    constraints: { type: "array", required: true, items: { type: "string" } },
+    acceptanceCriteria: { type: "array", required: true, items: { type: "string" } },
+    relationshipToMission: { type: "string", required: true },
+    participantRoleIds: { type: "array", required: true, items: { type: "string" } },
+    addedRoleIds: { type: "array", required: true, items: { type: "string" } },
+    addedAt: { type: "number", required: true },
+    reason: { type: "string" },
+  },
+} as const;
+
 /**
  * Graft new lanes onto a Team that is already running.
  *
@@ -3040,24 +3067,22 @@ export async function addLanesToTeam(
 
     const preset = typeof entry?.preset === "string" ? entry.preset : "";
     if (preset === "") throw new Error(`orchestra_add_lanes: role "${roleId}" requires a "preset" — an unnamed role has no persona`);
-    if (rolePresetSpec(preset) === undefined) {
-      const known = ALL_BUILTIN_ROLE_PRESETS.map((spec) => spec.id);
-      throw new Error(
-        `orchestra_add_lanes: preset "${preset}" is not a known role preset, so the lane would have no persona. Known presets: ${known.join(", ")}`,
-      );
+    const spec = rolePresetSpec(preset);
+    if (spec === undefined) {
+      try { await resolvePresetFile(ctx, cwd, preset); } catch (error) {
+        throw new Error(`orchestra_add_lanes: preset "${preset}" is not a known role preset or declared native preset: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
-    const spec = rolePresetSpec(preset)!;
-    const sandbox = entry.sandbox ?? spec.sandbox;
+    const sandbox = entry.sandbox ?? spec?.sandbox ?? "workspace-write";
     if (sandbox !== "read-only" && sandbox !== "workspace-write") {
       throw new Error(`orchestra_add_lanes: role "${roleId}" sandbox must be "read-only" or "workspace-write"`);
     }
     const working: RoleConfig = {
       id: roleId,
-      name: spec.name,
+      name: spec?.name ?? roleId,
       preset,
       sandbox,
-      compositionTools: [...spec.compositionTools],
-      orchestraTools: [...spec.orchestraTools],
+      ...(spec === undefined ? {} : { compositionTools: [...spec.compositionTools], orchestraTools: [...spec.orchestraTools] }),
       ...(entry.purpose !== undefined ? { welcome: entry.purpose } : {}),
       ...(entry.phase !== undefined ? { phase: entry.phase } : {}),
       ...(entry.lane !== undefined ? { lane: entry.lane } : {}),
@@ -3088,7 +3113,7 @@ export async function addLanesToTeam(
       model: plans[plans.length - 1].blueprint === undefined
         ? "inherited-from-controller"
         : `${String(plans[plans.length - 1].blueprint?.receipt.provider)}/${String(plans[plans.length - 1].blueprint?.receipt.model)}`,
-      summary: working.welcome ?? spec.purpose,
+      summary: working.welcome ?? spec?.purpose ?? `Use declared preset ${preset} for the assigned lane`,
     });
   }
 
@@ -3154,16 +3179,29 @@ export async function addLanesToTeam(
  * back to any preference file).
  */
 async function reconstructReservedSessionPlan(ctx: Context, team: TeamState, role: TeamRole, cwd: string, signal?: AbortSignal): Promise<GovernedRolePlan> {
-  if (role.preset === null || role.blueprint === undefined) throw new Error(`reserved Session role ${role.id} has no complete governed birth facts`);
-  return prepareGovernedRolePlan(ctx, {
+  if (role.preset === null) throw new Error(`Session role ${role.id} has no governed preset identity`);
+  const facts = role.blueprint;
+  const catalog = rolePresetSpec(role.preset);
+  const compositionTools = facts?.expectedCompositionTools ?? catalog?.compositionTools;
+  const orchestraTools = facts?.expectedOrchestraTools ?? catalog?.orchestraTools;
+  if (compositionTools === undefined || orchestraTools === undefined) {
+    throw new SessionBlueprintError("composition_tools_unproven", `role ${role.id} has no recorded expected tool contract; create an approved replacement`);
+  }
+  const plan = await prepareGovernedRolePlan(ctx, {
     cwd, teamId: team.teamId, controllerSessionId: team.controllerSessionId,
-    topologyId: role.blueprint.topologyId, topologySource: role.blueprint.topologySource,
-    role: { id: role.id, name: role.name, preset: role.preset, sandbox: role.sandbox as any,
-      compositionTools: role.blueprint.compositionTools?.names, orchestraTools: role.blueprint.orchestraTools?.names } as RoleConfig,
-    presetId: role.preset, sandbox: role.sandbox, permissionPreset: role.blueprint.permissionPreset,
-    provider: role.model?.provider, model: role.model?.model, reasoningEffort: role.model?.reasoningEffort,
-    title: role.blueprint.title, sessionId: role.sessionId, signal,
+    topologyId: facts?.topologyId ?? team.topologyRef.id, topologySource: facts?.topologySource ?? team.topologyRef.source,
+    role: { id: role.id, name: role.name, preset: role.preset, sandbox: role.sandbox as RoleConfig["sandbox"],
+      compositionTools, orchestraTools, requiredTools: facts?.expectedRequiredTools } as RoleConfig,
+    presetId: role.preset, sandbox: role.sandbox, permissionPreset: facts?.permissionPreset,
+    provider: role.model?.provider ?? facts?.provider, model: role.model?.model ?? facts?.model,
+    reasoningEffort: role.model?.reasoningEffort ?? facts?.reasoningEffort,
+    title: facts?.title, sessionId: role.sessionId, signal,
+    caller: ctx.agents.get(SID(team.controllerSessionId)),
   });
+  if (facts?.compositionRowIds !== undefined && !isDeepStrictEqual([...facts.compositionRowIds].sort(), plan.compositionRowIds?.slice().sort())) {
+    throw new SessionBlueprintError("composition_mismatch", `declared preset rows changed for role ${role.id}; reapprove a replacement`);
+  }
+  return plan;
 }
 
 async function materializeRole(
@@ -3256,6 +3294,7 @@ async function materializeRole(
     let created: { sessionId: string };
     const existing = ctx.agents.get(SID(role.sessionId));
     if (existing !== undefined) {
+      verifyGovernedAgent(ctx, existing, rebuilt.blueprint!.receipt);
       created = { sessionId: role.sessionId };
     } else {
       try {
@@ -3266,22 +3305,12 @@ async function materializeRole(
         created = { sessionId: createdResult.sessionId };
       } catch (error) {
         if (!/already exists/i.test(error instanceof Error ? error.message : String(error))) throw error;
-        const controller = ctx.get("sessionController");
-        if (controller === undefined) throw new Error(`cannot restore role ${role.id}: sessionController is unavailable`);
-        const resolved = await controller.resolveAgent(SID(role.sessionId));
-        if ("error" in resolved) throw new Error(`cannot restore role ${role.id}: ${resolved.error.message}`);
-        created = { sessionId: role.sessionId };
+        const restored = await buildRoleSession(ctx, { kind: "resume", mode: "governed",
+          sessionId: role.sessionId, governedBlueprint: rebuilt.blueprint!, signal: exec.signal });
+        created = { sessionId: restored.sessionId };
       }
     }
     createdSessionId = created.sessionId;
-
-    // Belt-and-braces: the governed Blueprint already pins the sandbox at
-    // creation time; this only re-asserts it on the live session, and is a
-    // no-op when the session is already read-only.
-    if (role.sandbox === "read-only") {
-      const session = ctx.sessions.get(SID(created.sessionId));
-      if (session !== undefined) session.append("sandbox/mode", { mode: "read-only" });
-    }
 
     // The Blueprint record is deliberately NOT refreshed here. Reservation is
     // the moment the approved composition is pinned, so `blueprint` keeps
@@ -3776,7 +3805,8 @@ export interface ActivateArchivedTeamResult {
 
 export interface ActivateResumeOptions {
   resumeSessionId: SessionId;
-  agentOptions?: Record<string, unknown>;
+  governedBlueprint?: PreparedGovernedBlueprint;
+  agentOptions?: AgentOptions;
   setup?: (agentCtx: Context) => Promise<void>;
   signal?: AbortSignal;
 }
@@ -3833,8 +3863,9 @@ export async function activateArchivedTeam(
   const archived = loaded.snapshot;
   // Rebuild the active state from the archive snapshot (archive stays immutable).
   const query = ctx.get("sessionQuery");
+  const { archiveId: _archiveId, dismissedAt: _dismissedAt, dismissalAttempt: _attempt, ...archivedTeam } = archived;
   let newTeam: TeamState = {
-    ...archived,
+    ...archivedTeam,
     status: "active",
     activatedFromArchiveId: archived.archiveId,
     roles: archived.roles.map((role) => ({ ...role, sessionHistory: [...(role.sessionHistory ?? [])] })),
@@ -3879,6 +3910,7 @@ export async function activateArchivedTeam(
   const resumeRoleSession = dependencies.resumeAgent ?? (async (agentCtx: Context, options: ActivateResumeOptions): Promise<unknown> => {
     return buildRoleSession(agentCtx, {
       kind: "resume",
+      ...(options.governedBlueprint === undefined ? {} : { mode: "governed" as const, governedBlueprint: options.governedBlueprint }),
       sessionId: String(options.resumeSessionId),
       ...(options.agentOptions === undefined ? {} : { agentOptions: options.agentOptions }),
       ...(options.setup === undefined ? {} : { setup: options.setup }),
@@ -3900,9 +3932,17 @@ export async function activateArchivedTeam(
     }
     const agent = ctx.agents.get(SID(role.sessionId));
     if (agent !== undefined) {
-      // Step 5a: live → reused
-      await deliverRoleWelcome(ctx, exec.agent.id, role.sessionId, role.name, activationNotice);
-      results.push({ role_id: role.id, sessionId: role.sessionId, action: "reused" });
+      try {
+        const plan = await reconstructReservedSessionPlan(ctx, newTeam, role, cwd, exec.signal);
+        verifyGovernedAgent(ctx, agent, plan.blueprint!.receipt);
+        await deliverRoleWelcome(ctx, exec.agent.id, role.sessionId, role.name, activationNotice);
+        role.phase = "active";
+        role.diagnostic = undefined;
+        results.push({ role_id: role.id, sessionId: role.sessionId, action: "reused" });
+      } catch (error) {
+        degraded = true; role.phase = "failed"; role.diagnostic = provisioningDiagnostic(error);
+        results.push({ role_id: role.id, sessionId: role.sessionId, action: "failed" });
+      }
       continue;
     }
     // Step 5b/5c/5d: probe persistence to distinguish "missing" from "temporarily failing".
@@ -3919,7 +3959,13 @@ export async function activateArchivedTeam(
     } else {
       snapshot = "no-query";
     }
-    if (snapshot === "not-found" || snapshot === "no-query") {
+    if (snapshot === "no-query" || snapshot === "query-error" || snapshot === "corrupt") {
+      degraded = true; role.phase = "failed";
+      role.diagnostic = { code: "session_unavailable", message: `cannot establish persisted role identity: ${snapshot}` };
+      results.push({ role_id: role.id, sessionId: role.sessionId, action: "failed" });
+      continue;
+    }
+    if (snapshot === "not-found") {
       // Step 5c: authoritatively missing → create a replacement session.
       try {
         if (role.execution === "subagent") {
@@ -3934,27 +3980,16 @@ export async function activateArchivedTeam(
           results.push({ role_id: role.id, sessionId: role.sessionId, action: "replaced" });
           continue;
         }
-        const presetFile =
-          role.preset === null ? undefined : await resolvePresetFile(ctx, cwd, role.preset);
-        const roleModel = role.model;
+        const replacement = { ...role, sessionId: governedSessionId(newTeam.teamId) };
+        const plan = await reconstructReservedSessionPlan(ctx, newTeam, replacement, cwd, exec.signal);
         const created = await createRoleSession(ctx, {
-          kind: "create",
-          sessionId: governedSessionId(newTeam.teamId),
-          cwd,
-          ...(presetFile === undefined ? {} : { presetFile }),
-          ...(roleModel === undefined || roleModel.provider === undefined || roleModel.model === undefined
-            ? {}
-            : { provider: roleModel.provider, model: roleModel.model, reasoningEffort: roleModel.reasoningEffort }),
-          createdBySessionId: exec.agent.id,
-          title: roleSessionTitle({ roleId: role.id, missionObjective: newTeam.mission.objective, cwd }),
-          signal: exec.signal,
+          kind: "create", mode: "governed", sessionId: replacement.sessionId, cwd,
+          governedBlueprint: plan.blueprint!, createdBySessionId: exec.agent.id, signal: exec.signal,
         });
-        if (role.sandbox === "read-only") {
-          const session = ctx.sessions.get(SID(created.sessionId));
-          if (session !== undefined) session.append("sandbox/mode", { mode: "read-only" });
-        }
         const oldSessionId = role.sessionId;
         role.sessionId = created.sessionId;
+        role.phase = "active";
+        role.diagnostic = undefined;
         role.sessionHistory = [
           ...role.sessionHistory,
           { sessionId: oldSessionId, replacedAt: Date.now(), reason: "session-not-found" },
@@ -3991,51 +4026,14 @@ export async function activateArchivedTeam(
     }
     // Step 5b/5d: snapshot readable → try to resume; other errors → failed.
     try {
-      const presetFile = role.preset === null ? undefined : await resolvePresetFile(ctx, cwd, role.preset);
-      const roleModel = role.model;
-      let setup: ((agentCtx: Context) => Promise<void>) | undefined;
-      if (presetFile !== undefined) {
-        setup = async (agentCtx) => {
-          // S3: a preset the roster knows is mounted BY ID. Mounting a roster
-          // preset by file bypassed discovery entirely, which is how a
-          // cold-resumed role came back without its composition.
-          await mountRolePreset(agentCtx, {
-            presetId: presetFile.id,
-            ...(presetFile.source === "project" || presetFile.source === "global"
-              ? { overrideFile: { id: presetFile.id, trust: presetFile.trust, path: presetFile.path } }
-              : {}),
-          });
-          installModelOverride(agentCtx, true, roleModel?.provider, roleModel?.model, roleModel?.reasoningEffort);
-        };
-      } else if (roleModel !== undefined) {
-        setup = (agentCtx) => {
-          installModelOverride(agentCtx, true, roleModel.provider, roleModel.model, roleModel.reasoningEffort);
-          return Promise.resolve();
-        };
-      }
-      const override =
-        role.model !== undefined &&
-        (role.model.provider !== undefined || role.model.model !== undefined || role.model.reasoningEffort !== undefined)
-          ? role.model
-          : undefined;
-      const modelSvc = ctx.get("agentDefaultModel");
-      const selection = modelSvc === undefined ? undefined : modelSvc.currentSelection();
-      const agentOptions =
-        override === undefined
-          ? selection === undefined
-            ? {}
-            : { provider: selection.provider, model: selection.model }
-          : {
-              ...(override.provider === undefined ? {} : { provider: override.provider }),
-              ...(override.model === undefined ? {} : { model: override.model }),
-            };
+      const plan = await reconstructReservedSessionPlan(ctx, newTeam, role, cwd, exec.signal);
       await resumeRoleSession(ctx, {
-        resumeSessionId: SID(role.sessionId),
-        agentOptions,
-        ...(setup === undefined ? {} : { setup }),
-        ...(exec.signal === undefined ? {} : { signal: exec.signal }),
+        resumeSessionId: SID(role.sessionId), governedBlueprint: plan.blueprint!,
+        agentOptions: plan.blueprint!.agentOptions, signal: exec.signal,
       });
       await deliverRoleWelcome(ctx, exec.agent.id, role.sessionId, role.name, activationNotice);
+      role.phase = "active";
+      role.diagnostic = undefined;
       results.push({ role_id: role.id, sessionId: role.sessionId, action: "resumed" });
     } catch (error) {
       degraded = true;
@@ -4700,7 +4698,20 @@ export function apply(ctx: Context): void {
         roles: {
           type: "array",
           required: true,
-          items: { type: "json" },
+          items: {
+            type: "object", additionalProperties: false,
+            properties: {
+              roleId: { type: "string", required: true },
+              preset: { type: "string" },
+              sandbox: { type: "string", enum: ["read-only", "workspace-write"] },
+              phase: { type: "string" }, lane: { type: "string" }, purpose: { type: "string" },
+              maxRounds: { type: "number" },
+              model: { type: "object", additionalProperties: false, properties: {
+                provider: { type: "string", required: true }, model: { type: "string", required: true },
+                reasoningEffort: { type: "string" },
+              } },
+            },
+          },
           description:
             "One entry per participant: { roleId (lowercase kebab-case; existing ids reuse the role), preset (required for a NEW role only), sandbox?: 'read-only'|'workspace-write', phase?, lane?, purpose? (one line, becomes the role's welcome), maxRounds?, model?: { provider, model, reasoningEffort } }.",
         },
@@ -4723,7 +4734,7 @@ export function apply(ctx: Context): void {
             team_id: { type: "string", required: true },
             state_path: { type: "string", required: true },
             plan: { type: "array", required: true, items: { type: "json" } },
-            lane: { type: "json", required: true },
+            lane: { ...LANE_OUTPUT_SCHEMA, required: true },
             added: { type: "array", items: { type: "json" } },
           },
         },
@@ -4738,7 +4749,7 @@ export function apply(ctx: Context): void {
         ],
       },
       async execute(args: AddLanesArgs, exec: ToolExecutionInput) {
-        return addLanesToTeam(ctx, activeTeamState, exec, args as unknown as AddLanesArgs) as any;
+        return addLanesToTeam(ctx, activeTeamState, exec, args) as any;
       },
     }),
   );
@@ -4867,22 +4878,7 @@ export function apply(ctx: Context): void {
                     added_lanes: {
                       type: "array",
                       required: true,
-                      items: {
-                        type: "object",
-                        additionalProperties: false,
-                        properties: {
-                          laneId: { type: "string", required: true },
-                          objective: { type: "string", required: true },
-                          scope: { type: "array", required: true, items: { type: "string" } },
-                          constraints: { type: "array", required: true, items: { type: "string" } },
-                          acceptanceCriteria: { type: "array", required: true, items: { type: "string" } },
-                          relationshipToMission: { type: "string", required: true },
-                          participantRoleIds: { type: "array", required: true, items: { type: "string" } },
-                          addedRoleIds: { type: "array", required: true, items: { type: "string" } },
-                          addedAt: { type: "number", required: true },
-                          reason: { type: "string" },
-                        },
-                      },
+                      items: LANE_OUTPUT_SCHEMA,
                     },
                     notice_failures: {
                       type: "array",

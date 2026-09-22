@@ -45,6 +45,25 @@ test("explicit node route wins without borrowing the driver's reasoning level", 
   assert.equal(facts.reasoningEffort, undefined);
 });
 
+test("inherit the driver's current request route after a UI model change", () => {
+  const switched = { ...caller, session: { requestHeader: () => ({
+    config: { provider: "current-p", model: "current-m", reasoningEffort: "medium" },
+  }) } };
+  assert.deepEqual(resolveDraftRoleModel(draftRuntimeContext(), { caller: switched }), {
+    provider: "current-p", model: "current-m", reasoningEffort: "medium",
+  });
+});
+
+test("adapter-default reasoning remains unspecified instead of becoming a frozen override", () => {
+  const defaults = { ...caller, session: { requestHeader: () => ({
+    config: { provider: "current-p", model: "current-m", reasoningEffort: "medium" },
+    adapterDefaults: { reasoningEffort: true },
+  }) } };
+  assert.deepEqual(resolveDraftRoleModel(draftRuntimeContext(), { caller: defaults }), {
+    provider: "current-p", model: "current-m",
+  });
+});
+
 test("deployment route is only a fallback when the driver has no selected route", () => {
   assert.deepEqual(resolveDraftRoleModel(draftRuntimeContext(), {}), {
     provider: "default-p", model: "default-m", reasoningEffort: "low",

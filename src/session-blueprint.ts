@@ -9,9 +9,10 @@
  */
 
 import type { Context } from "@deepseek-ai/cordis";
+import { isDeepStrictEqual } from "node:util";
 import { ReasoningEffortId } from "@deepseek-ai/dsh-llm";
 import { scopeOf } from "@deepseek-ai/dsh-scope";
-import { installModelSelection, type Agent, type AgentOptions, type AgentSetupCommit } from "@deepseek-ai/dsh-agent";
+import { installModelSelection, type Agent, type AgentHandle, type AgentOptions, type AgentSetupCommit } from "@deepseek-ai/dsh-agent";
 import { mountRolePreset } from "./role-preset-mount.js";
 import { setSandboxMode } from "@deepseek-ai/dsh-sandbox-policy";
 import { setApprovalPolicy } from "@deepseek-ai/dsh-user-approval";
@@ -169,6 +170,10 @@ export interface GovernedBlueprintReceipt {
   compositionTools: LightweightToolReadiness;
   orchestraTools: LightweightToolReadiness;
   optionalCapabilities: string[];
+  /** Declared requirements, independent of observations made at publication. */
+  expectedCompositionTools?: string[];
+  expectedOrchestraTools?: string[];
+  expectedRequiredTools?: string[];
   tools: LightweightToolReadiness;
 }
 
@@ -457,6 +462,16 @@ export function pinApprovalNever(ctx: Context, agentCtx: Context, sessionId: str
 }
 
 function currentModel(ctx: Context, caller: Agent | undefined): { provider: string; model: string; reasoningEffort?: string } {
+  // A live UI selection can override the Agent's creation options. During a
+  // tool call the current request header is the route that actually ran.
+  const header = caller?.session?.requestHeader?.();
+  const current = header?.config;
+  if (typeof current?.provider === "string" && current.provider !== "" && typeof current.model === "string" && current.model !== "") {
+    return { provider: current.provider, model: current.model,
+      ...(header?.adapterDefaults?.reasoningEffort === true || current.reasoningEffort === undefined
+        ? {} : { reasoningEffort: String(current.reasoningEffort) }),
+    };
+  }
   if (caller?.options?.provider !== undefined && caller.options.model !== undefined) {
     return {
       provider: caller.options.provider,
@@ -958,9 +973,14 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
     compositionTools: compositionReadiness,
     orchestraTools: orchestraReadiness,
     optionalCapabilities: input.optionalCapabilities ?? [],
+    expectedCompositionTools: [...capabilities.composition],
+    expectedOrchestraTools: [...capabilities.orchestra],
+    expectedRequiredTools: [...capabilities.legacy],
     tools: readiness,
   };
-  const agentOptions: AgentOptions = { provider: model.provider, model: model.model };
+  const agentOptions: AgentOptions = { provider: model.provider, model: model.model,
+    ...(model.reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(model.reasoningEffort) }),
+  };
 
   const setup = async (agentCtx: Context, agent: Agent): Promise<AgentSetupCommit> => {
     const agentPresets = agentCtx.get("agentPresets") ?? presets;
@@ -1076,6 +1096,64 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
   return { receipt, agentOptions, meta: { cwd: input.cwd, agentPreset }, setup };
 }
 
+/** Verify an already-live role without remounting or mutating its identity. */
+export function verifyGovernedAgent(ctx: Context, agent: Agent, expected: GovernedBlueprintReceipt): void {
+  const session = agent.session;
+  if (session.header.origin === "subagent" || String(agent.id) !== expected.sessionId || session.header.cwd !== expected.cwd) {
+    throw new SessionBlueprintError("composition_mismatch", "live role identity/cwd does not match its governed blueprint");
+  }
+  const presets = agent.ctx.get("agentPresets") ?? ctx.get("agentPresets");
+  if (presets?.composedPreset(agent.ctx) !== expected.agentPreset) {
+    throw new SessionBlueprintError("composition_mismatch", "live role preset does not match its governed blueprint");
+  }
+  if (sandboxOverrideOf(session) !== expected.sandbox || effectiveApprovalPolicy(session) !== "never") {
+    throw new SessionBlueprintError("permission_mismatch", "live role sandbox/approval does not match its governed blueprint");
+  }
+  const actualModel = currentModel(ctx, agent);
+  if (actualModel.provider !== expected.provider || actualModel.model !== expected.model ||
+      String(actualModel.reasoningEffort ?? "") !== String(expected.reasoningEffort ?? "")) {
+    throw new SessionBlueprintError("model_unavailable", "live role model route differs from the reserved route");
+  }
+  const names = visibleToolNames(agent.ctx);
+  const missing = [
+    ...(expected.expectedCompositionTools ?? []).filter((name) => !hasCompositionTool(names, name)),
+    ...(expected.expectedOrchestraTools ?? []).filter((name) => !names.includes(name)),
+    ...(expected.expectedRequiredTools ?? []).filter((name) => !hasCompositionTool(names, name)),
+  ];
+  if (missing.length > 0) throw new SessionBlueprintError("required_tools_missing", `live role lacks required tools: ${missing.join(", ")}`);
+}
+
+const governedResumes = new WeakMap<object, Map<string, Promise<AgentHandle | undefined>>>();
+
+/** Native unpublished setup + commit, shared by governed restoration callers. */
+export async function resumeGovernedSession(ctx: Context, blueprint: PreparedGovernedBlueprint, signal?: AbortSignal): Promise<AgentHandle | undefined> {
+  const id = blueprint.receipt.sessionId;
+  let flights = governedResumes.get(ctx.agents);
+  if (flights === undefined) { flights = new Map(); governedResumes.set(ctx.agents, flights); }
+  const pending = flights.get(id);
+  if (pending !== undefined) {
+    const handle = await pending;
+    const live = ctx.agents.get(id as SessionId);
+    if (live === undefined) throw new SessionBlueprintError("session_unavailable", `resumed role ${id} was not published`);
+    verifyGovernedAgent(ctx, live, blueprint.receipt);
+    return handle;
+  }
+  const operation = (async () => {
+    const live = ctx.agents.get(id as SessionId);
+    if (live !== undefined) { verifyGovernedAgent(ctx, live, blueprint.receipt); return undefined; }
+    const query = ctx.get("sessionQuery");
+    if (query === undefined) throw new SessionBlueprintError("session_unavailable", "governed restore requires sessionQuery identity verification");
+    const stored = await query.readSession(id as SessionId);
+    if (stored.session.origin === "subagent" || stored.session.cwd !== blueprint.receipt.cwd ||
+        (stored.session.agentPreset !== undefined && stored.session.agentPreset !== blueprint.receipt.agentPreset)) {
+      throw new SessionBlueprintError("composition_mismatch", "persisted role is not an ordinary Session in the approved cwd");
+    }
+    return ctx.agents.resume({ resumeSessionId: id as SessionId, agentOptions: blueprint.agentOptions, setup: blueprint.setup, signal });
+  })();
+  flights.set(id, operation);
+  try { return await operation; } finally { flights.delete(id); }
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
@@ -1174,6 +1252,15 @@ export interface BlueprintStore {
   write(sessionId: string, marker: BlueprintMarker, options?: BlueprintWriteOptions): Promise<void>;
 }
 
+// Markers are recovery intent, not evidence that setup/publication succeeded.
+// Retry may reuse the same birth contract; mutable controller/title/observed
+// permission and creation timestamps do not change the role's birth identity.
+function sameBlueprintBirth(a: BlueprintMarker, b: BlueprintMarker): boolean {
+  const volatile = new Set(["createdAt", "controllerSessionId", "title", "effectivePermissionPreset"]);
+  const identity = (value: BlueprintMarker) => Object.fromEntries(Object.entries(value).filter(([key]) => !volatile.has(key)));
+  return isDeepStrictEqual(identity(a), identity(b));
+}
+
 /** Process-local markers: the fallback when no `fs` service is composed. */
 export function createMemoryBlueprintStore(): BlueprintStore {
   const records = new Map<string, BlueprintMarker>();
@@ -1182,6 +1269,8 @@ export function createMemoryBlueprintStore(): BlueprintStore {
       return records.get(sessionId);
     },
     async write(sessionId, marker) {
+      const previous = records.get(sessionId);
+      if (previous !== undefined && !sameBlueprintBirth(previous, marker)) throw new SessionBlueprintError("composition_mismatch", `conflicting birth contract for session ${sessionId}`);
       records.set(sessionId, marker);
     },
   };
@@ -1207,7 +1296,10 @@ export function createFsBlueprintStore(fs: RecordFileSystem, cwd: string): Bluep
       // session — that must be loud, not last-writer-wins.
       const outcome = await writeRecordJson(fs, pathOf(sessionId), cwd, marker, { kind: "createIfAbsent" }, options);
       if (outcome === "exists") {
-        throw new SessionBlueprintError("composition_mismatch", `a composition marker already exists for session ${sessionId}; refusing to overwrite it`);
+        const previous = await this.read(sessionId);
+        if (previous === undefined || !sameBlueprintBirth(previous, marker)) {
+          throw new SessionBlueprintError("composition_mismatch", `a different composition marker already exists for session ${sessionId}; refusing to overwrite it`);
+        }
       }
     },
   };

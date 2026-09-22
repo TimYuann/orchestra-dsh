@@ -84,6 +84,17 @@ test("createSubagentNode composes the native spec and maps the receipt back", as
   assert.ok(!("outputSchema" in spec.request), "the seam never claims a result contract it does not use");
 });
 
+test("native child inherits the current request route after the driver changes model", async () => {
+  const { ctx, calls } = makeRuntime();
+  const parent = { ...PARENT, options: { provider: "old", model: "old" }, session: {
+    requestHeader: () => ({ config: { provider: "current", model: "current", reasoningEffort: "high" } }),
+  } };
+  await createSubagentNode(ctx, parent, { label: "scout", prompt: "inspect" }, SIGNAL());
+  assert.deepEqual(calls.startContinuable[0].request.agentOptions, { provider: "current", model: "current", reasoningEffort: "high" });
+  await createSubagentNode(ctx, parent, { label: "explicit", prompt: "inspect", agentOptions: { provider: "chosen", model: "chosen" } }, SIGNAL());
+  assert.deepEqual(calls.startContinuable[1].request.agentOptions, { provider: "chosen", model: "chosen" });
+});
+
 test("createSubagentNode defaults to spawn and omits every unstated knob", async () => {
   const { ctx, calls } = makeRuntime();
   const receipt = await createSubagentNode(ctx, PARENT, { label: "auditor", prompt: "audit the module" }, SIGNAL());
