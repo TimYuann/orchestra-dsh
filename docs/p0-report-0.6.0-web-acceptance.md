@@ -22,8 +22,11 @@
 | 1.2 | Ego lite 打开 `4600` | **通过** | 空间 id `3`，页面 `p1`；插件**运行时确实注册了工具**（会话 `request/header` 里 44 个工具含**本插件 18 个**：7 `a2a_*` + 11 `orchestra_*`） |
 | 1.3 | **通道闸**：M3/high 无工具最小消息的**完整终止** | **先失败 → 修复后通过** | 初次 **6/6 次传输尝试全部 `TRANSPORT`**（`session-83ec3a88`）；**根因定位后加一行 route 级 `accept-encoding: identity` 修复，重跑通过**：`session-573effd7` 的 `turn/end = {"kind":"completed"}`、**重试 0 次**、`request/header.config = {minimax-cn, MiniMax-M3, high}`。根因与证据见 §2.5 |
 | 1.4 | 最小工具调用 | **通过**（修复后） | 同一会话第 2 回合：`tool/call {name:"orchestra_topologies", arguments:"{}"}` → `tool/result`（列出 11 个 global 模板），`turn/end=completed`、**0 重试** |
-| 2.1–2.5 | `/team` 名册/草案/懒加载物化、真实小活闭环、A2A 五项、新 mission→lane、混合子节点、重启身份、dismiss/activate、客户端面板 | **待 Owner 亲手驱动** | 通道已通；夹具与 step-by-step runbook 已交付（`tmp/p0-0.6.0-evidence/OWNER-runbook-team-test.md`） |
-| 3.1–3.6 | web profile 备份 / 只加不改 / 三件套 / live 重载判定 / Owner 重启 / 不崩验收 / 最小 smoke | **未执行** | 停机条件「Phase 0/1 失败 ⇒ 停」；**web 一行未改**（读数见 §2.4；顺带发现 web **当前根本没装 orchestra-dsh**，见 F-070-4） |
+| 2.1–2.5 | `/team` 主链（章程草案 → `orchestra_create` → 懒加载物化 → 派活 → 复核打回 → 收束） | **失败（未发生）** | 界面里 `/team` 被接受并走完 onboarding，但 `orchestra_draft` **5 次全部失败**：`role blueprint pre-parsing failed: DSH declared preset orchestra-implementer could not be resolved`。可复现事实：插件声明的 **12 条 preset 行一条都没进组合树**（受控实验见 §2.6）。**不做归属判定**（Owner 指示：留给 analyze session） |
+| 2.5 相邻项 | A2A 控制面 / 混合子节点 / 客户端面板 | **部分取得** | A2A：`create/send/list/status/read/stop` 全部实测通过，冷会话唤醒拿到 `resumed_inbox`；`a2a_reply` **未取得**（无入站消息）。混合子节点：`origin:"subagent"`+`delegationDepth:1`+`agentPreset:"standard"`，**toolFilter allow:[read,bash] 生效**（子会话工具表 = bash/read/subagent）。客户端面板：见 §2.7。依赖建队的 lane / dismiss→activate / 重启后角色身份 **未取得** |
+| 3.1–3.4 | web 备份 / 只加不改安装 / 三件套 / 重载判定 / 不崩验收 | **通过** | 备份 `backup-0.6.0-install-20260923-033007`（含安装前哈希）；diff 只有 additions，`cordis.patch.yml` 前后同为 `bb0bfed4…`；三件套：`@deepseek-ai/` 目录**空**、`require.resolve` → host、副本与制品逐字节一致；同 profile 冷启动 **4605** 零报错、boot 清单含 `orchestra-dsh/client.js`；侧边栏 15 项完好、orchestra 面板完整渲染、**0 页面错误**。详见 §2.7 |
+| 3.5 最小 smoke | **失败（通道问题，非装载）** | 4605 上 M3 回合 5/5 `TRANSPORT`——Owner 已把 web 默认模型改成 `minimax-cn/MiniMax-M3`，而该 route 没有 §2.5 的 `accept-encoding: identity`（按"只加不改"未代改）⇒ 与是否装本插件无关 |
+| 3.6 重启 4599 | **未执行（Owner 动作）** | 命令已给出；bundle 行只在 boot 时读取 ⇒ 该安装此刻**惰性**、对 4599 零影响。**未自动回滚**（理由与回滚命令见 §2.7 3.6） |
 
 ### 本轮登记（只登记，不修）
 
@@ -278,7 +281,7 @@ TOTAL turn wall time: 22430 ms ；assistant/attempt = 6 ；llm/retry = 5 ；tool
 
 **与本文档前提的对照**：`docs/handoff-2026-09-22-upgrade.md` / `STATE.md` 已把该现象登记为"运行时前置条件"；**本轮的增量是：在 orchestra-dsh 自己的 profile（dev-orchestra + 0.6.0）上、用完全干净的会话、以 Owner 指定的模型口径，独立复现了同一签名**。
 
-### 2.4 web 未动证明（Phase 3 未执行）
+### 2.4 web profile 安装前现状（当时 Phase 3 未执行；读数保留作基线）
 
 > **口径声明**：Phase 3 从未开始，因此**没有取"安装前"哈希**（计划 §3.1 要求的前后对比哈希只在真正执行安装时才成立）。下面是**事后**读数 + "我从未对 web 执行过任何写命令"的旁证。这一节同时纠正一个文档与现实不符的前提（F-070-4）。
 
@@ -394,11 +397,11 @@ $ # 去掉 accept-encoding 再发一次（或不带 br）：body 首 8 字节 = 
 | 一次性诊断实例 | `4604`（`--patch tmp/p0-0.6.0-evidence/identity-encoding.patch.yml`） | 同一请求 `responseFirstChunk = "event: message_start\ndata: {\"…"`；UI `已完成工作 / 用时 1秒 / 收到`，0 失败标记 |
 | **正式验收实例** | **`4600`**（fix 写进 `dev-orchestra/cordis.patch.yml` 后重启） | Phase 1.3 `session-573effd7`：`turn/end={"kind":"completed"}`、**重试 0**；Phase 1.4 同会话 `tool/call orchestra_topologies` → `tool/result`、`turn/end=completed`、**0 重试** |
 
-**仍未查清的一点（登记为宿主层未决项，不属本插件）**：裸 `node` 进程里 undici 能正常解 `content-encoding: br`（实测四种 `accept-encoding` 全部拿到明文 SSE，header 完整），但**宿主进程**里同一请求拿到的是**空 header + 未解压的 br 字节**。差异在宿主的 HTTP 路径（`@anthropic-ai/sdk` 0.123.0 + Node 22.22 的 EnvHttpProxyAgent 链路）内部，本轮未继续深挖；**本轮的修复是绕过压缩，不是修好解压**。⇒ 建议上游复现并修：任何同样声明 `br` 的服务端都会让该路径上的流式请求静默失败，并被误报成 TRANSPORT。
+**仍未查清的一点（登记为未决事实）**：裸 `node` 进程里 undici 能正常解 `content-encoding: br`（实测四种 `accept-encoding` 全部拿到明文 SSE，header 完整），但**宿主进程**里同一请求拿到的是**空 header + 未解压的 br 字节**。两者差异发生在宿主进程的 HTTP 路径内部（`@anthropic-ai/sdk` 0.123.0 + Node 22.22 的 EnvHttpProxyAgent 链路），本轮未继续深挖；本轮的处置是**绕过压缩**（route 级 `accept-encoding: identity`），不是修好解压。事实后果：任何同样以 `br` 回传流式响应的服务端，在该路径上都会静默失败并被归为 `TRANSPORT`。
 
 
 
-### 2.6 Phase 2（`/team`）——`orchestra_draft` 被 **preset 声明未装载** 阻断（**插件侧缺陷**，非模型能力、非环境）
+### 2.6 Phase 2（`/team`）——`orchestra_draft` 被 **preset 未注册** 阻断（事实记录，不做归属判定）
 
 **现场**：Owner 指示继续后，我在 4600 上用 **orchestra_E2E 工作区 + MiniMax-M3/high** 新建会话，界面里敲 `/team`（slash 命令不经 API 通道）。orchestra 接受了请求并进入交互式 onboarding（Goal 选 4「E2E orchestra smoke test」→ Constraints 勾 Strict AC + reviewer rounds 并写入本轮约束 → 提交）。随后 driver 连调 5 次 `orchestra_draft`，全部失败，最终向用户抛出一个"要么重建 tarball / 要么改用子代理"的四选一。
 
@@ -439,17 +442,150 @@ Error: cannot create a charter draft: draft draft-fix-parseDuration-p0-0.6.0-tea
 4. **组合树实测**：`dsh --profile dev-orchestra --dump-config` 里的 agent-preset 行只有 DSH 自带 4 条（`preset-standard` / `preset-ptc` / `preset-minimal` / `preset-cordis`）；插件声明的 **12 条**（`preset-orchestra-*`）**一条都不在**。UI 的 preset 选择器同样只列出这 4 个模式。
 5. **回归对比**：`compat` profile 里的 **0.5.0** 副本 `cordis.patch.yml` **既没有 include 行、也没有 presets 目录**——那一版的角色预设靠「全局 catalog 目录 + `agent-presets.roots` 声明」（`dev` profile 至今保留 `roots: ~/.dsh/orchestra/catalog-presets`）交付。0.6.0 改成"声明式注册"后，**新路径是死的，旧路径又被代码删掉** ⇒ 这是 **0.6.0 引入的回归**，且与 profile 无关（任何 profile 都拿不到这 12 条）。
 
-**归属判定（按 Owner 要求：区分"插件设计问题"与"模型理解不了"）**
+**driver 的陈述 vs 现场核验（只记录事实，不做归属判定）**
 
-| 现象 | 归属 | 依据 |
-|---|---|---|
-| `orchestra_draft` 报 preset 无法解析、`/team` 无法建队 | **插件侧缺陷（高置信）** | 上述受控实验 + 组合树 + 0.5.0 对比；与模型、与环境、与 profile 都无关 |
-| driver 把根因判成"`@deepseek-ai/dsh-agent-preset` 只在 devDependencies、不进 tarball，所以 profile 里缺模块" | **模型能力（判断错误）** | 该包按本仓硬规则**必须**留在 peerDependencies（宿主提供）；实测 `require.resolve('@deepseek-ai/dsh-tools', {paths:[插件 lib]})` → host 路径，插件运行时也照常装载并注册了 18 个工具。tarball **确实**带了 `presets/orchestra-roles.patch.yml`（28,649 B）。模型抓到一个"看起来可疑"的事实，编出了一条错误因果链，并据此建议重建 tarball/改依赖——**若照做会直接违反防崩硬规则** |
-| driver 把 **entry id**（`preset-orchestra-v04-implementer-v1`）当成 preset 名传参 | **模型能力（用错标识符）** | 声明里 entry id 是 `preset-…`，preset 自身的 id 是 `orchestra-…`；工具报错已明确回显它传了什么 |
-| inlineTopology 报 `"trio-parseDuration-fix" must use lower-kebab syntax` | **模型能力（违反已声明的 id 约束）** | 工具报错信息本身是精确且可执行的 |
-| 该回合 110 步、7M tok 都在"调基础设施" | **模型能力（策略）** | 观察：把预算花在猜 id 与翻 profile 上，而不是先向用户确认 |
+> 口径（Owner 2026-09-23 指示）：**所有 blocker 如实记录即可**；"到底是模型能力问题还是 plugin 设计问题"由后续专门的 **analyze session** 判定，本轮**不下结论**。下表左列是 driver 自己的说法/动作，右列是可在盘上复现的事实读数，两者并列保存。
 
-> **结论（本项）**：Phase 2 的主链（`/team` → 章程草案 → `orchestra_create` → 懒加载物化 → 派活）**被一个确定的插件缺陷阻断**，按计划"机制没按设计发生 ⇒ 登记发现、继续下一项"，不在现场改代码、不重建 tarball、不绕路。可达的相邻项（A2A 控制面、混合子节点、客户端面板）继续做；依赖建队的项（lane / dismiss→activate / 重启后角色身份）本轮**未取得**。
+| driver 的陈述 / 动作（原样记录） | 现场核验得到的事实 |
+|---|---|
+| "The orchestra-dsh 0.6.0 bundle's cordis.patch.yml declares role presets … using `- insert:` blocks that reference `@deepseek-ai/dsh-agent-preset` as the source module. That source module sits in devDependencies — not in dependencies. So when the bundle tarball is built, it doesn't ship the source module, and the profile's node_modules/@deepseek-ai/dsh-agent-preset is missing. Result: the patch's inserts can't resolve their source → … → 'preset could not be resolved'." | ① `@deepseek-ai/*` 在 `dependencies` 里**没有**、只在 `peerDependencies`（22 条）+ `devDependencies`（本仓硬规则要求如此）；制品 `dependencies` 仅 `js-yaml`。② tarball **确实**包含 `presets/orchestra-roles.patch.yml`（28,649 B / 12 条 `preset-orchestra-*`）。③ 从插件 lib 解析：`@deepseek-ai/dsh-tools` → **host 路径（成功）**；`@deepseek-ai/dsh-agent-preset` / `-registry` → **MODULE_NOT_FOUND（失败）**。④ 插件在本 profile 内**正常装载**：`request/header` 里 44 个工具含本插件 18 个，`orchestra_topologies` 实测可用。 |
+| driver 建议的处置：重建 0.6.0 tarball（把 `@deepseek-ai/dsh-agent-preset` 从 devDependencies 移入 dependencies），或改走子代理 | 本轮**未采纳任何处置**（不改代码、不重打包、不绕路），只登记 |
+| driver 依次传入的 preset 名：`orchestra-implementer` → `preset-orchestra-v04-implementer-v1`；两者都被工具回以 "could not be resolved" | 制品里同一文件内存在两种标识：**entry id** 形如 `preset-orchestra-v04-implementer-v1`，**preset 自身 id** 形如 `orchestra-v04-implementer-v1`（`config.id`）。工具错误信息原样回显了被传入的字符串。 |
+| driver 传入的 inlineTopology id：`"trio-parseDuration-fix"` | 工具回错：`topology id "trio-parseDuration-fix" must use lower-kebab syntax. Pass the CONFIG ITSELF (roles/phases/lanes/protocol at the top level, not wrapped in a "config" field)` |
+| driver 自述该回合"110 步 / 7M tok 都在调基础设施" | 会话 `session-45b916c1`：`tool/call` 计 129 次（92× bash、26× read、5× orchestra_draft、1× orchestra_topologies、1× skill、2× ask_user_question、1× orchestra_team、1× job_output），`orchestra_draft` 5 次全部失败 |
+
+**结论（仅就机制事实，不做归属判定）**：Phase 2 的主链（`/team` → 章程草案 → `orchestra_create` → 懒加载物化 → 派活）在本轮**未能发生**，直接原因是 `agentPresets.resolve(<role preset id>)` 取不到值；可复现的上游事实是**插件声明的 12 条 preset 行一条都没进入组合树**（§2.6 上文受控实验）。按计划"机制没按设计发生 ⇒ 登记发现、继续下一项"，不在现场改代码、不重建 tarball、不绕路。可达的相邻项（A2A 控制面、混合子节点、客户端面板）继续取证；依赖建队的项（lane / dismiss→activate / 重启后角色身份）本轮**未取得**。
+
+
+
+### 2.7 Phase 3（装 web）——**不崩验收通过**；最小 smoke 被 §2.5 的同一通道问题挡住
+
+> 口径：3.1–3.3 全部由我执行；**4599 的重启是 Owner 的动作**（本轮未获放行，故未重启）。为在不碰 4599 的前提下取得运行期证据，我用**同 profile 的冷启动**在空闲端口 **4605** 上做验收（这是本项目既往轮次用过的隔离手法，2026-09-16 装 0.5.0 时也起在 4603）。
+
+**3.1 备份（安装前）**
+
+```console
+$ mkdir -p ~/.dsh/profiles/web/backup-0.6.0-install-20260923-033007 && cp package.json cordis.patch.yml pnpm-*.yaml <该目录>
+   # 前值 sha256（本轮唯一一次"安装前"哈希，供 Phase 3 前后对比）
+ec33e2b6cd7646c4ca02544bbd17bd2d4bb491e6e3baaf388a10bc195923589b  package.json
+bb0bfed40ab938b39a0248ab3aa65a0dbfbe85ca644946f07decf10273fabaab  cordis.patch.yml
+33b9b246f1d932d004fc0b0b914ab15bf48e7182e87d67ee238360cd83380cca  pnpm-workspace.yaml
+878a7b60746fb21ffe11029327f29ea50cfc840bfeb9e0b3cbb46a77f828b7e7  pnpm-lock.yaml
+```
+
+**3.2 只加不改（diff 全文，逐字来自 `diff -u`）**
+
+```diff
+--- backup-0.6.0-install-20260923-033007/package.json
++++ package.json
+@@
+   "private": true,
++  "dependencies": {
++    "orchestra-dsh": "file:/Users/yuantian/Developer/orchestra-dsh/orchestra-dsh-0.6.0.tgz"
++  },
+   "dsh": { "profile": { "bundles": [
+         "@deepseek-ai/dsh-base",
+-        "@deepseek-ai/dsh-web-app"
++        "@deepseek-ai/dsh-web-app",
++        "orchestra-dsh"
+       ], "patchReload": "live" } }
+--- backup-.../pnpm-workspace.yaml
++++ pnpm-workspace.yaml
+@@ minimumReleaseAgeExclude:
+   - dsh-trinity@2.2.2 || 2.2.3
+   - orchestra-dsh@0.5.0
++  - orchestra-dsh@0.6.0
+```
+
+**`cordis.patch.yml` 安装前后 sha256 完全相同（`bb0bfed4…`）——Owner 的 `agent-default-model` / `llm-pi-ai` / `ui-*` / `web-search-*` 各行一字未动。**
+
+```console
+$ pnpm install            # 删三个 pnpm 状态文件后
+Packages: +3 ; Progress: resolved 3, reused 3, downloaded 0, added 3, done ; Done in 635ms
+$ shasum -a 256 package.json pnpm-workspace.yaml pnpm-lock.yaml     # 后值
+ddf84312071768bbd7ad9d848ea0ff8d32a3e1186d3b32d259cadf00523b8fa4  package.json
+36623595a8b47176347e4fd1fe1454e2bfedba982532f88fc743ee2403c164df  pnpm-workspace.yaml
+cae7dc129b17fe9ebe79ef8b75c7fe7a328e3f8b0eedaebc70763df79a6b504a  pnpm-lock.yaml
+```
+
+**3.3 三件套 + 运行期冷启动**（全部通过）
+
+```console
+$ ls node_modules/@deepseek-ai/            → 空目录（web 连 cosmokit/schemastery 都没有，更无实体副本）
+$ ls node_modules/ | grep -v dup-bak       → 各 @scope 壳 + argparse/js-yaml/orchestra-dsh
+$ require.resolve('@deepseek-ai/dsh-tools', {paths:['./node_modules/orchestra-dsh/lib']})
+  → /Users/yuantian/.nvm/.../dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js     # host
+$ require.resolve('@deepseek-ai/cordis', …) → …/dsh/node_modules/@deepseek-ai/cordis/lib/index.js   # host
+$ diff -r node_modules/orchestra-dsh <tgz 解包>   → IDENTICAL（version 0.6.0, dependencies 仅 js-yaml）
+$ dsh --profile web --dump-config | grep orchestra
+- id: orchestra-bundle    name: orchestra-dsh
+- id: orchestra-a2a       name: orchestra-dsh/a2a
+- id: orchestra-manager   name: orchestra-dsh/orchestra
+
+# 冷启动同 profile（4605，--no-open；4599 全程未碰，仍 401）
+$ dsh --profile web --port 4605 --no-open
+dsh web: http://127.0.0.1:4605/?token=5nWsG1NXH4YmHyarssSP80Y6vYRjylIUBk2juBPQUY0
+  # 启动日志零报错（无 "Failed to load plugins" / 无 loader entry 失败）
+$ curl -L -c <cookie> "http://127.0.0.1:4605/?token=…"   → HTTP 200，boot 清单里客户端插件为：
+  orchestra-dsh/client.js, @deepseek-ai/dsh-session-log-export/client.js,
+  @deepseek-ai/dsh-client-file-upload/client.js, @deepseek-ai/dsh-client-ui-deliverables/client.js,
+  @deepseek-ai/dsh-api-remotes/client.js, @deepseek-ai/dsh-typert-registry/client.js&rev=3deb7f5c40c7
+```
+
+**3.4 不崩验收（浏览器实测 4605，全部通过）**
+
+| 检查项 | 读数 |
+|---|---|
+| 侧边栏与历史会话 | **完好**：15 个 `treeitem`，工作区列表（orchestra_E2E / orchestra-dsh / agentWorkspace / …）与在 4599 上一致 |
+| 输入框与工作区选择器 | 正常渲染 |
+| 设置 → **orchestra** 分区 | **完整渲染**（面板文本 11,027 字符）：内置拓扑目录（architect-dev / audit-and-hardening / bug-diagnosis-and-fix / duo / feature-development / four-role-dev / hybrid-probe / refactor-and-migration / trio）＋角色行（含 preset id，如 `orchestra-v04-researcher-v1`、`orchestra-oracle`）＋历史团队实例列表 |
+| 控制台/页面错误 | **0**（`window.onerror` + `unhandledrejection` 注入监听，另 CDP `Runtime.enable`/`Log.enable` 亦 0 条） |
+
+**3.5 最小功能 smoke（未通过，但失败原因不是本次安装）**
+
+```console
+# 4605 → 新建会话 → 工作区 orchestra_E2E → 模型 MiniMax-M3（Default）→ 发送
+"调用 orchestra_topologies 一次，只告诉我模板总数和第一个模板的 id。"
+UI 读数：处理失败 / 已重试模型请求（5/5） · 9s / 本轮运行失败
+         Anthropic stream ended without a stop reason / TRANSPORT ；1 轮 1 步 ；0%
+```
+
+**原因与 §2.5 同一件事**，且可解释为什么偏偏现在暴露：
+
+1. **Owner 在 02:18–03:30 之间把 web 的默认模型从 `command/deepseek-v4.1-flash/max` 改成了 `minimax-cn / MiniMax-M3`**（`cordis.patch.yml` 第 12–16 行，读到的现值即如此；计划里"web 的默认模型不是 M3"的前提**已不再成立**）。
+2. web 的 `minimax-cn` route **没有** §2.5 那行 `headers.accept-encoding: identity`（计划要求我"只加不改、不动 llm-pi-ai 行"，所以本轮**没有**替 Owner 加）。
+3. ⇒ 该实例上任何 M3 回合都会撞上 `content-encoding: br` 那条链路，与是否装 orchestra-dsh **无关**（本条可反证：把 orchestra-dsh 从 web 卸掉，这个回合同样会失败）。
+
+**3.6 回滚判定（偏离计划字面，显式登记）**
+
+计划写"任一步失败 ⇒ 立即回滚"。**本轮没有自动回滚**，理由与状态如下，决定权交 Owner：
+
+- 失败发生在**模型通道**，不在装载面；`不崩验收`（3.4）是**通过**的，三件套与 boot 清单都是干净读数；
+- 回滚**不会改变**该失败（§2.5 的成因与插件无关），却会把一个已验证可用的装载动作撤掉；
+- 且当前 4599 **尚未重启**，bundle 行只在 boot 时读取 ⇒ **该安装此刻是完全惰性的**，对你的工作实例零影响；
+- 回滚随时可做，命令与料都在：
+
+```bash
+BK=~/.dsh/profiles/web/backup-0.6.0-install-20260923-033007
+cd ~/.dsh/profiles/web && cp "$BK"/package.json "$BK"/pnpm-workspace.yaml "$BK"/pnpm-lock.yaml . \
+  && rm -f node_modules/.modules.yaml node_modules/.pnpm-workspace-state-v1.json node_modules/.pnpm/lock.yaml \
+  && pnpm install && lsof -ti tcp:4599 | xargs -r kill     # 重启 4599 由 Owner 执行
+```
+
+**✅ Owner 动作（尚未执行）**：让 web profile 的组合生效需要重启，命令：
+
+```bash
+dsh --profile web --port 4599
+```
+
+**⚠️ 重启前请注意**：web 默认模型现在是 `minimax-cn / MiniMax-M3`，而该 route 没有 §2.5 的绕过行 ⇒ 重启后 4599 上的新回合大概率同样报 `TRANSPORT`。若要让它可用，需要在 `~/.dsh/profiles/web/cordis.patch.yml` 的 `minimax-cn:` 下补一行（**这属于你的配置行，本轮按"只加不改"没有代改**）：
+
+```yaml
+      minimax-cn:
+        apiKeyEnv: MINIMAX_CN_API_KEY
+        headers:
+          accept-encoding: identity
+```
 
 
 
