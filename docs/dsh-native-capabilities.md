@@ -1,13 +1,27 @@
 # DSH 原生能力对照（改动前必读）
 
 > **用途**：把"DSH 已有的能力不要自己造"变成可查的东西。任何涉及**会话生命周期、预设与组合、消息投递、审批与提问、命令执行**的改动，先查这张表。
-> **历史调研基线**：下表源于 DSH 0.1.5-rc.2 安装体，尤其“插件自建现状”描述的是当时，不应作当前实现清单。依赖已迁至 **0.1.6-alpha.2**。
-> **当前核对**：`docs/review-2026-09-22-plugin-and-delivery.md` §8 固定官方 tag/commit；该版仍要求等待 turn-stopping listener、通过原生 continuation 管理 subagent，shell 的 env 不是封闭环境。插件已做预设名册/入口收敛/审批 pin，但仍有真实调用分支缺口，见该报告 §3。§4 行号仅对应原始调研版本。
+> **当前目标（2026-09-22）**：**DSH 0.1.7-alpha.1**。本节新表是当前 API 入口；后面的 0.1.5/0.1.6 记录仅供追溯，不能用旧 roots、mountPreset、shell.run/start 配置目标宿主。当前实现与未测项见 `docs/upgrade-0.1.7-alpha.1-implementation.md`。
 > ⚠️ 标记的是本次复核**实际踩到或查明**的坑。
 
 ---
 
-## 1. 能力对照表
+## 当前 0.1.7 契约
+
+| 能力 | 当前公开接口 / 限制 |
+|---|---|
+| 预设 | bundle 声明 `@deepseek-ai/dsh-agent-preset` 行；`dsh-agent-preset-registry` 的 resolve/mount/compositionInventory；不存在旧目录 roots/file mount 路径 |
+| 普通 Session | Session V4；泛用/UI冷恢复 `sessionController.resolveAgent`；受治理角色用公开 `ctx.agents.resume({setup})` 保留两参数/commit，在发布前完整核验。禁止的是SessionController内部私有helper。已live需核验；不批量迁移历史日志 |
+| native child | startContinuable/sendMessage/drain；persona/toolFilter 持久化后才能恢复；generic A2A 不能冒用 child sessionId；listChildren 是 catalog，不是完整活动诊断 |
+| 回合结束 | `agent/turn-stopping` listener 必须返回被 await 的 Promise；事件注册处丢 Promise 会破坏保障 |
+| 宿主 shell | `resolve(request)` → `await execute(spec)` → `await handle.result()`；非零/取消/超时通常是结果，基础设施失败 reject；`handle.kill()` 后 await done |
+| shell 环境与证据 | env 在 credential scrub 后 overlay，dshEnv 管理保留键；不是 hermetic；sandbox 事实/输出丢失需单独判断；没有通用可信网络调用观测器 |
+| Client | `dsh-client-ui-renderer/client` + `dsh-client-ui-settings/client`；保留 slots.inject 声明门控；必须浏览器实测 |
+| Git / 交付账本 | DSH 未替 Orchestra 提供交付层；v2 计划使用外部 Git，不重写对象模型；当前尚未实现 |
+
+API 依据：目标发布包 `lib/types/index.d.ts`，shell 另见 `dsh-shell/lib/types/types.d.ts`。隔离包位置 `tmp/0.1.6alpha2-to-0.1.7alpha1/b/node_modules/@deepseek-ai/`；完整审计 `tmp/0.1.6alpha2-to-0.1.7alpha1/UPGRADE-ADAPTATION.md`。隔离资料未在时读取安装的精确目标版本，不把旧历史行号当依据。
+
+## 1. 历史能力对照表（0.1.5-rc.2，不用于目标版配置）
 
 | 能力 | DSH 原生提供 | 插件自建现状 | 结论 |
 |---|---|---|---|

@@ -27,9 +27,9 @@ Traditional agents use *plan mode*: a mode switch inside one context — plannin
 
 ## Quick start（快速开始）
 
-Requirements: DSH (DeepSeek Harness) with Node ≥ 22. The current source targets **DSH 0.1.6-alpha.2**; package version remains **0.5.1**, with 0.8.0 delivery-layer work not yet shipped.
+Requirements: DSH (DeepSeek Harness) with Node ≥ 22. The current source targets **DSH 0.1.7-alpha.1**; package version remains **0.5.1**. These local migration changes are **not an npm release**, and the optional host delivery layer is still [a v2 implementation plan](docs/plan-0.8.0-execution.md), not shipped functionality.
 
-**Current limitations (reviewed 2026-09-22):** the collaboration paths have live evidence, but lifecycle edge cases remain open: lazy materialization loses subagent persona/toolFilter, a retry-resume path can omit composition, the turn-stopping listener does not await its guard, and successful dismiss returns fields missing from its output schema. Graph loops/gates are declarations, not host-enforced execution. See [the full review](docs/review-2026-09-22-plugin-and-delivery.md) before relying on unattended delivery guarantees.
+**Continuation checkpoint (2026-09-22):** start with [the handoff](docs/handoff-2026-09-22-upgrade.md). Last green source `f479b23` passed **292 tests**. The newer **`f54383c` is WIP and currently fails TypeScript compilation** in three model/lane tool-contract locations; do not install it as a completed upgrade. Governed recovery/replacement and live browser/role/restart validation also remain unfinished. The delivery-layer v2 documents are drafts with nine recorded blockers, not implementation-ready approval. Graph loops/gates remain declarations. See [migration evidence](docs/upgrade-0.1.7-alpha.1-implementation.md); [initial review](docs/review-2026-09-22-plugin-and-delivery.md) is historical defect evidence.
 
 1. **Install from npm** in your DSH profile directory (`cd ~/.dsh/profiles/<your-profile>` first):
 
@@ -59,6 +59,8 @@ Just say it — natural language or the `/team` slash command:
 ```
 
 The driver runs the onboarding protocol (goal → constraints → context → **topology proposal** → **your approval** → execute), proposes a collaboration plan, and only after you approve does it provision the role sessions and dispatch self-contained tasks. There is no shortcut around that gate: `orchestra_create` requires a `frozenRef`, and only your approval of a draft produces one — calling it with just a goal and a template returns `approval_required` by design. You approve by replying in plain words (`启动` / `可以` / `ok`); `/team approve <draftId>@<revision>` also works but is never required.
+
+**Right-size first**: the driver can work directly, delegate a bounded native child, or use independent Sessions before introducing a shared team. New missions can become lanes of the current team using existing suitable members. A new role composition is guided by the discoverable `orchestra-preset-authoring` playbook; no preset-root setup is needed on DSH 0.1.7.
 
 **Lightweight mode**: you never need a team for one-off collaboration — the A2A tools (`a2a_list` / `a2a_create` / `a2a_send` / `a2a_reply` / `a2a_read` / `a2a_stop` / `a2a_status`) work standalone between any sessions on the host.
 
