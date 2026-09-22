@@ -1,6 +1,6 @@
 {
   "name": "orchestra-dsh",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Orchestra — DSH adaptive multi-role orchestration. A2A transport across agent threads (a2a_send, a2a_stop, a2a_list with activity sorting, a2a_read with reverse turn windowing) plus governed teams: compose a graph from role presets, approve the charter once, dispatch lanes that materialize on first use, graft new objectives onto the running team (orchestra_add_lanes), and inspect or archive the whole team objectively.",
   "type": "module",
   "main": "lib/index.js",
