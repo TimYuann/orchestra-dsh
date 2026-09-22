@@ -8,6 +8,7 @@
  * filesystem version or write the active state file directly.
  */
 
+import { randomUUID } from "node:crypto";
 import type {
   FsInfo,
   FsTarget,
@@ -203,7 +204,7 @@ export interface TeamState {
     pendingTasks?: Array<{ roleId: string; phase: string; reportCount: number }>;
   };
   /** Stable archive identity retained if snapshot publication beat marker CAS. */
-  dismissalAttempt?: { archiveId: string; dismissedAt: number };
+  dismissalAttempt?: { archiveId: string; dismissedAt: number; supersedesArchiveId?: string };
 }
 
 /** One driver milestone notice that could not be delivered. */
@@ -582,6 +583,13 @@ export function normalizeTeam(raw: unknown, cwd: string, options: { allowDismiss
   if (record.roles.some((role: any) => role?.execution !== undefined && role?.execution !== null && role?.execution !== "session" && role?.execution !== "subagent")) {
     return undefined;
   }
+  if (record.roles.some((role: any) =>
+    (role?.persona !== undefined && typeof role.persona !== "string") ||
+    (role?.toolFilter !== undefined && (asRecord(role.toolFilter) === undefined ||
+      [role.toolFilter.allow, role.toolFilter.deny].some((list) => list !== undefined &&
+        (!Array.isArray(list) || !list.every((name: unknown) => typeof name === "string"))))))) {
+    return undefined;
+  }
   const createdAt = typeof record.createdAt === "number" ? record.createdAt : Date.now();
   const teamId = typeof record.teamId === "string" && record.teamId !== "" ? record.teamId : `team-${createdAt}`;
   const roles: TeamRole[] = record.roles
@@ -602,6 +610,11 @@ export function normalizeTeam(raw: unknown, cwd: string, options: { allowDismiss
       ...(asRecord(role.welcome) && typeof role.welcome.messageId === "string" && typeof role.welcome.sessionId === "string" && typeof role.welcome.acceptedAt === "number"
         ? { welcome: role.welcome as TeamWelcomeReceipt }
         : {}),
+      ...(typeof role.persona === "string" ? { persona: role.persona } : {}),
+      ...(role.toolFilter === undefined ? {} : { toolFilter: {
+        ...(role.toolFilter.allow === undefined ? {} : { allow: [...role.toolFilter.allow] }),
+        ...(role.toolFilter.deny === undefined ? {} : { deny: [...role.toolFilter.deny] }),
+      } }),
       sessionHistory: Array.isArray(role.sessionHistory) ? role.sessionHistory : [],
       preset: role.preset === undefined || role.preset === null ? null : role.preset,
       sandbox: typeof role.sandbox === "string" ? role.sandbox : "workspace-write",
@@ -652,7 +665,9 @@ export function normalizeTeam(raw: unknown, cwd: string, options: { allowDismiss
       ? { handoffSummary: record.handoffSummary as any }
       : {}),
     ...(asRecord(record.dismissalAttempt) && typeof record.dismissalAttempt.archiveId === "string" && Number.isFinite(record.dismissalAttempt.dismissedAt)
-      ? { dismissalAttempt: { archiveId: record.dismissalAttempt.archiveId, dismissedAt: record.dismissalAttempt.dismissedAt } }
+      ? { dismissalAttempt: { archiveId: record.dismissalAttempt.archiveId, dismissedAt: record.dismissalAttempt.dismissedAt,
+          ...(typeof record.dismissalAttempt.supersedesArchiveId === "string" ? { supersedesArchiveId: record.dismissalAttempt.supersedesArchiveId } : {}),
+        } }
       : {}),
     ...(Array.isArray(record.addedLanes) ? { addedLanes: record.addedLanes as any } : {}),
     // A malformed breadcrumb is DROPPED rather than fatal: this list exists to
@@ -936,6 +951,7 @@ export function transferOrchestrationControl(
   const now = options.timestamp ?? Date.now();
   const reason = options.reason ?? "takeover";
   const oldController = team.controllerSessionId;
+  if (oldController === newControllerSessionId) return team;
 
   const controllerHistory = [
     ...(team.controllerHistory ?? []),
@@ -954,11 +970,21 @@ export function transferOrchestrationControl(
 
   const roles: TeamRole[] = team.roles.map((role) => {
     if (role.execution === "subagent") {
+      // A retry may already have persisted the native descriptor even when the
+      // seat has gone back to reserved. Only an untouched reservation is safe
+      // to reuse under a new native parent edge.
+      const untouched = role.phase === "reserved" && role.welcome === undefined &&
+        role.diagnostic === undefined && !(role.sessionHistory ?? []).some((entry) => entry.sessionId === role.sessionId);
       return {
         ...role,
+        sessionId: untouched ? role.sessionId : `orchestra-${team.teamId}-${randomUUID()}`,
+        sessionHistory: untouched ? role.sessionHistory : [
+          ...(role.sessionHistory ?? []), { sessionId: role.sessionId, replacedAt: now, reason: "controller-takeover" },
+        ],
         phase: "reserved" as const,
         parentSessionId: newControllerSessionId,
         welcome: undefined,
+        diagnostic: undefined,
       };
     }
     return role;

@@ -148,6 +148,7 @@ import "./relay-types.js";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 const SID = (value: string): SessionId => value as SessionId;
 
@@ -2163,27 +2164,19 @@ export async function handleTeamCommandInvocation(
       const isTerminal = ["completed", "failed", "abandoned"].includes(team.status);
       const policy = ctx.sandboxPolicy.resolve({ session: invocation.agent.session, mode: "workspace-write" });
 
+      const archiveCurrentTeam = async (reason: string, summary: string) => {
+        if (team.controllerSessionId !== invocation.agent.id) {
+          // Transfer closure authority, not native child lineage: these are the
+          // exact instances we must stop, not replacement reservations.
+          const transferred = { ...transferOrchestrationControl(team, invocation.agent.id, { reason: "re-entry-archive" }), roles: team.roles };
+          await activeTeamState.replace(observation, transferred, { policy });
+        }
+        return dismissGovernedTeam(ctx, activeTeamState, archiveStore, {
+          agent: invocation.agent as Agent, signal: new AbortController().signal,
+        } as ToolExecutionInput, { reason, summary });
+      };
       if (isTerminal) {
-        // A finished team is not a conflict: archive it and move on. D3: the roles
-        // are stopped and told BEFORE the active slot is cleared — clearing it
-        // first would leave live roles believing they still belong to a team the
-        // record says is gone, which is the same shape as the D3 blocker.
-        const dismissedAt = Date.now();
-        await retireTeamRoles(ctx, invocation.agent as Agent, team.roles, cwd);
-        const archived = await archiveStore.create(cwd, team, { dismissedAt, policy });
-        await activeTeamState.archive(
-          observation,
-          {
-            schemaVersion: 1,
-            archived: true,
-            status: "dismissed",
-            archiveId: archived.summary.archiveId,
-            archivePath: archived.summary.archivePath,
-            archivedAt: dismissedAt,
-            teamId: team.teamId,
-          },
-          { policy },
-        );
+        await archiveCurrentTeam("terminal team on re-entry", describeTeamProgress(team.roles, team.reports));
       } else {
         // An ACTIVE team is always surfaced, whatever the caller typed.
         //
@@ -2229,58 +2222,13 @@ export async function handleTeamCommandInvocation(
           // abandoned team, and the one session that could still run it is the
           // one that was never the controller. The takeover is recorded in
           // controllerHistory exactly like the "continue" path.
-          if (team.controllerSessionId !== invocation.agent.id) {
-            const handedOver = transferOrchestrationControl(team, invocation.agent.id, { reason: "re-entry-archive" });
-            await activeTeamState.replace(observation, handedOver, { policy });
-            observation = { ...observation, team: handedOver };
-          }
-          const activeTeam = observation.team;
-          // Dismissal order is fixed: stop every live role FIRST, then publish
-          // the archive, then clear the active state. Reversing it leaves roles
-          // running against a team that no longer exists.
-          for (const role of activeTeam.roles) {
-            const live = ctx.agents.get(SID(role.sessionId));
-            if (live === undefined) continue;
-            try {
-              live.cancel({ kind: "hook", reason: "team-archived-on-reentry" }, { keepInbox: false });
-            } catch {
-              // A role we cannot stop does not block the archive; the archive is
-              // the durable record and the notice below is best-effort.
-            }
-          }
-          const dismissedAt = Date.now();
-          // Same shape as orchestra_dismiss: the handoff summary rides ON the
-          // snapshot, so a later reader learns why it was archived without
-          // having to reconstruct it from the archive marker.
-          const archivedTeam: TeamState = {
-            ...activeTeam,
-            handoffSummary: {
-              reason: "archived on re-entry: the user chose to start a different objective",
-              summary: describeTeamProgress(activeTeam.roles, activeTeam.reports),
-              pendingTasks: activeTeam.roles
-                .filter((role) => (role.reportCount ?? 0) === 0)
-                .map((role) => ({ roleId: role.id, phase: role.phase, reportCount: role.reportCount ?? 0 })),
-            },
-          };
-          const archived = await archiveStore.create(cwd, archivedTeam, { dismissedAt, policy });
-          await activeTeamState.archive(
-            observation,
-            {
-              schemaVersion: 1,
-              archived: true,
-              status: "dismissed",
-              archiveId: archived.summary.archiveId,
-              archivePath: archived.summary.archivePath,
-              archivedAt: dismissedAt,
-              teamId: activeTeam.teamId,
-            },
-            { policy },
+          const archived = await archiveCurrentTeam(
+            "archived on re-entry: the user chose to start a different objective",
+            describeTeamProgress(team.roles, team.reports),
           );
           return {
             kind: "success",
-            text:
-              `Archived "${teamGoalLabel(activeTeam.mission)}" — its goal, roles and reports are preserved and it can be found and resumed later ` +
-              `(archive ${archived.summary.archiveId}).`,
+            text: `Archived "${teamGoalLabel(team.mission)}" — its goal, roles and reports are preserved and it can be found and resumed later (archive ${archived.archive_id}).`,
           };
         }
 
@@ -3632,7 +3580,14 @@ async function retireTeamRoles(ctx: Context, controller: Agent, roles: readonly 
   for (const role of roles) {
     try {
       if (role.execution === "subagent") {
-        await releaseSubagentNodeDefault(ctx, controller, role.sessionId);
+        if (role.phase === "reserved" && role.diagnostic === undefined && role.welcome === undefined &&
+          !(role.sessionHistory ?? []).some((entry) => entry.sessionId === role.sessionId)) continue;
+        const subagents = ctx.get("subagents");
+        if (subagents === undefined) throw new Error("native subagent service is unavailable");
+        const parent = role.parentSessionId === undefined || role.parentSessionId === controller.id
+          ? controller : ctx.agents.get(SID(role.parentSessionId));
+        if (parent === undefined) throw new Error(`native parent ${role.parentSessionId} is unavailable; cannot confirm child drain`);
+        await subagents.drainContinuableChildren(parent, [SID(role.sessionId)]);
       } else {
         const live = ctx.agents.get(SID(role.sessionId));
         if (live !== undefined) {
@@ -3688,17 +3643,17 @@ export async function dismissGovernedTeam(
   // snapshot wins but marker CAS loses, retry addresses this exact id rather
   // than guessing from archive ordering or minting a duplicate.
   const priorAttempt = team.dismissalAttempt;
-  const dismissedAt = priorAttempt?.dismissedAt ?? Date.now();
-  const archiveIdForAttempt = priorAttempt?.archiveId ?? `team-${team.teamId}-${dismissedAt}-${randomUUID()}`;
+  let dismissedAt = priorAttempt?.dismissedAt ?? Date.now();
+  let archiveIdForAttempt = priorAttempt?.archiveId ?? `team-${team.teamId}-${dismissedAt}-${randomUUID()}`;
   const pendingTasks = team.roles
     .filter((r) => r.reportCount === 0 || r.phase === "provisioning" || r.phase === "reserved")
     .map((r) => ({ roleId: r.id, phase: r.phase, reportCount: r.reportCount }));
   const handoffSummary = {
-    reason: args.reason ?? "dismissed by controller",
-    summary: args.summary ?? "Team dismissed and archived.",
+    reason: args.reason ?? team.handoffSummary?.reason ?? "dismissed by controller",
+    summary: args.summary ?? team.handoffSummary?.summary ?? "Team dismissed and archived.",
     pendingTasks,
   };
-  let teamWithHandoff: TeamState = { ...team, handoffSummary, dismissalAttempt: { archiveId: archiveIdForAttempt, dismissedAt } };
+  let teamWithHandoff: TeamState = { ...team, handoffSummary, dismissalAttempt: { ...priorAttempt, archiveId: archiveIdForAttempt, dismissedAt } };
   let markerObservation = teamObservation;
   if (priorAttempt === undefined) {
     const written = await activeTeamState.replace(teamObservation, teamWithHandoff, { policy: escrowPolicy(ctx, exec), signal: exec.signal });
@@ -3718,7 +3673,28 @@ export async function dismissGovernedTeam(
   // thing can simply be run again.
   await retireTeamRoles(ctx, exec.agent, teamWithHandoff.roles, cwd);
 
-  const existingAttempt = await archiveStore.read(cwd, archiveIdForAttempt, { signal: exec.signal });
+  let existingAttempt = await archiveStore.read(cwd, archiveIdForAttempt, { signal: exec.signal });
+  if (existingAttempt.kind === "ready") {
+    if (existingAttempt.snapshot.teamId !== team.teamId || existingAttempt.snapshot.dismissedAt !== dismissedAt) {
+      throw new Error(`orchestra_dismiss: persisted attempt ${archiveIdForAttempt} names an unrelated archive`);
+    }
+    const { archiveId: _id, dismissedAt: _time, status: _status, ...archivedTeam } = existingAttempt.snapshot;
+    const { status: _activeStatus, ...activeTeam } = teamWithHandoff;
+    if (!isDeepStrictEqual(archivedTeam, activeTeam)) {
+      // The first snapshot may have lost marker CAS to a late report. Keep that
+      // immutable archive but explicitly supersede it; never discard the newer
+      // active facts merely to reuse an old archive identity.
+      const supersedesArchiveId = archiveIdForAttempt;
+      dismissedAt = Date.now();
+      archiveIdForAttempt = `team-${team.teamId}-${dismissedAt}-${randomUUID()}`;
+      teamWithHandoff = { ...teamWithHandoff, dismissalAttempt: { archiveId: archiveIdForAttempt, dismissedAt, supersedesArchiveId } };
+      const written = await activeTeamState.replace(markerObservation, teamWithHandoff, { policy: escrowPolicy(ctx, exec), signal: exec.signal });
+      if (written.snapshot === undefined) throw new Error("orchestra_dismiss: superseding attempt was not persisted");
+      markerObservation = written.snapshot;
+      teamWithHandoff = written.snapshot.team;
+      existingAttempt = await archiveStore.read(cwd, archiveIdForAttempt, { signal: exec.signal });
+    }
+  }
   const archived = existingAttempt.kind === "ready"
     ? (() => {
         if (existingAttempt.snapshot.teamId !== team.teamId || existingAttempt.snapshot.dismissedAt !== dismissedAt) {

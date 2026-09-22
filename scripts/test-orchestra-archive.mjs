@@ -529,6 +529,94 @@ test("D3 3: after the marker lands, orchestra_team reports no team and lists the
   });
 });
 
+test("strict dismiss propagates native drain failure before publishing an archive", async () => {
+  await withTempFs(async (fs) => {
+    const harness = dismissHarness(fs);
+    const activeStore = createActiveTeamStateStore(fs);
+    const archiveStore = createArchiveStore(fs);
+    const role = { ...team().roles[0], execution: "subagent", phase: "active", parentSessionId: harness.controller.id, sessionHistory: [] };
+    await activeStore.create(cwd, team({ roles: [role] }), { policy: {} });
+    let drains = 0;
+    const baseGet = harness.ctx.get.bind(harness.ctx);
+    harness.ctx.get = (name) => name === "subagents" ? {
+      async drainContinuableChildren(parent, ids) {
+        drains++;
+        assert.equal(parent, harness.controller);
+        assert.deepEqual(ids.map(String), [role.sessionId]);
+        throw new Error("native drain failed");
+      },
+    } : baseGet(name);
+    await assert.rejects(() => dismissGovernedTeam(harness.ctx, activeStore, archiveStore, harness.exec, {}), /native drain failed/);
+    assert.equal(drains, 1);
+    assert.equal((await activeStore.read(cwd)).kind, "ready");
+    assert.equal((await archiveStore.list(cwd)).ready.length, 0);
+  });
+});
+
+for (const [status, rawInput] of [["active", "新目标"], ["completed", ""]]) {
+  test(`/team ${status} archive propagates native drain failure`, async () => {
+    await withTempFs(async (fs) => {
+      const harness = dismissHarness(fs);
+      const activeStore = createActiveTeamStateStore(fs);
+      const archiveStore = createArchiveStore(fs);
+      const role = { ...team().roles[0], execution: "subagent", phase: "active", parentSessionId: harness.controller.id, sessionHistory: [] };
+      await activeStore.create(cwd, team({ status, roles: [role] }), { policy: {} });
+      let drains = 0;
+      const baseGet = harness.ctx.get.bind(harness.ctx);
+      harness.ctx.get = (name) => name === "subagents" ? {
+        async drainContinuableChildren() { drains++; throw new Error("native drain failed"); },
+      } : baseGet(name);
+      await assert.rejects(() => handleTeamCommandInvocation(harness.ctx, activeStore, archiveStore, {
+        rawInput, commandId: "cmd-archive", agent: harness.controller, source: { kind: "user" },
+      }), /native drain failed/);
+      assert.equal(drains, 1);
+      assert.equal((await activeStore.read(cwd)).kind, "ready");
+      assert.equal((await archiveStore.list(cwd)).ready.length, 0);
+    });
+  });
+}
+
+test("archive CAS retry preserves a late report in an explicitly superseding snapshot", async () => {
+  await withTempFs(async (fs) => {
+    const harness = dismissHarness(fs);
+    const activeStore = createActiveTeamStateStore(fs);
+    const archiveStore = createArchiveStore(fs);
+    const role = { ...team().roles[0], execution: "session", phase: "active", sessionHistory: [] };
+    await activeStore.create(cwd, team({ roles: [role] }), { policy: {} });
+    harness.register(role.sessionId);
+    const lateReport = { reportId: "late-report-1", roleId: role.id, sessionId: role.sessionId, path: "/tmp/late.md", createdAt: 999 };
+    const realArchive = activeStore.archive.bind(activeStore);
+    let injectLateMutation = true;
+    activeStore.archive = async (...args) => {
+      if (injectLateMutation) {
+        injectLateMutation = false;
+        await activeStore.mutate(cwd, (current) => ({
+          ...current,
+          reports: [...current.reports, lateReport],
+          roles: current.roles.map((entry) => entry.id === role.id ? { ...entry, reportCount: entry.reportCount + 1, lastReport: lateReport.path } : entry),
+        }), { policy: {} });
+        throw new ActiveTeamStateError("stale_write", "injected late report before marker CAS");
+      }
+      return realArchive(...args);
+    };
+    await assert.rejects(() => dismissGovernedTeam(harness.ctx, activeStore, archiveStore, harness.exec, {}), /CAS failed/);
+    const beforeRetry = await activeStore.read(cwd);
+    assert.equal(beforeRetry.kind, "ready");
+    const staleArchiveId = beforeRetry.team.dismissalAttempt.archiveId;
+    const staleSnapshot = await archiveStore.read(cwd, staleArchiveId);
+    assert.equal(staleSnapshot.kind, "ready");
+    assert.equal(staleSnapshot.snapshot.reports.some((report) => report.reportId === lateReport.reportId), false);
+    const retried = await dismissGovernedTeam(harness.ctx, activeStore, archiveStore, harness.exec, {});
+    assert.equal(retried.status, "dismissed");
+    assert.notEqual(retried.archive_id, staleArchiveId);
+    const selected = await archiveStore.read(cwd, retried.archive_id);
+    assert.equal(selected.kind, "ready");
+    assert.equal(selected.snapshot.reports.some((report) => report.reportId === lateReport.reportId), true);
+    assert.equal(selected.snapshot.dismissalAttempt.supersedesArchiveId, staleArchiveId);
+    assert.equal((await archiveStore.read(cwd, staleArchiveId)).kind, "ready");
+  });
+});
+
 /** The state file path this fs writes, for the ordering assertions. */
 async function statePathOf(fs) {
   return fs.absolute("orchestra/state/team.json");
