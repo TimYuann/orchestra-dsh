@@ -75,7 +75,7 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
-import { readStoredEvents } from "./check-session-readable.mjs";
+import { readStoredEvents, hasStoredLog } from "./check-session-readable.mjs";
 
 const HOST_PACKAGES =
   process.env.DSH_HOST_PACKAGES ??
@@ -161,9 +161,11 @@ function loadHost() {
 /**
  * The session store root for one cwd, using the harness's own slug rule.
  *
- * `~/.dsh/sessions/<slug>/<sessionId>/session.v3.jsonl.zstd`, where the slug is
+ * `~/.dsh/sessions/<slug>/<sessionId>/session.v<N>.jsonl.zstd`, where the slug is
  * the cwd with path separators and dots replaced — the shape recorded in the
- * plan's assumption list and observed on disk.
+ * plan's assumption list and observed on disk. The generation number is whatever
+ * the writing host chose (v4 since DSH 0.1.7-alpha.1, v3 before), so the log is
+ * located by generation rather than by a pinned filename.
  */
 export function slugForCwd(cwd) {
   const normalised = cwd.replace(/\/+$/, "");
@@ -240,11 +242,13 @@ function realSessionIds(store) {
   // Only sessions that actually HAVE a readable log. A directory without one is
   // not a substitute: swapping it in would stop at "no log" and prove only that
   // missing sessions are reported missing — not that a real, wrong session is
-  // refused, which is the calibration this flag exists for.
+  // refused, which is the calibration this flag exists for. The log is located by
+  // generation (`session.v4`/`session.v3`), never by one pinned filename, or every
+  // session the current host writes would be invisible here.
   return readdirSync(store, { withFileTypes: true })
     .filter((entry) => entry.isDirectory() && entry.name !== "archived")
     .map((entry) => entry.name)
-    .filter((id) => existsSync(join(store, id, "session.v3.jsonl.zstd")));
+    .filter((id) => hasStoredLog(join(store, id)));
 }
 
 function main() {

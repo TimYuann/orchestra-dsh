@@ -15,4 +15,13 @@
 
 # Role identity is declaration-owned in DSH 0.1.7.  The registry is host-owned;
 # this bundle contributes only its named preset rows.
-- include: ./presets/orchestra-roles.patch.yml
+#
+# Those rows live in ./presets/orchestra-roles.patch.yml and are declared as a
+# SECOND entry of `dsh.bundle.patch` in package.json — the host loads each listed
+# file as its own patch layer (the shipped @deepseek-ai/dsh-web-app bundle declares
+# cordis.patch.yml + its four preset files exactly this way).
+#
+# They are NOT `- include:`d from here.  `include` is not a patch key: the Loader's
+# applyEntryPatches destructures `{ id, insert, name, ...overrides }`, so an include
+# row matches nothing, is skipped with "patch: id is required for non-insert patches",
+# and the presets never reach the composed tree.

@@ -19,7 +19,7 @@
  * Exit code 0 when every checked log is readable, 1 otherwise.
  */
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
@@ -50,15 +50,59 @@ function loadHost() {
 /**
  * Decode one stored log into its event envelopes.
  *
+ * ## Which file is the log
+ *
+ * A Session directory holds ONE authoritative generation, named
+ * `session.v<generation>.jsonl.zstd`. The host writes the current generation
+ * (v4 since DSH 0.1.7-alpha.1; v3 before it) and, when reading, selects the
+ * numerically HIGHEST generation present (`resolveGenerationInDirectory` in
+ * `dsh-session-persistence-jsonl`, which sorts descending and takes the first) —
+ * it does not hard-code a version number.
+ *
+ * This reader follows the same rule rather than pinning one filename: a pinned
+ * `session.v3.jsonl.zstd` reported "no session.v3.jsonl.zstd" for every session
+ * the current host writes, i.e. it failed on exactly the sessions it exists to
+ * check. Selecting the highest generation also makes the reader correct for a
+ * directory that still holds both.
+ *
  * The log is a CONCATENATION of zstd frames — one per append batch — and Node's
  * `zstdDecompressSync` stops after the first frame, silently returning just the
  * header. That failure mode is dangerous here of all places: a truncated read
  * would report every session as clean. So the whole file is decoded through the
  * `zstd` binary, and a decode failure is an error rather than an empty event list.
  */
+export function sessionLogPath(sessionDir) {
+  const names = readdirSync(sessionDir);
+  const generations = [];
+  for (const name of names) {
+    const match = /^session\.v(\d+)\.jsonl\.zstd$/.exec(name);
+    if (match !== null) generations.push({ name, version: Number(match[1]) });
+  }
+  if (generations.length === 0) {
+    throw new Error(`no session.v<N>.jsonl.zstd under ${sessionDir} (looked for session.v*.jsonl.zstd)`);
+  }
+  generations.sort((left, right) => right.version - left.version);
+  return join(sessionDir, generations[0].name);
+}
+
+/**
+ * Whether a directory holds a readable-generation log at all.
+ *
+ * Discovery callers (picking session directories to inspect or to use as a
+ * negative control) must ask this rather than testing one pinned filename —
+ * `session.v3.jsonl.zstd` is false for every session the current host writes.
+ */
+export function hasStoredLog(sessionDir) {
+  try {
+    sessionLogPath(sessionDir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function readStoredEvents(sessionDir) {
-  const logPath = join(sessionDir, "session.v3.jsonl.zstd");
-  if (!existsSync(logPath)) throw new Error(`no session.v3.jsonl.zstd under ${sessionDir}`);
+  const logPath = sessionLogPath(sessionDir);
   let text;
   try {
     text = execFileSync("zstd", ["-d", "-c", logPath], { maxBuffer: 512 * 1024 * 1024 }).toString("utf8");
