@@ -447,6 +447,17 @@ export function effectiveApprovalPolicy(session: Session): string | undefined {
  */
 export const PINNED_APPROVAL = "never";
 
+/**
+ * The host's "this knob state names no configured preset" value.
+ *
+ * `@deepseek-ai/dsh-permission-presets` derives the EFFECTIVE preset from the live
+ * sandbox/approval state and returns this literal when no table entry matches
+ * (`CUSTOM_PRESET` in the host source). It cannot be a preset's own name: the host
+ * rejects a table entry called `custom`. Kept as one constant so a verification that
+ * admits this state stays greppable and cannot drift from the name it admits.
+ */
+export const DERIVED_PERMISSION = "custom";
+
 export function pinApprovalNever(ctx: Context, agentCtx: Context, sessionId: string, prepared?: Agent): boolean {
   const session = sessionFrom(ctx, agentCtx, sessionId, prepared) ?? liveSessionOf(ctx, sessionId);
   if (session === undefined) {
@@ -698,8 +709,9 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
 
   const permissionPreset = asString(input.permissionPreset) ?? permissions.defaultPreset;
   if (permissionPreset === undefined) throw new SessionBlueprintError("permission_unavailable", "permissionPresets has no default preset");
+  let permissionSpec: { sandbox: SandboxMode; approval: string };
   try {
-    permissions.resolve(permissionPreset);
+    permissionSpec = permissions.resolve(permissionPreset);
   } catch (error) {
     throw new SessionBlueprintError("permission_unavailable", `permission preset "${permissionPreset}" could not be resolved: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -774,6 +786,13 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
     if (session === undefined) throw new SessionBlueprintError("session_unavailable", `unpublished session ${sessionId} is not visible during blueprint setup`);
     const permissionService = agentCtx.get("permissionPresets") ?? permissions;
     permissionService.set(session, permissionPreset);
+    // `set()` applies a knob through its own setter ONLY when the spec differs from
+    // what is already effective (the deployment default included), so a spec that
+    // happens to equal that default leaves NO event behind. The declared sandbox is a
+    // fact this blueprint owns — the governed path writes it explicitly for exactly
+    // that reason — so record it here as well instead of letting the verification
+    // below read an absent event as "never declared".
+    if (sandboxOverrideOf(session) !== permissionSpec.sandbox) setSandboxMode(session, permissionSpec.sandbox);
     if (input.title !== undefined && input.title !== "") {
       session.append("session/title", { title: input.title, messageSeqs: [], source: { kind: "user" } });
     }
@@ -793,7 +812,22 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
         const actualPreset = agentPresets.composedPreset(agentCtx);
         if (presetStrategy !== "file" && actualPreset !== agentPreset) throw new SessionBlueprintError("composition_mismatch", `published composition "${String(actualPreset)}" does not match blueprint "${agentPreset}"`);
         const actualPermission = permissionService.current(session);
-        if (actualPermission !== permissionPreset) throw new SessionBlueprintError("permission_mismatch", `published permission "${actualPermission}" does not match blueprint "${permissionPreset}"`);
+        // Every created session is pinned to `approval: never` (D2-a), and that pin
+        // runs after the preset is applied. The host derives the EFFECTIVE preset from
+        // the resulting knob state, so a preset whose declared approval is `ask`
+        // (`read-only`, `workspace-write` in the stock table) stops naming a table
+        // entry and derives to the not-a-preset state instead. Demanding the pinned
+        // NAME there made the default backend of a2a_create fail with
+        // `published permission "custom" does not match blueprint "workspace-write"`.
+        // The declared facts are the knobs, not the derived name — this is the same
+        // pair the restore path already asserts — so admit the derived state only when
+        // both knobs are exactly what the blueprint declared, and keep failing loudly
+        // on any real drift.
+        const declaredKnobsHold =
+          sandboxOverrideOf(session) === permissionSpec.sandbox && effectiveApprovalPolicy(session) === PINNED_APPROVAL;
+        if (actualPermission !== permissionPreset && !(actualPermission === DERIVED_PERMISSION && declaredKnobsHold)) {
+          throw new SessionBlueprintError("permission_mismatch", `published permission "${actualPermission}" does not match blueprint "${permissionPreset}"`);
+        }
         const names = visibleToolNames(agentCtx);
         const missing = required.filter((name) => !names.includes(name));
         if (missing.length > 0) throw new SessionBlueprintError("required_tools_missing", `required tools are not visible in the composed scope: ${missing.join(", ")}`, { missing, visible: names });

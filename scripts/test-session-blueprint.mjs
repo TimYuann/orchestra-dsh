@@ -295,3 +295,73 @@ test("malformed durable markers are rejected without throwing or inventing facts
   }
   assert.deepEqual(parseLightweightBlueprint(valid), valid);
 });
+
+/**
+ * The host derives the EFFECTIVE permission preset from the live knob state, and every
+ * created session is pinned to `approval: never` (D2-a) AFTER the preset is applied. For
+ * a preset whose declared approval is `ask` — the stock `read-only` / `workspace-write`
+ * entries — that pin leaves the derived name at the host's not-a-preset state, so commit
+ * must judge the declared KNOBS instead of the derived NAME. This is the regression that
+ * made the default (session) backend of `a2a_create` fail on a stock deployment with
+ * `published permission "custom" does not match blueprint "workspace-write"`.
+ */
+function makePinnedRuntime(options = {}) {
+  const runtime = makeRuntime(options);
+  runtime.permissions.set = (target, name) => {
+    runtime.calls.permissions.push(name);
+    target.append("permission/preset", { preset: name });
+    // The real host applies a knob through its own setter ONLY when the spec differs
+    // from what is already effective, so a spec equal to the deployment default writes
+    // no sandbox event at all — `setWritesSandbox: false` reproduces that case, which
+    // is what made a knob-only verification read "never declared".
+    if (options.setWritesSandbox ?? true) target.append("sandbox/mode", { mode: options.effectiveSandbox ?? "workspace-write" });
+    target.append("approval/policy", { policy: options.effectiveApproval ?? "never" });
+  };
+  runtime.permissions.current = () => options.effectivePermission ?? "custom";
+  return runtime;
+}
+
+const pinnedInput = {
+  sessionId: "child",
+  createdBySessionId: "caller",
+  cwd: "/tmp/blueprint",
+  presetId: "explicit-preset",
+  provider: "provider-x",
+  model: "model-x",
+};
+
+test("commit admits the derived not-a-preset permission when the declared knobs still hold", async () => {
+  const runtime = makePinnedRuntime();
+  const prepared = await runSetup(runtime, { ...pinnedInput, caller: runtime.caller });
+  assert.deepEqual(runtime.calls.permissions, ["workspace-write"]);
+  assert.equal(prepared.receipt.permissionPreset, "workspace-write");
+  assert.equal(runtime.events.some((event) => event.type === "approval/policy" && event.data.policy === "never"), true);
+});
+
+test("commit still fails when the derived permission arrives without the pinned approval", async () => {
+  // The admitted derived state is exactly "declared sandbox + pinned approval". A log
+  // that kept the preset's own `ask` policy is a real drift, not the pin's side effect,
+  // so the derived name must still be rejected.
+  const runtime = makePinnedRuntime({ effectiveApproval: "ask" });
+  await assert.rejects(
+    runSetup(runtime, { ...pinnedInput, caller: runtime.caller }),
+    (error) => error instanceof SessionBlueprintError && error.code === "permission_mismatch" && /"custom"/.test(error.message),
+    "an unpinned approval must still be rejected",
+  );
+});
+
+test("commit repairs a drifted sandbox override to the declared one", async () => {
+  const runtime = makePinnedRuntime({ effectiveSandbox: "read-only" });
+  const prepared = await runSetup(runtime, { ...pinnedInput, caller: runtime.caller });
+  const sandboxEvents = runtime.events.filter((event) => event.type === "sandbox/mode");
+  assert.deepEqual(sandboxEvents.map((event) => event.data.mode), ["read-only", "workspace-write"]);
+  assert.equal(prepared.receipt.permissionPreset, "workspace-write");
+});
+
+test("commit records the declared sandbox even when the preset wrote no sandbox event", async () => {
+  const runtime = makePinnedRuntime({ setWritesSandbox: false });
+  const prepared = await runSetup(runtime, { ...pinnedInput, caller: runtime.caller });
+  const sandboxEvents = runtime.events.filter((event) => event.type === "sandbox/mode");
+  assert.deepEqual(sandboxEvents.map((event) => event.data.mode), ["workspace-write"]);
+  assert.equal(prepared.receipt.permissionPreset, "workspace-write");
+});
