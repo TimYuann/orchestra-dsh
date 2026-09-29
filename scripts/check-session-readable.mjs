@@ -21,12 +21,17 @@
 
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 
-const HOST_PACKAGES = "/Users/yuantian/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai";
+// The host closure this script reads from. Derived from the running user's home
+// instead of a literal personal path, so the file carries no machine identity;
+// override with DSH_SESSION_MODULE / DSH_PERSISTENCE_MODULE when the host lives
+// somewhere else.
+const HOST_PACKAGES = `${homedir()}/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai`;
 
 function loadHost() {
   const sessionModule = process.env.DSH_SESSION_MODULE ?? `${HOST_PACKAGES}/dsh-session/lib/index.js`;

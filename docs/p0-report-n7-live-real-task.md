@@ -33,7 +33,7 @@ $ ego-browser nodejs -e '… taskSpace(30) …'          # 复用上一轮的 sp
 （链路自检：prompt "Reply with exactly: LINK_CHECK_OK" → accepted）
 
 $ ls -la ~/.ego-browser/state/space-30.json
--rw-------@ 1 yuantian  staff  335 Sep 21 02:54 /Users/yuantian/.ego-browser/state/space-30.json
+-rw-------@ 1 yuantian  staff  335 Sep 21 02:54 ~/.ego-browser/state/space-30.json
 $ node -e "…require(space-30.json)…"
 spaceId 30 | pages {"p1":{"targetId":"293D3864337E654C688FB46A1EB702C9","openedBy":"agent"}}
 ```

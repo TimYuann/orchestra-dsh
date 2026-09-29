@@ -173,7 +173,7 @@ EXIT=1
 
 ```
 $ ls -d ~/.dsh/sessions/--Users-yuantian-Documents-agentWorkspace-artifacts-projects-orchestra_N7--/orchestra-team-33be3b56-467d49e7-1312-482b-bf98-d69d158ba92f
-/Users/yuantian/.dsh/sessions/--Users-yuantian-Documents-agentWorkspace-artifacts-projects-orchestra_N7--/orchestra-team-33be3b56-467d49e7-1312-482b-bf98-d69d158ba92f
+~/.dsh/sessions/--Users-yuantian-Documents-agentWorkspace-artifacts-projects-orchestra_N7--/orchestra-team-33be3b56-467d49e7-1312-482b-bf98-d69d158ba92f
 $ stat -f "%Sm  %z bytes" <上>/session.v3.jsonl.zstd
 Sep 21 19:30:37 2026  103858 bytes
 $ node scripts/verify-d2-approval.mjs --session <上>

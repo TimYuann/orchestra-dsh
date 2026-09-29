@@ -79,7 +79,7 @@ import { readStoredEvents, hasStoredLog } from "./check-session-readable.mjs";
 
 const HOST_PACKAGES =
   process.env.DSH_HOST_PACKAGES ??
-  "/Users/yuantian/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai";
+  `${homedir()}/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai`;
 
 /**
  * Where the plugin itself is installed in the deployment. The identity check

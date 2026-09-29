@@ -30,7 +30,7 @@ Sol high在**全新隔离快照**中执行，无profile安装/宿主启动：
 最终候选：`/tmp/orchestra-web-ready-017-final.f1Wcab/orchestra-dsh-0.5.1.tgz`。
 SHA-256：`a9745496d7b2a2f5758d2b7af43b116d5ee42197519c0217958b56aef689f178`。
 
-完整报告：`/Users/yuantian/.pi/agent/sessions/--Users-yuantian-Developer-orchestra-dsh--/subagent-artifacts/outputs/8139acf1-cb0e-432c-8cdd-2e58fe70ad5b/validation/web-ready-017.md`。
+完整报告：`~/.pi/agent/sessions/--Users-yuantian-Developer-orchestra-dsh--/subagent-artifacts/outputs/8139acf1-cb0e-432c-8cdd-2e58fe70ad5b/validation/web-ready-017.md`。
 日志：`/tmp/orchestra-web-ready-017-final-{typecheck,test,probes,pack}.log`。
 
 ## 失败记录与fixture边界

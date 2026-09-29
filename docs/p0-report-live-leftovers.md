@@ -63,7 +63,7 @@ drwxr-xr-x@  7 yuantian  staff  224 Sep 19 04:26 orchestra
 
 端口基线：4599 = PID 14248 / 401；4600 = none / 000
 起 4600（受管后台作业 bash-22）：dsh --profile dev --port 4600 --no-open
-   → dsh web: http://127.0.0.1:4600/?token=pr5i-34bkRngJDU8LNq1OIpgyPxLJonFt0aQCnn5VLc
+   → dsh web: http://127.0.0.1:4600/?token=<redacted>
 通道 = Ego lite（ego-browser skill）TaskSpace id=35 + 页内 page.fetch；非 browser-use、非无头。
 ```
 
@@ -129,7 +129,7 @@ $ ls ~/.dsh/sessions | grep -i "test-a"
 
 ```
 $ node scripts/verify-d2-approval.mjs --session ~/.dsh/sessions/--Users-yuantian-…-orchestra_E2E-test-a--/orchestra-team-b14140b8-f952d90d-1cd1-44fa-8aa5-672df98ffd0e --expect-policy never
-APPROVAL_OK    /Users/yuantian/.dsh/sessions/--Users-yuantian-Documents-agentWorkspace-artifacts-projects-orchestra_E2E-test-a--/orchestra-team-b14140b8-f952d90d-1cd1-44fa-8aa5-672df98ffd0e hanging 0 dangling 0
+APPROVAL_OK    ~/.dsh/sessions/--Users-yuantian-Documents-agentWorkspace-artifacts-projects-orchestra_E2E-test-a--/orchestra-team-b14140b8-f952d90d-1cd1-44fa-8aa5-672df98ffd0e hanging 0 dangling 0
 # sessions 1 ok 1 missing 0 hanging 0 dangling 0 problems 0
 EXIT=0
 
@@ -289,7 +289,7 @@ driver      R-6 期间被宿主追加过 ⇒ 441a653f… → 0f5a8a7a…（**这
 
 - **Ego lite**，TaskSpace **id=35**；证据文件 **`~/.ego-browser/state/space-35.json`**（**存在**，`-rw------- 335 B`，**mtime `Sep 22 01:59:31 2026`**）：
   `{"browserInstanceId":"browser-host:12340","spaceId":35,"usedLabels":["p1"],"initialized":true,"userControlPending":false,"pages":{"p1":{"targetId":"451CB607271845B7C559F111177F3229","openedBy":"agent"}}}`
-- 实例 URL（首启 token）：`http://127.0.0.1:4600/?token=pr5i-34bkRngJDU8LNq1OIpgyPxLJonFt0aQCnn5VLc`（重启后 token 变化；实例已停）。页内 `page.fetch` 在重启后仍可用（同一 space 复用 p1，未换 space）。
+- 实例 URL（首启 token）：`http://127.0.0.1:4600/?token=<redacted>`（重启后 token 变化；实例已停）。页内 `page.fetch` 在重启后仍可用（同一 space 复用 p1，未换 space）。
 - 实际通道 = **Ego lite + 页内 `page.fetch`**（`/api/session/create` · `/api/session/prompt` · `/api/session/page`）；**非 browser-use、非无头**。space 35 **未 finish**（沿用 §27/§30 已接受口径；Owner 口径"不需要 Owner 去看"）。
 
 ## 附 B｜痕迹登记

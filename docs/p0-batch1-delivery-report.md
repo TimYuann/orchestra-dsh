@@ -57,7 +57,7 @@ node scripts/verify-d2-approval.mjs \
   --session ~/.dsh/sessions/--Users-yuantian-Documents-agentWorkspace-artifacts-projects-orchestra_E2E-test-a--/orchestra-team-b14140b8-f952d90d-1cd1-44fa-8aa5-672df98ffd0e \
   --expect-policy never                                  # 期望 exit 0 + hanging 0 dangling 0（该会话 asked=1，非空转）
 node scripts/verify-role-identity.mjs \
-  --repo /Users/yuantian/Documents/agentWorkspace/artifacts/projects/orchestra_N7b \
+  --repo ~/Documents/agentWorkspace/artifacts/projects/orchestra_N7b \
   --team reports/fixture-forensics-2026-09-21/team-team-e310ff28-1789992613601-9763e236-3bca-410d-ba9c-c314c8e9b009.json
                                                           # 期望 exit 0 + IDENTITY_OK … rows=11（fixture 已清理仍可复跑）
 node scripts/test-orchestra-archive.mjs && node scripts/test-tool-schemas.mjs && node scripts/test-orchestra-role-presets.mjs

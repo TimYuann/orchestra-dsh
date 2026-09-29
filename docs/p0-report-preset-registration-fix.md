@@ -246,7 +246,7 @@ READABLE  session-59652cbf-7039-4297-94d9-834e84e8d95d
 $ ls -la tmp/preset-registration-verify/no-log-session-dir
 （空目录，0 条目）
 $ node scripts/check-session-readable.mjs tmp/preset-registration-verify/no-log-session-dir
-ERROR  /Users/yuantian/Developer/orchestra-dsh/tmp/preset-registration-verify/no-log-session-dir
+ERROR  ~/Developer/orchestra-dsh/tmp/preset-registration-verify/no-log-session-dir
           no session.v<N>.jsonl.zstd under …/no-log-session-dir (looked for session.v*.jsonl.zstd)
 1 log(s) would be refused
 EXIT=1
@@ -284,7 +284,7 @@ $ git worktree add --detach /tmp/orchestra-preset-fix-0.6.0 eb7a71d5ab26b6a41104
 HEAD is now at eb7a71d fix(bundle): deliver the 12 role presets via dsh.bundle.patch, not an inert include
 $ ls -d /tmp/orchestra-preset-fix-0.6.0/lib
 ls: /tmp/orchestra-preset-fix-0.6.0/lib: No such file or directory      # 无旧 lib/
-$ ln -sfn /Users/yuantian/Developer/orchestra-dsh/node_modules /tmp/orchestra-preset-fix-0.6.0/node_modules
+$ ln -sfn ~/Developer/orchestra-dsh/node_modules /tmp/orchestra-preset-fix-0.6.0/node_modules
 
 $ npm run typecheck
 > tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.client.json
@@ -331,9 +331,9 @@ orchestra-dsh
 $ ls -la node_modules/@deepseek-ai
 ls: node_modules/@deepseek-ai: No such file or directory            # 连目录都没有
 $ node -e "console.log(require.resolve('@deepseek-ai/dsh-tools', {paths:['./node_modules/orchestra-dsh/lib']}))"
-/Users/yuantian/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js
+~/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js
 $ node -e "console.log(require.resolve('@deepseek-ai/cordis', {paths:['./node_modules/orchestra-dsh/lib']}))"
-/Users/yuantian/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/cordis/lib/index.js
+~/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/cordis/lib/index.js
 $ node -e "const p=require('./node_modules/orchestra-dsh/package.json'); …"
 version 0.6.0 | dependencies {"js-yaml":"^4.1.0"} | peers 22 | dsh.bundle {"patch":["./cordis.patch.yml","./presets/orchestra-roles.patch.yml"]}
 $ diff -r node_modules/orchestra-dsh /tmp/orchestra-preset-fix-tarball/package → IDENTICAL
@@ -342,8 +342,8 @@ $ diff -r node_modules/orchestra-dsh /tmp/orchestra-preset-fix-tarball/package �
 **一件如实说明**：`require.resolve("@deepseek-ai/dsh-agent-preset")` **从插件 lib 视角仍然 MODULE_NOT_FOUND**——这**不是缺陷**：`dsh-agent-preset` 不在本插件 peers 里，它是**宿主自己的插件包**，由 Loader 用宿主基线解析（`mountRootInclude` 的 `HostResolvedRootInclude.import` → `loader.internal.import(specifier, bareModuleBaseUrl)`）：
 
 ```console
-$ node -e "console.log(require.resolve('@deepseek-ai/dsh-agent-preset', {paths:['/Users/yuantian/.nvm/.../dsh/node_modules']}))"
-/Users/yuantian/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-agent-preset/lib/index.js
+$ node -e "console.log(require.resolve('@deepseek-ai/dsh-agent-preset', {paths:['~/.nvm/.../dsh/node_modules']}))"
+~/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-agent-preset/lib/index.js
 ```
 
 上一轮 §2.6 把这条 MODULE_NOT_FOUND 读成"源模块缺失导致 preset 解析失败"——**本轮的受控实验证明该归因不成立**：真正的原因是补丁形状（include 不是补丁键），与 `dependencies` 无关；`dependencies` 仍只有 `js-yaml`，未改（**没有**按上一轮 driver 建议把 `@deepseek-ai/dsh-agent-preset` 移进 dependencies——那会踩本仓防崩硬规则 1）。
@@ -355,10 +355,10 @@ $ lsof -nP -iTCP:4600 -sTCP:LISTEN
 node 81500 … TCP 127.0.0.1:4600 (LISTEN)           # 旧实例
 $ kill 81500 ; lsof -nP -iTCP:4600 -sTCP:LISTEN → （空）
 $ dsh --profile dev-orchestra --port 4600 --no-open        # 受管后台作业 bash-700
-dsh web: http://127.0.0.1:4600/?token=hPaO9vlB3KnEUEY8yCnl2BOz8B-Fw9Wqezf6AW4hIac
+dsh web: http://127.0.0.1:4600/?token=<redacted>
 （stderr 只有 UNDICI-EHPA 实验性警告；无 "Failed to load plugins"、无 loader entry 失败、无 skipped-patch 警告）
 $ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4600/                                    → 401
-$ curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:4600/?token=hPaO9vlB3KnEUEY8yCnl2BOz8B-Fw9Wqezf6AW4hIac" → 303
+$ curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:4600/?token=<redacted>" → 303
 $ curl -sL … -o /tmp/preset-fix-boot.html -w '%{http_code}' …                                      → 200
 $ grep -o 'orchestra-dsh/client.js' /tmp/preset-fix-boot.html | head -2
 orchestra-dsh/client.js
@@ -371,7 +371,7 @@ node 94859 … TCP 127.0.0.1:4599 (LISTEN)    # Owner 实例，PID 未变，全�
 
 ### 2.8 工作项 3 · 真机落地验证（4600 上的新会话 + `orchestra_draft` 一次）
 
-**步骤**：ego-browser 打开 `http://127.0.0.1:4600/?token=…`（空间 id `9`，页面 `p1`）→ 新建会话（工作区 `orchestra_E2E` = `/Users/yuantian/Documents/agentWorkspace/artifacts/projects/orchestra_E2E`）→ 发一条**只调用一次 `orchestra_draft`** 的指令，参数里给的是**离线先验过**的 12 角色 inlineTopology（`tmp/preset-registration-verify/twelve-role-inline-topology.json`，用 `lib/orchestra-topology.js::validateTopology` 预检 **problems: 0**）。
+**步骤**：ego-browser 打开 `http://127.0.0.1:4600/?token=…`（空间 id `9`，页面 `p1`）→ 新建会话（工作区 `orchestra_E2E` = `~/Documents/agentWorkspace/artifacts/projects/orchestra_E2E`）→ 发一条**只调用一次 `orchestra_draft`** 的指令，参数里给的是**离线先验过**的 12 角色 inlineTopology（`tmp/preset-registration-verify/twelve-role-inline-topology.json`，用 `lib/orchestra-topology.js::validateTopology` 预检 **problems: 0**）。
 
 **旁证一：界面里的 preset 选择器（= 宿主 `agentPresets` 实时名册）** 现在列出 12 条 orchestra 预设（此前只有 shipped 4 条）：
 
@@ -453,7 +453,7 @@ charter draft draft-6a5ead65-6953-4a3e-9c54-dc08d562ac29@1 (pending) digest=6917
 ## ④ 下一跳建议
 
 1. **把本轮的两条判据接进维护套件**（本轮**故意没做**：`npm test` 的 295 基线是本轮冻结口径，加测试会让计数变成 296+）。具体：把 `scripts/verify-role-preset-registration.mjs` 以 `--bundle <repo>` 形式加进 `npm test` 的脚本清单，并在 `scripts/test-role-preset-roster.mjs` 里加一条"`dsh.bundle.patch` 必须列出 `./presets/orchestra-roles.patch.yml`"的断言——**这正是本轮缺陷的形态（声明与投递不一致），值得有守卫**。
-2. **Owner 手测路径**：在 4600 上开新会话 → `/team`（走交互式 onboarding）→ 批准 → `orchestra_create` → 首次派活，验证"每条 preset 真能 mount 出角色会话"（本轮只到草案层）。URL：`http://127.0.0.1:4600/?token=hPaO9vlB3KnEUEY8yCnl2BOz8B-Fw9Wqezf6AW4hIac`。
+2. **Owner 手测路径**：在 4600 上开新会话 → `/team`（走交互式 onboarding）→ 批准 → `orchestra_create` → 首次派活，验证"每条 preset 真能 mount 出角色会话"（本轮只到草案层）。URL：`http://127.0.0.1:4600/?token=<redacted>`。
 3. **跨重启角色身份**（`AGENTS.md` 的必备项）仍未取得：建队成功后重启 4600 再派活即可验证；本轮重启只验证了"组合生效"。
 4. **文档同步**：`docs/p0-report-0.6.0-web-acceptance.md` §2.6 / ⑤ 的两条建议已被本轮取代——`- include:` 方案（Option (b) `cordis-plugin-include` 入口行）**未被采用且不必要**；建议在该报告加一行"已由 `eb7a71d` 以 `dsh.bundle.patch` 列表修复"，避免后续 session 再走 include 那条路。
 5. **web 放行后**：0.6.0 的 tgz 已更新（新 sha256 `49c10002…`），Phase 3 若重做，应使用**本制品**而不是 §附录 A1 里记的 `8250b6ea…`（旧制品已备份到 `/tmp/orchestra-preset-fix-backup/`）。

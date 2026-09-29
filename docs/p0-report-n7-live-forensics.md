@@ -75,7 +75,7 @@ $ session/prompt → "Reply with exactly: PROBE_ALPHA_OK"
 $ session/prompt → "Call the orchestra_team tool now …"
 {"type":"tool/call","seq":456,"name":"orchestra_team","arguments":"{}"}
 tool/result 文本开头：
-  "team team-f01da153 (trio, active): implementer(cold,R1, report=/Users/yuantian/Documents/ag…"
+  "team team-f01da153 (trio, active): implementer(cold,R1, report=~/Documents/ag…"
 {"type":"turn/end","data":{"turn":10,"reason":{"kind":"completed"}}}
 ```
 

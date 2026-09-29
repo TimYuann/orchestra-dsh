@@ -46,14 +46,14 @@
 17. `orchestra_create` 中关于一次性锁死全部 Roster 的臃肿校验。
 
 ### 2.2 ADR 状态同步
-* [ADR-0001](file:///Users/yuantian/Developer/orchestra-dsh/docs/adr/0001-product-scope-two-halves.md)：保持 Accepted。
-* [ADR-0002](file:///Users/yuantian/Developer/orchestra-dsh/docs/adr/0002-record-home-and-authority.md)：保持 Accepted（文件即文档已落地）。
-* [ADR-0003](file:///Users/yuantian/Developer/orchestra-dsh/docs/adr/0003-session-control-surface.md)：更新并补充 `a2a_stop`（调用 `agent.cancel()`）。
-* [ADR-0006](file:///Users/yuantian/Developer/orchestra-dsh/docs/adr/0006-thin-scaffolding.md)：保持 Accepted，确认本规格书为其终局落地。
-* [ADR-0007](file:///Users/yuantian/Developer/orchestra-dsh/docs/adr/0007-node-backend-boundary.md)：保持 Accepted。
-* [ADR-0008](file:///Users/yuantian/Developer/orchestra-dsh/docs/adr/0008-graph-model.md)：保持 Accepted，微观事件退场，车道 DAG 确立。
-* [ADR-0009](file:///Users/yuantian/Developer/orchestra-dsh/docs/adr/0009-test-environment-discipline.md)：保持 Accepted。
-* [ADR-0010](file:///Users/yuantian/Developer/orchestra-dsh/docs/adr/0010-execution-default-open.md)：状态由 Proposed 变更为 **Accepted（维持默认独立 Session）**。
+* [ADR-0001](file://~/Developer/orchestra-dsh/docs/adr/0001-product-scope-two-halves.md)：保持 Accepted。
+* [ADR-0002](file://~/Developer/orchestra-dsh/docs/adr/0002-record-home-and-authority.md)：保持 Accepted（文件即文档已落地）。
+* [ADR-0003](file://~/Developer/orchestra-dsh/docs/adr/0003-session-control-surface.md)：更新并补充 `a2a_stop`（调用 `agent.cancel()`）。
+* [ADR-0006](file://~/Developer/orchestra-dsh/docs/adr/0006-thin-scaffolding.md)：保持 Accepted，确认本规格书为其终局落地。
+* [ADR-0007](file://~/Developer/orchestra-dsh/docs/adr/0007-node-backend-boundary.md)：保持 Accepted。
+* [ADR-0008](file://~/Developer/orchestra-dsh/docs/adr/0008-graph-model.md)：保持 Accepted，微观事件退场，车道 DAG 确立。
+* [ADR-0009](file://~/Developer/orchestra-dsh/docs/adr/0009-test-environment-discipline.md)：保持 Accepted。
+* [ADR-0010](file://~/Developer/orchestra-dsh/docs/adr/0010-execution-default-open.md)：状态由 Proposed 变更为 **Accepted（维持默认独立 Session）**。
 
 ---
 

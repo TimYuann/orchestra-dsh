@@ -83,7 +83,7 @@ $ git worktree add --detach /tmp/orchestra-p0-0.6.0 27b29af8cad628fa68fb7f987f63
 HEAD is now at 27b29af chore(release): bump version to 0.6.0
 $ ls -d /tmp/orchestra-p0-0.6.0/lib
 ls: /tmp/orchestra-p0-0.6.0/lib: No such file or directory     # ← 关键：无旧 lib/
-$ ln -sfn /Users/yuantian/Developer/orchestra-dsh/node_modules /tmp/orchestra-p0-0.6.0/node_modules
+$ ln -sfn ~/Developer/orchestra-dsh/node_modules /tmp/orchestra-p0-0.6.0/node_modules
 
 $ npm run typecheck
 > tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.client.json
@@ -170,9 +170,9 @@ ls: node_modules/@deepseek-ai: No such file or directory      # ← 连目录都
 $ ls node_modules/.pnpm/                                      → lock.yaml（无虚拟店实体包）
 
 $ node -e "console.log(require.resolve('@deepseek-ai/dsh-tools', {paths:['./node_modules/orchestra-dsh/lib']}))"
-/Users/yuantian/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js
+~/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js
 $ node -e "…require.resolve('@deepseek-ai/cordis', …)"
-/Users/yuantian/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/cordis/lib/index.js
+~/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/cordis/lib/index.js
 
 $ node -e '…profile 内 orchestra-dsh/package.json…'
 version: 0.6.0 ; dependencies: {"js-yaml":"^4.1.0"} ; peer count: 22
@@ -183,7 +183,7 @@ $ diff -r node_modules/orchestra-dsh <tgz 解包> → IDENTICAL    # profile 副
 
 ```console
 $ dsh --profile dev-orchestra --port 4600 --no-open           # 受管作业 bash-307
-dsh web: http://127.0.0.1:4600/?token=8xUA9LSTiJ1f31a87QOj0HqZW4gjp6GJXO2B2xFSvYU
+dsh web: http://127.0.0.1:4600/?token=<redacted>
 $ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4600/       → 401（无 token）
 $ curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:4600/?token=…" → 303
 $ dsh --profile dev-orchestra --dump-config | grep orchestra
@@ -194,7 +194,7 @@ $ dsh --profile dev-orchestra --dump-config | grep orchestra
 
 ### 2.3 通道闸（Phase 1.3）——**失败点**
 
-**UI 动作（Ego lite，空间 id `3`，页面 `p1`）**：新建会话 → 工作区选 `orchestra_E2E`（=`/Users/yuantian/Documents/agentWorkspace/artifacts/projects/orchestra_E2E`）→ 模型选择器 `minimax-cn / MiniMax-M3` + 推理等级 `High` → 发一条**不需要工具**的消息。
+**UI 动作（Ego lite，空间 id `3`，页面 `p1`）**：新建会话 → 工作区选 `orchestra_E2E`（=`~/Documents/agentWorkspace/artifacts/projects/orchestra_E2E`）→ 模型选择器 `minimax-cn / MiniMax-M3` + 推理等级 `High` → 发一条**不需要工具**的消息。
 
 **UI 原文（页面 `innerText`，已核对截图裁切区只含此块、不含侧边栏）**
 
@@ -481,7 +481,7 @@ bb0bfed40ab938b39a0248ab3aa65a0dbfbe85ca644946f07decf10273fabaab  cordis.patch.y
 @@
    "private": true,
 +  "dependencies": {
-+    "orchestra-dsh": "file:/Users/yuantian/Developer/orchestra-dsh/orchestra-dsh-0.6.0.tgz"
++    "orchestra-dsh": "file:~/Developer/orchestra-dsh/orchestra-dsh-0.6.0.tgz"
 +  },
    "dsh": { "profile": { "bundles": [
          "@deepseek-ai/dsh-base",
@@ -514,7 +514,7 @@ cae7dc129b17fe9ebe79ef8b75c7fe7a328e3f8b0eedaebc70763df79a6b504a  pnpm-lock.yaml
 $ ls node_modules/@deepseek-ai/            → 空目录（web 连 cosmokit/schemastery 都没有，更无实体副本）
 $ ls node_modules/ | grep -v dup-bak       → 各 @scope 壳 + argparse/js-yaml/orchestra-dsh
 $ require.resolve('@deepseek-ai/dsh-tools', {paths:['./node_modules/orchestra-dsh/lib']})
-  → /Users/yuantian/.nvm/.../dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js     # host
+  → ~/.nvm/.../dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js     # host
 $ require.resolve('@deepseek-ai/cordis', …) → …/dsh/node_modules/@deepseek-ai/cordis/lib/index.js   # host
 $ diff -r node_modules/orchestra-dsh <tgz 解包>   → IDENTICAL（version 0.6.0, dependencies 仅 js-yaml）
 $ dsh --profile web --dump-config | grep orchestra
@@ -524,7 +524,7 @@ $ dsh --profile web --dump-config | grep orchestra
 
 # 冷启动同 profile（4605，--no-open；4599 全程未碰，仍 401）
 $ dsh --profile web --port 4605 --no-open
-dsh web: http://127.0.0.1:4605/?token=5nWsG1NXH4YmHyarssSP80Y6vYRjylIUBk2juBPQUY0
+dsh web: http://127.0.0.1:4605/?token=<redacted>
   # 启动日志零报错（无 "Failed to load plugins" / 无 loader entry 失败）
 $ curl -L -c <cookie> "http://127.0.0.1:4605/?token=…"   → HTTP 200，boot 清单里客户端插件为：
   orchestra-dsh/client.js, @deepseek-ai/dsh-session-log-export/client.js,
@@ -692,8 +692,8 @@ dsh --profile web --port 4599
 
 ### A2 "看这里"（三行，按 Phase 4 格式，供 Owner 现场复核）
 
-1. **URL + token**：dev/4600 → <http://127.0.0.1:4600/?token=_LA52YJk05JIokXZ5H09ecZ6gKGUlArf6gbmwu1ske8>（作业 `bash-409`，**通道已修好**，可用 M3）。**web/4599 与 4605 均已不在运行本插件**（web 安装已回滚、4605 已停）。要停 4600：`lsof -ti tcp:4600 | xargs kill`；要起：`dsh --profile dev-orchestra --port 4600 --no-open`（重启换新 token）。
-2. **工作区与会话**：`orchestra_E2E`（=`/Users/yuantian/Documents/agentWorkspace/artifacts/projects/orchestra_E2E`）。可看的三条：`session-573effd7`（通道闸通过：`收到` + `orchestra_topologies` 真调用）、`session-45b916c1`（`/team` 被 preset 阻断的全过程）、`session-d61e2732` + 子代理 `bcb533db`（A2A 六工具与 toolFilter 生效）。
+1. **URL + token**：dev/4600 → <http://127.0.0.1:4600/?token=<redacted>>（作业 `bash-409`，**通道已修好**，可用 M3）。**web/4599 与 4605 均已不在运行本插件**（web 安装已回滚、4605 已停）。要停 4600：`lsof -ti tcp:4600 | xargs kill`；要起：`dsh --profile dev-orchestra --port 4600 --no-open`（重启换新 token）。
+2. **工作区与会话**：`orchestra_E2E`（=`~/Documents/agentWorkspace/artifacts/projects/orchestra_E2E`）。可看的三条：`session-573effd7`（通道闸通过：`收到` + `orchestra_topologies` 真调用）、`session-45b916c1`（`/team` 被 preset 阻断的全过程）、`session-d61e2732` + 子代理 `bcb533db`（A2A 六工具与 toolFilter 生效）。
 3. **Owner 可以亲手做的一步**：在 4600 上**再敲一次 `/team`**——预期仍会在 `orchestra_draft` 处报 `DSH declared preset orchestra-implementer could not be resolved`（§2.6 的缺陷未修）。**web/4599 现已在安装前状态**（回滚完成、PID 未变），本次安装不会再对它产生任何影响。
 
 ### A3 宿主写回的 profile diff（F-070-3 原文）
@@ -729,14 +729,14 @@ shasum -a 256 /tmp/orchestra-stale-artifacts/*
 # （edit package.json: version 0.5.1 → 0.6.0）
 git diff -- package.json && git add package.json && git commit -m "chore(release): bump version to 0.6.0"
 git worktree add --detach /tmp/orchestra-p0-0.6.0 27b29af8cad628fa68fb7f987f638c878881ef44
-ln -sfn /Users/yuantian/Developer/orchestra-dsh/node_modules /tmp/orchestra-p0-0.6.0/node_modules
+ln -sfn ~/Developer/orchestra-dsh/node_modules /tmp/orchestra-p0-0.6.0/node_modules
 cd /tmp/orchestra-p0-0.6.0 && npm run typecheck && npm run build
 npm test > /tmp/orchestra-p0-npm-test.log 2>&1; grep -E '^# (tests|pass|fail|cancelled)' /tmp/orchestra-p0-npm-test.log
 npm pack --cache /tmp/dsh-npm-cache
 tar -xzf orchestra-dsh-0.6.0.tgz -C /tmp/orchestra-artifact-check
 tar -tzf orchestra-dsh-0.6.0.tgz | grep -c '@deepseek-ai'
 diff -r /tmp/orchestra-artifact-check/package/lib /tmp/orchestra-p0-0.6.0/lib
-cp /tmp/orchestra-p0-0.6.0/orchestra-dsh-0.6.0.tgz /Users/yuantian/Developer/orchestra-dsh/
+cp /tmp/orchestra-p0-0.6.0/orchestra-dsh-0.6.0.tgz ~/Developer/orchestra-dsh/
 # —— Phase 1
 cd ~/.dsh/profiles/dev-orchestra && cp package.json{,.bak-$(date +%Y%m%d-%H%M%S)}   # 另含 pnpm-workspace.yaml / cordis.patch.yml
 # （写入新 package.json / pnpm-workspace.yaml；rm -f node_modules/.modules.yaml .pnpm-workspace-state-v1.json .pnpm/lock.yaml）

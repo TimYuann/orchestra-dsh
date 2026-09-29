@@ -56,11 +56,11 @@ marker 原文（节选，证明它只能是 `prepareGovernedBlueprint` 的 `setu
   "topologySource": "global",
   "agentPreset": "orchestra-implementer",
   "presetSource": "file",
-  "presetPath": "/Users/yuantian/.dsh/orchestra/catalog-presets/orchestra-implementer/agent.cordis.yml",
+  "presetPath": "~/.dsh/orchestra/catalog-presets/orchestra-implementer/agent.cordis.yml",
   "presetTrust": "system",
   "approval": "ask",
   "sandbox": "workspace-write",
-  "cwd": "/Users/yuantian/Documents/agentWorkspace",
+  "cwd": "~/Documents/agentWorkspace",
   "title": "implementer · 在 artifacts/w… · agentWorkspace",
   "compositionTools": ["tool-bash","tool-fs","tool-fs-search"],
   "orchestraTools": ["orchestra_report"],
@@ -199,9 +199,9 @@ return { …, path: resolved.path, source: "dsh", spec, composition: validateCan
 `path === ""` 是死分支（台账 §12 裁定 D 已实测：名册 `AgentPreset.path` 是必需绝对路径），**真实名册一定走到下面那行并带回 `composition`**。实测（探针用宿主的 `discoverPresets` 造 roster，喂给 `lib/orchestra-role-presets.js` 的 `resolveRolePresetFile`）：
 
 ```
-== orchestra-v04-reviewer-v1 source= dsh path= "/Users/yuantian/.dsh/orchestra/catalog-presets/orchestra-v04-reviewer-v1/agent.cordis.yml" hasComposition= true
+== orchestra-v04-reviewer-v1 source= dsh path= "~/.dsh/orchestra/catalog-presets/orchestra-v04-reviewer-v1/agent.cordis.yml" hasComposition= true
    rowIds= ["persona","agent-instructions","tool-fs","tool-fs-search","tool-bash","skill-filesystem","tool-skill","compaction","compaction-basic","command-compact","tool-result-pruner"]
-== orchestra-implementer source= dsh path= "/Users/yuantian/.dsh/orchestra/catalog-presets/orchestra-implementer/agent.cordis.yml" hasComposition= true
+== orchestra-implementer source= dsh path= "~/.dsh/orchestra/catalog-presets/orchestra-implementer/agent.cordis.yml" hasComposition= true
    rowIds= ["persona","agent-instructions","tool-fs","tool-fs-search","tool-bash"]
 ```
 

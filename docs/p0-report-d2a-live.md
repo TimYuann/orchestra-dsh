@@ -28,7 +28,7 @@ d88cd3fd127e853f84f2b490935ce2a2b8e512aa
 
 $ shasum -a 256 lib/orchestra.js ~/.dsh/profiles/dev/node_modules/orchestra-dsh/lib/orchestra.js   # 换之前
 4c41ef7f38a416526d926d98cf55e081fb4af10950743d80112beebd6268594d  lib/orchestra.js
-50c5d6b9125539d9db2e4fba967c0286227779da1f40794c4508585cfe9c6f20  /Users/yuantian/.dsh/profiles/dev/…/lib/orchestra.js
+50c5d6b9125539d9db2e4fba967c0286227779da1f40794c4508585cfe9c6f20  ~/.dsh/profiles/dev/…/lib/orchestra.js
 
 $ npm run typecheck      → TYPECHECK_EXIT=0
 $ npm run build          → BUILD_EXIT=0（tsdown：lib/client.js 12.23 kB）
@@ -51,7 +51,7 @@ INSTALL_EXIT=0
 
 ```
 $ shasum -a 256 ~/.dsh/profiles/dev/node_modules/orchestra-dsh/lib/orchestra.js lib/orchestra.js
-4c41ef7f38a416526d926d98cf55e081fb4af10950743d80112beebd6268594d  /Users/yuantian/.dsh/profiles/dev/node_modules/orchestra-dsh/lib/orchestra.js
+4c41ef7f38a416526d926d98cf55e081fb4af10950743d80112beebd6268594d  ~/.dsh/profiles/dev/node_modules/orchestra-dsh/lib/orchestra.js
 4c41ef7f38a416526d926d98cf55e081fb4af10950743d80112beebd6268594d  lib/orchestra.js
 $ diff <两者>                       → （空 = identical）
 ```
@@ -63,7 +63,7 @@ $ ls ~/.dsh/profiles/dev/node_modules/@deepseek-ai/
 cosmokit
 schemastery
 $ node -e 'const {createRequire}=require("module");const r=createRequire("…/profiles/dev/node_modules/orchestra-dsh/lib/index.js");console.log(r.resolve("@deepseek-ai/dsh-tools"))'
-/Users/yuantian/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js   ← host
+~/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js   ← host
 $ node -e 'console.log(JSON.stringify(require("…/orchestra-dsh/package.json").dependencies))'
 {"js-yaml":"^4.1.0"}
 $ grep -c "pinApprovalNever" …/orchestra-dsh/lib/session-blueprint.js    → 1
@@ -86,7 +86,7 @@ drwxr-xr-x   7 yuantian  staff   224 Sep 19 04:26 orchestra
 
 - 建 `test-a/`（`mkdir -p …/orchestra_E2E/test-a`，exit 0）。
 - 起 4600 为**受管后台作业**（job `bash-20`）：`dsh --profile dev --port 4600 --no-open`
-  → `dsh web: http://127.0.0.1:4600/?token=YYPkBs7sotCRA6u7XQLQeSioAfRLAHv6gAxoxHu71zA`；`curl 4600 → 401`（无 token）。
+  → `dsh web: http://127.0.0.1:4600/?token=<redacted>`；`curl 4600 → 401`（无 token）。
 - 通道 = **Ego lite**（`ego-browser` skill，TaskSpace **id=34**）+ 页内 `page.fetch`；**非 browser-use、非无头**。
 - 端口基线：起实例前 `lsof 4599 → node PID 14248 (LISTEN)`、`curl 4599 → 401`、`curl 4600 → 000`。
 
@@ -170,7 +170,7 @@ sessionHistory(top) null
 
 ```
 $ node scripts/verify-d2-approval.mjs --session ~/.dsh/sessions/--Users-yuantian-…-orchestra_E2E-test-a--/orchestra-team-e574cfbd-3181d637-01dd-4e02-be65-5b5e4cbf8508 --expect-policy never
-APPROVAL_OK    /Users/yuantian/.dsh/sessions/--Users-yuantian-Documents-agentWorkspace-artifacts-projects-orchestra_E2E-test-a--/orchestra-team-e574cfbd-3181d637-01dd-4e02-be65-5b5e4cbf8508 hanging 0 dangling 0
+APPROVAL_OK    ~/.dsh/sessions/--Users-yuantian-Documents-agentWorkspace-artifacts-projects-orchestra_E2E-test-a--/orchestra-team-e574cfbd-3181d637-01dd-4e02-be65-5b5e4cbf8508 hanging 0 dangling 0
 # sessions 1 ok 1 missing 0 hanging 0 dangling 0 problems 0
 EXIT=0
 ```
@@ -333,7 +333,7 @@ archive(Sep 19 13:42) charter(Sep 19 15:32) reports(Sep 19 15:18) state(Sep 22 0
 
 - **Ego lite**，TaskSpace **id=34**；证据文件 **`~/.ego-browser/state/space-34.json`**（**存在**，`-rw------- 335 B`，**mtime `Sep 22 00:50:54 2026`**）：
   `{"browserInstanceId":"browser-host:12340","spaceId":34,"usedLabels":["p1"],"initialized":true,"userControlPending":false,"pages":{"p1":{"targetId":"A0FFDF1496E4152660F6AC8022166198","openedBy":"agent"}}}`
-- 打开 URL：`http://127.0.0.1:4600/?token=YYPkBs7sotCRA6u7XQLQeSioAfRLAHv6gAxoxHu71zA`（实例已停，token 随重启变化）。
+- 打开 URL：`http://127.0.0.1:4600/?token=<redacted>`（实例已停，token 随重启变化）。
 - 实际通道 = **Ego lite + 页内 `page.fetch`**（`/api/session/create` · `/api/session/prompt` · `/api/session/page`）；**非 browser-use、非无头**。space 34 **未 finish**（沿用 §27 已接受的口径；Owner 口径明确"不需要 Owner 去看"）。
 
 ## 附 B｜痕迹登记

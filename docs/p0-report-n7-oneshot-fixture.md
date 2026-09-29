@@ -48,7 +48,7 @@ orchestra-dsh-0.5.1.tgz   79 files  332.6 kB  shasum 645042a3…
 ```
 ① ls ~/.dsh/profiles/dev/node_modules/@deepseek-ai/  → cosmokit  schemastery   （无第三项，无回归）
 ② require.resolve('@deepseek-ai/dsh-tools',{paths:[…/orchestra-dsh/lib]})
-   → /Users/yuantian/.nvm/.../dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js   （host 路径）
+   → ~/.nvm/.../dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js   （host 路径）
 ③ 插件副本 dependencies = {"js-yaml":"^4.1.0"}   （无 @deepseek-ai）
    health：root 带 token → 303（正常重定向）、不带 token → 401（正常拒绝）；启动日志零插件加载失败
    （本 DSH 构建无独立 /health 200 端点；web 服务在服务即视为 healthy）
@@ -66,7 +66,7 @@ $ diff <profile>…/orchestra.js repo/lib/orchestra.js   → DIFF_EMPTY: identic
 
 ### 硬前提 B：§7-dev 单跳 override 重启后仍生效（自带对照项）
 
-起受管 4600（job `bash-15`）：`dsh web: http://127.0.0.1:4600/?token=3k32TcxkJdi7qUIMeW4C9YU3TLQn3V4FEBduaz-J6LU`。
+起受管 4600（job `bash-15`）：`dsh web: http://127.0.0.1:4600/?token=<redacted>`。
 
 ```
 $ node scripts/verify-role-presets-roster.mjs
@@ -167,7 +167,7 @@ reviewer 末条 assistant：「No writable location at all (fully read-only sand
 ## 通道（Ego lite space 证据）
 
 - **Ego lite**（`ego-browser` skill），TaskSpace **id=31**；证据 `~/.ego-browser/state/space-31.json`（335 B，mtime `Sep 21 03:51` 本地）：`spaceId:31`、`pages:{"p1":{"targetId":"E20980FEA314A46B21AE353737489500","openedBy":"agent"}}`、`initialized:true`；state 目录文件数 24→25。
-- **space 31 未 finish**，Owner 在 Ego lite 里能看到它。打开 URL：`http://127.0.0.1:4600/?token=3k32TcxkJdi7qUIMeW4C9YU3TLQn3V4FEBduaz-J6LU`（token 会随实例重启变化；本轮结束按纪律停掉 4600，端口留空）。
+- **space 31 未 finish**，Owner 在 Ego lite 里能看到它。打开 URL：`http://127.0.0.1:4600/?token=<redacted>`（token 会随实例重启变化；本轮结束按纪律停掉 4600，端口留空）。
 - 中段已把 **controller 会话**（`/team approve draft-2da34c7f…`）与 **reviewer 会话**（`reviewer · 在本工作区构建一个小型 N… · orchestra_N7`）在 App 里打开，Owner 可直接在侧边栏 `orchestra_N7` 工作区看到这两条会话的全部对话。
 - 实际通道 = **Ego lite + 页内 page.fetch**（非 browser-use、非无头）。
 

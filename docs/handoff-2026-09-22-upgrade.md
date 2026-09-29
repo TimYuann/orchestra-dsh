@@ -158,9 +158,9 @@ Trinity主会话报告：在其 **dev-trinity / DSH0.1.7-alpha.1** 中，两次�
 
 ## 9. 证据与文件索引
 
-- 原始完整搜证（九个源码缺口+public resume裁定+v2九项阻断）：`/Users/yuantian/.pi/agent/sessions/--Users-yuantian-Developer-orchestra-dsh--/subagent-artifacts/outputs/14914f7b-24f3-4c0a-95ed-fb14ad389ffc/evidence/remaining-source-gaps.md`。
+- 原始完整搜证（九个源码缺口+public resume裁定+v2九项阻断）：`~/.pi/agent/sessions/--Users-yuantian-Developer-orchestra-dsh--/subagent-artifacts/outputs/14914f7b-24f3-4c0a-95ed-fb14ad389ffc/evidence/remaining-source-gaps.md`。
 - 前一阶段验证历史：同目录`checkpoint-tests.md`（含285、292以及后来失败的WIP；按snapshot读取）。
-- 本次Sol high run：`8139acf1-cb0e-432c-8cdd-2e58fe70ad5b`；已完成并停止。最终报告：`/Users/yuantian/.pi/agent/sessions/--Users-yuantian-Developer-orchestra-dsh--/subagent-artifacts/outputs/8139acf1-cb0e-432c-8cdd-2e58fe70ad5b/validation/web-ready-017.md`。报告的整体NO-GO指**未执行live验收**，不是自动测试失败；不要引用其中主观分数替代具体证据。
+- 本次Sol high run：`8139acf1-cb0e-432c-8cdd-2e58fe70ad5b`；已完成并停止。最终报告：`~/.pi/agent/sessions/--Users-yuantian-Developer-orchestra-dsh--/subagent-artifacts/outputs/8139acf1-cb0e-432c-8cdd-2e58fe70ad5b/validation/web-ready-017.md`。报告的整体NO-GO指**未执行live验收**，不是自动测试失败；不要引用其中主观分数替代具体证据。
 - 目标发布包：`tmp/0.1.6alpha2-to-0.1.7alpha1/b/node_modules/@deepseek-ai/`；审计全文同目录上一级`UPGRADE-ADAPTATION.md`。全局host已变新版本，不能当旧版证据。
 - 当前摘要与原生能力：`docs/upgrade-0.1.7-alpha.1-implementation.md`、`docs/dsh-native-capabilities.md`。
 - `AGENTS.md`、`STATE.md`、`DSH-INTEGRATION.md`是Git ignored本地上下文；已同步，但接续事实以本tracked文档和提交为准。

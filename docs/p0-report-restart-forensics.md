@@ -26,7 +26,7 @@
 
 ```
 $ node scripts/probe-preset-roster.mjs
-harnessBase: file:///Users/yuantian/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-cordis-host-runner/lib/
+harnessBase: file://~/.nvm/versions/node/v22.22.2/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-cordis-host-runner/lib/
 roster size: 16
 CONTROL (shipped presets):
    standard     healthy
@@ -82,7 +82,7 @@ orchestra-team-4b21c7ee-88d613d1-12d2-4720-8826-755cfbb323f8.json
 $ 标记内容（两个都同形）
 preset=orchestra-implementer | source=file | approval=ask | role=implementer
 preset=orchestra-reviewer    | source=file | approval=ask | role=reviewer
-presetPath=/Users/yuantian/.dsh/orchestra/catalog-presets/<id>/agent.cordis.yml
+presetPath=~/.dsh/orchestra/catalog-presets/<id>/agent.cordis.yml
 permissionPreset=workspace-write | sandbox=workspace-write
 ```
 

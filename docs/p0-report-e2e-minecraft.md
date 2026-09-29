@@ -85,7 +85,7 @@ team.json → 两角色 blueprint.provider/model/reasoningEffort = minimax-cn / 
 
 ```
 4599 全程 401（PID 14248，未碰）；4600 = none/000 → 起实例（受管作业 bash-27）
-dsh web: http://127.0.0.1:4600/?token=1EX4mCvpm2A-TXrrQocI_ok6w5QxnY3HdbPlHjCAB6g
+dsh web: http://127.0.0.1:4600/?token=<redacted>
 Ego lite TaskSpace id=37；证据 ~/.ego-browser/state/space-37.json（存在、mtime Sep 22 02:47）
 
 界面建会话（**不用 /api/session/create**）：点侧边栏「新建会话」→ 空会话默认挂 orchestra-dsh
@@ -258,7 +258,7 @@ screenshots/r4-after-right-click-break.png b43b8c91f7eca3e97461bc6c44e181c66169b
 - **Ego lite** TaskSpace **id=37**（name `orchestra E2E minecraft delivery`）；证据文件 **`~/.ego-browser/state/space-37.json`（存在，82,431 B，mtime `Sep 22 03:56:44`，`initialized:true`、`userControlPending:false`）**：
   `pages = {"p1":{"targetId":"1372317263911C17F20DBB12DD4D2DE6","openedBy":"agent"}（DSH 界面，active）, "p2":{"targetId":"C43ACE6ECDCC422915347412D2CB21F8","openedBy":"agent"}（游戏本体，Owner 直接可见）}`
 - 附带读数（界面自身统计）：队长会话 `18 轮 76 步 · 169 tok/s`、`8.6M tok · 缓存命中 97%`、`上下文已用 23%`。
-- 当前 URL + token：`http://127.0.0.1:4600/?token=1EX4mCvpm2A-TXrrQocI_ok6w5QxnY3HdbPlHjCAB6g`（**4600 保持运行**）。
+- 当前 URL + token：`http://127.0.0.1:4600/?token=<redacted>`（**4600 保持运行**）。
 - **未 `task.finish()`**；收尾用 **`task.handOff()`** 把 space 交给 Owner。
 - 三条会话标题（Owner 在侧边栏按此认）：**`Minecraft HTML 小游戏交付任务`**（队长）、**`reviewer · 在本工作区（cwd: /U… · orchestra_E2E`**、**`implementer · 在本工作区（cwd: /U… · orchestra_E2E`**。
 

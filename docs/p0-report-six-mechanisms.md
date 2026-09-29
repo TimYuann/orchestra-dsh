@@ -166,7 +166,7 @@ audit-and-hardening     loops=1 gates=1 handoffs=5 closure=yes
 ```
 A 无团队：  #17 CALL orchestra_wait {"timeoutMs":15000}
            #19 RESULT Error: orchestra_wait requires an active Team at
-             /Users/yuantian/Documents/agentWorkspace/artifacts/projects/orchestra_E2E/test-wait
+             ~/Documents/agentWorkspace/artifacts/projects/orchestra_E2E/test-wait
              (state is missing); waiting with nothing to wait on would just burn the timeout     [isError:true]
            同时 team.json 不存在（ENOENT 已核）
 
@@ -503,8 +503,8 @@ system/message 含实现者 persona（"你作为 implementer（实现者）…"�
 ## 附 A｜通道
 
 - **Ego lite TaskSpace id=45**（name `orchestra six-mechanisms live probe (round 6)`），页面 `p1`；**真 Chromium**（非无头），全程只用 `page.fetch`（`/api/session/create` · `/api/session/prompt` · `/api/session/page`）与 `page.click/snapshot/evaluate`（仅项 6②）。
-- **实例**：`dsh --profile dev --port 4600 --no-open`（受管后台作业 `bash-31`）；token `http://127.0.0.1:4600/?token=koq90CGITcDKz2nLQG3wZ77af7fQMoTUp18ySBiw07U`。
-  **项 6① 需要中断**：停实例（`curl → 000`）→ 删角色会话目录 → **重启**（作业 `bash-37`，新 token `…?token=NpgAN57r8VOXTMBalDR5mxgwePKSnBbMMAIthyHTMAU`）。
+- **实例**：`dsh --profile dev --port 4600 --no-open`（受管后台作业 `bash-31`）；token `http://127.0.0.1:4600/?token=<redacted>`。
+  **项 6① 需要中断**：停实例（`curl → 000`）→ 删角色会话目录 → **重启**（作业 `bash-37`，新 token `…?token=<redacted>`）。
 - **4599 全程未碰**：`lsof :4599` = PID 14248，`curl → 401`（起实例前 / 收尾后各一次）。
 - **收尾**：4600 停掉（`curl → 000`）。
 

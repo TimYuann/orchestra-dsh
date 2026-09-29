@@ -42,7 +42,7 @@ $ ego-browser nodejs -e '… taskSpace("orchestra N7 live: 4600 restart identity
 
 ```
 $ ls -la ~/.ego-browser/state/space-30.json
--rw-------@ 1 yuantian  staff  335 Sep 21 02:54 /Users/yuantian/.ego-browser/state/space-30.json
+-rw-------@ 1 yuantian  staff  335 Sep 21 02:54 ~/.ego-browser/state/space-30.json
 
 $ node -e "…require('~/.ego-browser/state/space-30.json')…"
 spaceId: 30 | pages: {"p1":{"targetId":"293D3864337E654C688FB46A1EB702C9","openedBy":"agent"}}
@@ -75,7 +75,7 @@ prompt: "Call your cordis inspection tool (cordis_inspect_list). … If you have
 
 ```
 [起] bash scripts/dev-instance.sh 4600        → job bash-13（受管后台作业）
-     dsh web: http://127.0.0.1:4600/?token=SnTiFZQURgHtBeMR9iaEBc6FAFdYNxINgD9mVik1-Ao
+     dsh web: http://127.0.0.1:4600/?token=<redacted>
      → curl 4600 health: 401（= 已起，需认证）
 
 [改动前基线] 见 §2.4
@@ -84,7 +84,7 @@ prompt: "Call your cordis inspection tool (cordis_inspect_list). … If you have
      → curl 4600: 000 / no listener ✓（确认已停）
 
 [拉] bash scripts/dev-instance.sh 4600        → job bash-14
-     dsh web: http://127.0.0.1:4600/?token=-EWU1LvI7Fdc6838__KLyL18UgeEj7mO7bz2ERqxwOY
+     dsh web: http://127.0.0.1:4600/?token=<redacted>
      → curl 4600 health: 401 ✓
 ```
 
