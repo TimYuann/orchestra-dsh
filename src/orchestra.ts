@@ -6124,6 +6124,15 @@ export function apply(ctx: Context): void {
                           sessionId: { type: "string", required: true },
                           path: { type: "string", required: true },
                           createdAt: { type: "number", required: true },
+                          // The first batch books MORE than an index entry, and
+                          // `additionalProperties: false` makes one undeclared key
+                          // fail the WHOLE call — the model would get an error
+                          // instead of the board. Every field the ledger can set
+                          // is therefore declared here.
+                          dispatchId: { type: "string", description: "The dispatch this report answers, when it answers one." },
+                          binding: { type: "string", description: '"explicit" = the caller named the dispatch; "inferred" = matched to the reporting session\'s single open dispatch.' },
+                          contentHash: { type: "string", description: "sha256 of the bytes this report booked." },
+                          outcome: { type: "string", description: '"report" (a result) or "blocked" (an explicit block).' },
                         },
                       },
                     },

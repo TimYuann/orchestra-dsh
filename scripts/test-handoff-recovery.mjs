@@ -221,3 +221,52 @@ test("E6: an old report does not hide a new undelivered dispatch across archive 
   );
   assert.equal(restored.status, "active");
 });
+
+test("tool boundary: the REAL handlers' success values pass their REAL declared schemas", async () => {
+  // The failure this pins is not hypothetical: the first live run of this batch
+  // made `orchestra_team` return an ERROR instead of the board, because a booked
+  // report now carries `dispatchId`/`binding`/`contentHash`/`outcome` and the
+  // board's `reports` items were declared with `additionalProperties: false`.
+  // DSH validates the returned value, so one undeclared key fails the WHOLE call.
+  const { apply: applyOrchestra } = await import("../lib/orchestra.js");
+  const { validateJsonSchemaValue } = await import("@deepseek-ai/dsh-tools");
+  const { snapshotJsonValue } = await import("@deepseek-ai/dsh-util-values");
+
+  const h = makeHarness();
+  applyOrchestra(h.context);
+  const tool = (name) => {
+    const definition = h.toolNamed(name);
+    assert.notEqual(definition, undefined, `${name} must be registered`);
+    return definition;
+  };
+  const checkValue = (name, value) => {
+    assert.notEqual(snapshotJsonValue(value), undefined, `${name}: value must survive a JSON round trip`);
+    const violations = validateJsonSchemaValue(tool(name).output.schema, value, "value");
+    assert.deepEqual(violations, [], `${name} returned a value its declared schema rejects`);
+  };
+
+  const frozen = await newGovernedTeam(h, [WORKER], "draft-tool-boundary");
+  const exec = { agent: h.controller, signal: undefined };
+
+  const dispatched = await tool("orchestra_dispatch").execute(
+    dispatchArgs(frozen, { roleId: "worker", dispatchId: "tool-boundary-1" }),
+    exec,
+  );
+  checkValue("orchestra_dispatch", dispatched);
+
+  const workerSessionId = (await h.store.read(CWD)).team.roles.find((role) => role.id === "worker").sessionId;
+  const booked = await tool("orchestra_report").execute(
+    { path: "tool-boundary.md", content: "boundary", dispatchId: "tool-boundary-1" },
+    { agent: h.agents.get(workerSessionId), signal: undefined },
+  );
+  checkValue("orchestra_report", booked);
+  assert.equal(booked.booked, true);
+
+  // The board is the value that broke: an ACTIVE team with a bound report.
+  const board = await tool("orchestra_team").execute({}, exec);
+  checkValue("orchestra_team", board);
+  assert.equal(board.team.reports.length, 1);
+  assert.equal(board.team.reports[0].dispatchId, "tool-boundary-1");
+  assert.equal(board.team.dispatches.length, 1);
+  assert.equal(board.team.handoff_notices.length, 1);
+});

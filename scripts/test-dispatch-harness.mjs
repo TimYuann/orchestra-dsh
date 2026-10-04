@@ -177,6 +177,8 @@ export function makeHarness({ fs = new MemoryFs(), cwd = CWD, events = fs.events
         };
       }
       if (name === "agentDefaultModel") return { currentSelection: () => ({ provider: "default-p", model: "default-m" }) };
+      if (name === "skills") return { register: () => () => {} };
+      if (name === "subagents") return { listChildren: () => [], drainContinuableChildren: async () => {} };
       // Persisted-session reads, as the activation path performs them: a session
       // that exists in the harness's store reads back, one that does not is
       // authoritatively missing.
@@ -234,6 +236,17 @@ export function makeHarness({ fs = new MemoryFs(), cwd = CWD, events = fs.events
     },
   };
 
+  // Tool registration surface: `apply()` is the only place the real tool
+  // definitions exist, so a test that must check a REAL returned value against
+  // its REAL declared schema registers the plugin here and drives the handlers.
+  const registered = [];
+  context.tools = { register: (definition) => registered.push(definition) };
+  context.effect = (fn) => {
+    fn();
+    return () => {};
+  };
+  context.on = () => () => {};
+
   const controller = agentFor("driver-1");
   const store = createActiveTeamStateStore(fs);
   const archiveStore = createArchiveStore(fs);
@@ -242,6 +255,11 @@ export function makeHarness({ fs = new MemoryFs(), cwd = CWD, events = fs.events
   return {
     cwd,
     fs,
+    registered,
+    /** Look a registered tool up LAZILY: `apply()` populates `registered` later. */
+    toolNamed(name) {
+      return registered.find((definition) => definition.name === name);
+    },
     events,
     sessions,
     agents,
