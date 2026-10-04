@@ -312,18 +312,68 @@ test("D5: the ledger render stays bounded when the ledger grows", async () => {
   assert.equal(noticeLines.length, BOARD_RENDER_LIMIT);
   assert.ok(dispatchLines.every((line) => line.startsWith("  - ")), "rows are indented under their count line");
 
-  // Unresolved work is shown FIRST, so truncation can never hide what is open.
+  // Unresolved work is shown FIRST. That ordering does NOT guarantee all of it
+  // fits: this fixture has 7 open rows against a bound of 5, so 2 open rows ARE
+  // truncated — which is exactly why the truncation line counts categories
+  // separately instead of reporting one total that would hide it.
   assert.ok(dispatchLines[0].includes("d-2"), `open work must lead: ${dispatchLines[0]}`);
-  assert.ok(dispatchLines.every((line) => line.includes("UNDELIVERED")), "every open row is inside the bound here");
+  assert.ok(dispatchLines.every((line) => line.includes("UNDELIVERED")), "the shown rows are all open ones (the closed pair is behind them)");
   assert.ok(noticeLines[0].includes("notice:0"), `awaiting notices must lead: ${noticeLines[0]}`);
 
-  // Truncation is stated, and the counts stay complete.
-  assert.match(text, /… 4 more dispatch\(es\) not shown \(bounded render; counts above are complete\)/);
-  assert.match(text, /… 3 more notice\(s\) not shown/);
+  // Truncation is stated PER CATEGORY, and the counts stay complete.
+  assert.match(
+    text,
+    /… 2 open \+ 2 closed not shown \(bounded render; counts above are complete\)/,
+    "the hidden dispatch rows must be split into open vs closed",
+  );
+  assert.match(
+    text,
+    /… 0 awaiting the driver \+ 3 settled not shown \(bounded render; counts above are complete\)/,
+    "the hidden notice rows must be split into awaiting vs settled",
+  );
   assert.match(text, new RegExp(`dispatches: ${many.length} total, 7 undelivered`));
   assert.match(text, new RegExp(`handoff notices: ${notices.length} total, 2 awaiting the driver`));
 
   // A bounded render is bounded in BYTES too, not only in rows.
   const bytesPerRow = text.length / (dispatchLines.length + noticeLines.length);
   assert.ok(bytesPerRow < 400, `one row must stay one short line (got ${bytesPerRow.toFixed(1)} chars/row)`);
+});
+
+test("D5: when everything truncated is unresolved, the truncation line says so", async () => {
+  const { BOARD_RENDER_LIMIT, dispatchBoardTextFromRows } = await import("../lib/orchestra-dispatch.js");
+
+  // The case the old single total could not express: MORE unresolved rows than
+  // the bound, so the hidden tail is entirely open / entirely awaiting.
+  const rows = Array.from({ length: BOARD_RENDER_LIMIT + 3 }, (_, index) => ({
+    dispatch_id: `open-${index}`,
+    role_id: `role-${index}`,
+    delivery_state: "delivered",
+    open: true,
+    target_session_id: `s-${index}`,
+  }));
+  const notices = Array.from({ length: BOARD_RENDER_LIMIT + 4 }, (_, index) => ({
+    notice_id: `notice:open-${index}`,
+    report_id: `r-${index}`,
+    role_id: `role-${index}`,
+    state: "pending",
+    attempts: 1,
+    path: `orchestra/reports/r-${index}.md`,
+  }));
+
+  const text = dispatchBoardTextFromRows(rows, notices);
+  assert.match(
+    text,
+    /… 3 open \+ 0 closed not shown \(bounded render; counts above are complete\)/,
+    "an all-open hidden tail must be reported as such, not as a bare total",
+  );
+  assert.match(
+    text,
+    /… 4 awaiting the driver \+ 0 settled not shown \(bounded render; counts above are complete\)/,
+  );
+  assert.match(text, new RegExp(`dispatches: ${rows.length} total, ${rows.length} undelivered`));
+  assert.match(text, new RegExp(`handoff notices: ${notices.length} total, ${notices.length} awaiting the driver`));
+
+  // And the render is still bounded: the counts are complete, the detail is not.
+  assert.equal(text.split("\n").filter((line) => line.includes("- dispatch ")).length, BOARD_RENDER_LIMIT);
+  assert.equal(text.split("\n").filter((line) => line.includes("- notice ")).length, BOARD_RENDER_LIMIT);
 });

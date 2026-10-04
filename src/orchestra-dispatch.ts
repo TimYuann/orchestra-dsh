@@ -475,8 +475,14 @@ export const BOARD_RENDER_LIMIT = 5;
  * reader who could act on it was one that read `team.json` itself
  * (`docs/taskbook-2026-10-04-d5-d2.md`, item D5).
  *
- * UNRESOLVED FIRST, THEN THE REST, THEN AN EXPLICIT TRUNCATION COUNT: the rows a
- * reader most needs are the ones that are still open / still awaiting them.
+ * UNRESOLVED FIRST, THEN THE REST, THEN AN EXPLICIT TRUNCATION COUNT — SPLIT BY
+ * CATEGORY. The rows a reader most needs are the ones still open / still
+ * awaiting them, so those lead; but ordering alone does NOT guarantee they all
+ * fit, and saying so would be a false promise: with more unresolved rows than
+ * the bound, the tail of the unresolved block is truncated too. What the reader
+ * needs in that case is to know HOW MANY of the hidden rows are unresolved, so
+ * the truncation line counts each category separately rather than reporting one
+ * total that hides exactly that fact.
  */
 export function dispatchBoardTextFromRows(
   rows: ReadonlyArray<{
@@ -499,15 +505,21 @@ export function dispatchBoardTextFromRows(
     driver_state?: string;
   }>,
 ): string {
+  const isAwaiting = (notice: { state: string }): boolean => notice.state === "pending" || notice.state === "unknown";
+
   const open = rows.filter((row) => row.open);
   const orderedRows = [...open, ...rows.filter((row) => !row.open)];
   const shownRows = orderedRows.slice(0, BOARD_RENDER_LIMIT);
-  const hiddenRows = orderedRows.length - shownRows.length;
+  const hiddenRowList = orderedRows.slice(BOARD_RENDER_LIMIT);
+  const hiddenOpen = hiddenRowList.filter((row) => row.open).length;
+  const hiddenClosed = hiddenRowList.length - hiddenOpen;
 
-  const awaiting = notices.filter((notice) => notice.state === "pending" || notice.state === "unknown");
-  const orderedNotices = [...awaiting, ...notices.filter((notice) => notice.state !== "pending" && notice.state !== "unknown")];
+  const awaiting = notices.filter(isAwaiting);
+  const orderedNotices = [...awaiting, ...notices.filter((notice) => !isAwaiting(notice))];
   const shownNotices = orderedNotices.slice(0, BOARD_RENDER_LIMIT);
-  const hiddenNotices = orderedNotices.length - shownNotices.length;
+  const hiddenNoticeList = orderedNotices.slice(BOARD_RENDER_LIMIT);
+  const hiddenAwaiting = hiddenNoticeList.filter(isAwaiting).length;
+  const hiddenSettled = hiddenNoticeList.length - hiddenAwaiting;
 
   const lines = [
     `dispatches: ${rows.length} total, ${open.length} undelivered (per-row state follows; counts are complete)`,
@@ -520,7 +532,11 @@ export function dispatchBoardTextFromRows(
         (row.superseded_by === undefined ? "" : ` superseded_by=${row.superseded_by}`) +
         (row.target_session_id === undefined ? "" : ` session=${row.target_session_id}`),
     ),
-    ...(hiddenRows === 0 ? [] : [`  … ${hiddenRows} more dispatch(es) not shown (bounded render; counts above are complete)`]),
+    ...(hiddenRowList.length === 0
+      ? []
+      : [
+          `  … ${hiddenOpen} open + ${hiddenClosed} closed not shown (bounded render; counts above are complete)`,
+        ]),
     `handoff notices: ${notices.length} total, ${awaiting.length} awaiting the driver`,
     ...shownNotices.map(
       (notice) =>
@@ -529,7 +545,11 @@ export function dispatchBoardTextFromRows(
         (notice.path === undefined ? "" : ` path=${notice.path}`) +
         (notice.dispatch_id === undefined ? "" : ` dispatch=${notice.dispatch_id}`),
     ),
-    ...(hiddenNotices === 0 ? [] : [`  … ${hiddenNotices} more notice(s) not shown (bounded render; counts above are complete)`]),
+    ...(hiddenNoticeList.length === 0
+      ? []
+      : [
+          `  … ${hiddenAwaiting} awaiting the driver + ${hiddenSettled} settled not shown (bounded render; counts above are complete)`,
+        ]),
   ];
   return lines.join("\n");
 }
