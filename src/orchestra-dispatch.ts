@@ -455,21 +455,82 @@ export function handoffNoticeRows(team: TeamState): HandoffNoticeRow[] {
 }
 
 /**
- * One-line board summary, computed from the SAME projected rows the board shows.
+ * How many ledger rows ONE render may list before it truncates.
  *
- * It takes the rows rather than the Team so the tool's render text and the rows
- * it renders cannot describe two different ledgers.
+ * The counts are always complete; only the per-row detail is bounded. A board
+ * that dumps every row would grow with the run and crowd out everything else the
+ * driver asked for, which is why the limit exists at all.
+ */
+export const BOARD_RENDER_LIMIT = 5;
+
+/**
+ * The board's ledger block: per-row state, from the SAME projected rows the tool
+ * returns.
+ *
+ * WHY PER-ROW AND NOT A SUMMARY. §3.2 keeps "show undelivered work per dispatch"
+ * in the first batch, and a single "3 total, 0 undelivered" line cannot answer
+ * the question a driver actually has — WHICH dispatch is still open, which one
+ * already has a report, and which notice is still waiting for them. The
+ * structured rows carried that answer; the render text did not, so the only
+ * reader who could act on it was one that read `team.json` itself
+ * (`docs/taskbook-2026-10-04-d5-d2.md`, item D5).
+ *
+ * UNRESOLVED FIRST, THEN THE REST, THEN AN EXPLICIT TRUNCATION COUNT: the rows a
+ * reader most needs are the ones that are still open / still awaiting them.
  */
 export function dispatchBoardTextFromRows(
-  rows: ReadonlyArray<{ dispatch_id: string; role_id: string; delivery_state: string; open: boolean }>,
-  notices: ReadonlyArray<{ state: string }>,
+  rows: ReadonlyArray<{
+    dispatch_id: string;
+    role_id: string;
+    delivery_state: string;
+    open: boolean;
+    report_id?: string;
+    superseded_by?: string;
+    target_session_id?: string;
+  }>,
+  notices: ReadonlyArray<{
+    notice_id?: string;
+    report_id?: string;
+    dispatch_id?: string;
+    role_id?: string;
+    state: string;
+    attempts?: number;
+    path?: string;
+    driver_state?: string;
+  }>,
 ): string {
   const open = rows.filter((row) => row.open);
+  const orderedRows = [...open, ...rows.filter((row) => !row.open)];
+  const shownRows = orderedRows.slice(0, BOARD_RENDER_LIMIT);
+  const hiddenRows = orderedRows.length - shownRows.length;
+
   const awaiting = notices.filter((notice) => notice.state === "pending" || notice.state === "unknown");
-  return (
-    `dispatches: ${rows.length} total, ${open.length} undelivered` +
-    `${open.length === 0 ? "" : ` (${open.map((row) => `${row.dispatch_id}→${row.role_id}:${row.delivery_state}`).join(", ")})`}` +
-    ` | handoff notices: ${notices.length}, ${awaiting.length} awaiting the driver`
-  );
+  const orderedNotices = [...awaiting, ...notices.filter((notice) => notice.state !== "pending" && notice.state !== "unknown")];
+  const shownNotices = orderedNotices.slice(0, BOARD_RENDER_LIMIT);
+  const hiddenNotices = orderedNotices.length - shownNotices.length;
+
+  const lines = [
+    `dispatches: ${rows.length} total, ${open.length} undelivered (per-row state follows; counts are complete)`,
+    ...shownRows.map(
+      (row) =>
+        `  - dispatch ${row.dispatch_id} → role ${row.role_id} [delivery=${row.delivery_state}] ` +
+        (row.open
+          ? "UNDELIVERED (no bound result)"
+          : `handed back${row.report_id === undefined ? "" : ` report=${row.report_id}`}`) +
+        (row.superseded_by === undefined ? "" : ` superseded_by=${row.superseded_by}`) +
+        (row.target_session_id === undefined ? "" : ` session=${row.target_session_id}`),
+    ),
+    ...(hiddenRows === 0 ? [] : [`  … ${hiddenRows} more dispatch(es) not shown (bounded render; counts above are complete)`]),
+    `handoff notices: ${notices.length} total, ${awaiting.length} awaiting the driver`,
+    ...shownNotices.map(
+      (notice) =>
+        `  - notice ${notice.notice_id ?? "(unknown)"} → role ${notice.role_id ?? "(unknown)"} [state=${notice.state}] ` +
+        `driver=${notice.driver_state ?? "unknown"} attempts=${notice.attempts ?? 0}` +
+        (notice.path === undefined ? "" : ` path=${notice.path}`) +
+        (notice.dispatch_id === undefined ? "" : ` dispatch=${notice.dispatch_id}`),
+    ),
+    ...(hiddenNotices === 0 ? [] : [`  … ${hiddenNotices} more notice(s) not shown (bounded render; counts above are complete)`]),
+  ];
+  return lines.join("\n");
 }
 

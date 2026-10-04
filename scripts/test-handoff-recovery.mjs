@@ -269,4 +269,61 @@ test("tool boundary: the REAL handlers' success values pass their REAL declared 
   assert.equal(board.team.reports[0].dispatchId, "tool-boundary-1");
   assert.equal(board.team.dispatches.length, 1);
   assert.equal(board.team.handoff_notices.length, 1);
+
+  // D5: the ledger's per-row state must reach the READER, not just the JSON.
+  const rendered = tool("orchestra_team")
+    .output.render({}, board)
+    .map((block) => block.text)
+    .join("\n");
+  assert.match(rendered, /dispatches: 1 total, 0 undelivered/);
+  assert.match(rendered, /- dispatch tool-boundary-1 → role worker \[delivery=delivered\] handed back report=/);
+  assert.match(rendered, /handoff notices: 1 total, 0 awaiting the driver/);
+  assert.match(rendered, /- notice notice:[0-9a-f]+ → role worker \[state=delivered\] driver=/, "a notice row names its state and the driver's own lifecycle");
+  assert.match(rendered, /attempts=\d+/);
+  assert.match(rendered, /path=.*tool-boundary\.md/);
+});
+
+test("D5: the ledger render stays bounded when the ledger grows", async () => {
+  const { BOARD_RENDER_LIMIT, dispatchBoardTextFromRows } = await import("../lib/orchestra-dispatch.js");
+  assert.ok(BOARD_RENDER_LIMIT > 0 && BOARD_RENDER_LIMIT < 20, "the bound must be a real bound");
+
+  const many = Array.from({ length: BOARD_RENDER_LIMIT + 4 }, (_, index) => ({
+    dispatch_id: `d-${index}`,
+    role_id: `role-${index}`,
+    delivery_state: "delivered",
+    open: index >= 2,
+    ...(index < 2 ? { report_id: `r-${index}` } : {}),
+    target_session_id: `s-${index}`,
+  }));
+  const notices = Array.from({ length: BOARD_RENDER_LIMIT + 3 }, (_, index) => ({
+    notice_id: `notice:${index}`,
+    report_id: `r-${index}`,
+    role_id: `role-${index}`,
+    state: index < 2 ? "pending" : "delivered",
+    attempts: 1,
+    path: `orchestra/reports/r-${index}.md`,
+  }));
+
+  const text = dispatchBoardTextFromRows(many, notices);
+  const lines = text.split("\n");
+  const dispatchLines = lines.filter((line) => line.includes("- dispatch "));
+  const noticeLines = lines.filter((line) => line.includes("- notice "));
+  assert.equal(dispatchLines.length, BOARD_RENDER_LIMIT, "the render lists at most the bound");
+  assert.equal(noticeLines.length, BOARD_RENDER_LIMIT);
+  assert.ok(dispatchLines.every((line) => line.startsWith("  - ")), "rows are indented under their count line");
+
+  // Unresolved work is shown FIRST, so truncation can never hide what is open.
+  assert.ok(dispatchLines[0].includes("d-2"), `open work must lead: ${dispatchLines[0]}`);
+  assert.ok(dispatchLines.every((line) => line.includes("UNDELIVERED")), "every open row is inside the bound here");
+  assert.ok(noticeLines[0].includes("notice:0"), `awaiting notices must lead: ${noticeLines[0]}`);
+
+  // Truncation is stated, and the counts stay complete.
+  assert.match(text, /… 4 more dispatch\(es\) not shown \(bounded render; counts above are complete\)/);
+  assert.match(text, /… 3 more notice\(s\) not shown/);
+  assert.match(text, new RegExp(`dispatches: ${many.length} total, 7 undelivered`));
+  assert.match(text, new RegExp(`handoff notices: ${notices.length} total, 2 awaiting the driver`));
+
+  // A bounded render is bounded in BYTES too, not only in rows.
+  const bytesPerRow = text.length / (dispatchLines.length + noticeLines.length);
+  assert.ok(bytesPerRow < 400, `one row must stay one short line (got ${bytesPerRow.toFixed(1)} chars/row)`);
 });
