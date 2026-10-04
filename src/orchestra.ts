@@ -4014,6 +4014,7 @@ export async function dispatchRoleTask(
               deliverIdempotencyKey: record.delivery.idempotencyKey,
             })
           : await sendToSubagentNode(ctx, callerAgent, roleEntry.sessionId, [{ type: "text", text: dispatchNotice }], { signal: exec.signal });
+      targetSessionId = materializedSessionId(receipt, roleEntry.sessionId);
       createdNewSession = true;
       materialized = true;
       // The new contract does NOT silently reach an unsupported backend: the
@@ -4093,6 +4094,19 @@ export async function dispatchRoleTask(
   return flight.joined && result.status !== "unsupported_backend" ? { ...result, status: "reused" } : result;
 }
 
+/**
+ * The session a native materialization actually produced.
+ *
+ * The seat id in the roster is a HINT for a sub-agent child: the provider owns
+ * the child id, so a record that named the seat would point at a session that
+ * was never built. Only a receipt that says so may override the seat.
+ */
+function materializedSessionId(receipt: unknown, fallback: string): string {
+  if (typeof receipt !== "object" || receipt === null) return fallback;
+  const candidate = (receipt as { childId?: unknown }).childId;
+  return typeof candidate === "string" && candidate !== "" ? candidate : fallback;
+}
+
 /** Narrow a delivery or node receipt to the transport's acceptance shape. */
 function acceptanceOf(receipt: unknown): { message_id: string; target_session_id: string; accepted_at_ms: number; delivery_mode: string } | undefined {
   if (typeof receipt !== "object" || receipt === null) return undefined;
@@ -4131,7 +4145,7 @@ async function reconcileDispatchDelivery(
 ): Promise<DeliveryOutcome> {
   const { cwd, team, role, dispatchNotice } = input;
   const policy = escrowPolicy(ctx, exec);
-  const targetSessionId = record.subjects.targetSessionId;
+  let targetSessionId = record.subjects.targetSessionId;
 
   if (record.delivery.state === "unsupported_backend") {
     return { state: "unsupported_backend", reason: record.delivery.reason, targetSessionId };
@@ -4178,6 +4192,7 @@ async function reconcileDispatchDelivery(
         role.phase === "reserved" || role.phase === "provisioning"
           ? await materializeRole(ctx, activeTeamState, exec, { cwd, team, role, dispatchNotice, deliverIdempotencyKey: record.delivery.idempotencyKey })
           : await sendToSubagentNode(ctx, exec.agent as Agent, role.sessionId, [{ type: "text", text: dispatchNotice }], { signal: exec.signal });
+      targetSessionId = materializedSessionId(nextReceipt, role.sessionId);
       materialized = true;
       state = "unsupported_backend";
       reason = "native subagent backend: outside this batch's Session-only delivery guarantee.";
