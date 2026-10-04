@@ -22,6 +22,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  actedSinceRequest,
   detectSilentHandoff,
   pendingDeliveryRequests,
   silentHandoffNotice,
@@ -96,17 +97,20 @@ test("D3/R4-1: reasoning-only turn with an unanswered request is detected", () =
   assert.equal(detection.pendingRequest.messageId, "orchestra-dispatch:task-1");
   assert.equal(detection.pendingRequest.senderSessionId, COUNTERPARTY);
   assert.equal(detection.pendingCount, 1);
+  // The live incidents had 55 and 12 tool calls after the request arrived; the
+  // (c) second half must keep them inside the detection.
+  assert.equal(actedSinceRequest(events, 0), true);
 });
 
 test("D3/R4-1: the durable splice shape is detected too (cold delivery path)", () => {
-  const events = [splicedInbound("orchestra-dispatch:task-2"), reasoningOnly(1)];
+  const events = [splicedInbound("orchestra-dispatch:task-2"), toolCall(1, "read", { file_path: "/tmp/x" }), reasoningOnly(1)];
   const detection = detectSilentHandoff(events, 1);
   assert.equal(detection.kind, "detected");
   assert.equal(detection.pendingRequest.messageId, "orchestra-dispatch:task-2");
 });
 
 test("D3/R4-1: disposition tells the counterparty, records the fact and steers the session", async () => {
-  const events = [inbound("orchestra-dispatch:task-1"), reasoningOnly(1)];
+  const events = [inbound("orchestra-dispatch:task-1"), toolCall(1, "read", { file_path: "/tmp/x" }), reasoningOnly(1)];
   const { guard, calls } = guardHarness();
   const outcome = await guard.onTurnStopping({ agent: fakeAgent(events), turn: 1 });
 
@@ -127,7 +131,7 @@ test("D3/R4-1: disposition tells the counterparty, records the fact and steers t
 });
 
 test("D3/R4-1: one turn costs at most one steer, even if the boundary fires again", async () => {
-  const events = [inbound("orchestra-dispatch:task-1"), reasoningOnly(1)];
+  const events = [inbound("orchestra-dispatch:task-1"), toolCall(1, "read", { file_path: "/tmp/x" }), reasoningOnly(1)];
   const { guard, calls } = guardHarness();
   await guard.onTurnStopping({ agent: fakeAgent(events), turn: 1 });
   const second = await guard.onTurnStopping({ agent: fakeAgent(events), turn: 1 });
@@ -137,7 +141,7 @@ test("D3/R4-1: one turn costs at most one steer, even if the boundary fires agai
 });
 
 test("D3/R4-1: when the team path already owns the turn, the fact is still recorded but not steered twice", async () => {
-  const events = [inbound("orchestra-dispatch:task-1"), reasoningOnly(1)];
+  const events = [inbound("orchestra-dispatch:task-1"), toolCall(1, "read", { file_path: "/tmp/x" }), reasoningOnly(1)];
   const { guard, calls } = guardHarness({ teamOwnsTurn: async () => true, roleIdOf: async () => "implementer" });
   const outcome = await guard.onTurnStopping({ agent: fakeAgent(events), turn: 1 });
   assert.equal(outcome.kind, "detected");
@@ -168,11 +172,34 @@ test("D3/R4-2: a delivery in an EARLIER turn does not excuse this one", async ()
     inbound("orchestra-dispatch:task-1"),
     toolCall(1, "a2a_reply", { reply_to: "orchestra-dispatch:task-1", message: "done" }),
     inbound("orchestra-dispatch:task-2"),
+    // The session DID work on the second request — it just never handed anything
+    // back, which is exactly the shape (c) is meant to catch.
+    toolCall(2, "read", { file_path: "/tmp/y" }),
     reasoningOnly(2),
   ];
   const detection = detectSilentHandoff(events, 2);
   assert.equal(detection.kind, "detected", "the second request is still unanswered");
   assert.equal(detection.pendingRequest.messageId, "orchestra-dispatch:task-2");
+});
+
+test("D3/R4-3: an acknowledged message with NO work after it is a chat, not a stall", async () => {
+  // Oracle's ruling: (c) needs BOTH halves — an unanswered request AND at least
+  // one tool call after it. Otherwise a peer that merely said "收到" and got no
+  // answer would be reported as a silent hand-off.
+  const chat = [inbound("a2a-ack-1"), reasoningOnly(1)];
+  const detection = detectSilentHandoff(chat, 1);
+  assert.equal(detection.kind, "no-work-since-request", `expected a chat, got ${JSON.stringify(detection)}`);
+  assert.equal(actedSinceRequest(chat, 0), false);
+  const { guard, calls } = guardHarness();
+  const outcome = await guard.onTurnStopping({ agent: fakeAgent(chat), turn: 1 });
+  assert.equal(outcome.kind, "ignored");
+  assert.equal(calls.notified.length + calls.persisted.length + calls.steered.length, 0, "nothing may fire for a chat");
+
+  // The moment the session actually works on it, the same request DOES fire —
+  // that is the case the counterparty is genuinely waiting on.
+  const worked = [inbound("a2a-ack-1"), toolCall(1, "read", { file_path: "/tmp/x" }), reasoningOnly(1)];
+  assert.equal(actedSinceRequest(worked, 0), true);
+  assert.equal(detectSilentHandoff(worked, 1).kind, "detected");
 });
 
 test("D3/R4-3: reasoning-only with no pending request (a chat) is never reported", async () => {

@@ -4,7 +4,7 @@
  * THE SHAPE (empirically located, see `docs/live-run-2026-10-04-first-batch.md`
  * §D3): a session finishes a turn whose LAST assistant message contains only
  * private reasoning, makes no outbound delivery call at all, and still owes a
- * reply to somebody who is waiting. The host then records `turn/end completed`
+ * reply to somebody who is waiting — having actually WORKED on that request. The host then records `turn/end completed`
  * — correctly, because the model really did stop with `stopReason=stop` — and
  * nothing anywhere reports that the counterparty is now waiting forever.
  *
@@ -64,7 +64,9 @@ export type SilentHandoffDetection =
   | { kind: "detected"; pendingRequest: PendingDeliveryRequest; pendingCount: number; lastAssistantAt: number }
   | { kind: "no-reasoning-only-last-message"; detail: string }
   | { kind: "outbound-delivery-in-turn"; tools: string[] }
-  | { kind: "no-pending-request" };
+  | { kind: "no-pending-request" }
+  /** A request is unanswered, but the session never worked on it: a chat, not a stall. */
+  | { kind: "no-work-since-request" };
 
 interface InboundMessage extends PendingDeliveryRequest {}
 
@@ -195,6 +197,24 @@ export function pendingDeliveryRequests(events: readonly SilentHandoffEvent[], s
   return inbound.filter((request) => !outbound.some((call) => call.index > request.index && settles(call, request)));
 }
 
+/**
+ * Whether the session ran any tool at all after one inbound request arrived.
+ *
+ * This is the second half of criterion (c). "An unanswered inbound message" is
+ * not the same thing as "a delivery request": a peer that merely acknowledges
+ * something ("收到") and gets no reply is a conversation going quiet, not a
+ * stalled hand-off. Requiring that the session actually did something after the
+ * request separates the two, and both halves stay event-derived — no message
+ * text is read.
+ */
+export function actedSinceRequest(events: readonly SilentHandoffEvent[], index: number, startIndex = 0): boolean {
+  for (let cursor = Math.max(0, startIndex); cursor < events.length; cursor++) {
+    if (cursor <= index) continue;
+    if (events[cursor]?.type === "tool/call") return true;
+  }
+  return false;
+}
+
 interface LastAssistant {
   index: number;
   blocks: Record<string, any>[];
@@ -234,7 +254,7 @@ function lastAssistantMessage(
  * All three criteria must hold together: (a) the turn's last assistant message
  * is private reasoning with nothing visible and no tool call, (b) the turn made
  * zero outbound delivery calls, and (c) an inbound delivery request is still
- * unanswered. The returned variant names which criterion failed, so a caller (or
+ * unanswered AND the session did at least one thing after it arrived. The returned variant names which criterion failed, so a caller (or
  * a test) never has to guess why nothing happened.
  */
 export function detectSilentHandoff(
@@ -254,7 +274,12 @@ export function detectSilentHandoff(
 
   const pending = pendingDeliveryRequests(events, startIndex);
   if (pending.length === 0) return { kind: "no-pending-request" };
-  return { kind: "detected", pendingRequest: pending[0], pendingCount: pending.length, lastAssistantAt: last.index };
+  // (c) second half: the session must have WORKED since the request arrived.
+  // Without this, a peer that merely said "收到" and got no answer would be
+  // reported as a stalled hand-off.
+  const acted = pending.filter((request) => actedSinceRequest(events, request.index, startIndex));
+  if (acted.length === 0) return { kind: "no-work-since-request" };
+  return { kind: "detected", pendingRequest: acted[0], pendingCount: pending.length, lastAssistantAt: last.index };
 }
 
 /** Stable identity of one silent-handoff fact: one session, one turn. */
