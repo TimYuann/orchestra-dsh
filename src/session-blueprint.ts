@@ -578,6 +578,18 @@ function hasCompositionTool(visibleNames: readonly string[], requiredRow: string
   return aliases !== undefined && aliases.some((alias) => visibleNames.includes(alias));
 }
 
+/**
+ * Does any declared composition ROW export this TOOL NAME?
+ *
+ * This is the row→tool direction of {@link COMPOSITION_ROW_TOOLS}: the reverse of
+ * {@link hasCompositionTool}, which maps a required row to the tool names it
+ * exports. Both directions are needed because the two namespaces meet here.
+ */
+function compositionRowsProvide(declaredRows: readonly string[], toolName: string): boolean {
+  if (declaredRows.includes(toolName)) return true;
+  return declaredRows.some((row) => COMPOSITION_ROW_TOOLS[row]?.includes(toolName) === true);
+}
+
 function toolReadiness(names: readonly string[], required: readonly string[]): LightweightToolReadiness {
   const selected = [...new Set(required)].filter((name) => hasCompositionTool(names, name)).sort();
   return { names: selected, count: selected.length };
@@ -609,21 +621,58 @@ export function preflightGovernedRequiredTools(input: {
       { required: capabilities.legacy, source, plane: "legacy-required-tools" },
     );
   }
-  if (capabilities.composition.length > 0) {
-    const declared = input.rolePresetSpec?.compositionTools ?? input.staticCompositionTools;
-    if (declared === undefined) {
+  // TWO PROOF PLANES, KEPT SEPARATE.
+  //
+  // `compositionTools` are DSH composition ROW IDs (`tool-fs`, `tool-bash`, …).
+  // `requiredTools` are TOOL NAMES (`read`, `edit`, `bash`, …) — its own doc
+  // string says so, and the lightweight path forwards it as such.
+  //
+  // These used to be merged into ONE set and compared against the declared row
+  // ids, so any role that named a tool was reported as missing EVERY row and no
+  // such role could ever pass, while the message told the reader to fix the
+  // wrong side ("catalog composition does not declare required compositionTools:
+  // read, edit, write, bash, grep, glob"). Live cost: six rejected revisions of
+  // a real Team (docs/live-run-2026-10-04-first-batch.md).
+  const declaredRows = input.rolePresetSpec?.compositionTools ?? input.staticCompositionTools;
+  const declaredToolNames = input.hostToolNames ?? [];
+  const requiredRows = [...new Set(input.compositionTools ?? [])];
+  if (requiredRows.length > 0) {
+    if (declaredRows === undefined) {
       throw new SessionBlueprintError(
         "composition_tools_unproven",
         "compositionTools cannot be proven before Agent publication for " + source + "; a catalog spec or static composition proof is required",
-        { required: capabilities.composition, source, plane: "composition" },
+        { required: requiredRows, source, plane: "composition" },
       );
     }
-    const missing = capabilities.composition.filter((name) => !declared.includes(name));
+    // Same namespace, so the alias-aware matcher applies: a declared row may be
+    // recorded by its row id or by one of the tool names the row exports.
+    const missing = requiredRows.filter((row) => !hasCompositionTool(declaredRows, row));
     if (missing.length > 0) {
       throw new SessionBlueprintError(
         "composition_tools_missing",
-        "catalog composition does not declare required compositionTools: " + missing.join(", "),
-        { missing, declared, source, plane: "composition" },
+        "catalog composition does not declare required composition rows: " + missing.join(", ") +
+          " (required compositionTools are DSH composition ROW IDs; declared rows: " +
+          (declaredRows.length === 0 ? "(none)" : declaredRows.join(", ")) + ")",
+        { missing, declared: declaredRows, source, plane: "composition" },
+      );
+    }
+  }
+  const requiredNames = [...new Set(capabilities.legacy)];
+  if (requiredNames.length > 0) {
+    // A tool NAME is proven by the scope that can actually supply it: the host's
+    // visible tool names, or a declared composition row that exports that tool.
+    const missing = requiredNames.filter(
+      (name) => !declaredToolNames.includes(name) && !compositionRowsProvide(declaredRows ?? [], name),
+    );
+    if (missing.length > 0) {
+      throw new SessionBlueprintError(
+        "composition_tools_missing",
+        "requiredTools are TOOL NAMES and none of these can be proven before publication: " + missing.join(", ") +
+          " — requiredTools (" + requiredNames.join(", ") + ") is a DIFFERENT namespace from the declared compositionTools ROW IDs (" +
+          (declaredRows === undefined || declaredRows.length === 0 ? "none declared" : declaredRows.join(", ")) +
+          "); declare the row that exports the tool, or use a tool name the host scope actually exposes (" +
+          (declaredToolNames.length === 0 ? "none visible" : declaredToolNames.join(", ")) + ")",
+        { missing, required: requiredNames, declared: declaredRows ?? [], visible: declaredToolNames, source, plane: "required-tool-names" },
       );
     }
   }
