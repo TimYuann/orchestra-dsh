@@ -496,7 +496,18 @@ const CASES = {
     pattern: /./,
   },
   orchestra_dispatch: {
-    args: () => ({ roleId: "implementer", task: "D4 boundary probe" }),
+    // The first-batch contract makes the delegation fields part of the tool's
+    // parameter schema, so the boundary probe supplies them: the refused call it
+    // pins is the missing active Team, not a malformed argument list.
+    args: () => ({
+      roleId: "implementer",
+      task: "D4 boundary probe",
+      dispatchId: "d4-boundary-probe",
+      charterRef: "d4-boundary@1#deadbeef",
+      authorityRef: "d4-boundary@1#deadbeef",
+      brief: "D4 boundary probe: goal, known facts, must-not-change, fixed inputs, observation and closure, write surface.",
+      responsibility: "boundary probe",
+    }),
     expect: "error",
     pattern: /./,
   },

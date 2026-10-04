@@ -42,6 +42,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { createActiveTeamStateStore } from "../lib/orchestra-state.js";
 import { dispatchRoleTask } from "../lib/orchestra.js";
+import { initializeFrozenOrchestrationDocument } from "../lib/orchestration-document.js";
+import { buildFrozenRevision, dispatchArgs } from "./test-dispatch-harness.mjs";
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
 const cwd = "/tmp/orchestra-materialization-failure";
@@ -98,8 +100,20 @@ function sessionFor(id) {
 
 const RESERVED_SESSION = "orchestra-team-deadbeef-11111111-2222-3333-4444-555555555555";
 
+/**
+ * The Team these tests drive must carry a real delegation source: the dispatch
+ * contract refuses a call whose charterRef/authorityRef do not resolve to this
+ * Team's own frozen charter. Building it here keeps the test's subject — the
+ * materialization FAILURE branch — untouched.
+ */
+function frozenSource() {
+  return buildFrozenRevision({ controller: { id: "driver-1" } }, [
+    { id: "implementer", name: "implementer", preset: "orchestra-implementer", sandbox: "workspace-write" },
+  ], "draft-materialization");
+}
+
 function teamRecord() {
-  return {
+  const record = {
     schemaVersion: 1,
     teamId: "team-deadbeef",
     status: "active",
@@ -107,6 +121,11 @@ function teamRecord() {
     rootCwd: cwd,
     controllerSessionId: "driver-1",
     createdAt: 1,
+    // The orchestration-document projection clones these, so a hand-built Team
+    // that carries a frozen charter must carry them too.
+    topologyRef: { id: "materialization-topo", source: "bundled" },
+    mission: { objective: "materialization failure history", scope: [], constraints: [], acceptanceCriteria: [], nonGoals: [], context: "test" },
+    activatedFromArchiveId: null,
     roles: [
       {
         id: "implementer",
@@ -125,6 +144,14 @@ function teamRecord() {
     notices: [],
     noticeFailures: [],
   };
+  const { frozen } = frozenSource();
+  return { ...record, document: initializeFrozenOrchestrationDocument(record, frozen, 4) };
+}
+
+/** One guaranteed dispatch per attempt, under this Team's real charter. */
+function dispatchFor(task, dispatchId) {
+  const { frozen } = frozenSource();
+  return dispatchArgs(frozen.frozenRef, { roleId: "implementer", task, dispatchId });
 }
 
 /**
@@ -219,7 +246,7 @@ test("a failed materialization leaves sessionHistory, sessionId and phase semant
   // The dispatch will try to materialize the reserved seat, the composition window
   // will fail, and the role goes back to `reserved`.
   await assert.rejects(
-    () => dispatchRoleTask(harness.context, harness.store, harness.exec, { roleId: "implementer", task: "probe" }),
+    () => dispatchRoleTask(harness.context, harness.store, harness.exec, dispatchFor("probe", "mat-probe-1")),
     (error) => {
       assert.equal(error instanceof Error, true);
       return true;
@@ -262,7 +289,7 @@ test("two consecutive failures still leave sessionHistory untouched (the loop's 
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     await assert.rejects(
-      () => dispatchRoleTask(harness.context, harness.store, harness.exec, { roleId: "implementer", task: `probe ${attempt}` }),
+      () => dispatchRoleTask(harness.context, harness.store, harness.exec, dispatchFor(`probe ${attempt}`, `mat-probe-${attempt}`)),
       () => true,
     );
   }
@@ -371,13 +398,13 @@ function subagentTeamRecord() {
  * the role — so the attempt reaches the failure branch with whatever it already
  * materialized. The first write is the `provisioning` marker.
  */
-function failPublishWrite(fs, stateKey) {
+function failPublishWrite(fs, stateKey, publishWrite = 2) {
   const realWrite = fs.writeText.bind(fs);
   let writes = 0;
   fs.writeText = async (target, content, expected) => {
     if (target.key === stateKey) {
       writes += 1;
-      if (writes === 2) throw Object.assign(new Error("probe: the publish write failed"), { code: "FS_IO_ERROR" });
+      if (writes === publishWrite) throw Object.assign(new Error("probe: the publish write failed"), { code: "FS_IO_ERROR" });
     }
     return realWrite(target, content, expected);
   };
@@ -388,13 +415,16 @@ test("裁定 Q: the abandoned-attempt breadcrumb names the session the attempt c
   await harness.store.create(cwd, subagentTeamRecord(), { policy: { kind: "policy" }, signal: undefined });
   // Fail the state write that would publish the role, so the attempt lands in the
   // failure branch with the child already materialized. Writes to team.json once
-  // the hook is in, in order: provisioning marker, active publish, reserved
-  // rollback — so the publish is the second one.
+  // the hook is in, in order: (1) the dispatch RECORD (the ledger is written
+  // before any delivery is attempted, so a crash in between leaves a locatable
+  // intent), (2) the provisioning marker, (3) the active publish — so the
+  // publish is the third one. The index is named explicitly instead of being
+  // implied, because the ledger deliberately added a write in front of it.
   const stateKey = `${cwd}:orchestra/state/team.json`;
-  failPublishWrite(harness.fs, stateKey);
+  failPublishWrite(harness.fs, stateKey, 3);
 
   await assert.rejects(
-    () => dispatchRoleTask(harness.context, harness.store, harness.exec, { roleId: "implementer", task: "build it" }),
+    () => dispatchRoleTask(harness.context, harness.store, harness.exec, dispatchFor("build it", "mat-q-1")),
     /could not be brought up/,
   );
 
@@ -408,10 +438,10 @@ test("裁定 Q: the abandoned-attempt breadcrumb names the session the attempt c
   // child the provider made, not the seat.
   const live = subagentDivergenceHarness();
   await live.store.create(cwd, subagentTeamRecord(), { policy: { kind: "policy" }, signal: undefined });
-  failPublishWrite(live.fs, stateKey);
+  failPublishWrite(live.fs, stateKey, 3);
   live.agents.set(live.CHILD_ID, { id: live.CHILD_ID, session: sessionFor(live.CHILD_ID), status: "idle" });
   await assert.rejects(
-    () => dispatchRoleTask(live.context, live.store, live.exec, { roleId: "implementer", task: "build it" }),
+    () => dispatchRoleTask(live.context, live.store, live.exec, dispatchFor("build it", "mat-q-2")),
     /could not be brought up/,
   );
   const recorded = (await live.store.read(cwd)).team.noticeFailures ?? [];

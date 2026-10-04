@@ -10,6 +10,7 @@ import {
   handleTeamCommandInvocation,
 } from "../lib/orchestra.js";
 import { prepareApprovalEvent, prepareDraftEvent, prepareFreezeEvent } from "../lib/orchestration-charter.js";
+import { dispatchArgs } from "./test-dispatch-harness.mjs";
 
 const cwd = "/tmp/orchestra-fleet-test";
 
@@ -213,7 +214,9 @@ test("Sealed backdoor: dispatchRoleTask rejects when no active team exists", asy
         harness.context,
         harness.store,
         { agent: harness.controller },
-        { roleId: "dev", task: "code something" },
+        // The guaranteed dispatch contract is satisfied even here: the refusal
+        // this test pins is the missing active Team, not a malformed call.
+        dispatchArgs("no-team-charter@1#deadbeef", { roleId: "dev", task: "code something" }),
       );
     },
     /no active team found in this workspace/,
@@ -258,7 +261,7 @@ test("Reserve-only creation: createGovernedTeam leaves roles reserved and zero a
         harness.context,
         harness.store,
         { agent: harness.controller },
-        { roleId: "unknown-role", task: "do something" },
+        dispatchArgs("no-team-charter@1#deadbeef", { roleId: "unknown-role", task: "do something" }),
       );
     },
     /cannot dispatch: role "unknown-role" is not declared in the team roster/,
@@ -269,7 +272,7 @@ test("Reserve-only creation: createGovernedTeam leaves roles reserved and zero a
     harness.context,
     harness.store,
     { agent: harness.controller },
-    { roleId: "planner", task: "plan the sprint" },
+    dispatchArgs(frozenRef, { roleId: "planner", task: "plan the sprint", dispatchId: "fleet-planner-1" }),
   );
   assert.equal(dispatchRes.status, "dispatched");
   assert.equal(dispatchRes.created_new_session, true);
@@ -415,7 +418,7 @@ test("orchestra_dismiss authorization check and handoffSummary with bifurcated c
     harness.context,
     harness.store,
     { agent: harness.controller },
-    { roleId: "live-role", task: "run tests" },
+    dispatchArgs(frozenRef, { roleId: "live-role", task: "run tests", dispatchId: "fleet-dismiss-1" }),
   );
 
   const unauthorizedAgent = { id: "unauthorized-session", session: { header: { cwd } } };

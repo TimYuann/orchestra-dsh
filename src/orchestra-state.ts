@@ -21,6 +21,8 @@ import type { OrchestrationDocument } from "./orchestration-document.js";
 import { readOrchestrationDocument } from "./orchestration-document.js";
 import type { GraphRuntimeState } from "./orchestra-graph.js";
 import { readGraphRuntime } from "./orchestra-graph.js";
+import type { DispatchRecord, HandoffNotice } from "./orchestra-dispatch.js";
+import { normalizeDispatches, normalizeHandoffNotices } from "./orchestra-dispatch.js";
 
 export type TeamRolePhase = "reserved" | "provisioning" | "active" | "failed";
 export type TeamStatus = "provisioning" | "active" | "degraded" | "blocked" | "failed" | "completed" | "abandoned";
@@ -149,6 +151,29 @@ export interface TeamRole {
   lastReport: string | null;
 }
 
+/**
+ * One delivered report, as booked by `orchestra_report`'s single CAS.
+ *
+ * `dispatchId` is the only link between a result and the intent it answers: the
+ * first batch fixes `bindingRevision` at 1 and deliberately does not use it for
+ * that purpose. `binding` records HOW the link was made — declared by the caller
+ * or matched to the calling session's single open dispatch — because a reader
+ * auditing "did this instance answer THAT dispatch?" must be able to tell the
+ * two apart. `contentHash` is the hash of the bytes the tool actually wrote.
+ */
+export interface TeamReportEntry {
+  reportId: string;
+  roleId: string;
+  sessionId: string;
+  path: string;
+  createdAt: number;
+  dispatchId?: string;
+  binding?: "explicit" | "inferred";
+  contentHash?: string;
+  /** `blocked` = an explicit block, which is a completed handback too. */
+  outcome?: "report" | "blocked";
+}
+
 /** team.json v1.1 runtime state. */
 export interface TeamState {
   schemaVersion: number;
@@ -173,7 +198,26 @@ export interface TeamState {
   /** Append-only execution DAG; absent only on legacy/draft state until Graph initialization. */
   graphRuntime?: GraphRuntimeState;
   roles: TeamRole[];
-  reports: { reportId: string; roleId: string; sessionId: string; path: string; createdAt: number }[];
+  reports: TeamReportEntry[];
+  /**
+   * The first-batch dispatch ledger: one record per intent, newest last.
+   *
+   * It answers "who was entrusted, on what basis, with which fixed inputs, to
+   * hand what back where" without becoming a second task platform: there is no
+   * scheduler here, the initial binding is immutable, and a substantive change
+   * is a NEW record that names the one it follows. Absent on legacy records,
+   * which normalize to an empty ledger.
+   */
+  dispatches?: DispatchRecord[];
+  /**
+   * Committed reports whose notice to the driver is not settled yet.
+   *
+   * WHY NOT `noticeFailures`: that list is a bounded diagnostic (its own cap
+   * drops the oldest), so a pending handoff stored there would disappear exactly
+   * when a run fails often enough to need it. The two live side by side and mean
+   * different things.
+   */
+  handoffNotices?: HandoffNotice[];
   /**
    * Driver wake-ups that could NOT be delivered, newest last.
    *
@@ -204,7 +248,7 @@ export interface TeamState {
   handoffSummary?: {
     reason?: string;
     summary?: string;
-    pendingTasks?: Array<{ roleId: string; phase: string; reportCount: number }>;
+    pendingTasks?: Array<{ roleId: string; phase: string; reportCount: number; openDispatchIds?: string[] }>;
   };
   /** Stable archive identity retained if snapshot publication beat marker CAS. */
   dismissalAttempt?: { archiveId: string; dismissedAt: number; supersedesArchiveId?: string };
@@ -441,6 +485,37 @@ function asRecord(raw: unknown): Record<string, any> | undefined {
   return typeof raw === "object" && raw !== null && !Array.isArray(raw) ? (raw as Record<string, any>) : undefined;
 }
 
+/**
+ * Normalize the report index.
+ *
+ * A report entry written before the first batch carries none of the binding
+ * fields; it keeps its original shape minus the unknown extras, and its absent
+ * `dispatchId` means "not bound to any dispatch" — which a reader must report
+ * rather than treat as a handback.
+ */
+function normalizeReports(raw: unknown): TeamReportEntry[] {
+  if (!Array.isArray(raw)) return [];
+  const out: TeamReportEntry[] = [];
+  for (const entry of raw) {
+    const record = asRecord(entry);
+    if (record === undefined) continue;
+    if (typeof record.reportId !== "string" || record.reportId === "") continue;
+    if (typeof record.path !== "string") continue;
+    out.push({
+      reportId: record.reportId,
+      roleId: typeof record.roleId === "string" ? record.roleId : "",
+      sessionId: typeof record.sessionId === "string" ? record.sessionId : "",
+      path: record.path,
+      createdAt: typeof record.createdAt === "number" ? record.createdAt : 0,
+      ...(typeof record.dispatchId === "string" && record.dispatchId !== "" ? { dispatchId: record.dispatchId } : {}),
+      ...(record.binding === "explicit" || record.binding === "inferred" ? { binding: record.binding } : {}),
+      ...(typeof record.contentHash === "string" && record.contentHash !== "" ? { contentHash: record.contentHash } : {}),
+      ...(record.outcome === "report" || record.outcome === "blocked" ? { outcome: record.outcome } : {}),
+    });
+  }
+  return out;
+}
+
 function classifyRaw(raw: unknown, cwd: string):
   | { kind: "ready"; team: TeamState; compatibility: ActiveTeamCompatibility; warnings: string[]; diagnostic: ActiveTeamDiagnostic }
   | { kind: "inactive"; reason: "archived" | "dismissed"; marker?: ActiveTeamArchivedMarker; compatibility: ActiveTeamCompatibility; warnings: string[]; diagnostic: ActiveTeamDiagnostic }
@@ -575,8 +650,7 @@ function classifyRaw(raw: unknown, cwd: string):
 }
 
 /** Normalize a raw team.json (v1.0 or v1.1) into v1.1 shape. */
-export function normalizeTeam(raw: unknown, cwd: string, options: { allowDismissed?: boolean } = {}): TeamState | undefined {
-  const record = asRecord(raw);
+export function normalizeTeam(raw: unknown, cwd: string, options: { allowDismissed?: boolean } = {}): TeamState | undefined {  const record = asRecord(raw);
   if (record === undefined) return undefined;
   if (record.archived === true) return undefined;
   if (record.status === "dismissed" && options.allowDismissed !== true) return undefined;
@@ -598,6 +672,11 @@ export function normalizeTeam(raw: unknown, cwd: string, options: { allowDismiss
   }
   const createdAt = typeof record.createdAt === "number" ? record.createdAt : Date.now();
   const teamId = typeof record.teamId === "string" && record.teamId !== "" ? record.teamId : `team-${createdAt}`;
+  // The dispatch ledger and its pending notices: same drop-don't-fail rule as
+  // `noticeFailures`. A record that cannot be read is visibly absent rather than
+  // silently coerced into a well-formed lie.
+  const dispatches = normalizeDispatches(record.dispatches);
+  const handoffNotices = normalizeHandoffNotices(record.handoffNotices);
   const roles: TeamRole[] = record.roles
     .filter((role: any) => typeof role?.sessionId === "string" && role.sessionId !== "")
     .map((role: any) => ({
@@ -666,7 +745,9 @@ export function normalizeTeam(raw: unknown, cwd: string, options: { allowDismiss
     ...(asRecord(record.document) ? { document: record.document as OrchestrationDocument } : {}),
     ...(asRecord(record.graphRuntime) ? { graphRuntime: record.graphRuntime as GraphRuntimeState } : {}),
     roles,
-    reports: Array.isArray(record.reports) ? record.reports : [],
+    reports: normalizeReports(record.reports),
+    ...(dispatches.length === 0 ? {} : { dispatches }),
+    ...(handoffNotices.length === 0 ? {} : { handoffNotices }),
     ...(record.handoffSummary !== undefined && typeof record.handoffSummary === "object"
       ? { handoffSummary: record.handoffSummary as any }
       : {}),

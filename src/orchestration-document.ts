@@ -337,6 +337,15 @@ export function documentSummary(document: OrchestrationDocument | undefined, tea
   stale: boolean;
   currentCharterRevision?: number;
   currentCharterDigest?: string;
+  /**
+   * The current revision's FULL reference (`draftId@revision#digest`).
+   *
+   * It is surfaced because a dispatch must cite exactly this string: the digest
+   * alone cannot be typed back into `charterRef`, and a caller that cannot copy
+   * the reference would be left guessing at the one value the dispatch contract
+   * refuses to take on trust.
+   */
+  currentCharterRef?: string;
   approvalRef?: string;
   lastDecision?: { decisionId: string; kind: string; summary: string };
 } {
@@ -347,7 +356,14 @@ export function documentSummary(document: OrchestrationDocument | undefined, tea
     status: document.charterStatus,
     revision: document.documentRevision,
     stale: isRuntimeProjectionStale(document, team),
-    ...(current === undefined ? {} : { currentCharterRevision: current.charterRevision, currentCharterDigest: current.digest, approvalRef: current.approval.approvalRef }),
+    ...(current === undefined
+      ? {}
+      : {
+          currentCharterRevision: current.charterRevision,
+          currentCharterDigest: current.digest,
+          currentCharterRef: current.frozenRef,
+          approvalRef: current.approval.approvalRef,
+        }),
     ...(last === undefined ? {} : { lastDecision: { decisionId: last.decisionId, kind: last.kind, summary: last.summary } }),
   };
 }

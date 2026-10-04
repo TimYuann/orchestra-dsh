@@ -34,8 +34,34 @@ import type {} from "@deepseek-ai/dsh-sandbox-policy";
 import type {} from "@deepseek-ai/dsh-permission-presets";
 import type {} from "@deepseek-ai/dsh-system-prompt";
 import type {} from "@deepseek-ai/dsh-commands";
-import { buildRoleSession, createSession, deliverMessage, readDeliveryReceipt, transportStores } from "./a2a.js";
+import { buildRoleSession, createSession, deliverMessage, queryMessageStatus, readDeliveryReceipt, transportStores } from "./a2a.js";
 import { receiptStoreFor } from "./receipt-store.js";
+import type { ReceiptStore } from "./receipt-store.js";
+import {
+  blockingDispatchFor,
+  computeDispatchPayloadDigest,
+  dispatchBoardTextFromRows,
+  dispatchIdempotencyKey,
+  dispatchLedgerRows,
+  dispatchIsHandedBack,
+  handoffNoticeRows,
+  normalizeDispatches,
+  normalizeHandoffNotices,
+  noticeIdFor,
+  openDispatchForSession,
+  openDispatchesFor,
+  roleDeliveryStallPrompt,
+  sha256Hex,
+  DISPATCH_BINDING_REVISION,
+  DISPATCH_ID_LIMIT,
+} from "./orchestra-dispatch.js";
+import type {
+  DispatchMethodBinding,
+  DispatchProfileRef,
+  DispatchRecord,
+  HandoffNotice,
+  HandoffOutcome,
+} from "./orchestra-dispatch.js";
 import { charterRecordStoreFor } from "./charter-store.js";
 import type { ResolvedPresetFile } from "./a2a.js";
 import { hostToolNamesForPreflight, PINNED_APPROVAL, prepareRoleBlueprint, preflightGovernedRequiredTools, resolveDraftRoleModel, verifyGovernedAgent, SessionBlueprintError, REMOVED_ORCHESTRA_TOOLS } from "./session-blueprint.js";
@@ -479,7 +505,11 @@ export function createRoleTurnGuard(options: RoleTurnGuardOptions): RoleTurnGuar
       const cwd = agent.session?.header?.cwd;
       if (typeof cwd !== "string" || cwd === "") return;
       if (agent.inbox?.hasPending === true) return;
-      if (handedBackThisTurn(agent, turn)) return;
+      // Read the coarse, name-based signal, but do NOT let it decide while a
+      // dispatch is open: it accepts ANY call of a handoff-named tool, including
+      // a plain progress message, which is exactly the false positive that let a
+      // role end a turn with its assigned work undelivered.
+      const namedHandoff = handedBackThisTurn(agent, turn);
       let observation: ActiveTeamRead;
       try {
         observation = await options.readTeam(cwd);
@@ -491,11 +521,34 @@ export function createRoleTurnGuard(options: RoleTurnGuardOptions): RoleTurnGuar
       if (sessionId === team.controllerSessionId) return;
       const role = team.roles.find((entry) => entry.sessionId === sessionId);
       if (role === undefined) return;
+
+      // Judgment 1 of §5.3, and the ONLY one that decides the steer: has this
+      // role's committed ledger got a result (or an explicit block) bound to the
+      // dispatch it still owes? It is read from TeamState — the commit point —
+      // rather than from the tool result, so a report whose call returned an
+      // error after committing, or whose notice could not be delivered, is still
+      // a fulfilled submission and does not re-steer the worker into producing
+      // the same report twice. Judgments 2 (the receiver accepted the notice) and
+      // 3 (the driver processed it) are recorded as their own facts and belong to
+      // the other two parties.
+      if ((team.dispatches ?? []).some((entry) => entry.roleId === role.id)) {
+        // This role has a ledger, so the ledger is authoritative: a committed
+        // result — or an explicit block — bound to the dispatch it owed is a
+        // fulfilled submission, and the coarse name-based signal is NOT consulted
+        // as a fallback. Falling through here would re-steer a role that already
+        // handed its report in, which is exactly how one result turns into two.
+        const openDispatch = openDispatchForSession(team, sessionId);
+        if (openDispatch === undefined) return;
+        // The steer is remembered BEFORE it is sent: the host re-reads the inbox
+        // and runs another step, and that step's boundary fires this handler
+        // again with the SAME turn number. Without the key being taken first, a
+        // role that ignores the steer would be steered once per step forever.
+        steeredTurns.add(key);
+        options.steer(agent, roleDeliveryStallPrompt(team.teamId, role.id, openDispatch.dispatchId));
+        return;
+      }
+      if (namedHandoff) return;
       const reportCount = role.reportCount ?? 0;
-      // The steer is remembered BEFORE it is sent: the host re-reads the inbox
-      // and runs another step, and that step's boundary fires this handler
-      // again with the SAME turn number. Without the key being taken first, a
-      // role that ignores the steer would be steered once per step forever.
       steeredTurns.add(key);
       options.steer(agent, roleTurnStallPrompt(team.teamId, role.id, reportCount));
     },
@@ -526,6 +579,25 @@ export interface MilestoneNoticeOptions {
    * the failure is only warned about, which is the legacy behavior.
    */
   recordFailure?: NoticeFailureRecorder;
+  /**
+   * Idempotency credential for THIS notice.
+   *
+   * A best-effort milestone notice has no use for one — a fresh key per call
+   * deduplicates nothing and only creates durable state the notice cannot
+   * honour. A notice that is itself a tracked pending fact is the opposite
+   * case: the key is what makes "the driver was already told" checkable, so a
+   * recovery sweep can retry without sending the same fact twice.
+   */
+  idempotencyKey?: string;
+  /** Explicit receipt sink, for callers whose cwd is not the actor's cwd. */
+  receiptStore?: ReceiptStore;
+  /** Sandbox policy for the receipt write; without one the write has no authority. */
+  receiptPolicy?: unknown;
+  /**
+   * Observes the outcome. The notice NEVER throws, so a caller that must record
+   * "was the driver actually told?" needs this instead of a try/catch.
+   */
+  onOutcome?: (outcome: { delivered: boolean; reason?: string; skipped?: "self" }) => void;
 }
 
 /**
@@ -584,35 +656,47 @@ export async function notifyDriverMilestone(
   detail: string,
   options: typeof deliverMessage | MilestoneNoticeOptions = {},
 ): Promise<void> {
-  if (actorSessionId === team.controllerSessionId) return;
   const resolved: MilestoneNoticeOptions = typeof options === "function" ? { deliver: options } : options;
+  if (actorSessionId === team.controllerSessionId) {
+    // A role that IS the controller has no one to notify: the fact is already in
+    // its own hands.
+    resolved.onOutcome?.({ delivered: false, skipped: "self" });
+    return;
+  }
   const deliver = resolved.deliver ?? deliverMessage;
   const text = milestoneNotice(team.teamId, kind, detail);
   try {
-    // No idempotency key: this key was a fresh randomUUID on every call, so it
-    // never deduplicated anything — it only forced an acceptance record (a file,
-    // in the durable store) for each best-effort notice. A notice whose whole
-    // contract is "never fail the tool that triggered it" should not create
-    // durable state it cannot honour.
+    // An idempotency key is supplied ONLY when the caller tracks this notice as a
+    // pending fact (see {@link MilestoneNoticeOptions.idempotencyKey}); the
+    // historical best-effort path still carries none, so it creates no durable
+    // state it cannot honour.
     await deliver(ctx, actorSessionId, team.controllerSessionId, [{ type: "text", text }], {
       wake: true,
-      ...milestoneStores(ctx, actorSessionId),
+      ...(resolved.idempotencyKey === undefined ? {} : { idempotencyKey: resolved.idempotencyKey }),
+      ...(resolved.receiptPolicy === undefined ? {} : { receiptPolicy: resolved.receiptPolicy }),
+      ...(resolved.receiptStore === undefined
+        ? milestoneStores(ctx, actorSessionId)
+        : { receiptStore: resolved.receiptStore }),
     });
+    resolved.onOutcome?.({ delivered: true });
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     if (resolved.recordFailure !== undefined) {
       try {
         await resolved.recordFailure({ milestone: kind, targetSessionId: team.controllerSessionId, failedAt: Date.now(), reason });
+        resolved.onOutcome?.({ delivered: false, reason });
         return;
       } catch (recordError) {
         const recordReason = recordError instanceof Error ? recordError.message : String(recordError);
         console.warn(
           `orchestra: milestone notice to controller ${team.controllerSessionId} failed (${reason}) AND recording that failure failed (${recordReason}); the driver was not woken and the run carries no durable trace of it`,
         );
+        resolved.onOutcome?.({ delivered: false, reason });
         return;
       }
     }
     console.warn(`orchestra: milestone notice to controller ${team.controllerSessionId} failed: ${reason}`);
+    resolved.onOutcome?.({ delivered: false, reason });
   }
 }
 
@@ -811,7 +895,7 @@ function roleProtocolText(
     `Your driver (the role that launched the team and owns decisions) is session ${executorSessionId}.`,
     `Reply rule: all replies go via a2a_reply to ${executorSessionId}; never reply directly to the user — users interact with you only through your driver.`,
     `Task source: tasks are dispatched by your driver via a2a_send; each task is self-contained and does not depend on your history.`,
-    `Handoff: write outputs/reports with orchestra_report under orchestra/reports/, and return the report path when replying to the orchestrator.`,
+    `Handoff: write outputs/reports with orchestra_report under orchestra/reports/, and pass dispatchId=<the Dispatch ID in your task text> so the handback is bound to THAT dispatch (outcome="blocked" when you cannot proceed), then reply to the orchestrator with the report path. A progress message alone is not a handback.`,
     `Discipline (wait for dispatch): a welcome/activation message is NOT a task — do not start any work until your driver dispatches a concrete task via a2a_send; work starts only after the task arrives.`,
     `Discipline (spec scope): implement strictly what the dispatched task's spec asks for; do not extend features, variables, files, or scope beyond it.`,
   ];
@@ -2924,6 +3008,26 @@ export interface OrchestraDispatchArgs {
   laneId?: string;
   preset?: string;
   timeoutMs?: number;
+  /**
+   * The intent's identity, held by the caller BEFORE the first call. This batch
+   * deliberately does not mint one: an id that only exists after the call
+   * returns cannot be used to retry the call that lost its answer.
+   */
+  dispatchId?: string;
+  /** The Team's current frozen charter reference (`draftId@revision#digest`). */
+  charterRef?: string;
+  /** The approval the charter rests on (`approvalRef` of the frozen revision). */
+  authorityRef?: string;
+  /** One persistent, fixed brief carrying the six startup baselines. */
+  brief?: string;
+  /** This dispatch's responsibility inside the delegated scope. */
+  responsibility?: string;
+  /** The working range this dispatch is authorized within. */
+  scope?: string[];
+  /** The selected Profile: its fixed body plus where it came from. */
+  profileRef?: { id: string; source: string; content: string };
+  /** The few methods this dispatch binds, with the identity of their fixed text. */
+  methodBindings?: DispatchMethodBinding[];
 }
 
 export interface OrchestraDispatchResult {
@@ -2933,6 +3037,154 @@ export interface OrchestraDispatchResult {
   session_id: string;
   created_new_session: boolean;
   receipt?: unknown;
+  dispatch_id?: string;
+  payload_digest?: string;
+  binding_revision?: number;
+  delivery_state?: string;
+  delivery_reason?: string;
+}
+
+/** Where a Team's authority for a dispatch comes from, resolved from its own record. */
+interface DelegationBasis {
+  charterRef: string;
+  authorityRef: string;
+  charterRevision: number;
+}
+
+/**
+ * Resolve the delegation source a dispatch must name.
+ *
+ * It is read from the Team's own frozen charter — never from a caller's claim —
+ * which is what makes "the reference is real and it is THIS Team's" checkable.
+ * A Team with no frozen charter has no authority source a dispatch may cite, so
+ * the dispatch is refused instead of inventing one.
+ */
+function delegationBasisOf(team: TeamState): DelegationBasis | undefined {
+  const document = team.document;
+  if (document === undefined || document.currentCharterRevision === null || document.currentCharterRevision === undefined) return undefined;
+  const frozen = document.charterRevisions.find((revision) => revision.charterRevision === document.currentCharterRevision);
+  if (frozen === undefined) return undefined;
+  if (frozen.frozenRef === "" || frozen.approval.approvalRef === "") return undefined;
+  return { charterRef: frozen.frozenRef, authorityRef: frozen.approval.approvalRef, charterRevision: frozen.charterRevision };
+}
+
+/** What one method-binding validation produced. */
+interface ResolvedMethodBinding extends DispatchMethodBinding {}
+
+/**
+ * Read and verify every bound method's fixed text.
+ *
+ * A cwd-relative `ref` is read here and its sha256 must equal `contentDigest`:
+ * that is the only place the plugin can prove "this exact text is what the
+ * worker is being pointed at", and a missing or changed file is a hard refusal
+ * rather than a binding that merely claims a digest. A binding without a
+ * readable `ref` is recorded as unverified instead of being silently trusted.
+ */
+async function resolveMethodBindings(
+  ctx: Context,
+  cwd: string,
+  raw: readonly DispatchMethodBinding[] | undefined,
+  signal: AbortSignal | undefined,
+): Promise<ResolvedMethodBinding[]> {
+  const out: ResolvedMethodBinding[] = [];
+  for (const binding of raw ?? []) {
+    if (binding === undefined || typeof binding !== "object") {
+      throw new Error("orchestra_dispatch: each methodBinding must be an object with methodId, sourceCommit, contentDigest and purpose");
+    }
+    const methodId = typeof binding.methodId === "string" ? binding.methodId.trim() : "";
+    const sourceCommit = typeof binding.sourceCommit === "string" ? binding.sourceCommit.trim() : "";
+    const contentDigest = normalizeDigest(typeof binding.contentDigest === "string" ? binding.contentDigest : "");
+    const purpose = typeof binding.purpose === "string" ? binding.purpose.trim() : "";
+    if (methodId === "" || sourceCommit === "" || contentDigest === "" || purpose === "") {
+      throw new Error("orchestra_dispatch: each methodBinding needs a non-empty methodId, sourceCommit, contentDigest and purpose");
+    }
+    const ref = typeof binding.ref === "string" ? binding.ref.trim() : undefined;
+    const base: ResolvedMethodBinding = {
+      methodId,
+      sourceCommit,
+      contentDigest,
+      purpose,
+      ...(Array.isArray(binding.sections) && binding.sections.length > 0 ? { sections: [...binding.sections] } : {}),
+      ...(ref === undefined || ref === "" ? {} : { ref }),
+    };
+    const verifiable = ref !== undefined && ref !== "" && !ref.startsWith("/") && !ref.includes("://") && !ref.includes("..");
+    if (!verifiable) {
+      out.push(base);
+      continue;
+    }
+    const target = await ctx.fs.resolve(`${cwd}/${ref}`, { cwd, signal });
+    let text: string;
+    try {
+      text = await ctx.fs.readText(target, signal);
+    } catch (error) {
+      throw new Error(
+        `orchestra_dispatch: bound method "${methodId}" names ${ref}, which cannot be read (${error instanceof Error ? error.message : String(error)}); ` +
+          `a method whose fixed text is not there is refused instead of recorded — no dispatch record was created`,
+      );
+    }
+    const actual = sha256Hex(text);
+    if (actual !== contentDigest) {
+      throw new Error(
+        `orchestra_dispatch: bound method "${methodId}" at ${ref} has digest ${actual}, not the bound ${contentDigest}; ` +
+          `the binding would claim a text that is not there — no dispatch record was created`,
+      );
+    }
+    out.push({ ...base, contentVerified: true });
+  }
+  return out;
+}
+
+function normalizeDigest(value: string): string {
+  const trimmed = value.trim().toLowerCase();
+  return trimmed.startsWith("sha256:") ? trimmed.slice("sha256:".length).trim() : trimmed;
+}
+
+/** The text one dispatch delivers: the brief, the binding, and the handback rule. */
+function buildDispatchNotice(input: {
+  teamId: string;
+  roleId: string;
+  laneId: string;
+  dispatchId: string;
+  task: string;
+  brief: string;
+  delegation: { charterRef: string; authorityRef: string; responsibility: string; scope: string[] };
+  profileRef?: DispatchProfileRef;
+  profileContent?: string;
+  methodBindings: readonly ResolvedMethodBinding[];
+}): string {
+  const profileLine =
+    input.profileRef === undefined
+      ? "Profile: (none bound for this dispatch)"
+      : `Profile: ${input.profileRef.id} (${input.profileRef.source}, sha256:${input.profileRef.contentDigest})\n` +
+        `${(input.profileContent ?? "").trim()}`;
+  const methodLines =
+    input.methodBindings.length === 0
+      ? "Methods: (none bound for this dispatch)"
+      : input.methodBindings
+          .map(
+            (binding) =>
+              `- ${binding.methodId} @ ${binding.sourceCommit} sha256:${binding.contentDigest}` +
+              `${binding.ref === undefined ? "" : ` — read it at ${binding.ref}`}` +
+              `${binding.contentVerified === true ? " (text verified at dispatch)" : " (text NOT verified at dispatch)"}` +
+              ` — purpose: ${binding.purpose}`,
+          )
+          .join("\n");
+  return (
+    `[Orchestra Dispatch | Lane: ${input.laneId} | Role: ${input.roleId} | Dispatch ID: ${input.dispatchId} | BINDING_REVISION: ${DISPATCH_BINDING_REVISION} (placeholder, no first-batch consumer) ]\n\n` +
+    `Task:\n${input.task}\n\n` +
+    `Brief (fixed for this dispatch; the six startup baselines):\n${input.brief}\n\n` +
+    `Delegation: charterRef=${input.delegation.charterRef} authorityRef=${input.delegation.authorityRef}\n` +
+    `Responsibility: ${input.delegation.responsibility}\n` +
+    `Authorized scope: ${input.delegation.scope.length === 0 ? "(as bounded by the brief)" : input.delegation.scope.join("; ")}\n\n` +
+    `${profileLine}\n${methodLines}\n\n` +
+    `---\n` +
+    `Frontline Autonomy Rule: execute independently and coordinate Hard Facts directly with collaborators.\n` +
+    `Close the loop BEFORE you end your turn: file your report with the orchestra_report TOOL (never the generic write/edit tool — it is denied under a read-only sandbox) ` +
+    `and pass dispatchId="${input.dispatchId}" so the handback is bound to THIS dispatch; pass outcome="blocked" if you cannot proceed. ` +
+    `Then reply to the controller with a2a_reply. A turn that ends with no report and no reply cannot wake the driver and stalls the run. ` +
+    `A progress message alone is NOT a handback. ` +
+    `If a write is refused, say so in that reply instead of escalating the sandbox: nobody answers an escalation prompt in an unattended run.`
+  );
 }
 
 export interface AddLaneRoleArgs {
@@ -3213,9 +3465,16 @@ async function materializeRole(
     team: TeamState;
     role: TeamRole;
     dispatchNotice: string;
+    /**
+     * The idempotency credential the first-turn delivery carries. A guaranteed
+     * dispatch must leave a queryable receipt even when this very call created
+     * the session, otherwise the dispatch's own retry has nothing to reconcile
+     * against and the only safe reading would be "unknown" forever.
+     */
+    deliverIdempotencyKey?: string;
   },
 ): Promise<unknown> {
-  const { cwd, team, role, dispatchNotice } = input;
+  const { cwd, team, role, dispatchNotice, deliverIdempotencyKey } = input;
   const controller = exec.agent;
   if (controller === undefined) throw new Error("materializeRole requires an agent caller");
   const policy = escrowPolicy(ctx, exec);
@@ -3330,6 +3589,8 @@ async function materializeRole(
 
     return deliverMessage(ctx, controller.id, role.sessionId, [{ type: "text", text: combinedFirstTurn }], {
       wake: true,
+      ...(deliverIdempotencyKey === undefined ? {} : { idempotencyKey: deliverIdempotencyKey }),
+      receiptPolicy: policy,
       ...transportStores(ctx, cwd),
     });
   } catch (error) {
@@ -3426,6 +3687,34 @@ export async function dispatchRoleTask(
 
   const roleId = args.roleId.trim();
   const laneId = args.laneId?.trim() || "main";
+  const dispatchId = typeof args.dispatchId === "string" ? args.dispatchId.trim() : "";
+  if (dispatchId === "") {
+    // The reliable path needs the id BEFORE the first call, because an id minted
+    // by the tool that then fails to return cannot be used to retry the call
+    // whose answer was lost. The convenience default is deliberately absent
+    // rather than silently weaker than the guarantee it would appear to carry.
+    throw new Error(
+      'orchestra_dispatch: "dispatchId" is required — the caller holds it before the first call and reuses it to retry. This batch does not mint one, and a dispatch without an id is refused instead of being quietly downgraded.',
+    );
+  }
+  if (dispatchId.length > DISPATCH_ID_LIMIT) {
+    throw new Error(`orchestra_dispatch: "dispatchId" must be at most ${DISPATCH_ID_LIMIT} characters (it becomes a message identity)`);
+  }
+  const brief = typeof args.brief === "string" ? args.brief.trim() : "";
+  if (brief === "") {
+    throw new Error('orchestra_dispatch: "brief" is required — one persistent, fixed brief carries the six startup baselines (goal, known facts, must-not-change, fixed inputs, observation and closure, write surface)');
+  }
+  const responsibility = typeof args.responsibility === "string" ? args.responsibility.trim() : "";
+  if (responsibility === "") {
+    throw new Error('orchestra_dispatch: "responsibility" is required — this dispatch must state the responsibility it places inside the delegated scope');
+  }
+  const scope = [
+    ...new Set(
+      (Array.isArray(args.scope) ? args.scope : [])
+        .filter((entry): entry is string => typeof entry === "string" && entry.trim() !== "")
+        .map((entry) => entry.trim()),
+    ),
+  ];
 
   const observation = await activeTeamState.read(cwd, { signal: exec.signal });
   throwIfBlocked("dispatch a task", observation);
@@ -3437,6 +3726,13 @@ export async function dispatchRoleTask(
   }
 
   const team = observation.team;
+  const initiatingSessionId = exec.agent.id;
+  if (initiatingSessionId !== team.controllerSessionId) {
+    throw new Error(
+      `orchestra_dispatch: only the controller session "${team.controllerSessionId}" may dispatch in this Team; caller is "${initiatingSessionId}". A session that is not the delegating party cannot create a dispatch record for work it does not own.`,
+    );
+  }
+
   const roleIndex = team.roles.findIndex((r) => r.id.toLowerCase() === roleId.toLowerCase());
   if (roleIndex === -1) {
     throw new Error(
@@ -3445,67 +3741,864 @@ export async function dispatchRoleTask(
   }
 
   const roleEntry = team.roles[roleIndex];
+
+  // The delegation basis comes from THIS Team's own frozen charter, never from
+  // the caller's assertion. A reference that is absent, from another Team, or
+  // from an older revision is refused, and nothing is recorded.
+  const basis = delegationBasisOf(team);
+  if (basis === undefined) {
+    throw new Error(
+      "orchestra_dispatch: this Team has no frozen charter, so no charterRef/authorityRef can be resolved. Approve a charter (/team or orchestra_create) before dispatching — a dispatch with no real delegation source is refused.",
+    );
+  }
+  const charterRef = typeof args.charterRef === "string" ? args.charterRef.trim() : "";
+  if (charterRef === "") {
+    throw new Error(`orchestra_dispatch: "charterRef" is required; this Team's current frozen charter is "${basis.charterRef}"`);
+  }
+  if (charterRef !== basis.charterRef) {
+    throw new Error(
+      `orchestra_dispatch: charterRef "${charterRef}" is not this Team's current frozen charter ("${basis.charterRef}", revision ${basis.charterRevision}). ` +
+        `A reference to another Team or to an older revision is refused — no dispatch record was created.`,
+    );
+  }
+  const authorityRef = typeof args.authorityRef === "string" ? args.authorityRef.trim() : "";
+  if (authorityRef === "") {
+    throw new Error(`orchestra_dispatch: "authorityRef" is required; this Team's current approval is "${basis.authorityRef}"`);
+  }
+  if (authorityRef !== basis.authorityRef) {
+    throw new Error(
+      `orchestra_dispatch: authorityRef "${authorityRef}" is not this Team's current approval ("${basis.authorityRef}"). ` +
+        `A model-written "the owner approved" is not authority; the durable approval record is — no dispatch record was created.`,
+    );
+  }
+
+  const methodBindings = await resolveMethodBindings(ctx, cwd, args.methodBindings, exec.signal);
+  const profileInput = args.profileRef;
+  let profileRef: DispatchProfileRef | undefined;
+  let profileContent: string | undefined;
+  if (profileInput !== undefined) {
+    const id = typeof profileInput.id === "string" ? profileInput.id.trim() : "";
+    const source = typeof profileInput.source === "string" ? profileInput.source.trim() : "";
+    const content = typeof profileInput.content === "string" ? profileInput.content : "";
+    if (id === "" || source === "" || content.trim() === "") {
+      throw new Error(
+        'orchestra_dispatch: "profileRef" needs a non-empty id, source and content — the selected Profile is carried as its fixed body, so an empty body cannot be bound',
+      );
+    }
+    profileRef = { id, source, contentDigest: sha256Hex(content) };
+    profileContent = content;
+  }
+
+  const delegation = { charterRef: basis.charterRef, authorityRef: basis.authorityRef, responsibility, scope };
   const policy = escrowPolicy(ctx, exec);
 
-  // The handoff discipline travels WITH the dispatch, not only inside a role
-  // preset: a governed team can run a legacy preset whose persona predates this
-  // rule, and a role that ends its turn silently stalls the whole run (there is
-  // no reply to wake the driver). Two observed failures motivated spelling it
-  // out here: a role that wrote its report with the generic file tools and never
-  // reported, and a read-only role that retried a denied write until it raised a
-  // permission prompt nobody was there to answer.
-  const dispatchNotice =
-    `[Orchestra Dispatch | Lane: ${laneId} | Role: ${roleId}]\n\n` +
-    `Task:\n${args.task}\n\n` +
-    `---\n` +
-    `Frontline Autonomy Rule: execute independently and coordinate Hard Facts directly with collaborators.\n` +
-    `Close the loop BEFORE you end your turn: file your report with the orchestra_report TOOL (never the generic write/edit tool — it is denied under a read-only sandbox), ` +
-    `then reply to the controller with a2a_reply. A turn that ends with no report and no reply cannot wake the driver and stalls the run. ` +
-    `If a write is refused, say so in that reply instead of escalating the sandbox: nobody answers an escalation prompt in an unattended run.`;
-
-  // Lazy Fleet Materialization: reserved -> provisioning -> active.
+  // ---------------------------------------------------------------------
+  // Identity: the lookup and the create happen inside ONE state change.
   //
-  // A role is materialized on its FIRST dispatch. `provisioning` is a
-  // write-ahead marker, not a resting state: it is what makes a crash between
-  // "we are about to create the session" and "the session exists" recoverable.
-  // A role found in `provisioning` is therefore REBUILT rather than delivered
-  // to — the previous attempt never proved a session exists, so delivering
-  // would fail with "role session is not live" and strand the lane forever.
-  // See {@link materializeRole}.
-  if (roleEntry.phase === "reserved" || roleEntry.phase === "provisioning") {
-    const receipt = await materializeRole(ctx, activeTeamState, exec, {
+  // A read-then-create pair could see "no record" twice and publish two facts
+  // for one intent. The CAS retry loop re-runs this updater against a fresh
+  // snapshot, so the second arrival observes the first one's record instead of
+  // duplicating it.
+  // ---------------------------------------------------------------------
+  let created: DispatchRecord | undefined;
+  let existing: DispatchRecord | undefined;
+  const boundDigest = (current: TeamState, canonicalRoleId: string): string =>
+    computeDispatchPayloadDigest({
+      teamId: current.teamId,
+      roleId: canonicalRoleId,
+      laneId,
+      task: args.task,
+      brief,
+      delegation,
+      ...(profileRef === undefined ? {} : { profileRef }),
+      methodBindings,
+      resultRecipientSessionId: current.controllerSessionId,
+    });
+
+  await activeTeamState.mutate(
+    cwd,
+    (current) => {
+      created = undefined;
+      existing = undefined;
+      const role = current.roles.find((r) => r.id.toLowerCase() === roleId.toLowerCase());
+      if (role === undefined) {
+        throw new Error(`cannot dispatch: role "${roleId}" is no longer declared in the team roster`);
+      }
+      const digest = boundDigest(current, role.id);
+      const found = (current.dispatches ?? []).find((entry) => entry.dispatchId === dispatchId);
+      if (found !== undefined) {
+        if (found.payloadDigest !== digest) {
+          throw new Error(
+            `orchestra_dispatch: dispatchId "${dispatchId}" already exists with different content (bound ${found.payloadDigest}, this call ${digest}). ` +
+              `Same id + same content reuses the record; same id + different content is a conflict. A substantive change is a NEW dispatch that names this one — no record was changed.`,
+          );
+        }
+        existing = found;
+        return current;
+      }
+      const blocking = blockingDispatchFor(current, role.id);
+      if (blocking !== undefined) {
+        throw new Error(
+          `orchestra_dispatch: role "${role.id}" already has an undelivered dispatch "${blocking.dispatchId}" (delivery: ${blocking.delivery.state}). ` +
+            `This call would create a second undelivered dispatch for the same role, so it is refused. Wait for that handback, or retry that same dispatchId.`,
+        );
+      }
+      const superseded = openDispatchesFor(current, role.id);
+      const record: DispatchRecord = {
+        dispatchId,
+        payloadDigest: digest,
+        bindingRevision: DISPATCH_BINDING_REVISION,
+        teamId: current.teamId,
+        roleId: role.id,
+        laneId,
+        task: args.task,
+        brief,
+        delegation,
+        ...(profileRef === undefined ? {} : { profileRef }),
+        methodBindings,
+        subjects: {
+          initiatingSessionId,
+          roleId: role.id,
+          targetSessionId: role.sessionId,
+          resultRecipientSessionId: current.controllerSessionId,
+          materialized: false,
+        },
+        // Delivery has not been attempted yet: the record is written BEFORE the
+        // attempt, so a crash in between leaves a locatable intent instead of a
+        // task nobody can see.
+        delivery: { state: "not_delivered", idempotencyKey: dispatchIdempotencyKey(dispatchId), attemptedAt: Date.now() },
+        createdAt: Date.now(),
+      };
+      created = record;
+      const nextDispatches = (current.dispatches ?? []).map((entry) =>
+        superseded.some((candidate) => candidate.dispatchId === entry.dispatchId) ? { ...entry, supersededBy: dispatchId } : entry,
+      );
+      return { ...current, dispatches: [...nextDispatches, record] };
+    },
+    { policy, signal: exec.signal },
+  );
+
+  if (existing !== undefined) {
+    const outcome = await reconcileDispatchDelivery(ctx, activeTeamState, exec, existing, {
       cwd,
       team,
       role: roleEntry,
-      dispatchNotice,
+      dispatchNotice: buildDispatchNotice({
+        teamId: team.teamId,
+        roleId: roleEntry.id,
+        laneId,
+        dispatchId,
+        task: args.task,
+        brief,
+        delegation,
+        ...(profileRef === undefined ? {} : { profileRef }),
+        ...(profileContent === undefined ? {} : { profileContent }),
+        methodBindings,
+      }),
     });
     return {
-      status: "dispatched",
+      status: "reused",
       team_id: team.teamId,
       role_id: roleEntry.id,
-      session_id: roleEntry.sessionId,
-      created_new_session: true,
-      receipt,
+      session_id: outcome.targetSessionId,
+      created_new_session: false,
+      dispatch_id: dispatchId,
+      payload_digest: existing.payloadDigest,
+      binding_revision: existing.bindingRevision,
+      delivery_state: outcome.state,
+      ...(outcome.reason === undefined ? {} : { delivery_reason: outcome.reason }),
+      ...(outcome.receipt === undefined ? {} : { receipt: outcome.receipt }),
     };
   }
 
-  // Role already active: native children must stay on their direct-parent
-  // continuation seam; generic inbox delivery only applies to Session roles.
-  const delivery = roleEntry.execution === "subagent"
-    ? await sendToSubagentNode(ctx, exec.agent, roleEntry.sessionId, [{ type: "text", text: dispatchNotice }], { signal: exec.signal })
-    : await deliverMessage(ctx, exec.agent.id, roleEntry.sessionId, [{ type: "text", text: dispatchNotice }], {
+  const record = created;
+  if (record === undefined) throw new Error("orchestra_dispatch: the identity state change produced no dispatch record");
+
+  const dispatchNotice = buildDispatchNotice({
+    teamId: team.teamId,
+    roleId: roleEntry.id,
+    laneId,
+    dispatchId,
+    task: args.task,
+    brief,
+    delegation,
+    ...(profileRef === undefined ? {} : { profileRef }),
+    ...(profileContent === undefined ? {} : { profileContent }),
+    methodBindings,
+  });
+
+  let receipt: unknown;
+  let state: DispatchRecord["delivery"]["state"] = "not_delivered";
+  let reason: string | undefined;
+  let materialized = false;
+  let createdNewSession = false;
+  let targetSessionId = roleEntry.sessionId;
+
+  try {
+    if (roleEntry.execution === "subagent") {
+      receipt =
+        roleEntry.phase === "reserved" || roleEntry.phase === "provisioning"
+          ? await materializeRole(ctx, activeTeamState, exec, {
+              cwd,
+              team,
+              role: roleEntry,
+              dispatchNotice,
+              deliverIdempotencyKey: record.delivery.idempotencyKey,
+            })
+          : await sendToSubagentNode(ctx, exec.agent, roleEntry.sessionId, [{ type: "text", text: dispatchNotice }], { signal: exec.signal });
+      createdNewSession = true;
+      materialized = true;
+      // The new contract does NOT silently reach an unsupported backend: the
+      // native path mints its own message identity and offers no receipt store,
+      // so "confirmed delivery" is not a claim this record may make.
+      state = "unsupported_backend";
+      reason =
+        "native subagent backend: outside this batch's Session-only delivery guarantee (no caller-supplied dedup key, no durable delivery receipt). The dispatch record and its identity still hold; the delivery guarantee does not.";
+    } else if (roleEntry.phase === "reserved" || roleEntry.phase === "provisioning") {
+      receipt = await materializeRole(ctx, activeTeamState, exec, {
+        cwd,
+        team,
+        role: roleEntry,
+        dispatchNotice,
+        deliverIdempotencyKey: record.delivery.idempotencyKey,
+      });
+      createdNewSession = true;
+      materialized = true;
+      state = "delivered";
+    } else {
+      receipt = await deliverMessage(ctx, initiatingSessionId, roleEntry.sessionId, [{ type: "text", text: dispatchNotice }], {
         wake: true,
+        idempotencyKey: record.delivery.idempotencyKey,
+        receiptPolicy: policy,
         ...transportStores(ctx, cwd),
       });
+      materialized = true;
+      state = "delivered";
+    }
+  } catch (error) {
+    reason = error instanceof Error ? error.message : String(error);
+    const live = ctx.agents.get(SID(targetSessionId)) !== undefined || ctx.sessions.get(SID(targetSessionId)) !== undefined;
+    materialized = live;
+    // "The session exists" is not "it was delivered": the transport enqueues
+    // BEFORE it records the receipt and says so in its own contract, so a thrown
+    // delivery is an UNKNOWN outcome, never a proven non-delivery.
+    state = live ? "unknown" : "not_delivered";
+    await recordDispatchDelivery(ctx, activeTeamState, cwd, exec, record, {
+      state,
+      reason,
+      materialized,
+      targetSessionId,
+      policy,
+    });
+    if (roleEntry.phase === "reserved" || roleEntry.phase === "provisioning") {
+      // A build failure keeps its existing loud contract: the role is back to
+      // reserved and the caller must see why. The ledger already carries the
+      // delivery outcome, so nothing is lost by re-raising.
+      throw error;
+    }
+  }
+
+  const settled = await recordDispatchDelivery(ctx, activeTeamState, cwd, exec, record, {
+    state,
+    ...(reason === undefined ? {} : { reason }),
+    materialized,
+    targetSessionId,
+    policy,
+    ...(acceptanceOf(receipt) === undefined ? {} : { receipt: acceptanceOf(receipt)! }),
+  });
 
   return {
-    status: "dispatched",
+    status: state === "unsupported_backend" ? "unsupported_backend" : "dispatched",
     team_id: team.teamId,
     role_id: roleEntry.id,
-    session_id: roleEntry.sessionId,
-    created_new_session: false,
-    receipt: delivery,
+    session_id: settled.subjects.targetSessionId,
+    created_new_session: createdNewSession,
+    dispatch_id: dispatchId,
+    payload_digest: record.payloadDigest,
+    binding_revision: record.bindingRevision,
+    delivery_state: settled.delivery.state,
+    ...(settled.delivery.reason === undefined ? {} : { delivery_reason: settled.delivery.reason }),
+    ...(receipt === undefined ? {} : { receipt }),
   };
+}
+
+/** Narrow a delivery or node receipt to the transport's acceptance shape. */
+function acceptanceOf(receipt: unknown): { message_id: string; target_session_id: string; accepted_at_ms: number; delivery_mode: string } | undefined {
+  if (typeof receipt !== "object" || receipt === null) return undefined;
+  const value = receipt as Record<string, unknown>;
+  if (typeof value.message_id !== "string" || typeof value.accepted_at_ms !== "number") return undefined;
+  return {
+    message_id: value.message_id,
+    target_session_id: typeof value.target_session_id === "string" ? value.target_session_id : "",
+    accepted_at_ms: value.accepted_at_ms,
+    delivery_mode: typeof value.delivery_mode === "string" ? value.delivery_mode : "",
+  };
+}
+
+/** What one delivery/reconciliation pass established. */
+interface DeliveryOutcome {
+  state: DispatchRecord["delivery"]["state"];
+  reason?: string;
+  receipt?: unknown;
+  targetSessionId: string;
+}
+
+/**
+ * The reuse path for an existing intent.
+ *
+ * Order matters and is the whole point of §5.2: reconcile against durable facts
+ * FIRST, and only a delivery that provably never happened may be attempted
+ * again. An `unknown` outcome is reported as unknown — never silently retried,
+ * because that is exactly how one intent turns into two executions.
+ */
+async function reconcileDispatchDelivery(
+  ctx: Context,
+  activeTeamState: ActiveTeamStateStore,
+  exec: ToolExecutionInput,
+  record: DispatchRecord,
+  input: { cwd: string; team: TeamState; role: TeamRole; dispatchNotice: string },
+): Promise<DeliveryOutcome> {
+  const { cwd, team, role, dispatchNotice } = input;
+  const policy = escrowPolicy(ctx, exec);
+  const targetSessionId = record.subjects.targetSessionId;
+
+  if (record.delivery.state === "unsupported_backend") {
+    return { state: "unsupported_backend", reason: record.delivery.reason, targetSessionId };
+  }
+
+  let receipt: unknown;
+  try {
+    receipt = await readDeliveryReceipt(ctx, targetSessionId, record.delivery.idempotencyKey, receiptStoreFor(ctx, cwd));
+  } catch (error) {
+    receipt = undefined;
+  }
+  if (receipt !== undefined) {
+    const settled = await recordDispatchDelivery(ctx, activeTeamState, cwd, exec, record, {
+      state: "delivered",
+      materialized: true,
+      targetSessionId,
+      policy,
+      receipt: receipt as never,
+    });
+    return { state: settled.delivery.state, targetSessionId, receipt };
+  }
+  if (record.delivery.state === "delivered") {
+    return { state: "delivered", targetSessionId, receipt: undefined };
+  }
+  if (record.delivery.state === "unknown") {
+    return {
+      state: "unknown",
+      targetSessionId,
+      reason:
+        (record.delivery.reason === undefined ? "" : `${record.delivery.reason}; `) +
+        "reconciled against the durable receipt and the target's own log and found no proof either way — an unknown delivery is not re-dispatched, so this intent stays unknown until the worker's own handback or the driver resolves it",
+    };
+  }
+
+  // `not_delivered` is the only state that may be delivered again: the record
+  // says the attempt provably never landed.
+  let nextReceipt: unknown;
+  let state: DispatchRecord["delivery"]["state"] = "not_delivered";
+  let reason: string | undefined;
+  let materialized = false;
+  try {
+    if (role.execution === "subagent") {
+      nextReceipt =
+        role.phase === "reserved" || role.phase === "provisioning"
+          ? await materializeRole(ctx, activeTeamState, exec, { cwd, team, role, dispatchNotice, deliverIdempotencyKey: record.delivery.idempotencyKey })
+          : await sendToSubagentNode(ctx, exec.agent as Agent, role.sessionId, [{ type: "text", text: dispatchNotice }], { signal: exec.signal });
+      materialized = true;
+      state = "unsupported_backend";
+      reason = "native subagent backend: outside this batch's Session-only delivery guarantee.";
+    } else if (role.phase === "reserved" || role.phase === "provisioning") {
+      nextReceipt = await materializeRole(ctx, activeTeamState, exec, { cwd, team, role, dispatchNotice, deliverIdempotencyKey: record.delivery.idempotencyKey });
+      materialized = true;
+      state = "delivered";
+    } else {
+      nextReceipt = await deliverMessage(ctx, record.subjects.initiatingSessionId, role.sessionId, [{ type: "text", text: dispatchNotice }], {
+        wake: true,
+        idempotencyKey: record.delivery.idempotencyKey,
+        receiptPolicy: policy,
+        ...transportStores(ctx, cwd),
+      });
+      materialized = true;
+      state = "delivered";
+    }
+  } catch (error) {
+    reason = error instanceof Error ? error.message : String(error);
+    const live = ctx.agents.get(SID(targetSessionId)) !== undefined || ctx.sessions.get(SID(targetSessionId)) !== undefined;
+    materialized = live;
+    state = live ? "unknown" : "not_delivered";
+    if (role.phase === "reserved" || role.phase === "provisioning") {
+      await recordDispatchDelivery(ctx, activeTeamState, cwd, exec, record, { state, reason, materialized, targetSessionId, policy });
+      throw error;
+    }
+  }
+
+  const settled = await recordDispatchDelivery(ctx, activeTeamState, cwd, exec, record, {
+    state,
+    ...(reason === undefined ? {} : { reason }),
+    materialized,
+    targetSessionId,
+    policy,
+  });
+  return {
+    state: settled.delivery.state,
+    ...(settled.delivery.reason === undefined ? {} : { reason: settled.delivery.reason }),
+    targetSessionId,
+    ...(nextReceipt === undefined ? {} : { receipt: nextReceipt }),
+  };
+}
+
+/** Persist one delivery fact about an existing dispatch record. */
+async function recordDispatchDelivery(
+  ctx: Context,
+  activeTeamState: ActiveTeamStateStore,
+  cwd: string,
+  exec: ToolExecutionInput,
+  record: DispatchRecord,
+  outcome: {
+    state: DispatchRecord["delivery"]["state"];
+    reason?: string;
+    materialized: boolean;
+    targetSessionId: string;
+    policy: SandboxExecutionPolicy;
+    receipt?: { message_id?: string; accepted_at_ms?: number; delivery_mode?: string };
+  },
+): Promise<DispatchRecord> {
+  const result = await activeTeamState.mutate(
+    cwd,
+    (team) => {
+      const found = (team.dispatches ?? []).find((entry) => entry.dispatchId === record.dispatchId);
+      if (found === undefined) return team;
+      const next = (team.dispatches ?? []).map((entry) =>
+        entry.dispatchId === record.dispatchId
+          ? {
+              ...entry,
+              subjects: { ...entry.subjects, materialized: outcome.materialized },
+              delivery: {
+                ...entry.delivery,
+                state: outcome.state,
+                attemptedAt: Date.now(),
+                ...(outcome.receipt?.message_id === undefined ? {} : { messageId: outcome.receipt.message_id }),
+                ...(outcome.receipt?.accepted_at_ms === undefined ? {} : { acceptedAt: outcome.receipt.accepted_at_ms }),
+                ...(outcome.receipt?.delivery_mode === undefined ? {} : { deliveryMode: outcome.receipt.delivery_mode }),
+                ...(outcome.reason === undefined ? { reason: undefined } : { reason: outcome.reason }),
+              },
+            }
+          : entry,
+      );
+      return { ...team, dispatches: next };
+    },
+    { policy: outcome.policy, signal: exec.signal },
+  );
+  const updated = (("dispatches" in result.state ? (result.state.dispatches as DispatchRecord[] | undefined) : undefined) ?? []).find(
+    (entry) => entry.dispatchId === record.dispatchId,
+  );
+  return (
+    updated ?? {
+      ...record,
+      subjects: { ...record.subjects, materialized: outcome.materialized },
+      delivery: { ...record.delivery, state: outcome.state, attemptedAt: Date.now(), ...(outcome.reason === undefined ? {} : { reason: outcome.reason }) },
+    }
+  );
+}
+
+/** Arguments of the report booking seam, shared by the tool and its tests. */
+export interface BookRoleReportArgs {
+  path: string;
+  content: string;
+  /** The dispatch this report answers. Absent means "bind if unambiguous". */
+  dispatchId?: string;
+  /** `blocked` = an explicit block; a completed handback either way. */
+  outcome?: HandoffOutcome;
+}
+
+export interface BookRoleReportResult {
+  path: string;
+  report_id?: string;
+  /** True when THIS call added the index entry (false = a replay). */
+  booked?: boolean;
+  dispatch_id?: string;
+  binding?: "explicit" | "inferred";
+  notice_id?: string;
+  notice_delivery?: "delivered" | "pending" | "unknown" | "not_applicable";
+  notice_error?: string;
+}
+
+/** How many pending notices one sweep may attempt, and how often it may retry. */
+export const HANDOFF_SWEEP_LIMIT = 5;
+export const HANDOFF_RETRY_DELAY_MS = 5_000;
+export const HANDOFF_RETRY_MAX_ATTEMPTS = 3;
+
+/**
+ * One committed report, and the pending-notice fact that goes with it.
+ *
+ * ORDER AND COMMIT POINT. The file write is NOT the commit point: it is an
+ * unconditional overwrite with no CAS of its own. The commit point is the single
+ * `mutate` below, in which the report index AND the待通知 fact become visible
+ * together — so a reader either sees both or neither, and a crash between the
+ * two steps replays into the same `reportId` and is deduplicated rather than
+ * double-counted. That is bookkeeping idempotence, NOT a cross-file transaction:
+ * the report file itself may be rewritten (see `docs` and the plan §5.3 note).
+ *
+ * IDENTITY. The dispatch binding is checked against the RUNTIME-recorded
+ * subject: a report may only be booked against a dispatch whose target session
+ * is the calling session. A model-written author/recordedBy field is never
+ * consulted, so another instance cannot satisfy somebody else's dispatch.
+ */
+export async function bookRoleReport(
+  ctx: Context,
+  activeTeamState: ActiveTeamStateStore,
+  exec: ToolExecutionInput,
+  args: BookRoleReportArgs,
+): Promise<BookRoleReportResult> {
+  if (exec.agent === undefined) throw new Error("orchestra_report requires an agent caller");
+  const agentId = exec.agent.id;
+  const cwd = exec.agent.session.header.cwd;
+  if (cwd === undefined) throw new Error("current session has no working directory");
+  const rel = String(args.path ?? "");
+  if (rel === "" || rel.includes("..") || rel.startsWith("/")) {
+    throw new Error("path must be relative under orchestra/reports/, no '..' or absolute paths");
+  }
+  const outcome: HandoffOutcome = args.outcome === "blocked" ? "blocked" : "report";
+  const requestedDispatchId = typeof args.dispatchId === "string" ? args.dispatchId.trim() : "";
+  const full = `${cwd}/orchestra/reports/${rel}`;
+  const target = await ctx.fs.resolve(full, { cwd });
+  // Official canonical path API: FsTarget is an object ({ targetKey, displayPath })
+  // — String(target) would yield "[object Object]". Use the backend's canonical
+  // execution-world path so lastReport/render/return are real absolute paths.
+  const canonical = ctx.fs.processPath(target);
+  const policy = escrowPolicy(ctx, exec);
+  const teamObservation = await activeTeamState.read(cwd, { signal: exec.signal });
+  throwIfBlocked("bookkeep the report", teamObservation);
+
+  // Identity is checked BEFORE anything is written: a foreign instance cannot
+  // bind its report to a dispatch it does not own, and its refused call leaves
+  // no half-fact behind.
+  if (requestedDispatchId !== "" && teamObservation.kind === "ready") {
+    const record = (teamObservation.team.dispatches ?? []).find((entry) => entry.dispatchId === requestedDispatchId);
+    if (record === undefined) {
+      throw new Error(
+        `orchestra_report: dispatch "${requestedDispatchId}" is not this Team's dispatch; a report cannot be booked against an intent that does not exist here.`,
+      );
+    }
+    if (record.subjects.targetSessionId !== agentId) {
+      throw new Error(
+        `orchestra_report: dispatch "${requestedDispatchId}" belongs to session "${record.subjects.targetSessionId}", not to the calling session "${agentId}". ` +
+          `The subject is recorded by the runtime, so this report cannot complete that dispatch.`,
+      );
+    }
+  }
+
+  await ctx.fs.writeText(target, String(args.content ?? ""), undefined, undefined, escrowPolicy(ctx, exec));
+
+  if (teamObservation.kind !== "ready") return { path: canonical };
+
+  const contentHash = sha256Hex(String(args.content ?? ""));
+  let reportId = "";
+  let booked = false;
+  let boundDispatchId: string | undefined;
+  let boundBy: "explicit" | "inferred" | undefined;
+
+  const mutateResult = await activeTeamState.mutate(
+    cwd,
+    (team) => {
+      // Reset the observation on every attempt: the CAS retry loop re-runs this
+      // updater against a fresh snapshot, and a stale attempt's answer must not
+      // leak into the one that actually commits.
+      reportId = "";
+      booked = false;
+      boundDispatchId = undefined;
+      boundBy = undefined;
+      const role = team.roles.find((entry) => entry.sessionId === agentId);
+      if (role === undefined) return team;
+      const id = createHash("sha256").update(`${team.teamId}:${role.id}:${canonical}:${contentHash}`).digest("hex");
+      reportId = id;
+      if (team.reports.some((entry) => entry.reportId === id)) return team;
+      booked = true;
+      // The link is declared when the caller names it; otherwise it is inferred
+      // ONLY from an unambiguous match (exactly one open dispatch targeting this
+      // very session) and is recorded as inferred, so a reader can always tell
+      // a declared link from a matched one.
+      boundDispatchId = requestedDispatchId === "" ? undefined : requestedDispatchId;
+      boundBy = boundDispatchId === undefined ? undefined : "explicit";
+      if (boundDispatchId === undefined) {
+        const candidates = openDispatchesFor(team, role.id).filter((entry) => entry.subjects.targetSessionId === agentId);
+        if (candidates.length === 1) {
+          boundDispatchId = candidates[0].dispatchId;
+          boundBy = "inferred";
+        }
+      }
+      const createdAt = Date.now();
+      const nextReport = {
+        reportId: id,
+        roleId: role.id,
+        sessionId: agentId,
+        path: canonical,
+        createdAt,
+        contentHash,
+        outcome,
+        ...(boundDispatchId === undefined ? {} : { dispatchId: boundDispatchId, binding: boundBy as "explicit" | "inferred" }),
+      };
+      const nextNotice: HandoffNotice = {
+        noticeId: noticeIdFor(id),
+        reportId: id,
+        ...(boundDispatchId === undefined ? {} : { dispatchId: boundDispatchId }),
+        roleId: role.id,
+        submittingSessionId: agentId,
+        targetSessionId: team.controllerSessionId,
+        path: canonical,
+        contentHash,
+        outcome,
+        createdAt,
+        state: "pending",
+        attempts: 0,
+      };
+      return {
+        ...team,
+        roles: team.roles.map((entry) =>
+          entry.sessionId === agentId ? { ...entry, reportCount: (entry.reportCount ?? 0) + 1, lastReport: canonical } : entry,
+        ),
+        // One change: the index entry and the pending-notice fact are visible
+        // together, never one without the other.
+        reports: [...team.reports, nextReport],
+        handoffNotices: [...(team.handoffNotices ?? []), nextNotice],
+      };
+    },
+    { policy, signal: exec.signal },
+  );
+
+  if (!("roles" in mutateResult.state) || reportId === "") return { path: canonical };
+  const committed = mutateResult.state as TeamState;
+  const notice = (committed.handoffNotices ?? []).find((entry) => entry.reportId === reportId);
+
+  let noticeDelivery: BookRoleReportResult["notice_delivery"] = "pending";
+  let noticeError: string | undefined;
+  if (notice !== undefined && (notice.state === "pending" || notice.state === "unknown")) {
+    if (notice.targetSessionId === notice.submittingSessionId) {
+      await settleHandoffNotice(ctx, activeTeamState, cwd, notice, exec, policy, {
+        state: "not_applicable",
+        reason: "the reporting session is the controller itself; no notice is needed",
+        counted: false,
+      });
+      noticeDelivery = "not_applicable";
+    } else {
+      const delivery = await deliverHandoffNotice(ctx, activeTeamState, cwd, committed, notice, exec, policy);
+      if (delivery.delivered) {
+        await settleHandoffNotice(ctx, activeTeamState, cwd, notice, exec, policy, { state: "delivered", deliveredAt: Date.now() });
+        noticeDelivery = "delivered";
+      } else {
+        const state = delivery.reconciled === false ? "unknown" : "pending";
+        await settleHandoffNotice(ctx, activeTeamState, cwd, notice, exec, policy, {
+          state,
+          ...(delivery.reason === undefined ? {} : { reason: delivery.reason }),
+        });
+        noticeDelivery = state;
+        noticeError = delivery.reason;
+        // Bounded runtime retry: one deferred attempt, never an unbounded loop.
+        if (notice.attempts + 1 < HANDOFF_RETRY_MAX_ATTEMPTS) scheduleHandoffRetry(ctx, activeTeamState, cwd, exec);
+      }
+    }
+  } else if (notice !== undefined) {
+    noticeDelivery = notice.state === "delivered" ? "delivered" : notice.state === "not_applicable" ? "not_applicable" : "unknown";
+  }
+
+  return {
+    path: canonical,
+    report_id: reportId,
+    booked,
+    ...(boundDispatchId === undefined ? {} : { dispatch_id: boundDispatchId, binding: boundBy }),
+    ...(notice === undefined ? {} : { notice_id: notice.noticeId }),
+    notice_delivery: noticeDelivery,
+    ...(noticeError === undefined ? {} : { notice_error: noticeError }),
+  };
+}
+
+/**
+ * Tell the driver that a committed report exists.
+ *
+ * This is a NOTIFICATION retry, never a task retry: it says "report R exists",
+ * and repeating it at worst repeats that sentence. It is deliberately idempotent
+ * (the notice id IS the delivery's idempotency key), so a repeated sweep after a
+ * restart cannot produce a second copy of the same notice.
+ */
+async function deliverHandoffNotice(
+  ctx: Context,
+  activeTeamState: ActiveTeamStateStore,
+  cwd: string,
+  team: TeamState,
+  notice: HandoffNotice,
+  exec: ToolExecutionInput,
+  policy: SandboxExecutionPolicy,
+): Promise<{ delivered: boolean; reason?: string; reconciled: boolean }> {
+  let delivered = false;
+  let reason: string | undefined;
+  let skipped = false;
+  const receiptStore = receiptStoreFor(ctx, team.rootCwd === "" ? cwd : team.rootCwd);
+  await notifyDriverMilestone(ctx, team, notice.submittingSessionId, "report", describeHandoff(notice), {
+    idempotencyKey: notice.noticeId,
+    receiptStore,
+    receiptPolicy: policy,
+    recordFailure: noticeRecorderFor(ctx, activeTeamState, cwd, exec),
+    onOutcome: (outcome) => {
+      delivered = outcome.delivered;
+      skipped = outcome.skipped === "self";
+      reason = outcome.reason;
+    },
+  });
+  if (delivered || skipped) return { delivered, reason, reconciled: true };
+  // The delivery may have landed and merely failed to be recorded (the transport
+  // enqueues before it records). Reconcile before reporting failure, exactly as
+  // the dispatch path does.
+  try {
+    const proved = await readDeliveryReceipt(ctx, notice.targetSessionId, notice.noticeId, receiptStore);
+    if (proved !== undefined) return { delivered: true, reconciled: true };
+    return { delivered: false, reason, reconciled: true };
+  } catch (error) {
+    return {
+      delivered: false,
+      reason: `${reason === undefined ? "" : `${reason}; `}reconciliation failed (${error instanceof Error ? error.message : String(error)}), so whether the driver was told is unknown`,
+      reconciled: false,
+    };
+  }
+}
+
+function describeHandoff(notice: HandoffNotice): string {
+  return (
+    `written: ${notice.path}` +
+    `${notice.dispatchId === undefined ? "" : ` (dispatch ${notice.dispatchId})`}` +
+    ` — reportId ${notice.reportId}${notice.outcome === "blocked" ? " [explicit block, not a completion]" : ""}`
+  );
+}
+
+/** Apply one settled notice fact through the Team CAS. */
+async function settleHandoffNotice(
+  ctx: Context,
+  activeTeamState: ActiveTeamStateStore,
+  cwd: string,
+  notice: HandoffNotice,
+  exec: ToolExecutionInput,
+  policy: SandboxExecutionPolicy,
+  patch: { state: HandoffNotice["state"]; reason?: string; deliveredAt?: number; counted?: boolean },
+): Promise<void> {
+  await activeTeamState.mutate(
+    cwd,
+    (team) => {
+      const list = team.handoffNotices ?? [];
+      if (!list.some((entry) => entry.noticeId === notice.noticeId)) return team;
+      return {
+        ...team,
+        handoffNotices: list.map((entry) =>
+          entry.noticeId === notice.noticeId
+            ? {
+                ...entry,
+                state: patch.state,
+                ...(patch.reason === undefined ? {} : { reason: patch.reason }),
+                ...(patch.deliveredAt === undefined ? {} : { deliveredAt: patch.deliveredAt }),
+                lastAttemptAt: Date.now(),
+                attempts: (entry.attempts ?? 0) + (patch.counted === false ? 0 : 1),
+              }
+            : entry,
+        ),
+      };
+    },
+    { policy, signal: exec.signal },
+  );
+}
+
+/** One bounded deferred retry, using the host timer the plugin already injects. */
+function scheduleHandoffRetry(ctx: Context, activeTeamState: ActiveTeamStateStore, cwd: string, exec: ToolExecutionInput): void {
+  try {
+    const timer = ctx.get("timer") as
+      | { timeout?: (callback: () => void, delay: number) => unknown; setTimeout?: (callback: () => void, delay: number) => unknown }
+      | undefined;
+    const schedule = timer?.timeout ?? timer?.setTimeout;
+    if (timer === undefined || typeof schedule !== "function") return;
+    schedule.call(timer, () => {
+      void (async () => {
+        const observation = await activeTeamState.read(cwd);
+        if (observation.kind === "ready") await reconcileHandoffNotices(ctx, activeTeamState, observation, exec);
+      })().catch(() => {
+        // A retry that cannot run is not a failure of the report that scheduled
+        // it: the pending fact is durable and the next read re-attempts it.
+      });
+    }, HANDOFF_RETRY_DELAY_MS);
+  } catch {
+    // No timer is not an error: the pending fact is picked up by the next sweep.
+  }
+}
+
+/**
+ * Resume/reconcile every handoff notice that is not settled yet.
+ *
+ * The three triggers the plan names all land here: the bounded runtime retry
+ * (scheduled above), re-attachment after a restart, and reconciliation when the
+ * receiver becomes reachable again. All three are the SAME operation, which is
+ * why there is no second service and no scheduler.
+ *
+ * @returns how many notices this pass newly delivered.
+ */
+export async function reconcileHandoffNotices(
+  ctx: Context,
+  activeTeamState: ActiveTeamStateStore,
+  observation: ActiveTeamReady,
+  exec: ToolExecutionInput,
+): Promise<number> {
+  const cwd = observation.cwd;
+  const team = observation.team;
+  const notices = team.handoffNotices ?? [];
+  if (notices.length === 0) return 0;
+  const policy = escrowPolicy(ctx, exec);
+  const patches = new Map<string, Partial<HandoffNotice>>();
+  let deliveredCount = 0;
+
+  for (const notice of notices.filter((entry) => entry.state === "pending" || entry.state === "unknown").slice(0, HANDOFF_SWEEP_LIMIT)) {
+    if (notice.targetSessionId === notice.submittingSessionId) {
+      patches.set(notice.noticeId, { state: "not_applicable", reason: "the reporting session is the controller itself; no notice is needed", attempts: notice.attempts });
+      continue;
+    }
+    const delivery = await deliverHandoffNotice(ctx, activeTeamState, cwd, team, notice, exec, policy);
+    if (delivery.delivered) {
+      deliveredCount++;
+      patches.set(notice.noticeId, { state: "delivered", deliveredAt: Date.now(), attempts: notice.attempts + 1 });
+    } else {
+      patches.set(notice.noticeId, {
+        state: delivery.reconciled === false ? "unknown" : "pending",
+        ...(delivery.reason === undefined ? {} : { reason: delivery.reason }),
+        attempts: notice.attempts + 1,
+      });
+    }
+  }
+
+  // Judgment 3: the receiver's OWN message lifecycle. It is read from the
+  // transport, never inferred, and it is what lets a reader tell "delivered" from
+  // "the driver actually consumed it".
+  const receiptStore = receiptStoreFor(ctx, team.rootCwd === "" ? cwd : team.rootCwd);
+  for (const notice of notices
+    .filter((entry) => entry.state === "delivered" && entry.driverState === undefined && patches.get(entry.noticeId) === undefined)
+    .slice(0, HANDOFF_SWEEP_LIMIT)) {
+    try {
+      const status = await queryMessageStatus(ctx, notice.noticeId, notice.targetSessionId, receiptStore);
+      patches.set(notice.noticeId, { driverState: status.state === "not_found" ? "unknown" : (status.state as HandoffNotice["driverState"]) });
+    } catch {
+      // An unreadable lifecycle is left unset rather than guessed.
+    }
+  }
+
+  if (patches.size === 0) return 0;
+  await activeTeamState.mutate(
+    cwd,
+    (current) => ({
+      ...current,
+      handoffNotices: (current.handoffNotices ?? []).map((entry) => {
+        const patch = patches.get(entry.noticeId);
+        return patch === undefined ? entry : { ...entry, ...patch };
+      }),
+    }),
+    { policy, signal: exec.signal },
+  );
+  return deliveredCount;
 }
 
 export interface DismissGovernedTeamArgs {
@@ -3639,9 +4732,19 @@ export async function dismissGovernedTeam(
   const priorAttempt = team.dismissalAttempt;
   let dismissedAt = priorAttempt?.dismissedAt ?? Date.now();
   let archiveIdForAttempt = priorAttempt?.archiveId ?? `team-${team.teamId}-${dismissedAt}-${randomUUID()}`;
+  // Pending work is read from the COMMITTED LEDGER, not from a role's lifetime
+  // report count: a role that reported on an old task and holds a new, never
+  // handed-back dispatch is pending, and a lifetime count cannot express that.
+  const openDispatchIdsFor = (roleId: string): string[] =>
+    openDispatchesFor(team, roleId).map((entry) => entry.dispatchId);
   const pendingTasks = team.roles
-    .filter((r) => r.reportCount === 0 || r.phase === "provisioning" || r.phase === "reserved")
-    .map((r) => ({ roleId: r.id, phase: r.phase, reportCount: r.reportCount }));
+    .filter((r) => r.reportCount === 0 || r.phase === "provisioning" || r.phase === "reserved" || openDispatchIdsFor(r.id).length > 0)
+    .map((r) => ({
+      roleId: r.id,
+      phase: r.phase,
+      reportCount: r.reportCount,
+      ...(openDispatchIdsFor(r.id).length === 0 ? {} : { openDispatchIds: openDispatchIdsFor(r.id) }),
+    }));
   const handoffSummary = {
     reason: args.reason ?? team.handoffSummary?.reason ?? "dismissed by controller",
     summary: args.summary ?? team.handoffSummary?.summary ?? "Team dismissed and archived.",
@@ -4648,10 +5751,61 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "orchestra_dispatch",
       description:
-        "Dispatch a concrete task to a role lane of the ACTIVE team in this working directory. Requires a team approved and created via /team or orchestra_create — dispatching with no active team fails instead of silently founding one, so a lane can never run outside an approved charter. The role's Session is materialized on its FIRST dispatch (the team is created with reserved seats and no live sessions); later dispatches reuse it. If a first materialization fails, the error names the role and the model the charter pinned, and the role falls back to reserved so the next dispatch retries the build. The task message is delivered with wake=true and the delivery receipt is returned.",
+        "Dispatch ONE concrete task to a role lane of the ACTIVE team in this working directory, under this Team's real frozen charter. " +
+        "Requires a team approved and created via /team or orchestra_create — dispatching with no active team fails instead of silently founding one. " +
+        "MANDATORY CONTRACT (first batch): dispatchId (the id YOU hold before the first call; reuse it to retry the same intent — this tool never mints one), " +
+        "charterRef and authorityRef (copy them from orchestra_team's charter_ref / approval_ref; a reference to another Team or an older revision is refused), " +
+        "brief (ONE persistent fixed brief carrying the six startup baselines: goal/non-goals, known facts, must-not-change, fixed inputs, observation and closure, write surface), " +
+        "and responsibility (what this dispatch is responsible for inside the delegated scope). Optionally bind the selected Profile (profileRef: id/source/content — the fixed body itself) " +
+        "and a few methodBindings ({methodId, sourceCommit, contentDigest, purpose, ref?}); a cwd-relative `ref` is READ at dispatch time and its sha256 must match contentDigest, so a method whose fixed text is not there is refused. " +
+        "SEMANTICS: same dispatchId + same content reuses the existing record; same dispatchId + different content is an explicit conflict (a substantive change is a NEW dispatch that names the old one); " +
+        "a role that already has an undelivered dispatch refuses a second one. The delivery carries an idempotency credential and a durable receipt; an outcome that cannot be proven is reported as unknown and is NEVER silently re-dispatched. " +
+        "The role's Session is materialized on its FIRST dispatch; later dispatches reuse it. This batch's delivery guarantee covers the Session backend only — a native subagent role is reported as unsupported_backend rather than silently downgraded.",
       parameters: {
         roleId: { type: "string", required: true, description: "Role identifier to dispatch to (e.g. 'implementer', 'reviewer')." },
         task: { type: "string", required: true, description: "Actionable, self-contained task description for this role lane." },
+        dispatchId: {
+          type: "string",
+          required: true,
+          description:
+            "The identity of THIS intent, held by the caller before the first call. Reuse the exact same id (and the same content) to retry; use a NEW id for a new intent. Required — this batch deliberately does not mint one.",
+        },
+        charterRef: { type: "string", required: true, description: "This Team's current frozen charter reference (orchestra_team → team.charter_ref)." },
+        authorityRef: { type: "string", required: true, description: "This Team's current approval reference (orchestra_team → team.approval_ref)." },
+        brief: {
+          type: "string",
+          required: true,
+          description:
+            "One persistent, fixed brief for this dispatch, in words, carrying the six startup baselines and the references they need. The brief is immutable: a substantive change is a new dispatch, not an edit.",
+        },
+        responsibility: { type: "string", required: true, description: "What this dispatch is responsible for, inside the delegated scope." },
+        scope: { type: "array", items: { type: "string" }, description: "The working range this dispatch is authorized within." },
+        profileRef: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            id: { type: "string", required: true },
+            source: { type: "string", required: true },
+            content: { type: "string", required: true, description: "The Profile's fixed body, carried to the worker as-is." },
+          },
+          description: "The selected Profile, carried as its fixed body plus where it came from.",
+        },
+        methodBindings: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              methodId: { type: "string", required: true },
+              sourceCommit: { type: "string", required: true },
+              contentDigest: { type: "string", required: true, description: "sha256 of the fixed text (with or without a 'sha256:' prefix)." },
+              purpose: { type: "string", required: true },
+              sections: { type: "array", items: { type: "string" } },
+              ref: { type: "string", description: "Where the fixed text is read, relative to this workspace. Read and digest-checked at dispatch time." },
+            },
+          },
+          description: "The few methods this dispatch binds, each with the identity of its fixed text.",
+        },
         laneId: { type: "string", description: "Optional lane identifier or phase name." },
         preset: { type: "string", description: "Optional agent preset name override when lazily creating this role." },
         timeoutMs: { type: "number", description: "Heartbeat timeout in ms (default 20 minutes)." },
@@ -4661,27 +5815,37 @@ export function apply(ctx: Context): void {
           type: "object",
           additionalProperties: false,
           properties: {
-            status: { type: "string", required: true },
+            status: { type: "string", required: true, description: '"dispatched" | "reused" | "unsupported_backend"' },
             team_id: { type: "string", required: true },
             role_id: { type: "string", required: true },
             session_id: { type: "string", required: true },
             created_new_session: { type: "boolean", required: true },
+            dispatch_id: { type: "string" },
+            payload_digest: { type: "string" },
+            binding_revision: { type: "number" },
+            delivery_state: { type: "string", description: '"delivered" | "unknown" | "not_delivered" | "unsupported_backend"' },
+            delivery_reason: { type: "string" },
             receipt: { type: "json" },
           },
         },
         render: (_args, value) => [
           {
             type: "text",
-            text: `orchestra_dispatch: dispatched to role '${value.role_id}' (session ${value.session_id}${value.created_new_session ? ", newly provisioned" : ""}), status=${value.status}`,
+            text:
+              `orchestra_dispatch: ${value.status} → role '${value.role_id}' (session ${value.session_id}${value.created_new_session ? ", newly provisioned" : ""})` +
+              ` | dispatch ${value.dispatch_id ?? "(none)"} | delivery=${value.delivery_state ?? "(unknown)"}` +
+              (value.delivery_reason === undefined ? "" : ` — ${value.delivery_reason}`),
           },
         ],
       },
-      async execute(args: { roleId: string; task: string; laneId?: string; preset?: string; timeoutMs?: number }, exec: ToolExecutionInput) {
+      async execute(
+        args: OrchestraDispatchArgs,
+        exec: ToolExecutionInput,
+      ) {
         return dispatchRoleTask(ctx, activeTeamState, exec, args) as any;
       },
     }),
   );
-
 
 
 
@@ -4899,7 +6063,45 @@ export function apply(ctx: Context): void {
                     document_stale: { type: "boolean" },
                     current_charter_revision: { type: "number" },
                     charter_digest: { type: "string" },
+                    charter_ref: { type: "string" },
                     approval_ref: { type: "string" },
+                    dispatches: {
+                      type: "array",
+                      required: true,
+                      items: {
+                        type: "object",
+                        additionalProperties: false,
+                        properties: {
+                          dispatch_id: { type: "string", required: true },
+                          role_id: { type: "string", required: true },
+                          lane_id: { type: "string", required: true },
+                          target_session_id: { type: "string", required: true },
+                          delivery_state: { type: "string", required: true },
+                          open: { type: "boolean", required: true },
+                          report_id: { type: "string" },
+                          superseded_by: { type: "string" },
+                          created_at: { type: "number", required: true },
+                        },
+                      },
+                    },
+                    handoff_notices: {
+                      type: "array",
+                      required: true,
+                      items: {
+                        type: "object",
+                        additionalProperties: false,
+                        properties: {
+                          notice_id: { type: "string", required: true },
+                          report_id: { type: "string", required: true },
+                          dispatch_id: { type: "string" },
+                          role_id: { type: "string", required: true },
+                          state: { type: "string", required: true },
+                          attempts: { type: "number", required: true },
+                          path: { type: "string", required: true },
+                          driver_state: { type: "string" },
+                        },
+                      },
+                    },
                     graph_status: { type: "string" },
                     graph_runtime_revision: { type: "number" },
                     graph_stale: { type: "boolean" },
@@ -4996,6 +6198,7 @@ export function apply(ctx: Context): void {
           if (value.team == null) return [{ type: "text", text: `no active team; archives: ${archiveText}` }];
           const laneText = value.team.added_lanes.length === 0 ? "lanes: none" : `lanes: ${value.team.added_lanes.map((lane) => `${lane.laneId} (${lane.objective}; owner=${lane.ownerRoleId ?? "$controller"}; participants=${lane.participantRoleIds.join(",")}; acceptance=${lane.acceptanceCriteria.join("; ")})`).join("; ")}`;
           const noticeText = value.team.notice_failures.length === 0 ? "notices: none" : `notice failures: ${value.team.notice_failures.length}`;
+          const ledgerText = dispatchBoardTextFromRows(value.team.dispatches, value.team.handoff_notices);
           const graphText =
             value.team.graph == null
               ? "graph: none"
@@ -5005,7 +6208,7 @@ export function apply(ctx: Context): void {
               type: "text",
               text: `team ${value.team.team_id} (${value.team.topology}, ${value.team.status}): ${value.team.roles
                 .map((r) => `${r.id}(${r.status},R${r.reportCount}${r.lastReport === null ? "" : `, report=${r.lastReport}`}${r.lastActivity === undefined ? "" : `, last="${r.lastActivity}"`})`)
-                .join(", ")} | archives: ${archiveText} | ${laneText} | ${noticeText}\n${graphText}`,
+                .join(", ")} | archives: ${archiveText} | ${laneText} | ${noticeText} | ${ledgerText}\n${graphText}`,
             },
           ];
         },
@@ -5020,7 +6223,20 @@ export function apply(ctx: Context): void {
         const archives = archiveListForTeamTool(archiveList);
         if (initialTeam.kind !== "ready") return { team: null, archives };
         const teamObservation = await sweepTeamBoundedRun(ctx, activeTeamState, initialTeam, exec);
-        const team = teamObservation.team;
+        // Reconcile the handoff notices on every read: THIS is where "resumed
+        // after a restart" and "the receiver is reachable again" actually happen
+        // — the pending fact is durable, and the next reader of the Team retries
+        // it. Bounded per call; the same operation as the runtime's deferred
+        // retry, so there is no second service and no scheduler.
+        let reconciled = teamObservation;
+        try {
+          await reconcileHandoffNotices(ctx, activeTeamState, teamObservation, exec);
+          const reread = await activeTeamState.read(cwd, { signal: exec.signal });
+          if (reread.kind === "ready") reconciled = reread;
+        } catch (error) {
+          console.warn(`orchestra: handoff-notice reconciliation failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        const team = reconciled.team;
         const document = documentReadForTeam(team);
         const documentSummaryValue = documentSummary(document, team);
         const graphStale = document?.currentCharterRevision !== null && document?.currentCharterRevision !== undefined && document.charterRevisions.find((revision) => revision.charterRevision === document.currentCharterRevision)?.digest !== team.graphRuntime?.charterDigest;
@@ -5042,11 +6258,22 @@ export function apply(ctx: Context): void {
             // exactly what a reader must be able to notice.
             added_lanes: team.addedLanes ?? [],
             notice_failures: team.noticeFailures ?? [],
+            // The first-batch ledger, read from the same commit point as the
+            // reports: a reader can see which intents were dispatched, which are
+            // still undelivered, and which committed results are still waiting
+            // for the driver's attention.
+            dispatches: dispatchLedgerRows(team),
+            handoff_notices: handoffNoticeRows(team),
             document_status: documentSummaryValue.status,
             document_revision: documentSummaryValue.revision,
             document_stale: documentSummaryValue.stale,
             ...(documentSummaryValue.currentCharterRevision === undefined ? {} : { current_charter_revision: documentSummaryValue.currentCharterRevision }),
             ...(documentSummaryValue.currentCharterDigest === undefined ? {} : { charter_digest: documentSummaryValue.currentCharterDigest }),
+            // The exact strings a dispatch must cite. They are surfaced here
+            // because that is the only place a driver can copy them from: the
+            // dispatch contract refuses anything that is not this Team's own
+            // frozen charter and approval.
+            ...(documentSummaryValue.currentCharterRef === undefined ? {} : { charter_ref: documentSummaryValue.currentCharterRef }),
             ...(documentSummaryValue.approvalRef === undefined ? {} : { approval_ref: documentSummaryValue.approvalRef }),
             ...(graph === undefined ? {} : { graph_status: graph.status, graph_runtime_revision: graph.runtimeRevision, graph_stale: graph.stale }),
             ...(graph === undefined
@@ -5191,10 +6418,20 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "orchestra_report",
       description:
-        "Escrow write channel for role sessions under a read-only sandbox: write one file under orchestra/reports/ in the calling session's working directory. The path must be relative to orchestra/reports/ and must not contain \"..\". Returns the absolute path of the written file. Each successful write also books one delivered report on the calling role's team entry (reportCount +1, lastReport = path, reports[] appended). Reviewer roles use this to hand over review reports.",
+        "Escrow write channel for role sessions under a read-only sandbox: write one file under orchestra/reports/ in the calling session's working directory. The path must be relative to orchestra/reports/ and must not contain \"..\". Returns the absolute path of the written file. Each successful write also books one delivered report on the calling role's team entry (reportCount +1, lastReport = path, reports[] appended) AND, in the SAME Team state change, one pending-notice fact for the driver. Pass dispatchId when reporting on a dispatched task: the handback is then bound to THAT dispatch, which is what tells the driver the work is delivered. Pass outcome=\"blocked\" when the result is an explicit block instead of a completion.",
       parameters: {
         path: { type: "string", required: true, description: "Relative path under orchestra/reports/, e.g. \"review-fix-bug-R1.md\"." },
         content: { type: "string", required: true, description: "Full file content." },
+        dispatchId: {
+          type: "string",
+          description:
+            "The dispatch this report answers (the Dispatch ID from your orchestra_dispatch task text). Omitted, the report is bound to the calling session's single open dispatch when that is unambiguous, and the binding is recorded as inferred rather than declared. A dispatch id that is not this Team's, or that belongs to another session, is refused before anything is written.",
+        },
+        outcome: {
+          type: "string",
+          enum: ["report", "blocked"],
+          description: "\"report\" (default) for a result, \"blocked\" for an explicit block. Both complete the handback; neither is an acceptance, an authorization or a closure.",
+        },
       },
       output: {
         schema: {
@@ -5202,75 +6439,32 @@ export function apply(ctx: Context): void {
           additionalProperties: false,
           properties: {
             path: { type: "string", required: true },
+            report_id: { type: "string" },
+            booked: { type: "boolean" },
+            dispatch_id: { type: "string" },
+            binding: { type: "string" },
+            notice_id: { type: "string" },
+            notice_delivery: { type: "string" },
+            notice_error: { type: "string" },
           },
         },
-        render: (_args, value) => [{ type: "text", text: `report written: ${value.path}` }],
+        render: (_args, value) => [
+          {
+            type: "text",
+            text:
+              `report written: ${value.path}` +
+              (value.dispatch_id === undefined ? "" : ` (bound to dispatch ${value.dispatch_id} as ${value.binding})`) +
+              (value.notice_delivery === undefined ? "" : `; driver notice: ${value.notice_delivery}`),
+          },
+        ],
       },
-      async execute(args: { path: string; content: string }, exec: ToolExecutionInput) {
-        if (exec.agent === undefined) throw new Error("orchestra_report requires an agent caller");
-        const agentId = exec.agent.id;
-        const cwd = exec.agent.session.header.cwd;
-        if (cwd === undefined) throw new Error("current session has no working directory");
-        const rel = String(args.path ?? "");
-        if (rel === "" || rel.includes("..") || rel.startsWith("/"))
-          throw new Error("path must be relative under orchestra/reports/, no '..' or absolute paths");
-        const full = `${cwd}/orchestra/reports/${rel}`;
-        const target = await ctx.fs.resolve(full, { cwd });
-        // Official canonical path API: FsTarget is an object ({ targetKey,
-        // displayPath }) — String(target) would yield "[object Object]". Use the
-        // backend's canonical execution-world path so lastReport/render/return
-        // are real absolute paths (B5 fix).
-        const canonical = ctx.fs.processPath(target);
-        const teamObservation = await activeTeamState.read(cwd, { signal: exec.signal });
-        throwIfBlocked("bookkeep the report", teamObservation);
-        await ctx.fs.writeText(target, String(args.content ?? ""), undefined, undefined, escrowPolicy(ctx, exec));
-        // Bookkeeping: record one delivered report on the calling role's team entry.
-        if (teamObservation.kind === "ready") {
-          const contentHash = createHash("sha256").update(String(args.content ?? "")).digest("hex");
-          const mutateResult = await activeTeamState.mutate(
-            cwd,
-            (team) => {
-              const role = team.roles.find((entry) => entry.sessionId === agentId);
-              if (role === undefined) return team;
-              const reportId = createHash("sha256")
-                .update(`${team.teamId}:${role.id}:${canonical}:${contentHash}`)
-                .digest("hex");
-              if (team.reports.some((entry) => entry.reportId === reportId)) {
-                return team;
-              }
-              const nextRoles = team.roles.map((entry) =>
-                entry.sessionId === agentId
-                  ? { ...entry, reportCount: (entry.reportCount ?? 0) + 1, lastReport: canonical }
-                  : entry,
-              );
-              const nextReports = [
-                ...team.reports,
-                {
-                  reportId,
-                  roleId: role.id,
-                  sessionId: agentId,
-                  path: canonical,
-                  createdAt: Date.now(),
-                },
-              ];
-              return {
-                ...team,
-                roles: nextRoles,
-                reports: nextReports,
-              };
-            },
-            {
-              policy: escrowPolicy(ctx, exec),
-              signal: exec.signal,
-            },
-          );
-          if ("roles" in mutateResult.state) {
-            await notifyDriverMilestone(ctx, mutateResult.state, agentId, "report", `written: ${rel}`, {
-              recordFailure: noticeRecorderFor(ctx, activeTeamState, cwd, exec),
-            });
-          }
-        }
-        return { path: canonical };
+      async execute(
+        args: { path: string; content: string; dispatchId?: string; outcome?: HandoffOutcome },
+        exec: ToolExecutionInput,
+      ) {
+        // The returned value is snapshotted by the host against the declared
+        // schema, so it is passed through JSON to keep it to plain data.
+        return JSON.parse(JSON.stringify(await bookRoleReport(ctx, activeTeamState, exec, args)));
       },
     }),
   );
@@ -5668,7 +6862,7 @@ export function apply(ctx: Context): void {
         "3. Context: read the project context relevant to the goal (files, docs) to ground your understanding.\n" +
         "4. Proposal: call orchestra_draft to persist the mission and topology Draft, then report its draftId@revision and digest to the user with a per-role roster card preview.\n" +
         "5. Approval: ask the user to approve by replying with a plain yes — 启动 (or 可以 / 同意 / ok). Their reply is recorded automatically against the exact draft revision. Only the USER can approve. Until approval lands, do not dispatch roles.\n" +
-        "6. Dispatch and Execute: dispatch concrete lane tasks using orchestra_dispatch(roleId, task, { laneId, preset }). A role's session is materialized on its first dispatch; later dispatches reuse it. Roles work autonomously.\n" +
+        "6. Dispatch and Execute: dispatch concrete lane tasks using orchestra_dispatch(roleId, task, { laneId, preset, dispatchId, charterRef, authorityRef, brief, responsibility, scope?, profileRef?, methodBindings? }). Copy charterRef/authorityRef from orchestra_team's charter_ref/approval_ref, and hold the dispatchId YOURSELF before the call — reuse the same id and content to retry, and use a NEW id for a new intent. A role's session is materialized on its first dispatch; later dispatches reuse it. A role that still has an undelivered dispatch refuses a second one. Roles work autonomously.\n" +
         "6b. New objective, same project: ONE team per working directory, and a team is dynamic. Do NOT open a second team. Decompose the new objective into lanes and graft them onto the running graph with orchestra_add_lanes: it returns a plan first (compose the graph yourself from role presets — pick the roles the work actually needs, decide serial vs parallel placement, and set each lane's review-round cap); show the user that plan as one sentence, and only call it again with confirm: true after they agree. A different goal that is NOT part of this project is a different matter: say so and let the user decide.\n" +
         "7. Turn Handoff & Reactive Wakeup: after dispatching concrete tasks with orchestra_dispatch, summarize what was dispatched to the user and conclude your turn. Do NOT call orchestra_wait to block your execution. Roles work autonomously and report back via A2A messages; DSH's reactive messaging will automatically wake you for your next turn when reports or replies arrive.\n" +
         "8. Session Control: use a2a_stop(sessionId, reason) to immediately abort a runaway or stuck session. Use a2a_list(query) to inspect or search sessions sorted by recent activity. Use a2a_read for progressive turn review.\n" +

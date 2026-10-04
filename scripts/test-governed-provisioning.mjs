@@ -8,6 +8,7 @@ import { blueprintStoreFor, parseGovernedBlueprint, prepareGovernedBlueprint } f
 import { charterRecordStoreFor } from "../lib/charter-store.js";
 import { ensureBuiltinRolePresetArtifacts, resolveRolePresetFile } from "../lib/orchestra-role-presets.js";
 import { assertUniqueGovernedSessionIds, createGovernedTeam, dispatchRoleTask, prepareGovernedRolePlan, provisionGovernedPlans, abbreviateMissionObjective, roleSessionTitle } from "../lib/orchestra.js";
+import { dispatchArgs } from "./test-dispatch-harness.mjs";
 import { preflightGovernedRequiredTools } from "../lib/session-blueprint.js";
 import { prepareApprovalEvent, prepareDraftEvent, prepareFreezeEvent } from "../lib/orchestration-charter.js";
 
@@ -599,8 +600,18 @@ test("actual orchestra_create preserves durable one-to-one mappings for a/b and 
   assert.ok(runtime.events.filter((entry) => entry === "state:createIfAbsent").length === 1);
 
   // Lazy materialization via orchestra_dispatch
-  await dispatchRoleTask(runtime.context, runtime.store, { agent: runtime.controller }, { roleId: "a/b", task: "do work a" });
-  await dispatchRoleTask(runtime.context, runtime.store, { agent: runtime.controller }, { roleId: "a-b", task: "do work b" });
+  await dispatchRoleTask(
+    runtime.context,
+    runtime.store,
+    { agent: runtime.controller },
+    dispatchArgs(frozenRef, { roleId: "a/b", task: "do work a", dispatchId: "mapping-a-slash-b" }),
+  );
+  await dispatchRoleTask(
+    runtime.context,
+    runtime.store,
+    { agent: runtime.controller },
+    dispatchArgs(frozenRef, { roleId: "a-b", task: "do work b", dispatchId: "mapping-a-dash-b" }),
+  );
 
   const activeObserved = await runtime.store.read(cwd);
   assert.equal(activeObserved.kind, "ready");

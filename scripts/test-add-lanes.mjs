@@ -15,6 +15,7 @@ import {
   handleTeamCommandInvocation,
 } from "../lib/orchestra.js";
 import { prepareApprovalEvent, prepareDraftEvent, prepareFreezeEvent } from "../lib/orchestration-charter.js";
+import { dispatchArgs } from "./test-dispatch-harness.mjs";
 
 const cwd = "/tmp/orchestra-fleet-test";
 
@@ -282,10 +283,12 @@ test("add lanes: the first call PLANS and changes nothing; confirm applies it as
   assert.equal(after.team.addedLanes[0].reason, "objective B");
 
   // 3. The new lane is a real lane: dispatching it materializes it like any other.
-  const dispatched = await dispatchRoleTask(harness.context, harness.store, { agent: harness.controller }, {
-    roleId: "planner",
-    task: "decompose objective B into a task card",
-  });
+  const dispatched = await dispatchRoleTask(
+    harness.context,
+    harness.store,
+    { agent: harness.controller },
+    dispatchArgs(frozenRef, { roleId: "planner", task: "decompose objective B into a task card", dispatchId: "lanes-planner-1" }),
+  );
   assert.equal(dispatched.status, "dispatched");
   assert.equal(dispatched.created_new_session, true);
   const final = await harness.store.read(cwd);
@@ -335,10 +338,12 @@ test("dispatch is idempotent on a reserved seat whose session already exists", a
     followup() { harness.events.push(`reused:${seat.sessionId}`); },
   });
 
-  const dispatched = await dispatchRoleTask(harness.context, harness.store, { agent: harness.controller }, {
-    roleId: "wordsmith",
-    task: "finish the word list",
-  });
+  const dispatched = await dispatchRoleTask(
+    harness.context,
+    harness.store,
+    { agent: harness.controller },
+    dispatchArgs(frozenRef, { roleId: "wordsmith", task: "finish the word list", dispatchId: "lanes-wordsmith-1" }),
+  );
   assert.equal(dispatched.status, "dispatched");
   assert.equal(dispatched.created_new_session, true);
 
