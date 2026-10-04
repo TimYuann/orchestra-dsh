@@ -16,7 +16,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { bookRoleReport, dispatchRoleTask } from "../lib/orchestra.js";
 import { normalizeTeam } from "../lib/orchestra-state.js";
-import { dispatchBoardText, dispatchLedgerRows, handoffNoticeRows } from "../lib/orchestra-dispatch.js";
+import { dispatchBoardTextFromRows, dispatchLedgerRows, handoffNoticeRows } from "../lib/orchestra-dispatch.js";
 import { CWD, dispatchArgs, makeHarness, newGovernedTeam } from "./test-dispatch-harness.mjs";
 
 const WORKER = { id: "worker", name: "Worker", preset: "preset-worker", sandbox: "workspace-write" };
@@ -467,7 +467,7 @@ test("board and migration: the ledger is what the driver reads, and a legacy tea
   assert.equal(rows.length, 1);
   assert.equal(rows[0].open, true, "an unsettled dispatch is shown as undelivered work");
   assert.equal(rows[0].delivery_state, "delivered");
-  assert.match(dispatchBoardText(team), /1 undelivered/);
+  assert.match(dispatchBoardTextFromRows(rows, handoffNoticeRows(team)), /1 undelivered/);
 
   const workerSessionId = team.roles.find((role) => role.id === "worker").sessionId;
   const booked = await bookRoleReport(h.context, h.store, { agent: h.agents.get(workerSessionId) }, {
@@ -501,5 +501,5 @@ test("board and migration: the ledger is what the driver reads, and a legacy tea
   assert.equal(legacy.reports.length, 1);
   assert.equal(legacy.reports[0].dispatchId, undefined, "an unbound historical report stays unbound");
   assert.equal(dispatchLedgerRows(legacy).length, 0);
-  assert.match(dispatchBoardText(legacy), /0 total, 0 undelivered/);
+  assert.match(dispatchBoardTextFromRows(dispatchLedgerRows(legacy), handoffNoticeRows(legacy)), /0 total, 0 undelivered/);
 });

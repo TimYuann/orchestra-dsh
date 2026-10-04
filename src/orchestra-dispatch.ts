@@ -20,6 +20,9 @@
 
 import { createHash } from "node:crypto";
 import type { TeamState } from "./orchestra-state.js";
+// The CANONICALIZATION RULE is shared with the charter digests on purpose: two
+// canonicalizers would be two answers to "are these the same bytes".
+import { canonicalJson } from "./orchestration-charter.js";
 
 /**
  * The binding revision this batch writes. Fixed at 1 because the initial
@@ -163,26 +166,6 @@ export function dispatchIdempotencyKey(dispatchId: string): string {
 
 export function sha256Hex(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
-}
-
-/** Deterministic JSON: object keys sorted recursively, array order preserved. */
-export function canonicalJson(value: unknown): string {
-  return JSON.stringify(canonicalValue(value));
-}
-
-function canonicalValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalValue);
-  if (typeof value === "object" && value !== null) {
-    const record = value as Record<string, unknown>;
-    const out: Record<string, unknown> = {};
-    for (const key of Object.keys(record).sort()) {
-      const entry = record[key];
-      if (entry === undefined) continue;
-      out[key] = canonicalValue(entry);
-    }
-    return out;
-  }
-  return value;
 }
 
 /** The payload a dispatch pins. The dispatch id is deliberately NOT part of it. */
@@ -401,11 +384,6 @@ export function openDispatchForSession(team: TeamState, sessionId: string): Disp
   return blockingDispatchFor(team, role.id) ?? openDispatchesFor(team, role.id)[0];
 }
 
-/** The pending notice for one report, if the ledger has it. */
-export function noticeForReport(team: TeamState, reportId: string): HandoffNotice | undefined {
-  return (team.handoffNotices ?? []).find((notice) => notice.reportId === reportId);
-}
-
 /**
  * The steer text for a role that is closing a turn with work still undelivered.
  *
@@ -495,7 +473,3 @@ export function dispatchBoardTextFromRows(
   );
 }
 
-/** Convenience wrapper for callers that hold the Team rather than its rows. */
-export function dispatchBoardText(team: TeamState): string {
-  return dispatchBoardTextFromRows(dispatchLedgerRows(team), handoffNoticeRows(team));
-}

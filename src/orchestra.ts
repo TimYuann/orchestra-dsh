@@ -3044,6 +3044,40 @@ export interface OrchestraDispatchResult {
   delivery_reason?: string;
 }
 
+/**
+ * One in-flight dispatch per (working directory, dispatch id).
+ *
+ * The CAS makes "check the id, then create the record" atomic. It does NOT make
+ * the DELIVERY phase atomic: a second concurrent call with the same id would see
+ * the freshly created record, read its `not_delivered` state — which is true at
+ * that instant, because the first call is still delivering — and attempt the
+ * delivery a second time. Serializing same-id callers inside one process closes
+ * that window; the transport's own idempotency credential covers the rest.
+ */
+const dispatchInflight = new WeakMap<object, Map<string, Promise<OrchestraDispatchResult>>>();
+
+function singleFlightDispatch(
+  ctx: Context,
+  key: string,
+  run: () => Promise<OrchestraDispatchResult>,
+): { promise: Promise<OrchestraDispatchResult>; joined: boolean } {
+  const table = dispatchInflight.get(ctx) ?? new Map<string, Promise<OrchestraDispatchResult>>();
+  const prior = table.get(key);
+  // A caller that joins an in-flight call did not create anything: it observed
+  // an intent somebody (in this case its own id) had already started, so its
+  // answer says "reused" while carrying the other call's real outcome.
+  if (prior !== undefined) return { promise: prior, joined: true };
+  const promise = run();
+  table.set(key, promise);
+  dispatchInflight.set(ctx, table);
+  return {
+    promise: promise.finally(() => {
+      if (table.get(key) === promise) table.delete(key);
+    }),
+    joined: false,
+  };
+}
+
 /** Where a Team's authority for a dispatch comes from, resolved from its own record. */
 interface DelegationBasis {
   charterRef: string;
@@ -3676,7 +3710,10 @@ export async function dispatchRoleTask(
   args: OrchestraDispatchArgs,
 ): Promise<OrchestraDispatchResult> {
   if (exec.agent === undefined) throw new Error("orchestra_dispatch requires an agent caller");
-  const cwd = exec.agent.session.header.cwd;
+  // Hoisted: the identity+delivery phase runs inside a closure, where the
+  // narrowing of a mutable `exec.agent` no longer holds.
+  const callerAgent = exec.agent;
+  const cwd = callerAgent.session.header.cwd;
   if (cwd === undefined) throw new Error("current session has no working directory; cannot dispatch task");
   if (typeof args.roleId !== "string" || args.roleId.trim() === "") {
     throw new Error('orchestra_dispatch: "roleId" must be a non-empty string');
@@ -3815,6 +3852,7 @@ export async function dispatchRoleTask(
       resultRecipientSessionId: current.controllerSessionId,
     });
 
+  const flight = singleFlightDispatch(ctx, `${cwd}\u0000${dispatchId}`, async () => {
   await activeTeamState.mutate(
     cwd,
     (current) => {
@@ -3945,7 +3983,7 @@ export async function dispatchRoleTask(
               dispatchNotice,
               deliverIdempotencyKey: record.delivery.idempotencyKey,
             })
-          : await sendToSubagentNode(ctx, exec.agent, roleEntry.sessionId, [{ type: "text", text: dispatchNotice }], { signal: exec.signal });
+          : await sendToSubagentNode(ctx, callerAgent, roleEntry.sessionId, [{ type: "text", text: dispatchNotice }], { signal: exec.signal });
       createdNewSession = true;
       materialized = true;
       // The new contract does NOT silently reach an unsupported backend: the
@@ -4020,6 +4058,9 @@ export async function dispatchRoleTask(
     ...(settled.delivery.reason === undefined ? {} : { delivery_reason: settled.delivery.reason }),
     ...(receipt === undefined ? {} : { receipt }),
   };
+  });
+  const result = await flight.promise;
+  return flight.joined && result.status !== "unsupported_backend" ? { ...result, status: "reused" } : result;
 }
 
 /** Narrow a delivery or node receipt to the transport's acceptance shape. */
