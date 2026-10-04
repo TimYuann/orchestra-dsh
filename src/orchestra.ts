@@ -3024,8 +3024,12 @@ export interface OrchestraDispatchArgs {
   responsibility?: string;
   /** The working range this dispatch is authorized within. */
   scope?: string[];
-  /** The selected Profile: its fixed body plus where it came from. */
-  profileRef?: { id: string; source: string; content: string };
+  /**
+   * The selected Profile: where it came from, and its fixed body — either
+   * supplied inline (`content`) or read from a cwd-relative `ref`, which the
+   * dispatch reads and digest-checks itself.
+   */
+  profileRef?: { id: string; source: string; content?: string; ref?: string; contentDigest?: string };
   /** The few methods this dispatch binds, with the identity of their fixed text. */
   methodBindings?: DispatchMethodBinding[];
 }
@@ -3816,13 +3820,39 @@ export async function dispatchRoleTask(
   if (profileInput !== undefined) {
     const id = typeof profileInput.id === "string" ? profileInput.id.trim() : "";
     const source = typeof profileInput.source === "string" ? profileInput.source.trim() : "";
-    const content = typeof profileInput.content === "string" ? profileInput.content : "";
-    if (id === "" || source === "" || content.trim() === "") {
+    if (id === "" || source === "") {
+      throw new Error('orchestra_dispatch: "profileRef" needs a non-empty id and source naming the Profile that was selected');
+    }
+    const inline = typeof profileInput.content === "string" ? profileInput.content : "";
+    const ref = typeof profileInput.ref === "string" ? profileInput.ref.trim() : "";
+    let content = inline;
+    if (content.trim() === "") {
+      const readable = ref !== "" && !ref.startsWith("/") && !ref.includes("://") && !ref.includes("..");
+      if (!readable) {
+        throw new Error(
+          'orchestra_dispatch: "profileRef" needs the Profile\'s fixed body — pass content, or a cwd-relative ref the dispatch can read. ' +
+            "A Profile bound without a body would claim a selection it cannot show.",
+        );
+      }
+      const target = await ctx.fs.resolve(`${cwd}/${ref}`, { cwd, signal: exec.signal });
+      try {
+        content = await ctx.fs.readText(target, exec.signal);
+      } catch (error) {
+        throw new Error(
+          `orchestra_dispatch: Profile ref ${ref} cannot be read (${error instanceof Error ? error.message : String(error)}); ` +
+            `the binding would claim a body that is not there — no dispatch record was created`,
+        );
+      }
+    }
+    const digest = sha256Hex(content);
+    const declared = normalizeDigest(typeof profileInput.contentDigest === "string" ? profileInput.contentDigest : "");
+    if (declared !== "" && declared !== digest) {
       throw new Error(
-        'orchestra_dispatch: "profileRef" needs a non-empty id, source and content — the selected Profile is carried as its fixed body, so an empty body cannot be bound',
+        `orchestra_dispatch: profileRef contentDigest ${declared} does not match the bound Profile body (${digest}); ` +
+          `the binding pins the bytes that actually reach the worker — no dispatch record was created`,
       );
     }
-    profileRef = { id, source, contentDigest: sha256Hex(content) };
+    profileRef = { id, source, contentDigest: digest };
     profileContent = content;
   }
 
@@ -5797,7 +5827,7 @@ export function apply(ctx: Context): void {
         "MANDATORY CONTRACT (first batch): dispatchId (the id YOU hold before the first call; reuse it to retry the same intent — this tool never mints one), " +
         "charterRef and authorityRef (copy them from orchestra_team's charter_ref / approval_ref; a reference to another Team or an older revision is refused), " +
         "brief (ONE persistent fixed brief carrying the six startup baselines: goal/non-goals, known facts, must-not-change, fixed inputs, observation and closure, write surface), " +
-        "and responsibility (what this dispatch is responsible for inside the delegated scope). Optionally bind the selected Profile (profileRef: id/source/content — the fixed body itself) " +
+        "and responsibility (what this dispatch is responsible for inside the delegated scope). Optionally bind the selected Profile (profileRef: id/source + content or a readable ref — the fixed body itself) " +
         "and a few methodBindings ({methodId, sourceCommit, contentDigest, purpose, ref?}); a cwd-relative `ref` is READ at dispatch time and its sha256 must match contentDigest, so a method whose fixed text is not there is refused. " +
         "SEMANTICS: same dispatchId + same content reuses the existing record; same dispatchId + different content is an explicit conflict (a substantive change is a NEW dispatch that names the old one); " +
         "a role that already has an undelivered dispatch refuses a second one. The delivery carries an idempotency credential and a durable receipt; an outcome that cannot be proven is reported as unknown and is NEVER silently re-dispatched. " +
@@ -5826,8 +5856,10 @@ export function apply(ctx: Context): void {
           additionalProperties: false,
           properties: {
             id: { type: "string", required: true },
-            source: { type: "string", required: true },
-            content: { type: "string", required: true, description: "The Profile's fixed body, carried to the worker as-is." },
+            source: { type: "string", required: true, description: "Where this Profile came from (repository, commit, path)." },
+            content: { type: "string", description: "The Profile's fixed body, carried to the worker as-is. Give this or a readable `ref`." },
+            ref: { type: "string", description: "Workspace-relative path of the Profile's fixed text; the dispatch reads it and records its sha256." },
+            contentDigest: { type: "string", description: "Optional claim: refused if it does not match the body that was bound." },
           },
           description: "The selected Profile, carried as its fixed body plus where it came from.",
         },

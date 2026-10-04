@@ -413,6 +413,51 @@ test("authority/b: a method binding whose fixed text is not there with that dige
   assert.equal(dispatchesFor(await teamOf(h), "worker").length, 1);
 });
 
+test("profile binding: the Profile body is read from its fixed ref, and a stale digest is refused", async () => {
+  const h = makeHarness();
+  const frozen = await newGovernedTeam(h, [WORKER, WORKER_B], "draft-profile");
+  const { createHash } = await import("node:crypto");
+  const body = "# Implementation profile\n\nfixed profile text\n";
+  const digest = createHash("sha256").update(body).digest("hex");
+  await h.fs.writeText(await h.fs.resolve(`${CWD}/profiles/implementation.md`, { cwd: CWD }), body);
+
+  const bound = await dispatchRoleTask(
+    h.context,
+    h.store,
+    { agent: h.controller },
+    dispatchArgs(frozen, {
+      roleId: "worker",
+      dispatchId: "d-profile",
+      profileRef: { id: "implementation", source: "tpw@f5d6d05", ref: "profiles/implementation.md", contentDigest: digest },
+    }),
+  );
+  assert.equal(bound.status, "dispatched");
+  const record = dispatchesFor(await teamOf(h), "worker")[0];
+  assert.equal(record.profileRef.contentDigest, digest, "the digest is computed from the body that was actually bound");
+  assert.equal(record.profileRef.content, undefined, "the body itself is not duplicated into the ledger");
+  const workerSessionId = (await teamOf(h)).roles.find((role) => role.id === "worker").sessionId;
+  assert.ok(
+    h.textsFor(workerSessionId)[0].includes("fixed profile text"),
+    "the Profile body reaches the worker through the dispatch notice",
+  );
+
+  await assert.rejects(
+    async () =>
+      dispatchRoleTask(
+        h.context,
+        h.store,
+        { agent: h.controller },
+        dispatchArgs(frozen, {
+          roleId: "worker-b",
+          dispatchId: "d-profile-stale",
+          profileRef: { id: "implementation", source: "tpw@f5d6d05", content: "different bytes", contentDigest: digest },
+        }),
+      ),
+    /contentDigest/i,
+  );
+  assert.equal(dispatchesFor(await teamOf(h), "worker-b").length, 0);
+});
+
 test("unsupported backend: a native subagent role is reported as unsupported, never as a guaranteed delivery", async () => {
   const h = makeHarness();
   const frozen = await newGovernedTeam(h, [WORKER], "draft-native");
