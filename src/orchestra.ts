@@ -36,6 +36,7 @@ import type {} from "@deepseek-ai/dsh-system-prompt";
 import type {} from "@deepseek-ai/dsh-commands";
 import { buildRoleSession, createSession, deliverMessage, queryMessageStatus, readDeliveryReceipt, transportStores } from "./a2a.js";
 import { receiptStoreFor } from "./receipt-store.js";
+import { createSilentHandoffGuard, silentHandoffNoticeText } from "./silent-handoff.js";
 import type { ReceiptStore } from "./receipt-store.js";
 import {
   blockingDispatchFor,
@@ -6189,13 +6190,18 @@ export function apply(ctx: Context): void {
                         additionalProperties: false,
                         properties: {
                           notice_id: { type: "string", required: true },
-                          report_id: { type: "string", required: true },
+                          // `report_id` and `path` describe a REPORT notice. A
+                          // silent-handoff notice (D3) has no report, so both are
+                          // optional and `pending_message_id` carries its identity.
+                          report_id: { type: "string" },
                           dispatch_id: { type: "string" },
                           role_id: { type: "string", required: true },
                           state: { type: "string", required: true },
                           attempts: { type: "number", required: true },
-                          path: { type: "string", required: true },
+                          path: { type: "string" },
                           driver_state: { type: "string" },
+                          kind: { type: "string", description: 'Absent = a report notice; "silent-handoff" = a turn that ended with private reasoning only and no delivery while a request was unanswered.' },
+                          pending_message_id: { type: "string", description: "For a silent-handoff notice: the inbound A2A message the turn failed to answer." },
                         },
                       },
                     },
@@ -6935,6 +6941,92 @@ export function apply(ctx: Context): void {
       const reason = error instanceof Error ? error.message : String(error);
       console.warn(`orchestra: turn-stall guard failed: ${reason}`);
     }),
+  );
+
+  // D3: the silent handoff. A turn that ends with private reasoning only, no
+  // outbound delivery and an unanswered request used to leave no trace anywhere.
+  // This guard is a SEPARATE predicate on the same boundary: it never reads or
+  // writes `handedBackThisTurn`, so the governed-team semantics above are
+  // untouched, and its coverage is any session that owes a delivery (team role
+  // or bare A2A peer).
+  const silentHandoffGuard = createSilentHandoffGuard({
+    persist: async (notice, context) => {
+      const cwd = context.cwd;
+      if (cwd === undefined || cwd === "") return "no-team";
+      const observation = await activeTeamState.read(cwd);
+      if (observation.kind !== "ready") return "no-team";
+      const agent = ctx.get("agents")?.get(notice.submittingSessionId as never);
+      const policy = escrowPolicy(ctx, { agent, signal: undefined } as unknown as ToolExecutionInput);
+      await activeTeamState.mutate(
+        cwd,
+        (team) => {
+          const list = team.handoffNotices ?? [];
+          // One fact per (session, turn): a repeated boundary must not duplicate it.
+          if (list.some((entry) => entry.noticeId === notice.noticeId)) return team;
+          return { ...team, handoffNotices: [...list, notice] };
+        },
+        { policy, signal: undefined },
+      );
+      return "persisted";
+    },
+    notify: async (input) => {
+      if (input.counterpartySessionId === undefined || input.counterpartySessionId === "") {
+        return { delivered: false, reason: "the inbound message names no sender session, so there is nobody to tell" };
+      }
+      const agent = ctx.get("agents")?.get(input.sessionId as never);
+      const cwd = agent?.session.header.cwd;
+      const policy = agent === undefined ? undefined : escrowPolicy(ctx, { agent, signal: undefined } as unknown as ToolExecutionInput);
+      await deliverMessage(ctx, input.sessionId, input.counterpartySessionId, [
+        {
+          type: "text",
+          text: silentHandoffNoticeText({
+            sessionId: input.sessionId,
+            pendingMessageId: input.pendingMessageId,
+            pendingCount: input.pendingCount,
+            steered: input.steered,
+          }),
+        },
+      ], {
+        wake: true,
+        // Stable per (session, request): a repeat detection re-uses the receipt
+        // instead of sending the same fact twice.
+        idempotencyKey: `silent-handoff:${input.sessionId}:${input.pendingMessageId}`,
+        ...(policy === undefined ? {} : { receiptPolicy: policy }),
+        ...transportStores(ctx, cwd),
+      });
+      return { delivered: true };
+    },
+    steer: (agent, text) => {
+      agent.steer?.(
+        createUserMessage({
+          content: [{ type: "text", text }] as ContentBlock[],
+          source: { kind: "plugin:orchestra", form: "notice", summary: "silent handoff steer" } as MessageSource,
+        }) as never,
+      );
+    },
+    // The governed-team path already steers its own roles when a dispatch is
+    // open, so this guard must not steer the same turn a second time.
+    teamOwnsTurn: async (sessionId, cwd) => {
+      if (cwd === undefined || cwd === "") return false;
+      const observation = await activeTeamState.read(cwd);
+      if (observation.kind !== "ready") return false;
+      return openDispatchForSession(observation.team, sessionId) !== undefined;
+    },
+    roleIdOf: async (sessionId, cwd) => {
+      if (cwd === undefined || cwd === "") return undefined;
+      const observation = await activeTeamState.read(cwd);
+      if (observation.kind !== "ready") return undefined;
+      return observation.team.roles.find((role) => role.sessionId === sessionId)?.id;
+    },
+  });
+
+  ctx.on("agent/turn-stopping", (payload: any) =>
+    Promise.resolve(silentHandoffGuard.onTurnStopping(payload))
+      .then(() => undefined)
+      .catch((error) => {
+        const reason = error instanceof Error ? error.message : String(error);
+        console.warn(`orchestra: silent-handoff guard failed: ${reason}`);
+      }),
   );
 
   ctx.on("internal/service", (name) => {

@@ -131,14 +131,27 @@ export type HandoffNoticeState = "pending" | "delivered" | "unknown" | "not_appl
  */
 export interface HandoffNotice {
   noticeId: string;
-  reportId: string;
+  /**
+   * What this notice is about. Absent means `"report"` (records written before
+   * this field existed are report notices by construction).
+   *
+   * `"silent-handoff"` is the D3 fact: a turn ended with private reasoning only
+   * and no outbound delivery while an inbound request was still unanswered. It
+   * has no report, so the report-only fields below are absent on that kind.
+   */
+  kind?: "report" | "silent-handoff";
+  /** The committed report. Absent on a silent-handoff notice (there is none). */
+  reportId?: string;
   dispatchId?: string;
   roleId: string;
   submittingSessionId: string;
   targetSessionId: string;
-  path: string;
-  contentHash: string;
-  outcome: HandoffOutcome;
+  /** Where the report was written. Absent on a silent-handoff notice. */
+  path?: string;
+  contentHash?: string;
+  outcome?: HandoffOutcome;
+  /** For a silent-handoff notice: the inbound A2A message the turn failed to answer. */
+  pendingMessageId?: string;
   createdAt: number;
   state: HandoffNoticeState;
   attempts: number;
@@ -316,20 +329,30 @@ export function normalizeHandoffNotices(raw: unknown): HandoffNotice[] {
   for (const entry of raw) {
     const record = asRecord(entry);
     if (record === undefined) continue;
-    if (!nonEmptyString(record.noticeId) || !nonEmptyString(record.reportId)) continue;
-    if (!nonEmptyString(record.targetSessionId) || !nonEmptyString(record.path)) continue;
+    if (!nonEmptyString(record.noticeId)) continue;
+    if (!nonEmptyString(record.targetSessionId)) continue;
     if (record.state !== "pending" && record.state !== "delivered" && record.state !== "unknown" && record.state !== "not_applicable") continue;
-    if (record.outcome !== "report" && record.outcome !== "blocked") continue;
+    // A silent-handoff notice has no report: it is identified by the unanswered
+    // inbound message instead, and requiring report fields would drop it.
+    const silent = record.kind === "silent-handoff";
+    if (silent) {
+      if (!nonEmptyString(record.pendingMessageId)) continue;
+    } else {
+      if (!nonEmptyString(record.reportId) || !nonEmptyString(record.path)) continue;
+      if (record.outcome !== "report" && record.outcome !== "blocked") continue;
+    }
     out.push({
       noticeId: record.noticeId,
-      reportId: record.reportId,
+      ...(silent ? { kind: "silent-handoff" as const } : {}),
+      ...(nonEmptyString(record.reportId) ? { reportId: record.reportId } : {}),
+      ...(silent ? { pendingMessageId: record.pendingMessageId as string } : {}),
       ...(nonEmptyString(record.dispatchId) ? { dispatchId: record.dispatchId } : {}),
       roleId: typeof record.roleId === "string" ? record.roleId : "",
       submittingSessionId: typeof record.submittingSessionId === "string" ? record.submittingSessionId : "",
       targetSessionId: record.targetSessionId,
-      path: record.path,
-      contentHash: typeof record.contentHash === "string" ? record.contentHash : "",
-      outcome: record.outcome,
+      ...(nonEmptyString(record.path) ? { path: record.path } : {}),
+      ...(nonEmptyString(record.contentHash) ? { contentHash: record.contentHash } : {}),
+      ...(record.outcome === "report" || record.outcome === "blocked" ? { outcome: record.outcome } : {}),
       createdAt: typeof record.createdAt === "number" ? record.createdAt : 0,
       state: record.state,
       attempts: typeof record.attempts === "number" ? record.attempts : 0,
@@ -432,25 +455,31 @@ export function dispatchLedgerRows(team: TeamState): DispatchLedgerRow[] {
 /** Compact projection of one pending notice for the `orchestra_team` board. */
 export interface HandoffNoticeRow {
   notice_id: string;
-  report_id: string;
+  /** Absent on a silent-handoff notice: there is no report. */
+  report_id?: string;
   dispatch_id?: string;
   role_id: string;
   state: HandoffNoticeState;
   attempts: number;
-  path: string;
+  path?: string;
   driver_state?: HandoffNotice["driverState"];
+  /** `"silent-handoff"` marks a D3 fact; absent means an ordinary report notice. */
+  kind?: "silent-handoff";
+  pending_message_id?: string;
 }
 
 export function handoffNoticeRows(team: TeamState): HandoffNoticeRow[] {
   return (team.handoffNotices ?? []).map((notice) => ({
     notice_id: notice.noticeId,
-    report_id: notice.reportId,
+    ...(notice.reportId === undefined ? {} : { report_id: notice.reportId }),
     ...(notice.dispatchId === undefined ? {} : { dispatch_id: notice.dispatchId }),
     role_id: notice.roleId,
     state: notice.state,
     attempts: notice.attempts,
-    path: notice.path,
+    ...(notice.path === undefined ? {} : { path: notice.path }),
     ...(notice.driverState === undefined ? {} : { driver_state: notice.driverState }),
+    ...(notice.kind === "silent-handoff" ? { kind: "silent-handoff" as const } : {}),
+    ...(notice.pendingMessageId === undefined ? {} : { pending_message_id: notice.pendingMessageId }),
   }));
 }
 
@@ -503,6 +532,8 @@ export function dispatchBoardTextFromRows(
     attempts?: number;
     path?: string;
     driver_state?: string;
+    kind?: string;
+    pending_message_id?: string;
   }>,
 ): string {
   const isAwaiting = (notice: { state: string }): boolean => notice.state === "pending" || notice.state === "unknown";
@@ -540,10 +571,12 @@ export function dispatchBoardTextFromRows(
     `handoff notices: ${notices.length} total, ${awaiting.length} awaiting the driver`,
     ...shownNotices.map(
       (notice) =>
-        `  - notice ${notice.notice_id ?? "(unknown)"} → role ${notice.role_id ?? "(unknown)"} [state=${notice.state}] ` +
+        `  - notice ${notice.notice_id ?? "(unknown)"} → role ${notice.role_id ?? "(unknown)"} ` +
+        `[state=${notice.state}${notice.kind === undefined ? "" : ` kind=${notice.kind}`}] ` +
         `driver=${notice.driver_state ?? "unknown"} attempts=${notice.attempts ?? 0}` +
         (notice.path === undefined ? "" : ` path=${notice.path}`) +
-        (notice.dispatch_id === undefined ? "" : ` dispatch=${notice.dispatch_id}`),
+        (notice.dispatch_id === undefined ? "" : ` dispatch=${notice.dispatch_id}`) +
+        (notice.pending_message_id === undefined ? "" : ` unanswered=${notice.pending_message_id}`),
     ),
     ...(hiddenNoticeList.length === 0
       ? []
