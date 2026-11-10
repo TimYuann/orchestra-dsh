@@ -45,15 +45,14 @@ export function installModelOverride(
   provider: string | undefined,
   model: string | undefined,
   reasoningEffort: string | undefined,
+  agent: Agent,
 ): void {
   if (!active || provider === undefined || model === undefined) return;
-  installModelSelection(agentCtx, {
-    current: {
-      provider,
-      model,
-      ...(reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(reasoningEffort) }),
-    },
-    assembled: undefined,
+  installModelSelection(agentCtx);
+  agent.model.select({
+    provider,
+    model,
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(reasoningEffort) }),
   });
 }
 
@@ -124,6 +123,9 @@ export interface SessionCreateResult {
   governedBlueprint?: GovernedBlueprintReceipt;
   handle?: AgentHandle;
   permissionPreset?: string;
+  effectivePermissionPreset?: string;
+  sandbox?: string;
+  approval?: string;
   provider?: string;
   model?: string;
   reasoningEffort?: string;
@@ -233,8 +235,10 @@ export async function createLightweightSubagentNode(
   );
   // Report the route the node actually runs: an unstated override means the
   // child inherits the caller's, so the caller's values are the honest answer.
-  const provider = args.provider ?? caller.options.provider;
-  const model = args.model ?? caller.options.model;
+  const header = caller.session.requestHeader?.();
+  const inherited = caller.model?.current() ?? header?.config ?? caller.options;
+  const provider = args.provider ?? inherited.provider;
+  const model = args.model ?? inherited.model;
   return {
     sessionId: receipt.childId,
     execution: "subagent" as const,
@@ -460,13 +464,13 @@ export async function createSession(ctx: Context, options: CreateSessionOptions 
       throw new Error(`a2a: agentPresets service is unavailable for preset "${options.presetId}"`);
     }
     agentPreset = file?.id ?? String(options.presetId);
-    setup = async (agentCtx) => {
+    setup = async (agentCtx, agent) => {
       await mountRolePreset(agentCtx, {
         presetId: agentPreset as string,
         ...(presets === undefined ? {} : { roster: presets }),
         ...(file === undefined ? {} : { overrideFile: { id: file.id, trust: file.trust, path: file.path } }),
       });
-      installModelOverride(agentCtx, modelOverride, overrideProvider, overrideModel, options.reasoningEffort);
+      installModelOverride(agentCtx, modelOverride, overrideProvider, overrideModel, options.reasoningEffort, agent);
     };
   } else {
     throw new Error("a2a: createSession requires a complete Agent Preset; mode=lightweight resolves one when no preset is explicit");
@@ -550,6 +554,9 @@ export async function createSession(ctx: Context, options: CreateSessionOptions 
       : {
           mode: blueprintReceipt.mode,
           permissionPreset: blueprintReceipt.permissionPreset,
+          ...(blueprintReceipt.effectivePermissionPreset === undefined ? {} : { effectivePermissionPreset: blueprintReceipt.effectivePermissionPreset }),
+          ...(blueprintReceipt.sandbox === undefined ? {} : { sandbox: blueprintReceipt.sandbox }),
+          ...(blueprintReceipt.approval === undefined ? {} : { approval: blueprintReceipt.approval }),
           provider: blueprintReceipt.provider,
           model: blueprintReceipt.model,
           ...(blueprintReceipt.reasoningEffort === undefined ? {} : { reasoningEffort: blueprintReceipt.reasoningEffort }),
@@ -1189,7 +1196,7 @@ export async function sendRawA2A(ctx: Context, args: RawA2ASendArgs, exec: ToolE
     { type: "text", text: args.message },
   ], {
     wake: args.wake,
-    interrupt: args.interrupt === true,
+    interrupt: args.wake !== false && args.interrupt !== false,
     idempotencyKey: args.idempotencyKey,
     receiptPolicy: policy,
     ...transportStores(ctx, exec.agent.session.header.cwd),
@@ -1448,12 +1455,12 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "a2a_send",
       description:
-        "Send a raw SessionId-addressed A2A message across the host. Transport does not require an Orchestra Team or same cwd; use orchestra_send when addressing a Governed role by teamId+roleId. The message becomes the target's next turn and returns state=accepted without waiting for claimed/answered. Live targets are woken; attached targets receive a durable inbox splice; cold targets are resumed first and resume failure is loud. Sending to yourself is rejected. wake=false queues context without waking; interrupt=true is best-effort steering.",
+        "Send a message to another Session, without a Team. By default it reaches a busy agent at its next step boundary and wakes an idle agent; it does not cancel ongoing work. Returns an acceptance receipt, not an answer or proof of processing.",
       parameters: {
         to: { type: "string", required: true, description: "Target session id (see a2a_list)." },
         message: { type: "string", required: true, description: "The message text for the target agent." },
         wake: { type: "boolean", description: "Wake the target to process the message now. Defaults to true." },
-        interrupt: { type: "boolean", description: "Deliver as an immediate mid-turn interrupt (steering into the target's nearest step boundary) when the target is running. Idle targets are woken immediately either way. Defaults to false." },
+        interrupt: { type: "boolean", description: "Default true: steer at the next step boundary without canceling work. Set false to queue a separate turn. Ignored when wake=false." },
         idempotencyKey: { type: "string", description: "Optional retry key; repeated delivery with the same target and key returns the original accepted receipt." },
       },
       output: { schema: outputSchema, render: renderResult },
@@ -1467,12 +1474,12 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "a2a_reply",
       description:
-        "Reply to a message another agent sent you. Delivers your answer back to that agent as its next turn, tagged with the message id you are answering. Incoming a2a messages show their sender session id in the transcript. Returns immediately; the reply does not wait for a further answer. Note the argument name is reply_to (underscore, not camelCase). The reply on the default next-turn path is never dropped; interrupt=true steers it into a running target's nearest step boundary instead (best-effort, only for urgent answers).",
+        "Reply to another agent, correlated to its incoming message. By default a busy recipient sees the reply at its next step boundary, without canceling its work. Returns an acceptance receipt without waiting for another answer.",
       parameters: {
         to: { type: "string", required: true, description: "Session id of the agent you are answering (the sender of the message you received)." },
-        reply_to: { type: "string", required: true, description: "Message id you are answering, or a short marker such as \"your last message\". Note: the argument name is reply_to (underscore)." },
+        reply_to: { type: "string", required: true, description: "Exact incoming message_id for correlated answer status. A descriptive marker is accepted but cannot prove which message was answered." },
         message: { type: "string", required: true, description: "Your reply text." },
-        interrupt: { type: "boolean", description: "Deliver as an immediate mid-turn interrupt (steering into the target's nearest step boundary) when the target is running. Defaults to false." },
+        interrupt: { type: "boolean", description: "Default true: steer at the next step boundary. Set false to queue a separate turn. Does not cancel ongoing work." },
         idempotency_key: { type: "string", description: "Optional retry key; repeated delivery with the same target and key returns the original accepted receipt." },
       },
       output: { schema: outputSchema, render: renderResult },
@@ -1484,8 +1491,9 @@ export function apply(ctx: Context): void {
           { type: "text", text: args.message },
         ], {
           replyTo: args.reply_to,
-          interrupt: args.interrupt === true,
+          interrupt: args.interrupt !== false,
           idempotencyKey: args.idempotency_key,
+          receiptPolicy: (ctx as any).sandboxPolicy?.resolve?.({ session: exec.agent.session, mode: "workspace-write" }),
           ...transportStores(ctx, exec.agent.session.header.cwd),
         });
       },
@@ -1523,7 +1531,7 @@ export function apply(ctx: Context): void {
     defineTool({
       name: "a2a_create",
       description:
-        "Open a lightweight collaborator under the caller. Two backends share this tool, and `execution` selects one. Default \"session\": a complete peer Session that resolves and installs its own Agent Preset composition, pins a Permission Preset and Model Selection, records a lightweight blueprint marker, fixes the title, and verifies required tools; it is addressable by any session through a2a_send. \"subagent\": a durable continuable DSH sub-agent child — cheaper, and it CANNOT hold its own preset (it joins the caller's live composition), CANNOT ask the user for approval (its policy is pinned to never), and CANNOT be addressed by anyone but the exact caller, because native delegation authorizes delivery by the direct-parent edge alone. Choose \"subagent\" when the node needs only a model route and, optionally, a per-child persona or tool filter.",
+        "Create a collaborator without a Team. The default independent Session has its own preset, directory, sandbox and durable model selection, and is addressable through A2A. Optional native subagent activation is parent-owned and requires an opening prompt. Approval is pinned to never for unattended collaborators; this does not grant full filesystem access.",
       parameters: {
         execution: { type: "string", enum: ["session", "subagent"], description: "Backend: \"session\" (default, a complete peer Session) or \"subagent\" (a native continuable child of the caller)." },
         cwd: { type: "string", description: "Working directory for the new session. Defaults to the calling thread's cwd. Session backend only." },
@@ -1536,16 +1544,6 @@ export function apply(ctx: Context): void {
         title: { type: "string", description: "Title pinned before the Session is published. Session backend only." },
         label: { type: "string", description: "Durable creation label, shown by list_agents and the GUI lineage. Subagent backend only; defaults to a generated id." },
         prompt: { type: "string", description: "The node's opening task. REQUIRED by the subagent backend: the native contract establishes the child and delivers its initial prompt in one call, so there is no established-but-idle child to message later." },
-        persona: { type: "string", description: "Per-child persona shadowing the deployment persona for this child alone. Subagent backend only." },
-        toolFilter: {
-          type: "object",
-          additionalProperties: false,
-          description: "Native per-child tool scoping: the named tools vanish from the child's prompt AND refuse to execute. This narrows AVAILABILITY, it is NOT a permission guarantee (the denied tool's underlying capability, e.g. a shell, may still reach the same effect). Subagent backend only.",
-          properties: {
-            allow: { type: "array", items: { type: "string" }, description: "Global tool names the child keeps; everything else is removed." },
-            deny: { type: "array", items: { type: "string" }, description: "Global tool names removed from the child." },
-          },
-        },
         requiredTools: { type: "array", items: { type: "string" }, description: "Optional tool names that must be visible in the child scope before publication. Session backend only." },
       },
       output: {
@@ -1559,6 +1557,9 @@ export function apply(ctx: Context): void {
             agentPreset: { type: "string" },
             mode: { type: "string" },
             permissionPreset: { type: "string" },
+            effectivePermissionPreset: { type: "string" },
+            sandbox: { type: "string" },
+            approval: { type: "string" },
             provider: { type: "string" },
             model: { type: "string" },
             reasoningEffort: { type: "string" },
@@ -1588,7 +1589,7 @@ export function apply(ctx: Context): void {
             : [
                 {
                   type: "text",
-                  text: `new lightweight session ${value.sessionId} opened${value.cwd === undefined ? "" : ` in ${value.cwd}`} (${value.agentPreset}, permission=${value.permissionPreset}, model=${route}, tools=${value.tools?.count ?? 0})`,
+                  text: `new lightweight session ${value.sessionId} opened${value.cwd === undefined ? "" : ` in ${value.cwd}`} (${value.agentPreset}, permission=${value.permissionPreset}, effective=${value.effectivePermissionPreset ?? "unknown"}, sandbox=${value.sandbox ?? "unknown"}, approval=${value.approval ?? "unknown"}, model=${route}, effort=${value.reasoningEffort ?? "model default"}, tools=${value.tools?.count ?? 0})`,
                 },
               ];
         },
@@ -1644,7 +1645,7 @@ export function apply(ctx: Context): void {
     systemPrompt.section({
       name: SECTION_NAME,
       order: SECTION_ORDER,
-      text: "A2A: you can exchange messages with other agent threads. a2a_list shows all host-visible sessions with caller-cwd-first ordering and annotations that are not ACLs; a2a_send delivers by explicit SessionId across cwd; a2a_reply answers a specific message; a2a_read inspects history; a2a_status reports only proven accepted/claimed/answered lifecycle facts; a2a_create opens a complete lightweight session. A delivered message does not wait for the target's answer: request a reply explicitly and expect it later as your own new turn. Governed Team role dispatch uses orchestra_send(teamId+roleId), while raw a2a_send is for explicit free SessionId communication. Receipts state=accepted means no answer was awaited.",
+      text: "A2A is standalone peer collaboration; no Team is required. Give collaborators a bounded task, relevant context, checks and a result recipient. Default send/reply reaches a busy peer at its next step boundary without cancelling work; interrupt=false queues a separate turn, wake=false adds context without waking. Replies can arrive during your current turn: incorporate them before dependent work. Continue independent work while peers run; when only replies remain, end the turn. Acceptance is not processing or task completion. Use exact incoming message IDs with a2a_reply for correlated answer status. Use native parent/child messaging for native subagents; A2A Session IDs address independent peers.",
     });
   }
 }

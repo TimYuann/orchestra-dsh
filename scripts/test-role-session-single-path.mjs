@@ -243,7 +243,7 @@ function publishingContext() {
         };
         sessions.set(id, session);
         const child = { ...ctx, agentId: id, on: () => () => {} };
-        const commit = await options.setup?.(child, { id, session });
+        const commit = await options.setup?.(child, { id, session, model: { select: (selection) => session.append("model/selection", selection) } });
         commit?.commit?.();
         agents.set(id, { id, session });
         return { agent: agents.get(id), async dispose() {} };
@@ -263,7 +263,7 @@ function publishingContext() {
         };
         sessions.set(id, session);
         const child = { ...ctx, agentId: id, on: () => () => {} };
-        await options.setup?.(child, { id, session });
+        await options.setup?.(child, { id, session, model: { select: (selection) => session.append("model/selection", selection) } });
         return { agent: { id, session }, async dispose() {} };
       },
     },

@@ -105,7 +105,7 @@ function makeRuntime(options = {}) {
 
 async function runSetup(runtime, input) {
   const prepared = await prepareLightweightBlueprint(runtime.context, input);
-  const commit = await prepared.setup(runtime.childContext);
+  const commit = await prepared.setup(runtime.childContext, { session: runtime.session, model: { select: (selection) => runtime.session.append("model/selection", selection) } });
   commit.commit();
   return prepared;
 }
@@ -132,6 +132,10 @@ test("explicit preset mounts, pins permission/model, fixes title, and records ma
   assert.equal(prepared.receipt.provider, "provider-x");
   assert.equal(prepared.receipt.model, "model-x");
   assert.equal(prepared.receipt.reasoningEffort, "high");
+  assert.equal(prepared.agentOptions.reasoningEffort, "high", "effort is present before the first request");
+  assert.deepEqual(runtime.events.find((event) => event.type === "model/selection")?.data, { provider: "provider-x", model: "model-x", reasoningEffort: "high" }, "native durable selection drives both GUI and execution");
+  assert.equal(prepared.receipt.approval, "never");
+  assert.equal(prepared.receipt.sandbox, "workspace-write");
   assert.deepEqual(prepared.receipt.tools, { names: ["read", "write"], count: 2 });
   assert.equal(runtime.events.some((event) => event.type === "session/title"), true);
   const marker = await blueprintStoreFor(runtime.context, "/tmp/blueprint").read("child");
@@ -145,6 +149,20 @@ test("explicit preset mounts, pins permission/model, fixes title, and records ma
   assert.equal("teamId" in marker, false);
   assert.equal("roleId" in marker, false);
   assert.equal("topologyId" in marker, false);
+});
+
+test("an unsupported explicit effort fails before a child is published", async () => {
+  const runtime = makeRuntime();
+  const get = runtime.context.get;
+  runtime.context.get = (name) => name === "llm" ? { resolveCallConfig: async (selection) => {
+    assert.equal(selection.reasoningEffort, "max");
+    throw new Error("model does not support max");
+  } } : get(name);
+  await assert.rejects(() => prepareLightweightBlueprint(runtime.context, {
+    sessionId: "child", caller: runtime.caller, provider: "p", model: "m", reasoningEffort: "max",
+  }), /does not support max/);
+  assert.equal(runtime.calls.mounts.length, 0);
+  assert.equal(runtime.events.length, 0);
 });
 
 test("caller composition inherits the exact generation; rosterless caller mounts default", async () => {
@@ -213,7 +231,7 @@ test("required tool failure happens at commit and leaves no published agent in a
   });
   let published = false;
   await assert.rejects(async () => {
-    const commit = await prepared.setup(runtime.childContext);
+    const commit = await prepared.setup(runtime.childContext, { session: runtime.session, model: { select: (selection) => runtime.session.append("model/selection", selection) } });
     commit.commit();
     published = true;
   }, (error) => error instanceof SessionBlueprintError && error.code === "required_tools_missing");
@@ -229,7 +247,7 @@ test("createSession lightweight output carries complete receipt and rollback doe
     },
     async create(options) {
       try {
-        const commit = await options.setup(runtime.childContext);
+        const commit = await options.setup(runtime.childContext, { session: runtime.session, model: { select: (selection) => runtime.session.append("model/selection", selection) } });
         commit.commit();
         published.push(options);
         return { sessionId: options.sessionId };

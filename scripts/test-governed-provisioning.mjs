@@ -174,7 +174,7 @@ function makeRuntime(options = {}) {
         const session = sessionFor(id);
         const child = childContext(id);
         try {
-          const commit = await createOptions.setup(child);
+          const commit = await createOptions.setup(child, { session, model: { select: (selection) => session.append("model/selection", selection) } });
           commit?.commit();
         } catch (error) {
           sessions.delete(id);
@@ -433,7 +433,7 @@ test("Governed Blueprint applies explicit model over topology runtime and record
   assert.equal(blueprint.receipt.model, "explicit-model");
   assert.equal(blueprint.receipt.sandbox, "read-only");
   runtime.sessions.set("orchestra-team-test-reviewer", { id: "orchestra-team-test-reviewer", events: [], header: { cwd }, snapshotEvents() { return this.events; }, append(type, data) { this.events.push({ type, data }); } });
-  const commit = await blueprint.setup({ ...runtime.context, composedPreset: undefined, get: (name) => name === "agentPresets" ? runtime.presets : name === "permissionPresets" ? runtime.permissions : runtime.context.get(name) });
+  const commit = await blueprint.setup({ ...runtime.context, composedPreset: undefined, get: (name) => name === "agentPresets" ? runtime.presets : name === "permissionPresets" ? runtime.permissions : runtime.context.get(name) }, { model: { select: (selection) => runtime.sessions.get(blueprint.receipt.sessionId).append("model/selection", selection) } });
   commit.commit();
   assert.equal(blueprint.receipt.effectivePermissionPreset, "custom");
   assert.deepEqual(blueprint.receipt.tools, { names: ["orchestra_report", "read", "write"], count: 3 });
@@ -452,7 +452,7 @@ test("Governed required tool failure rolls setup back before publication", async
   runtime.sessions.set(blueprint.receipt.sessionId, { id: blueprint.receipt.sessionId, events: [], header: { cwd }, snapshotEvents() { return this.events; }, append(type, data) { this.events.push({ type, data }); } });
   await assert.rejects(
     async () => {
-      const commit = await blueprint.setup({ ...runtime.context, composedPreset: undefined, get: (name) => name === "agentPresets" ? runtime.presets : name === "permissionPresets" ? runtime.permissions : runtime.context.get(name), on: () => () => {} });
+      const commit = await blueprint.setup({ ...runtime.context, composedPreset: undefined, get: (name) => name === "agentPresets" ? runtime.presets : name === "permissionPresets" ? runtime.permissions : runtime.context.get(name), on: () => () => {} }, { model: { select: (selection) => runtime.sessions.get(blueprint.receipt.sessionId).append("model/selection", selection) } });
       commit.commit();
     },
     (error) => error?.code === "required_tools_missing",

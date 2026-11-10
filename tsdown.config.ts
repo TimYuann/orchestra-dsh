@@ -4,7 +4,7 @@
  *
  * - CJS closure-factory artifact: `window.__ModuleLoader__.load({ id,
  *   factory: (require) => ... })`; externals resolve through the loader
- *   module table (platform seed entries + the runtime store exemption).
+ *   module table (platform seed entries only).
  * - Every other @deepseek-ai value import is a build error (purity gate).
  */
 
@@ -15,16 +15,10 @@ import { defineConfig, type UserConfig } from 'tsdown'
 /** Platform seed entries the browser module table answers (external). */
 const PLATFORM_MODULES = [
   'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client', '@deepseek-ai/cordis',
-  '@deepseek-ai/dsh-client-ui-slots',
-  '@deepseek-ai/dsh-client-web-react',
-  '@deepseek-ai/dsh-client-ui-primitives',
 ]
 
-/** Runtime store engine: documented exemption, external at runtime. */
-const RUNTIME_STORE_EXEMPTION = '@deepseek-ai/dsh-client-runtime/client'
-
 /** Externals resolved from the loader module table. */
-const CLIENT_EXTERNALS: readonly string[] = [...PLATFORM_MODULES, RUNTIME_STORE_EXEMPTION]
+const CLIENT_EXTERNALS: readonly string[] = PLATFORM_MODULES
 
 /**
  * Module id this bundle registers under via `__ModuleLoader__.load`. The host

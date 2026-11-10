@@ -17,7 +17,7 @@ export const PRINCIPLES_SECTION_TEXT = [
   "Orchestra: choose the smallest collaboration that meets the user's mission.",
   "MISSION: align the outcome, scope and success check; ask only about missing decisions that change the work. The driver owns user discussion and final synthesis.",
   "SCALE: work directly when enough; delegate bounded work to native subagents; use independent Sessions for separate capabilities or peer collaboration. Add a Team only when shared roles and lanes help. A small task needs no graph or task-card file.",
-  "BACKEND: native children inherit the driver's composition/cwd; toolFilter narrows availability and is NOT a permission guarantee. Use Session for a separate preset, cwd or enforced read-only boundary. All members use approval never and route questions to the driver.",
+  "BACKEND: use Session for independent A2A addressing or an enforced read-only boundary. Native activation supports only its current host contract, not persona/toolFilter overrides. All members use approval never and route questions to the driver.",
   "LANES: discuss a new mission, then add its goal and completion conditions to the existing team's lanes; reuse suitable available members before reserving new ones. Keep the original mission and authorization intact.",
   "HANDOFF: give the next actor the goal, relevant inputs, constraints, success check and recipient. Reports distinguish verified results, remaining work and blockers. Name one closure owner; use independent checking when the task requires it.",
   "LIMITS: set a bounded retry/escalation path where needed. Current graph declarations do not enforce attempt caps or deadlines; use observed runtime facts, and report blocked work rather than inventing progress or approval.",
@@ -40,7 +40,7 @@ A graph describes dependencies when they matter; it is not the entrance fee for 
 
 ## Choose the backend honestly
 
-A native child joins the driver's LIVE Agent Preset. Per-child persona, tool filter and model can vary; a tool filter does not enforce a filesystem boundary. Use a Session when a separate preset, cwd or read-only sandbox is required. Check the actual native contract before promising another per-child capability. Permissions are enforced by the host, not by role prose.
+A native child uses the host's activation contract. This plugin does not support native persona/toolFilter overrides on DSH 0.2.2; older declarations requesting them fail before publication. Use a Session for an independent preset, cwd or read-only sandbox. Check the actual native contract before promising another per-child capability. Permissions are enforced by the host, not by role prose.
 
 Both member types keep approval never. A member reports a question or denied operation to the driver, who resolves it within authorization or discusses a scope change with the user; a Session is not a back door to member approval UI.
 
@@ -103,6 +103,12 @@ export function registerOrchestrationPrinciples(ctx: Context): PrinciplesRegistr
     description: "Create and verify a native DSH declared preset when an existing dispatch, skill or preset cannot supply the required capabilities.",
     whenToUse: "Load before proposing or authoring a new role capability composition; reuse existing presets for ordinary dispatch.",
     content: PRESET_AUTHORING_SKILL_CONTENT,
+  });
+  skills.register({
+    name: "orchestra-teams",
+    source: "runtime",
+    description: "Use for /team or managing an existing Governed Orchestra team: charter approval, dispatch, lanes, recovery and archival. Not for ordinary A2A collaboration.",
+    content: readFileSync(new URL("../skills/orchestra-teams/SKILL.md", import.meta.url), "utf8"),
   });
   return { skill: true };
 }

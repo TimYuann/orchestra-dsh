@@ -107,6 +107,7 @@ export function makeHarness({ fs = new MemoryFs(), cwd = CWD, events = fs.events
       session,
       status: "idle",
       options: {},
+      model: { current: () => undefined, select: (selection) => session.append("model/selection", selection) },
       inbox: { nextTurn: [], nextStep: [], hasPending: false, clear() {} },
       followup(message) {
         if (agent.faultyFollowup === true) throw new Error("injected followup failure");
@@ -178,7 +179,7 @@ export function makeHarness({ fs = new MemoryFs(), cwd = CWD, events = fs.events
       }
       if (name === "agentDefaultModel") return { currentSelection: () => ({ provider: "default-p", model: "default-m" }) };
       if (name === "skills") return { register: () => () => {} };
-      if (name === "subagents") return { listChildren: () => [], drainContinuableChildren: async () => {} };
+      if (name === "subagents") return { listChildren: () => [], drainChildren: async () => {} };
       // Persisted-session reads, as the activation path performs them: a session
       // that exists in the harness's store reads back, one that does not is
       // authoritatively missing.

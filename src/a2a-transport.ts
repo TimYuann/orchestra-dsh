@@ -63,6 +63,7 @@ type TransportOptions = {
 
 const receiptCache = new WeakMap<object, Map<string, DeliverResult>>();
 const inflightCache = new WeakMap<object, Map<string, Promise<DeliverResult>>>();
+const resumeFlights = new WeakMap<object, Map<string, Promise<void>>>();
 
 function keyOf(options: TransportOptions): string | undefined {
   if (options.idempotencyKey === undefined) return undefined;
@@ -175,7 +176,7 @@ function presetFromSnapshot(header: SessionHeader, events: readonly SessionEvent
   return state ?? undefined;
 }
 
-async function tryResume(
+async function performResume(
   ctx: Context,
   sessionId: string,
   senderSessionId: string | undefined,
@@ -228,7 +229,7 @@ async function tryResume(
   await ctx.agents.resume({
     resumeSessionId: SID(sessionId),
     agentOptions: provider === undefined || modelId === undefined ? {} : { provider, model: modelId },
-    setup: async (agentCtx) => {
+    setup: async (agentCtx, agent) => {
       if (presetFile === undefined && resolved === undefined) {
         throw new Error(`a2a transport: preset ${presetId} was not resolved`);
       }
@@ -240,18 +241,37 @@ async function tryResume(
         roster: presets,
         ...(presetFile === undefined ? {} : { overrideFile: presetFile }),
       });
-      if (provider !== undefined && modelId !== undefined) {
-        installModelSelection(agentCtx, {
-          current: {
-            provider,
-            model: modelId,
-            ...(reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(String(reasoningEffort)) }),
-          },
-          assembled: undefined,
+      installModelSelection(agentCtx);
+      const hasRecordedSelection = snapshot.events.some((event: SessionEvent) => event.type === "model/selection" || event.type === "request/header");
+      if (!hasRecordedSelection && provider !== undefined && modelId !== undefined) {
+        // The blueprint is a birth fallback, not authority to overwrite later
+        // selections made through the native GUI and retained in the Session.
+        agent.model.select({
+          provider,
+          model: modelId,
+          ...(reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(String(reasoningEffort)) }),
         });
       }
     },
   });
+}
+
+// Different peers can send different messages to the same cold Session at once.
+// Share only materialization, never their messages or receipts.
+async function tryResume(ctx: Context, sessionId: string, senderSessionId: string | undefined, options: TransportOptions): Promise<void> {
+  const owner = ctx.agents;
+  const flights = resumeFlights.get(owner) ?? new Map<string, Promise<void>>();
+  resumeFlights.set(owner, flights);
+  let flight = flights.get(sessionId);
+  if (flight === undefined) {
+    flight = performResume(ctx, sessionId, senderSessionId, options);
+    flights.set(sessionId, flight);
+  }
+  try {
+    await flight;
+  } finally {
+    if (flights.get(sessionId) === flight) flights.delete(sessionId);
+  }
 }
 
 /**
@@ -305,7 +325,7 @@ async function deliverMessageOnce(
   const live = ctx.agents.get(SID(toSessionId));
   if (live !== undefined) {
     assertSubagentTargetReachable(live.session.header, toSessionId, senderSessionId);
-    if (options.interrupt === true) {
+    if (wake && options.interrupt === true) {
       live.steer(message);
       const result: DeliverResult = {
         message_id: message.id,
@@ -336,7 +356,11 @@ async function deliverMessageOnce(
   const session = ctx.sessions.get(SID(toSessionId));
   if (session !== undefined) {
     assertSubagentTargetReachable(session.header, toSessionId, senderSessionId);
-    const target = wake ? "next-turn" : "next-step";
+  }
+  // An attached Session has no driver to wake. Waking sends must resume it;
+  // a splice alone can remain pending forever. Non-waking context stays parked.
+  if (session !== undefined && !wake) {
+    const target = "next-step";
     session.append("agent/inbox/spliced", { target, start: pendingLength(session, target), inserted: [message] });
     const result: DeliverResult = {
       message_id: message.id,
@@ -353,14 +377,17 @@ async function deliverMessageOnce(
   await tryResume(ctx, toSessionId, senderSessionId, options);
   const resumed = ctx.agents.get(SID(toSessionId));
   if (resumed === undefined) throw new Error(`a2a transport: target ${toSessionId} could not be resumed`);
-  if (wake) resumed.followup(message);
-  else resumed.inject(message);
+  assertSubagentTargetReachable(resumed.session?.header, toSessionId, senderSessionId);
+  if (!wake) resumed.inject(message);
+  else if (options.interrupt === true) resumed.steer(message);
+  else resumed.followup(message);
   const result: DeliverResult = {
     message_id: message.id,
     target_session_id: toSessionId,
     accepted_at_ms: acceptedAt,
     delivery_mode: "resumed_inbox",
     state: "accepted",
+    ...(wake && options.interrupt === true ? { interrupt: true } : {}),
     ...(options.replyTo === undefined ? {} : { reply_to_message_id: options.replyTo }),
   };
   if (options.idempotencyKey !== undefined) await recordReceipt(options.receiptStore, result, { policy: options.receiptPolicy });
@@ -506,16 +533,33 @@ export async function queryMessageStatus(
     let claimed = false;
     let answered = false;
     let firstAnswer = Number.POSITIVE_INFINITY;
+    let sender: string | undefined;
+    const replies = new Set<string>();
     for (const [index, event] of events.entries()) {
       if (event.type === "agent/inbox/spliced") {
         if (event.data.inserted.some((message: unknown) => isA2AMessage(message, messageId))) {
           accepted = true;
           firstAcceptedOrClaimed = Math.min(firstAcceptedOrClaimed, index);
+          const incoming = event.data.inserted.find((message) => isA2AMessage(message, messageId));
+          sender = (incoming?.source as { senderSessionId?: string } | undefined)?.senderSessionId ?? sender;
         }
       } else if (event.type === "user/message") {
         if (isA2AMessage(event.data, messageId)) {
           claimed = true;
           firstAcceptedOrClaimed = Math.min(firstAcceptedOrClaimed, index);
+          sender = (event.data.source as { senderSessionId?: string }).senderSessionId ?? sender;
+        }
+      } else if (event.type === "tool/call" && event.data.name === "a2a_reply" && sender !== undefined) {
+        try {
+          const args = JSON.parse(event.data.arguments);
+          if (args.reply_to === messageId && args.to === sender) replies.add(String(event.data.callId));
+        } catch { /* Malformed arguments cannot prove an answer. */ }
+      } else if (event.type === "tool/result" && replies.has(String(event.data.message.toolCallId))) {
+        // A call is intent; only its successful result proves the correlated
+        // reply was accepted. Native assistant messages carry no replyTo field.
+        if (event.data.error === undefined && event.data.message.isError !== true) {
+          answered = true;
+          firstAnswer = Math.min(firstAnswer, index);
         }
       } else if (event.type === "assistant/message") {
         if (replyToOf(event.data.message) === messageId || replyToOf(event.data) === messageId) {
@@ -525,7 +569,7 @@ export async function queryMessageStatus(
       }
     }
     if (answered && firstAnswer <= firstAcceptedOrClaimed) return { message_id: messageId, target_session_id: targetSessionId, state: "unknown", evidence: "assistant response precedes accepted/claimed fact" };
-    if (answered && (accepted || claimed) && firstAnswer > firstAcceptedOrClaimed) return { message_id: messageId, target_session_id: targetSessionId, state: "answered", evidence: "correlated assistant response after accepted/claimed" };
+    if (answered && (accepted || claimed) && firstAnswer > firstAcceptedOrClaimed) return { message_id: messageId, target_session_id: targetSessionId, state: "answered", evidence: "successful correlated reply or assistant response after accepted/claimed" };
     if (claimed) return { message_id: messageId, target_session_id: targetSessionId, state: "claimed", evidence: "target A2A user/message event" };
     if (accepted) {
       return {

@@ -2678,7 +2678,7 @@ async function releaseSubagentNodeDefault(ctx: Context, parent: Agent, childId: 
   const subagents = ctx.get("subagents");
   if (subagents === undefined) return;
   try {
-    await subagents.drainContinuableChildren(parent, [SID(childId)]);
+    await subagents.drainChildren(parent, [SID(childId)]);
   } catch {
     // See disposeCreatedHandles: the recorded failure outranks a cleanup error.
   }
@@ -4761,7 +4761,7 @@ async function retireTeamRoles(ctx: Context, controller: Agent, roles: readonly 
         const parent = role.parentSessionId === undefined || role.parentSessionId === controller.id
           ? controller : ctx.agents.get(SID(role.parentSessionId));
         if (parent === undefined) throw new Error(`native parent ${role.parentSessionId} is unavailable; cannot confirm child drain`);
-        await subagents.drainContinuableChildren(parent, [SID(role.sessionId)]);
+        await subagents.drainChildren(parent, [SID(role.sessionId)]);
       } else {
         const live = ctx.agents.get(SID(role.sessionId));
         if (live !== undefined) {
@@ -7044,18 +7044,7 @@ export function apply(ctx: Context): void {
     systemPrompt.section({
       name: SECTION_NAME,
       order: SECTION_ORDER,
-      text:
-        "Orchestra: you are the team driver — the role that starts a team toward a goal and owns decisions. When the user says /team or expresses intent to open a team / collaborate / delegate, follow the onboarding protocol below:\n" +
-        "1. Goal: ask the user to state the goal — what \"done\" looks like. One topology run completes one goal; a clear goal defines when to stop.\n" +
-        "2. Constraints: ask about limits/constraints (time, quality, boundaries). Merge into the same round when possible.\n" +
-        "3. Context: read the project context relevant to the goal (files, docs) to ground your understanding.\n" +
-        "4. Proposal: call orchestra_draft to persist the mission and topology Draft, then report its draftId@revision and digest to the user with a per-role roster card preview.\n" +
-        "5. Approval: ask the user to approve by replying with a plain yes — 启动 (or 可以 / 同意 / ok). Their reply is recorded automatically against the exact draft revision. Only the USER can approve. Until approval lands, do not dispatch roles.\n" +
-        "6. Dispatch and Execute: dispatch concrete lane tasks using orchestra_dispatch(roleId, task, { laneId, preset, dispatchId, charterRef, authorityRef, brief, responsibility, scope?, profileRef?, methodBindings? }). Copy charterRef/authorityRef from orchestra_team's charter_ref/approval_ref, and hold the dispatchId YOURSELF before the call — reuse the same id and content to retry, and use a NEW id for a new intent. A role's session is materialized on its first dispatch; later dispatches reuse it. A role that still has an undelivered dispatch refuses a second one. Roles work autonomously.\n" +
-        "6b. New objective, same project: ONE team per working directory, and a team is dynamic. Do NOT open a second team. Decompose the new objective into lanes and graft them onto the running graph with orchestra_add_lanes: it returns a plan first (compose the graph yourself from role presets — pick the roles the work actually needs, decide serial vs parallel placement, and set each lane's review-round cap); show the user that plan as one sentence, and only call it again with confirm: true after they agree. A different goal that is NOT part of this project is a different matter: say so and let the user decide.\n" +
-        "7. Turn Handoff & Reactive Wakeup: after dispatching concrete tasks with orchestra_dispatch, summarize what was dispatched to the user and conclude your turn. Do NOT call orchestra_wait to block your execution. Roles work autonomously and report back via A2A messages; DSH's reactive messaging will automatically wake you for your next turn when reports or replies arrive.\n" +
-        "8. Session Control: use a2a_stop(sessionId, reason) to immediately abort a runaway or stuck session. Use a2a_list(query) to inspect or search sessions sorted by recent activity. Use a2a_read for progressive turn review.\n" +
-        "Stay in your role: you are the driver, not an implementer or reviewer. Do not edit code or do the role's work yourself. Dispatch tasks, allow roles to work autonomously, and verify objective facts with orchestra_team and report files upon delivery. Close the run with orchestra_dismiss when done.",
+      text: "Orchestra teams are optional. Use A2A for ordinary collaboration; a request to delegate does not require a team. For /team or managing an existing Governed Orchestra team, load orchestra-teams before drafting or dispatching. Team creation still requires the user-approved frozen charter; only the user can approve it.",
     });
   }
 

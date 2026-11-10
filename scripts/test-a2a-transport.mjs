@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { deliverMessage, queryMessageStatus } from "../lib/a2a-transport.js";
-import { listThreads, sendRawA2A } from "../lib/a2a.js";
+import { listThreads, sendRawA2A, apply as applyA2A } from "../lib/a2a.js";
 import { createGovernedRoleAddressResolver, GovernedAddressError } from "../lib/orchestra-address.js";
 import { sendGovernedRole } from "../lib/orchestra.js";
 import { createMemoryReceiptStore } from "../lib/receipt-store.js";
@@ -61,16 +61,17 @@ function runtime(options = {}) {
         return [...agents.values()];
       },
       async resume(options) {
-        await options.setup({ on() { return () => {}; } });
         const target = sessions.get(String(options.resumeSessionId)) ?? session(String(options.resumeSessionId), "/cold");
         const agent = {
           id: target.id,
           session: target,
           status: "idle",
+          model: { select: (selection) => target.append("model/selection", selection) },
           followup(message) { target.append("user/message", message); },
           inject(message) { target.append("user/message", message); },
           steer(message) { target.append("user/message", message); },
         };
+        await options.setup({ on() { return () => {}; } }, agent);
         sessions.set(target.id, target);
         agents.set(target.id, agent);
         return { agent, async dispose() { agents.delete(target.id); } };
@@ -105,7 +106,7 @@ test("raw transport accepts live, durable, and cold-resumed delivery without fs/
   assert.equal(live.delivery_mode, "live_inbox");
 
   env.agents.delete(target.id);
-  const durable = await deliverMessage(env.context, sender.id, target.id, [{ type: "text", text: "durable" }]);
+  const durable = await deliverMessage(env.context, sender.id, target.id, [{ type: "text", text: "durable" }], { wake: false });
   assert.equal(durable.state, "accepted");
   assert.equal(durable.delivery_mode, "durable_inbox");
 
@@ -219,8 +220,8 @@ test("explicit idempotency key deduplicates live, durable, and cold retries", as
   const durableEnv = runtime();
   const durableTarget = session("durable-target");
   durableEnv.sessions.set(durableTarget.id, durableTarget);
-  const durableA = await deliverMessage(durableEnv.context, "sender", durableTarget.id, [{ type: "text", text: "x" }], { idempotencyKey: "retry-durable" });
-  const durableB = await deliverMessage(durableEnv.context, "sender", durableTarget.id, [{ type: "text", text: "x" }], { idempotencyKey: "retry-durable" });
+  const durableA = await deliverMessage(durableEnv.context, "sender", durableTarget.id, [{ type: "text", text: "x" }], { idempotencyKey: "retry-durable", wake: false });
+  const durableB = await deliverMessage(durableEnv.context, "sender", durableTarget.id, [{ type: "text", text: "x" }], { idempotencyKey: "retry-durable", wake: false });
   assert.equal(durableA.message_id, durableB.message_id);
   assert.equal(durableTarget.events.filter((event) => event.type === "agent/inbox/spliced").length, 1);
 
@@ -371,13 +372,13 @@ test("durable idempotency replay returns the original receipt facts without writ
   // own log: recording a receipt in the log is what made every delivered-to
   // session unreadable after a restart (docs/adr/0002).
   const receipts = createMemoryReceiptStore();
-  const first = await deliverMessage(env.context, "sender", target.id, [{ type: "text", text: "retry" }], { idempotencyKey: "fresh-key", replyTo: "original", receiptStore: receipts });
+  const first = await deliverMessage(env.context, "sender", target.id, [{ type: "text", text: "retry" }], { idempotencyKey: "fresh-key", replyTo: "original", receiptStore: receipts, wake: false });
   const freshContext = {
     agents: { get() { return undefined; } },
     sessions: { get() { return target; } },
     get() { return undefined; },
   };
-  const replay = await deliverMessage(freshContext, "sender", target.id, [{ type: "text", text: "retry" }], { idempotencyKey: "fresh-key", replyTo: "original", receiptStore: receipts });
+  const replay = await deliverMessage(freshContext, "sender", target.id, [{ type: "text", text: "retry" }], { idempotencyKey: "fresh-key", replyTo: "original", receiptStore: receipts, wake: false });
   assert.deepEqual(replay, first);
   assert.equal(target.events.filter((event) => event.type === "agent/inbox/spliced").length, 1);
 });
@@ -533,4 +534,108 @@ test("the discovery cap cannot starve the caller's own working directory", async
   assert.equal(ids.includes("mine-live"), true);
   assert.match(listed.discovery_note ?? "", /discovery cap 200/);
   assert.match(listed.discovery_note ?? "", /other working directories/);
+});
+
+test("A2A waking sends steer busy peers by default; explicit queue and wake=false retain their meanings", async () => {
+  const env = runtime();
+  const sender = session("sender");
+  const target = session("busy");
+  const calls = [];
+  const agent = { id: target.id, session: target, status: "running",
+    steer: () => calls.push("next-step"), followup: () => calls.push("next-turn"), inject: () => calls.push("context"),
+    cancel() { assert.fail("delivery must not cancel existing work"); },
+  };
+  env.agents.set(target.id, agent);
+  const exec = { agent: { id: sender.id, session: sender } };
+  const receipt = await sendRawA2A(env.context, { to: target.id, message: "result" }, exec);
+  assert.equal(receipt.interrupt, true);
+  await sendRawA2A(env.context, { to: target.id, message: "later", interrupt: false }, exec);
+  await sendRawA2A(env.context, { to: target.id, message: "context", wake: false, interrupt: true }, exec);
+  assert.deepEqual(calls, ["next-step", "next-turn", "context"]);
+});
+
+test("waking an attached Session resumes its driver instead of only appending an unwakeable splice", async () => {
+  const env = runtime();
+  const target = session("attached");
+  env.sessions.set(target.id, target);
+  const receipt = await deliverMessage(env.context, "sender", target.id, [{ type: "text", text: "result" }], { interrupt: true });
+  assert.equal(receipt.delivery_mode, "resumed_inbox");
+  assert.equal(receipt.interrupt, true);
+  assert.ok(env.agents.has(target.id), "the harness published a driver after waking delivery");
+});
+
+test("cold A2A resume preserves later native GUI model selections instead of re-pinning the birth marker", async () => {
+  const env = runtime();
+  const target = session("gui-selected");
+  target.append("model/selection", { provider: "new-provider", model: "new-model", reasoningEffort: "max" });
+  env.coldSnapshots.set(target.id, { session: target.header, events: target.events });
+  const selected = [];
+  env.context.agents.resume = async (options) => {
+    const agent = { id: target.id, session: target, model: { select: (value) => selected.push(value) }, followup() {}, steer() {}, inject() {} };
+    await options.setup({ on: () => () => {} }, agent);
+    env.agents.set(target.id, agent);
+    return { agent };
+  };
+  await deliverMessage(env.context, "sender", target.id, [{ type: "text", text: "resume" }], {
+    resolveBlueprintStore: () => ({ read: async () => ({ mode: "lightweight", agentPreset: "preset", provider: "birth-provider", model: "birth-model", reasoningEffort: "low" }) }),
+  });
+  assert.deepEqual(selected, [], "recorded user choices remain the driver's source of truth");
+});
+
+test("answered requires a successful exact a2a_reply back to the original sender, not merely a reply call", async () => {
+  const env = runtime();
+  const target = session("answerer");
+  env.sessions.set(target.id, target);
+  target.append("user/message", { id: "request", source: { kind: "a2a", form: "relay", senderSessionId: "sender" } });
+  target.append("tool/call", { callId: "reply", name: "a2a_reply", arguments: JSON.stringify({ to: "sender", reply_to: "request", message: "result" }) });
+  assert.equal((await queryMessageStatus(env.context, "request", target.id)).state, "claimed");
+  target.append("tool/result", { message: { toolCallId: "reply", isError: true } });
+  assert.equal((await queryMessageStatus(env.context, "request", target.id)).state, "claimed");
+  target.append("tool/call", { callId: "wrong-recipient", name: "a2a_reply", arguments: JSON.stringify({ to: "stranger", reply_to: "request" }) });
+  target.append("tool/result", { message: { toolCallId: "wrong-recipient" } });
+  assert.equal((await queryMessageStatus(env.context, "request", target.id)).state, "claimed");
+  target.append("tool/call", { callId: "successful-reply", name: "a2a_reply", arguments: JSON.stringify({ to: "sender", reply_to: "request", message: "result" }) });
+  target.append("tool/result", { message: { toolCallId: "successful-reply" } });
+  assert.equal((await queryMessageStatus(env.context, "request", target.id)).state, "answered");
+});
+
+test("different peers share one cold resume without coalescing their distinct messages", async () => {
+  const env = runtime();
+  const target = session("cold-concurrent");
+  env.coldSnapshots.set(target.id, { session: target.header, events: target.events });
+  const resume = env.context.agents.resume;
+  let starts = 0;
+  env.context.agents.resume = async (options) => { starts++; await Promise.resolve(); return resume(options); };
+  await Promise.all([
+    deliverMessage(env.context, "peer-a", target.id, [{ type: "text", text: "a" }]),
+    deliverMessage(env.context, "peer-b", target.id, [{ type: "text", text: "b" }]),
+  ]);
+  assert.equal(starts, 1);
+  const delivered = env.sessions.get(target.id).events.filter((event) => event.type === "user/message");
+  assert.equal(delivered.length, 2);
+  assert.notEqual(delivered[0].data.id, delivered[1].data.id);
+});
+
+test("registered reply defaults to steering and gives read-only senders the receipt escrow policy", async () => {
+  const env = runtime();
+  const definitions = new Map();
+  const policy = { receiptEscrow: true };
+  let steers = 0;
+  let writes = 0;
+  const fs = {
+    resolve: async (path) => path,
+    stat: async () => undefined,
+    writeText: async (_target, _text, _operation, _signal, observedPolicy) => { assert.equal(observedPolicy, policy); writes++; },
+  };
+  const baseGet = env.context.get;
+  env.context.get = (name) => name === "fs" ? fs : baseGet(name);
+  env.context.tools = { register: (definition) => definitions.set(definition.name, definition) };
+  env.context.sandboxPolicy = { resolve: () => policy };
+  const target = session("reply-recipient");
+  env.agents.set(target.id, { id: target.id, session: target, steer: () => steers++, followup: () => assert.fail("reply must not wait for turn end"), inject() {} });
+  applyA2A(env.context);
+  const result = await definitions.get("a2a_reply").execute({ to: target.id, reply_to: "request", message: "result", idempotency_key: "reply-retry" }, { agent: { id: "read-only-peer", session: session("read-only-peer") } });
+  assert.equal(result.state, "accepted");
+  assert.equal(steers, 1);
+  assert.equal(writes, 1);
 });

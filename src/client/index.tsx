@@ -13,6 +13,7 @@
 
 import type { Context } from "@deepseek-ai/cordis";
 import type {} from "@deepseek-ai/dsh-client-ui-renderer/client";
+import type {} from "@deepseek-ai/dsh-client-locale/client";
 import type { SettingsSectionOwnerProps } from "@deepseek-ai/dsh-client-ui-settings/client";
 
 declare module "@deepseek-ai/dsh-client-ui-slots" {
@@ -23,6 +24,7 @@ declare module "@deepseek-ai/dsh-client-ui-slots" {
 import type {} from "@deepseek-ai/dsh-client-ui-slots";
 import type {} from "@deepseek-ai/dsh-client-ui-settings/client";
 import * as React from "react";
+import { dictionaries } from "./locale.js";
 
 const STATE_URL = "/plugins/orchestra-dsh/state";
 const POLL_MS = 5000;
@@ -90,7 +92,8 @@ function fetchState(): Promise<StateSnapshot> {
 const PANE_STYLE: React.CSSProperties = {
   maxHeight: 320,
   overflowY: "auto",
-  border: "1px solid var(--border-color, #333)",
+  border: "1px solid var(--dsw-alias-border-l1)",
+  background: "var(--dsw-alias-bg-layer-1)",
   borderRadius: 8,
   padding: 12,
   marginBottom: 16,
@@ -183,11 +186,13 @@ function instanceRoleLine(r: InstanceRole): string {
 }
 
 /** Settings panel page: two display-only scrollable panes. */
-export function OrchestraPanel(_props: SettingsSectionOwnerProps): React.JSX.Element {
+export function OrchestraPanel({ t }: SettingsSectionOwnerProps & { t: (key: string) => string }): React.JSX.Element {
   const [snapshot, setSnapshot] = React.useState<StateSnapshot | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const [showTeams, setShowTeams] = React.useState(false);
 
   React.useEffect(() => {
+    if (!showTeams) return;
     let cancelled = false;
     const tick = (): void => {
       fetchState()
@@ -207,55 +212,58 @@ export function OrchestraPanel(_props: SettingsSectionOwnerProps): React.JSX.Ele
       cancelled = true;
       clearInterval(timer);
     };
-  }, []);
+  }, [showTeams]);
 
   return (
     <div style={{ padding: 16 }}>
-      <h3>orchestra</h3>
-      <p style={{ opacity: 0.7, fontSize: 12 }}>
-        多角色拓扑协作 · 内置组织与角色恒显，团队实例尽力而为（轮询）。Multi-role topology collaboration: built-in
-        orchestrations &amp; roles are always shown; team instances are best-effort (polled).
-      </p>
+      <h3>{t("title")}</h3>
+      <p>{t("intro")}</p>
+      <h4>{t("tools")}</h4>
+      <p><code>a2a_create · a2a_send · a2a_reply · a2a_read · a2a_list · a2a_status · a2a_stop</code></p>
+      <p style={{ color: "var(--dsw-alias-label-secondary)", fontSize: 12 }}>{t("delivery")}</p>
+      <details onToggle={(event) => setShowTeams(event.currentTarget.open)}>
+        <summary>{t("teams")}</summary>
+        <p>{t("teamIntro")}</p>
       {error !== null ? (
-        <div style={{ color: "#e88" }}>state unavailable: {error}</div>
+        <div style={{ color: "var(--dsw-alias-state-error-primary)" }}>{t("unavailable")}: {error}</div>
       ) : snapshot === null ? (
-        <div style={{ opacity: 0.6 }}>loading…</div>
+        <div style={{ opacity: 0.6 }}>{t("loading")}</div>
       ) : (
         <>
           {/* 窗格 A：编排 / 组织 */}
           <section>
-            <h4>编排 · Orchestrations</h4>
+            <h4>{t("orchestrations")}</h4>
             <div style={PANE_STYLE}>
               <div style={{ marginBottom: 10 }}>
-                <strong>版型 · Templates</strong>
-                {snapshot.templates.map((t) => (
-                  <div key={t.id} style={{ marginTop: 6 }}>
+                <strong>{t("templates")}</strong>
+                {snapshot.templates.map((template) => (
+                  <div key={template.id} style={{ marginTop: 6 }}>
                     <div>
-                      {t.name} <span style={{ opacity: 0.6 }}>({t.id} · {t.source})</span>
+                      {template.name} <span style={{ opacity: 0.6 }}>({template.id} · {template.source})</span>
                     </div>
-                    {t.description === undefined ? null : (
-                      <div style={{ opacity: 0.75, fontSize: 12 }}>{t.description}</div>
+                    {template.description === undefined ? null : (
+                      <div style={{ opacity: 0.75, fontSize: 12 }}>{template.description}</div>
                     )}
-                    <div style={{ opacity: 0.55, fontSize: 12 }}>roles: {templateRolesSummary(t)}</div>
-                    {templateProtocolSummary(t) === "" ? null : (
-                      <div style={{ opacity: 0.5, fontSize: 11 }}>{templateProtocolSummary(t)}</div>
+                    <div style={{ opacity: 0.55, fontSize: 12 }}>roles: {templateRolesSummary(template)}</div>
+                    {templateProtocolSummary(template) === "" ? null : (
+                      <div style={{ opacity: 0.5, fontSize: 11 }}>{templateProtocolSummary(template)}</div>
                     )}
                   </div>
                 ))}
               </div>
               <div>
-                <strong>团队实例 · Team instances</strong>
+                <strong>{t("instances")}</strong>
                 {snapshot.teams.length === 0 ? (
-                  <div style={{ opacity: 0.55 }}>（无团队实例）none yet</div>
+                  <div style={{ opacity: 0.55 }}>{t("none")}</div>
                 ) : (
                   snapshot.teams.map((team) => (
                     <div key={teamKey(team)} style={{ marginTop: 6 }}>
                       <div>{teamLabel(team)}</div>
                       {team.archivePath === undefined
                         ? null
-                        : <div style={{ opacity: 0.6, fontSize: 12 }}>archive: {team.archivePath}</div>}
+                        : <div style={{ opacity: 0.6, fontSize: 12 }}>{t("archive")}: {team.archivePath}</div>}
                       {team.teamId === "" ? null : (
-                        <div style={{ opacity: 0.6, fontSize: 12 }}>team: {team.teamId}</div>
+                        <div style={{ opacity: 0.6, fontSize: 12 }}>{t("team")}: {team.teamId}</div>
                       )}
                       <div style={{ opacity: 0.6, fontSize: 12 }}>
                         roles: {team.roles.map((r) => `${r.id} R${r.reportCount}`).join(", ") || "—"}
@@ -268,10 +276,10 @@ export function OrchestraPanel(_props: SettingsSectionOwnerProps): React.JSX.Ele
           </section>
           {/* 窗格 B：角色 */}
           <section>
-            <h4>角色 · Roles</h4>
+            <h4>{t("roles")}</h4>
             <div style={PANE_STYLE}>
               <div style={{ marginBottom: 10 }}>
-                <strong>版型角色 · Template roles</strong>
+                <strong>{t("templateRoles")}</strong>
                 {flattenTemplateRoles(snapshot.templates).length === 0 ? (
                   <div style={{ opacity: 0.55 }}>—</div>
                 ) : (
@@ -281,15 +289,15 @@ export function OrchestraPanel(_props: SettingsSectionOwnerProps): React.JSX.Ele
                         {r.execution === undefined ? "" : ` · ${r.execution}`}
                         {r.preset === undefined ? "" : ` · ${r.preset}`}
                         {r.sandbox === undefined ? "" : ` · ${r.sandbox}`})</span>{" "}
-                      <span style={{ opacity: 0.6 }}>— 来源: {r.sources.join(", ")}</span>
+                      <span style={{ opacity: 0.6 }}>— {t("sources")}: {r.sources.join(", ")}</span>
                     </div>
                   ))
                 )}
               </div>
               <div>
-                <strong>实例角色 · Instance roles</strong>
+                <strong>{t("instanceRoles")}</strong>
                 {snapshot.teams.length === 0 ? (
-                  <div style={{ opacity: 0.55 }}>（无团队实例）none yet</div>
+                  <div style={{ opacity: 0.55 }}>{t("none")}</div>
                 ) : (
                   snapshot.teams.map((team) => (
                     <div key={teamKey(team)} style={{ marginTop: 6 }}>
@@ -307,12 +315,13 @@ export function OrchestraPanel(_props: SettingsSectionOwnerProps): React.JSX.Ele
           </section>
         </>
       )}
+      </details>
     </div>
   );
 }
 
 /** Services required by the settings registration (Cordis inject contract). */
-export const inject = ["slots"];
+export const inject = ["slots", "locale"];
 
 /**
  * Browser plugin: register the `settings.section` list entry.
@@ -329,15 +338,23 @@ export const inject = ["slots"];
  * @param ctx - client root context carrying the slot registry.
  */
 export function apply(ctx: Context): void {
+  for (const [language, dictionary] of Object.entries(dictionaries)) {
+    ctx.effect(() => ctx.locale.register("orchestra-dsh", language, dictionary));
+  }
+  const t = ctx.locale.bind("orchestra-dsh");
+  const Panel = (props: SettingsSectionOwnerProps) => {
+    React.useSyncExternalStore((listener) => ctx.locale.subscribe(listener), () => ctx.locale.getSnapshot());
+    return <OrchestraPanel {...props} t={t} />;
+  };
   ctx.slots.inject("settings.section", () =>
     ctx.slots.register(
       {
         name: "settings.section",
         id: "orchestra",
         order: 200,
-        label: "orchestra",
+        label: () => t("title"),
       },
-      OrchestraPanel,
+      Panel,
     ),
   );
 }

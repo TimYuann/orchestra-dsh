@@ -539,7 +539,7 @@ test("strict dismiss propagates native drain failure before publishing an archiv
     let drains = 0;
     const baseGet = harness.ctx.get.bind(harness.ctx);
     harness.ctx.get = (name) => name === "subagents" ? {
-      async drainContinuableChildren(parent, ids) {
+      async drainChildren(parent, ids) {
         drains++;
         assert.equal(parent, harness.controller);
         assert.deepEqual(ids.map(String), [role.sessionId]);
@@ -564,7 +564,7 @@ for (const [status, rawInput] of [["active", "新目标"], ["completed", ""]]) {
       let drains = 0;
       const baseGet = harness.ctx.get.bind(harness.ctx);
       harness.ctx.get = (name) => name === "subagents" ? {
-        async drainContinuableChildren() { drains++; throw new Error("native drain failed"); },
+        async drainChildren() { drains++; throw new Error("native drain failed"); },
       } : baseGet(name);
       await assert.rejects(() => handleTeamCommandInvocation(harness.ctx, activeStore, archiveStore, {
         rawInput, commandId: "cmd-archive", agent: harness.controller, source: { kind: "user" },

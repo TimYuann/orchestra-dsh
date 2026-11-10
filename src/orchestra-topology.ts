@@ -1084,35 +1084,12 @@ export function resolveRoleExecution(role: Pick<RoleConfig, "execution" | "prese
   return "session";
 }
 
-/**
- * Shape problems in a `subagent` role's native per-child knobs.
- *
- * Persona and toolFilter are the only per-child knobs the delegated backend
- * accepts beyond the model route. A malformed one is refused here rather than
- * at the delegation boundary, where the provider rejects the whole creation
- * with a message that no longer names the topology role that caused it.
- *
- * @param role - the role that resolved to the `subagent` backend.
- * @returns one diagnostic line per malformed knob (empty when both are usable).
- */
+/** Reject removed native knobs before a user approves an impossible role. */
 function subagentKnobProblems(role: RoleConfig): string[] {
   const problems: string[] = [];
-  if (role.persona !== undefined && (typeof role.persona !== "string" || role.persona.trim() === "")) {
-    problems.push(`role "${role.id}" persona must be a non-empty string`);
+  for (const knob of ["persona", "toolFilter"] as const) {
+    if (role[knob] !== undefined) problems.push(`role "${role.id}" ${knob} is unsupported by DSH 0.2.2 native activation; use a declared Session preset instead`);
   }
-  const filter: unknown = role.toolFilter;
-  if (filter === undefined) return problems;
-  if (!isRecord(filter)) {
-    problems.push(`role "${role.id}" toolFilter must be an object with allow and/or deny`);
-    return problems;
-  }
-  const toolNames = (value: unknown): value is string[] =>
-    Array.isArray(value) && value.length > 0 && value.every((entry) => typeof entry === "string" && entry !== "");
-  const allow = filter.allow;
-  const deny = filter.deny;
-  if (allow !== undefined && !toolNames(allow)) problems.push(`role "${role.id}" toolFilter.allow must be a non-empty array of non-empty tool names`);
-  if (deny !== undefined && !toolNames(deny)) problems.push(`role "${role.id}" toolFilter.deny must be a non-empty array of non-empty tool names`);
-  if (allow === undefined && deny === undefined) problems.push(`role "${role.id}" toolFilter declares neither allow nor deny, so it restricts nothing`);
   return problems;
 }
 
@@ -1279,12 +1256,12 @@ export function validateTopology(config: unknown): string[] {
       // above, applied in the other direction.
       if (role.persona !== undefined) {
         problems.push(
-          `role "${role.id}" resolves to the "session" backend but declares persona: a session role's persona lives inside its Agent Preset, so this field would never take effect — put the persona in the preset, or use execution: "subagent" for a native child persona`,
+          `role "${role.id}" resolves to the "session" backend but declares persona: a session role's persona lives inside its Agent Preset, so this field would never take effect — put the persona in a declared Session preset`,
         );
       }
       if (role.toolFilter !== undefined) {
         problems.push(
-          `role "${role.id}" resolves to the "session" backend but declares toolFilter: native per-child tool scoping exists only on the delegated backend, so this field would never take effect — narrow the tool set through the role's Agent Preset, or use execution: "subagent"`,
+          `role "${role.id}" resolves to the "session" backend but declares toolFilter: this legacy field would not alter a Session's composition — narrow the tool set through the role's declared Session preset`,
         );
       }
     }

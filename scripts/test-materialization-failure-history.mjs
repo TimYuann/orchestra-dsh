@@ -368,7 +368,7 @@ function subagentDivergenceHarness() {
       if (name === "fs") return fs;
       if (name === "subagents") {
         return {
-          async startContinuable(options) {
+          async startActivation(options) {
             started.push(String(options.childId));
             // The provider owns the child id: it echoes the REQUESTED id in
             // `childId` only as a hint, and returns the id it actually made.

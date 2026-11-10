@@ -18,10 +18,10 @@ import {
 import { createLightweightSubagentNode } from "../lib/a2a.js";
 
 function makeRuntime(options = {}) {
-  const calls = { startContinuable: [], sendMessage: [], listChildren: [] };
+  const calls = { startActivation: [], sendMessage: [], listChildren: [] };
   const subagents = {
-    async startContinuable(spec) {
-      calls.startContinuable.push(spec);
+    async startActivation(spec) {
+      calls.startActivation.push(spec);
       if (options.createFailure) throw new Error("provider exploded");
       return { childId: spec.childId ?? "child-generated", messageId: "msg-created" };
     },
@@ -57,23 +57,22 @@ test("createSubagentNode composes the native spec and maps the receipt back", as
       prompt: "review the candidate diff",
       childId: "child-reserved",
       provider: "fork",
-      persona: "You are the reviewer.",
-      toolFilter: { deny: ["write", "edit"] },
       agentOptions: { provider: "route-provider", model: "route-model", reasoningEffort: "high", maxTokens: 4096 },
     },
     SIGNAL(),
   );
 
   assert.deepEqual(receipt, { childId: "child-reserved", messageId: "msg-created", provider: "fork" });
-  assert.equal(calls.startContinuable.length, 1);
-  const spec = calls.startContinuable[0];
+  assert.equal(calls.startActivation.length, 1);
+  const spec = calls.startActivation[0];
   assert.equal(spec.provider, "fork");
   assert.equal(spec.label, "reviewer");
   assert.equal(spec.childId, "child-reserved");
   assert.equal(spec.request.parent, PARENT, "the caller's own Agent is the delegation parent");
   assert.deepEqual(spec.request.prompt, [{ type: "text", text: "review the candidate diff" }]);
-  assert.equal(spec.request.persona, "You are the reviewer.");
-  assert.deepEqual(spec.request.toolFilter, { deny: ["write", "edit"] });
+  assert.equal(spec.delivery, "parent", "native completion notifies the parent without a blocking wait");
+  assert.ok(!("persona" in spec.request));
+  assert.ok(!("toolFilter" in spec.request));
   assert.deepEqual(spec.request.agentOptions, {
     provider: "route-provider",
     model: "route-model",
@@ -90,19 +89,19 @@ test("native child inherits the current request route after the driver changes m
     requestHeader: () => ({ config: { provider: "current", model: "current", reasoningEffort: "high" } }),
   } };
   await createSubagentNode(ctx, parent, { label: "scout", prompt: "inspect" }, SIGNAL());
-  assert.deepEqual(calls.startContinuable[0].request.agentOptions, { provider: "current", model: "current", reasoningEffort: "high" });
+  assert.deepEqual(calls.startActivation[0].request.agentOptions, { provider: "current", model: "current", reasoningEffort: "high" });
   await createSubagentNode(ctx, parent, { label: "explicit", prompt: "inspect", agentOptions: { provider: "chosen", model: "chosen" } }, SIGNAL());
-  assert.deepEqual(calls.startContinuable[1].request.agentOptions, { provider: "chosen", model: "chosen" });
+  assert.deepEqual(calls.startActivation[1].request.agentOptions, { provider: "chosen", model: "chosen" });
 });
 
 test("createSubagentNode defaults to spawn and omits every unstated knob", async () => {
   const { ctx, calls } = makeRuntime();
   const receipt = await createSubagentNode(ctx, PARENT, { label: "auditor", prompt: "audit the module" }, SIGNAL());
 
-  assert.equal(calls.startContinuable[0].provider, "spawn", "a node is a new role, so a fresh child is the default");
+  assert.equal(calls.startActivation[0].provider, "spawn", "a node is a new role, so a fresh child is the default");
   assert.equal(receipt.childId, "child-generated", "without a reserved id the provider allocates one");
   assert.equal(receipt.messageId, "msg-created");
-  const spec = calls.startContinuable[0];
+  const spec = calls.startActivation[0];
   assert.ok(!("childId" in spec), "no reserved identity is invented when the caller did not supply one");
   assert.ok(!("agentOptions" in spec.request));
   assert.ok(!("toolFilter" in spec.request));
@@ -200,7 +199,7 @@ test("the lightweight path opens a native node only for what the contract can ho
   // reported route is the caller's own when the node states no override.
   const receipt = await createLightweightSubagentNode(
     runtime.ctx,
-    { label: "scout", prompt: "侦察这个仓库的构建脚本。", persona: "你是侦察节点。", toolFilter: { deny: ["write", "edit"] } },
+    { label: "scout", prompt: "侦察这个仓库的构建脚本。" },
     exec,
   );
   assert.equal(receipt.execution, "subagent");
@@ -208,13 +207,15 @@ test("the lightweight path opens a native node only for what the contract can ho
   assert.equal(receipt.label, "scout");
   assert.equal(receipt.provider, "command");
   assert.equal(receipt.model, "deepseek-v4.1-flash");
-  const spec = runtime.calls.startContinuable[0];
+  const spec = runtime.calls.startActivation[0];
   assert.equal(spec.provider, "spawn", "a node is a NEW role, never a fork of the caller's history");
   assert.equal(spec.label, "scout");
   assert.equal(spec.request.parent, caller);
   assert.equal(spec.request.prompt[0].text, "侦察这个仓库的构建脚本。");
-  assert.equal(spec.request.persona, "你是侦察节点。");
-  assert.deepEqual(spec.request.toolFilter, { deny: ["write", "edit"] });
+  for (const override of [{ persona: "reviewer" }, { toolFilter: { deny: ["write"] } }]) {
+    await assert.rejects(() => createLightweightSubagentNode(runtime.ctx, { prompt: "x", ...override }, exec), /does not support persona\/toolFilter/);
+  }
+  assert.equal(runtime.calls.startActivation.length, 1, "unsupported knobs must fail before publication");
   assert.equal(spec.request.agentOptions, undefined, "an unstated route stays unstated so the node inherits the caller's");
 
   // A generated label when none is given.
@@ -223,7 +224,7 @@ test("the lightweight path opens a native node only for what the contract can ho
 
   // Explicit route is forwarded and reported.
   const routed = await createLightweightSubagentNode(runtime.ctx, { prompt: "x", provider: "p", model: "m", reasoningEffort: "low" }, exec);
-  assert.deepEqual(runtime.calls.startContinuable[2].request.agentOptions, { provider: "p", model: "m", reasoningEffort: "low" });
+  assert.deepEqual(runtime.calls.startActivation[2].request.agentOptions, { provider: "p", model: "m", reasoningEffort: "low" });
   assert.equal(routed.provider, "p");
   assert.equal(routed.model, "m");
 

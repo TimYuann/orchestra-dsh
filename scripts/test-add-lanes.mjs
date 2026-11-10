@@ -148,6 +148,7 @@ function makeHarness() {
           session,
           status: "idle",
           options: createOptions.agentOptions ?? {},
+          model: { select: (selection) => session.append("model/selection", selection) },
           cancel() { events.push(`agent:cancel:${id}`); },
           async whenIdle() {},
           inbox: { clear() {} },

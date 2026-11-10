@@ -112,6 +112,9 @@ export interface LightweightToolReadiness {
 
 export interface LightweightBlueprintReceipt {
   mode: "lightweight";
+  effectivePermissionPreset?: string;
+  sandbox?: SandboxMode;
+  approval?: string;
   sessionId: string;
   cwd?: string;
   agentPreset: string;
@@ -473,6 +476,8 @@ export function pinApprovalNever(ctx: Context, agentCtx: Context, sessionId: str
 }
 
 function currentModel(ctx: Context, caller: Agent | undefined): { provider: string; model: string; reasoningEffort?: string } {
+  const selected = caller?.model?.current();
+  if (selected !== undefined) return { ...selected };
   // A live UI selection can override the Agent's creation options. During a
   // tool call the current request header is the route that actually ran.
   const header = caller?.session?.requestHeader?.();
@@ -800,7 +805,13 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
     ...(input.title === undefined ? {} : { title: input.title }),
     tools: readiness,
   };
-  const agentOptions: AgentOptions = { provider: model.provider, model: model.model };
+  const agentOptions: AgentOptions = {
+    provider: model.provider,
+    model: model.model,
+    ...(model.reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(model.reasoningEffort) }),
+  };
+  const llm = ctx.get("llm");
+  if (llm !== undefined) await llm.resolveCallConfig({ ...agentOptions, provider: model.provider, model: model.model }, input.signal);
 
   const setup = async (agentCtx: Context, agent: Agent): Promise<AgentSetupCommit> => {
     const agentPresets = agentCtx.get("agentPresets") ?? presets;
@@ -823,13 +834,11 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
     } else {
       await agentPresets.mount(agentCtx, resolvedPreset?.id ?? agentPreset);
     }
-    installModelSelection(agentCtx, {
-      current: {
-        provider: model.provider,
-        model: model.model,
-        ...(model.reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(model.reasoningEffort) }),
-      },
-      assembled: undefined,
+    installModelSelection(agentCtx);
+    agent.model.select({
+      provider: model.provider,
+      model: model.model,
+      ...(model.reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(model.reasoningEffort) }),
     });
     const session = sessionFrom(ctx, agentCtx, sessionId, agent);
     if (session === undefined) throw new SessionBlueprintError("session_unavailable", `unpublished session ${sessionId} is not visible during blueprint setup`);
@@ -880,6 +889,9 @@ export async function prepareLightweightBlueprint(ctx: Context, input: Lightweig
         const names = visibleToolNames(agentCtx);
         const missing = required.filter((name) => !names.includes(name));
         if (missing.length > 0) throw new SessionBlueprintError("required_tools_missing", `required tools are not visible in the composed scope: ${missing.join(", ")}`, { missing, visible: names });
+        receipt.effectivePermissionPreset = actualPermission;
+        receipt.sandbox = permissionSpec.sandbox;
+        receipt.approval = PINNED_APPROVAL;
         readiness.names = names;
         readiness.count = names.length;
       },
@@ -1082,13 +1094,11 @@ export async function prepareGovernedBlueprint(ctx: Context, input: GovernedBlue
     } else {
       await agentPresets.mount(agentCtx, resolvedPreset?.id ?? agentPreset);
     }
-    installModelSelection(agentCtx, {
-      current: {
-        provider: model.provider,
-        model: model.model,
-        ...(model.reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(model.reasoningEffort) }),
-      },
-      assembled: undefined,
+    installModelSelection(agentCtx);
+    agent.model.select({
+      provider: model.provider,
+      model: model.model,
+      ...(model.reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(model.reasoningEffort) }),
     });
     const session = sessionFrom(ctx, agentCtx, input.sessionId, agent);
     if (session === undefined) throw new SessionBlueprintError("session_unavailable", `unpublished governed session ${input.sessionId} is not visible during blueprint setup`);

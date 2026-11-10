@@ -7,13 +7,11 @@
  * deliberately has no filesystem, Team, topology, or preset-policy dependency,
  * mirroring the layering of `a2a-transport.ts`.
  *
- * What the native contract cannot do (and why callers must not pretend
- * otherwise): a child joins its parent's LIVE Agent Preset rather than mounting
- * its own composition; its approval policy is pinned to `never` at the
- * delegation boundary, so it can never ask the user anything; and its sandbox
- * mode is frozen from the parent's explicit override at that same boundary.
- * Per-child variation is limited to persona, tool filter, and the model route.
- * The topology validator rejects roles that ask for more.
+ * DSH 0.2.2 uses managed startActivation with an explicit result recipient.
+ * This seam exposes local children and model routing, not the old removed
+ * persona/toolFilter knobs. Legacy declarations requesting those knobs fail
+ * before publication rather than silently creating a different capability set.
+ * Independent peer addressing and separate permission control use Sessions.
  */
 
 import type { Context } from "@deepseek-ai/cordis";
@@ -21,7 +19,6 @@ import { ReasoningEffortId } from "@deepseek-ai/dsh-llm";
 import type { ContentBlock } from "@deepseek-ai/dsh-llm";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import type { SessionId } from "@deepseek-ai/dsh-session";
-import type { ToolRestriction } from "@deepseek-ai/dsh-tools";
 // Type-only: pulls in the `ctx.subagents` Context augmentation without adding a
 // runtime import (the service is provided by the host composition).
 import type {} from "@deepseek-ai/dsh-subagent";
@@ -102,16 +99,6 @@ function nativeAgentOptions(spec: SubagentNodeSpec) {
   };
 }
 
-/** Native tool scoping, copied so a later caller mutation cannot reach the child. */
-function nativeToolFilter(spec: SubagentNodeSpec): ToolRestriction | undefined {
-  const requested = spec.toolFilter;
-  if (requested === undefined) return undefined;
-  return {
-    ...(requested.allow === undefined ? {} : { allow: [...requested.allow] }),
-    ...(requested.deny === undefined ? {} : { deny: [...requested.deny] }),
-  };
-}
-
 /**
  * Establish one durable continuable child and deliver its opening prompt.
  *
@@ -140,6 +127,9 @@ export async function createSubagentNode(
   signal: AbortSignal,
 ): Promise<SubagentNodeReceipt> {
   const subagents = requireSubagents(ctx);
+  if (spec.persona !== undefined || spec.toolFilter !== undefined) {
+    throw new SubagentNodeError("create_failed", "DSH 0.2.2 native activation does not support persona/toolFilter overrides; use a declared Session preset instead");
+  }
   const label = requireNonEmpty(spec.label, "label");
   const prompt = requireNonEmpty(spec.prompt, "prompt");
   const provider = spec.provider === undefined || spec.provider === "" ? "spawn" : spec.provider;
@@ -150,10 +140,9 @@ export async function createSubagentNode(
         ...(header?.adapterDefaults?.reasoningEffort === true || current.reasoningEffort === undefined
           ? {} : { reasoningEffort: String(current.reasoningEffort) }),
       } : undefined;
-  const agentOptions = nativeAgentOptions({ ...spec, agentOptions: spec.agentOptions ?? inheritedRoute });
-  const toolFilter = nativeToolFilter(spec);
+  const agentOptions = nativeAgentOptions({ ...spec, agentOptions: spec.agentOptions ?? parent.model?.current() ?? inheritedRoute });
   try {
-    const started = await subagents.startContinuable({
+    const started = await subagents.startActivation({
       provider,
       label,
       ...(spec.childId === undefined ? {} : { childId: SID(spec.childId) }),
@@ -161,11 +150,17 @@ export async function createSubagentNode(
         prompt: [{ type: "text", text: prompt }] as ContentBlock[],
         parent,
         ...(agentOptions === undefined ? {} : { agentOptions }),
-        ...(toolFilter === undefined ? {} : { toolFilter }),
-        ...(spec.persona === undefined ? {} : { persona: spec.persona }),
       },
       signal,
+      delivery: "parent",
     });
+    if (started.messageId === undefined) {
+      await started.dispose();
+      throw new Error("the backend returned no local inbox receipt; A2A native nodes require a local child");
+    }
+    // Activation completion may reject independently of acceptance. Keep the
+    // rejection observed; the parent receives the native completion notification.
+    void started.result?.catch((error) => console.warn(`orchestra: native child ${started.childId} failed: ${error instanceof Error ? error.message : String(error)}`));
     return { childId: String(started.childId), messageId: String(started.messageId), provider };
   } catch (error) {
     throw new SubagentNodeError(

@@ -274,19 +274,19 @@ test("validateTopology refuses the two knobs a native sub-agent cannot honor", (
 
   // The two native per-child knobs belong to the delegated backend only, and
   // each direction fails loud instead of letting a declared field be ignored.
-  assert.deepEqual(
-    validateTopology(withRoles([{ id: "scout", name: "Scout", execution: "subagent", persona: "你是侦察节点。", toolFilter: { deny: ["write", "edit"] } }])),
-    [],
-    "both native knobs are legal on a subagent role",
+  assert.equal(
+    validateTopology(withRoles([{ id: "scout", name: "Scout", execution: "subagent", persona: "你是侦察节点。", toolFilter: { deny: ["write", "edit"] } }])).length,
+    2,
+    "removed native knobs fail before charter approval instead of being silently dropped",
   );
   assert.equal(validateTopology(withRoles([{ id: "scout", name: "Scout", execution: "subagent", persona: "   " }])).length, 1);
   assert.match(
     validateTopology(withRoles([{ id: "scout", name: "Scout", execution: "subagent", toolFilter: { deny: [] } }]))[0],
-    /toolFilter\.deny must be a non-empty array/,
+    /toolFilter is unsupported by DSH 0.2.2/,
   );
   assert.match(
     validateTopology(withRoles([{ id: "scout", name: "Scout", execution: "subagent", toolFilter: {} }]))[0],
-    /declares neither allow nor deny/,
+    /toolFilter is unsupported by DSH 0.2.2/,
   );
   const sessionKnobProblems = validateTopology(
     withRoles([{ id: "reviewer", name: "Reviewer", preset: "orchestra-reviewer", persona: "x", toolFilter: { deny: ["write"] } }]),

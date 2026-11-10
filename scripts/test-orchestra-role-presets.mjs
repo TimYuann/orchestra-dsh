@@ -327,7 +327,7 @@ test("every v0.4 preset mounts in an unpublished Blueprint harness with plane fa
       provider: "provider",
       model: "model",
     });
-    const commit = await prepared.setup(runtime.child);
+    const commit = await prepared.setup(runtime.child, { session: runtime.session, model: { select: (selection) => runtime.session.append("model/selection", selection) } });
     commit.commit();
     published = false;
     assert.equal(published, false);
@@ -367,7 +367,7 @@ test("Governed role planning resolves the catalog ID and preflights both planes"
     assert.equal(plan.presetId, spec.id);
     assert.equal(plan.blueprint.receipt.agentPreset, spec.id);
     runtime.addSession(plan.blueprint.receipt.sessionId);
-    const commit = await plan.blueprint.setup(runtime.child);
+    const commit = await plan.blueprint.setup(runtime.child, { session: runtime.session, model: { select: (selection) => runtime.session.append("model/selection", selection) } });
     commit.commit();
     assert.deepEqual(plan.blueprint.receipt.compositionTools.names, [...spec.compositionTools].sort());
     assert.deepEqual(plan.blueprint.receipt.orchestraTools.names, [...spec.orchestraTools].sort());
@@ -401,7 +401,7 @@ test("commit-time host readiness failure never publishes the role", async () => 
   });
   await assert.rejects(
     async () => {
-      const commit = await prepared.setup(runtime.child);
+      const commit = await prepared.setup(runtime.child, { session: runtime.session, model: { select: (selection) => runtime.session.append("model/selection", selection) } });
       commit.commit();
     },
     (error) => error instanceof SessionBlueprintError && error.code === "orchestra_tools_missing",

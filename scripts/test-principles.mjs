@@ -48,9 +48,11 @@ test("the principles reach the driver on both surfaces", () => {
     assert.ok(section.text.includes(rule), `the section must state the ${rule} rule`);
   }
   // The one rule whose violation is a safety bug rather than a style problem.
-  assert.match(section.text, /toolFilter narrows availability and is NOT a permission guarantee/);
+  assert.match(section.text, /Native activation supports only its current host contract/);
 
-  assert.equal(runtime.skills.length, 2);
+  assert.equal(runtime.skills.length, 3);
+  assert.equal(runtime.skills[2].name, "orchestra-teams");
+  assert.match(runtime.skills[2].content, /Only a genuine user reply/);
   const skill = runtime.skills[0];
   assert.equal(skill.name, PRINCIPLES_SKILL_NAME);
   assert.equal(skill.source, "runtime");
@@ -58,7 +60,7 @@ test("the principles reach the driver on both surfaces", () => {
   assert.ok(skill.content.includes(PRINCIPLES_SKILL_CONTENT));
   // The skill is the elaborated half: it carries the checklist and the why.
   assert.match(skill.content, /## Before dispatch/);
-  assert.match(skill.content, /joins the driver's LIVE Agent Preset/);
+  assert.match(skill.content, /native persona\/toolFilter overrides on DSH 0.2.2/);
   assert.ok(skill.content.length > section.text.length, "the skill must carry more than the section");
   const presetSkill = runtime.skills[1];
   assert.equal(presetSkill.name, "orchestra-preset-authoring");
